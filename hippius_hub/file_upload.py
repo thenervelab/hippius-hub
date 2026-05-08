@@ -95,14 +95,28 @@ def hippius_hub_upload(
         layers = list(executor.map(process_file, files_to_upload))
 
     # Build and Push OCI Manifest
+    config_data = b"{}"
+    import hashlib
+    config_digest = f"sha256:{hashlib.sha256(config_data).hexdigest()}"
+    config_size = len(config_data)
+
+    # Check and upload config blob
+    check_config_url = f"{DEFAULT_REGISTRY_URL}/v2/{repo_id}/blobs/{config_digest}"
+    if requests.head(check_config_url, headers=headers_manifest if 'headers_manifest' in locals() else {"Authorization": f"Bearer {oci_token}"}).status_code != 200:
+        resp_init = requests.post(f"{DEFAULT_REGISTRY_URL}/v2/{repo_id}/blobs/uploads/", headers={"Authorization": f"Bearer {oci_token}"})
+        if resp_init.status_code in (200, 202):
+            loc = resp_init.headers.get("Location")
+            if loc.startswith("/"): loc = f"{DEFAULT_REGISTRY_URL}{loc}"
+            sep = "&" if "?" in loc else "?"
+            requests.put(f"{loc}{sep}digest={config_digest}", headers={"Authorization": f"Bearer {oci_token}", "Content-Type": "application/octet-stream"}, data=config_data)
+
     manifest = {
         "schemaVersion": 2,
         "mediaType": "application/vnd.oci.image.manifest.v1+json",
         "config": {
             "mediaType": "application/vnd.oci.empty.v1+json",
-            "digest": "sha256:44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
-            "size": 2,
-            "data": "e30="
+            "digest": config_digest,
+            "size": config_size
         },
         "layers": layers,
         "annotations": {
