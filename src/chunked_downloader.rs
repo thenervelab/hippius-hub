@@ -1,15 +1,16 @@
 use futures::stream::{self, StreamExt};
 use reqwest::{header, Client};
 use sha2::{Digest, Sha256};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::time::Duration;
 use indicatif::{ProgressBar, ProgressStyle};
-use tokio::fs::{File, OpenOptions};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::fs::OpenOptions;
+use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt, SeekFrom};
 
 const DEFAULT_CHUNK_SIZE: u64 = 100 * 1024 * 1024; // 100 MB par défaut
 const MAX_CONCURRENT_DOWNLOADS: usize = 16;
 const MAX_RETRIES: u32 = 3;
+const VERIFY_READ_BUFFER: usize = 8 * 1024 * 1024; // 8 MB pour lecture de vérification SHA256
 
 #[derive(Debug)]
 pub enum DownloadError {
@@ -44,7 +45,7 @@ impl ChunkedDownloader {
         let client = Client::builder()
             .connect_timeout(Duration::from_secs(30))
             .build()?;
-            
+
         Ok(Self {
             client,
             url,
@@ -53,73 +54,92 @@ impl ChunkedDownloader {
         })
     }
 
-    /// Télécharge le fichier de manière concurrente en utilisant le Range Header
-    /// Assemble ensuite les chunks et retourne le hash SHA256 final.
+    /// Télécharge le fichier de manière concurrente en streamant chaque chunk
+    /// directement à son offset dans le fichier final (sparse pre-allocated).
+    /// Si verify_hash est vrai, lit le fichier complet en fin de course pour
+    /// produire le SHA256. Sinon retourne une chaîne vide.
     pub async fn download(&self, dest_path: &Path, verify_hash: bool) -> Result<String, DownloadError> {
         // 1. Récupération de la taille totale du blob
         let content_length = self.get_content_length().await?;
-        
+
         // Gérer le cas des fichiers vides
         if content_length == 0 {
             return self.create_empty_file(dest_path).await;
         }
-        
+
         let pb = ProgressBar::new(content_length);
         pb.set_style(ProgressStyle::default_bar()
             .template("{msg} {spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({bytes_per_sec}, {eta})")
             .unwrap()
             .progress_chars("#>-"));
         pb.set_message("📥 Downloading");
-            
+
         let num_chunks = (content_length as f64 / self.chunk_size as f64).ceil() as usize;
-        
-        // Préparation du dossier d'accueil (habituellement blobs/)
+
+        // Préparation du dossier d'accueil
         let parent_dir = dest_path.parent().unwrap_or_else(|| Path::new("."));
         tokio::fs::create_dir_all(parent_dir).await?;
-        
-        // Nom de base pour les chunks temporaires
-        let base_filename = dest_path.file_name().unwrap_or_default().to_string_lossy();
 
-        // 2. Division en N chunks et exécution concurrente avec StreamExt pour limiter la concurrence
+        // 2. Pré-allocation du fichier final à la taille exacte (sparse OK)
+        //    Chaque chunk task ouvrira son propre handle et seekera à son offset.
+        //    Les writes concurrents avec handles distincts sur des ranges disjointes
+        //    sont safe au niveau OS (chaque handle a son propre file pointer).
+        {
+            let f = OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(true)
+                .open(dest_path)
+                .await?;
+            f.set_len(content_length).await?;
+            f.sync_all().await?; // S'assurer que la taille est persistée avant les writes parallèles
+        }
+
+        let dest_path_buf = dest_path.to_path_buf();
+
+        // 3. Lancement des téléchargements concurrents — chacun stream directement
+        //    au bon offset dans le fichier final.
         let mut stream = stream::iter(0..num_chunks).map(|i| {
             let start = i as u64 * self.chunk_size;
             let end = std::cmp::min(start + self.chunk_size - 1, content_length - 1);
-            
+
             let client = self.client.clone();
             let url = self.url.clone();
             let token = self.auth_token.clone();
             let chunk_pb = pb.clone();
-            
-            let chunk_path = parent_dir.join(format!("{}.part_{}", base_filename, i));
-            
+            let path = dest_path_buf.clone();
+
             tokio::spawn(async move {
-                let res = download_chunk_with_retry(client, url, token, start, end, i, chunk_path, chunk_pb).await;
+                let res = download_chunk_with_retry(client, url, token, start, end, i, path, chunk_pb).await;
                 (i, res)
             })
         }).buffer_unordered(MAX_CONCURRENT_DOWNLOADS);
 
-        // Attente de l'exécution concurrente contrôlée
         while let Some(res) = stream.next().await {
-            let (i, chunk_res) = res.map_err(|_| DownloadError::ChunkFailed(0))?; // 0 is placeholder
-            if let Err(e) = chunk_res {
+            let (i, chunk_res) = res.map_err(|_| DownloadError::ChunkFailed(0))?;
+            if let Err(_e) = chunk_res {
                 return Err(DownloadError::ChunkFailed(i));
             }
         }
 
         pb.finish_with_message("✅ Download complete");
-        
-        let pb_asm = ProgressBar::new(content_length);
-        pb_asm.set_style(ProgressStyle::default_bar()
-            .template("{msg} {spinner:.green} [{elapsed_precise}] [{bar:40.magenta/red}] {bytes}/{total_bytes} ({bytes_per_sec}, {eta})")
-            .unwrap()
-            .progress_chars("=>-"));
-        pb_asm.set_message("🧩 Assembling & Hashing");
 
-        // 3. Assemblage des chunks et calcul du SHA256 à la volée
-        let hash = self.assemble_chunks(dest_path, num_chunks, parent_dir, &base_filename, &pb_asm, verify_hash).await?;
-        
-        pb_asm.finish_with_message("✅ Assembly complete");
-        Ok(hash)
+        // 4. SHA256 optionnel — un seul read-pass séquentiel sur le fichier final.
+        //    Bien plus rapide que l'ancienne assembly phase (pas de réécriture).
+        if verify_hash {
+            let pb_hash = ProgressBar::new(content_length);
+            pb_hash.set_style(ProgressStyle::default_bar()
+                .template("{msg} {spinner:.green} [{elapsed_precise}] [{bar:40.magenta/red}] {bytes}/{total_bytes} ({bytes_per_sec}, {eta})")
+                .unwrap()
+                .progress_chars("=>-"));
+            pb_hash.set_message("🔐 Verifying SHA256");
+
+            let hash = compute_sha256(dest_path, &pb_hash).await?;
+            pb_hash.finish_with_message("✅ Verified");
+            Ok(hash)
+        } else {
+            Ok(String::new())
+        }
     }
 
     /// Exécute une requête HEAD pour obtenir le Content-Length
@@ -128,84 +148,57 @@ impl ChunkedDownloader {
         if let Some(ref token) = self.auth_token {
             req = req.bearer_auth(token);
         }
-        
+
         let res = req.send().await?;
         if !res.status().is_success() {
             return Err(DownloadError::ServerError(res.status().as_u16(), format!("Failed HEAD request: {:?}", res.status())));
         }
-        
+
         let content_length = res.headers()
             .get(header::CONTENT_LENGTH)
             .and_then(|val| val.to_str().ok())
             .and_then(|val| val.parse::<u64>().ok())
             .unwrap_or(0);
-            
-        Ok(content_length)
-    }
 
-    /// Assemble tous les fichiers partiels en un fichier final tout en calculant le SHA256
-    async fn assemble_chunks(&self, dest_path: &Path, num_chunks: usize, parent_dir: &Path, base_filename: &str, pb: &ProgressBar, verify_hash: bool) -> Result<String, DownloadError> {
-        let mut final_file = OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .open(dest_path)
-            .await?;
-            
-        let mut hasher = Sha256::new();
-        // Utilisation d'un gros buffer (2 MB) pour maximiser la vitesse d'I/O disque NVMe
-        let mut buffer = vec![0u8; 2 * 1024 * 1024]; 
-        
-        for i in 0..num_chunks {
-            let chunk_path = parent_dir.join(format!("{}.part_{}", base_filename, i));
-            let mut chunk_file = File::open(&chunk_path).await?;
-            
-            loop {
-                let bytes_read = chunk_file.read(&mut buffer).await?;
-                if bytes_read == 0 {
-                    break; // Fin du chunk
-                }
-                
-                final_file.write_all(&buffer[..bytes_read]).await?;
-                // Mise à jour du hash SHA256 purement en Rust si demandé
-                if verify_hash {
-                    hasher.update(&buffer[..bytes_read]);
-                }
-                pb.inc(bytes_read as u64);
-            }
-            
-            // Suppression du chunk temporaire pour libérer l'espace disque
-            tokio::fs::remove_file(&chunk_path).await?;
-        }
-        
-        final_file.flush().await?;
-        
-        // Finalisation et conversion en string hexadécimal
-        if verify_hash {
-            let result = hasher.finalize();
-            Ok(hex::encode(result)) // Requiert la crate 'hex'
-        } else {
-            Ok(String::new())
-        }
+        Ok(content_length)
     }
 
     /// Cas spécifique pour créer un fichier vide si la taille est de 0
     async fn create_empty_file(&self, dest_path: &Path) -> Result<String, DownloadError> {
-        let mut final_file = OpenOptions::new()
+        let f = OpenOptions::new()
             .create(true)
             .write(true)
             .truncate(true)
             .open(dest_path)
             .await?;
-        final_file.flush().await?;
-        
+        f.sync_all().await?;
+        drop(f);
+
         let mut hasher = Sha256::new();
         hasher.update(&[]);
         Ok(hex::encode(hasher.finalize()))
     }
 }
 
-/// Gère un téléchargement de chunk avec logique de retry (Exponential Backoff)
+/// Calcule le SHA256 du fichier final en un seul read-pass séquentiel.
+async fn compute_sha256(path: &Path, pb: &ProgressBar) -> Result<String, DownloadError> {
+    let mut file = OpenOptions::new().read(true).open(path).await?;
+    let mut hasher = Sha256::new();
+    let mut buf = vec![0u8; VERIFY_READ_BUFFER];
+
+    loop {
+        let n = file.read(&mut buf).await?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+        pb.inc(n as u64);
+    }
+
+    Ok(hex::encode(hasher.finalize()))
+}
+
+/// Wrapper avec retry exponential-backoff pour le download d'un chunk.
 async fn download_chunk_with_retry(
     client: Client,
     url: String,
@@ -213,20 +206,19 @@ async fn download_chunk_with_retry(
     start: u64,
     end: u64,
     _chunk_index: usize,
-    chunk_path: PathBuf,
+    dest_path: std::path::PathBuf,
     pb: ProgressBar,
 ) -> Result<(), DownloadError> {
     let mut retries = 0;
-    
+
     loop {
-        match try_download_chunk(&client, &url, &token, start, end, &chunk_path, &pb).await {
+        match try_download_chunk_to_offset(&client, &url, &token, start, end, &dest_path, &pb).await {
             Ok(_) => return Ok(()),
             Err(e) => {
                 retries += 1;
                 if retries > MAX_RETRIES {
                     return Err(e);
                 }
-                // Exponential backoff : 200ms, 400ms, 800ms
                 let wait_time = 2u64.pow(retries) * 100;
                 tokio::time::sleep(Duration::from_millis(wait_time)).await;
             }
@@ -234,56 +226,56 @@ async fn download_chunk_with_retry(
     }
 }
 
-/// Logique interne du téléchargement d'un chunk
-async fn try_download_chunk(
+/// Téléchargement d'un chunk en streaming direct vers son offset dans le fichier
+/// final (déjà pré-alloué). Chaque task ouvre son propre handle, seek à son offset,
+/// et écrit les bytes au fur et à mesure qu'ils arrivent du stream HTTP.
+/// Les writes parallèles sur des ranges disjointes sont safe.
+async fn try_download_chunk_to_offset(
     client: &Client,
     url: &str,
     token: &Option<String>,
     start: u64,
     end: u64,
-    chunk_path: &Path,
+    dest_path: &Path,
     pb: &ProgressBar,
 ) -> Result<(), DownloadError> {
-    // Header Range: bytes=start-end pour Apache Traffic Server (Edge Cache)
     let mut req = client.get(url)
         .header(header::RANGE, format!("bytes={}-{}", start, end));
-        
+
     if let Some(ref t) = token {
         req = req.bearer_auth(t);
     }
-    
+
     let mut res = req.send().await?;
-    
-    // Support des codes 200 (OK complet sans range) et 206 (Partial Content)
+
     if !res.status().is_success() {
-        return Err(DownloadError::ServerError(res.status().as_u16(), format!("Failed chunk bytes {}-{}", start, end)));
+        return Err(DownloadError::ServerError(
+            res.status().as_u16(),
+            format!("Failed chunk bytes {}-{}", start, end),
+        ));
     }
-    
+
+    // Open this task's own handle on the pre-allocated final file, seek to start.
     let mut file = OpenOptions::new()
-        .create(true)
         .write(true)
-        .truncate(true)
-        .open(chunk_path)
+        .open(dest_path)
         .await?;
-        
-    let mut bytes_downloaded_this_attempt = 0;
-    // Stream des données dans le fichier temporaire pour limiter l'utilisation de RAM
+    file.seek(SeekFrom::Start(start)).await?;
+
+    // Stream HTTP body chunks directly to disk at our position.
+    // No temp file, no assembly phase.
     loop {
         match res.chunk().await {
-            Ok(Some(chunk)) => {
-                file.write_all(&chunk).await?;
-                bytes_downloaded_this_attempt += chunk.len() as u64;
-                pb.inc(chunk.len() as u64);
-            },
-            Ok(None) => break,
-            Err(e) => {
-                pb.set_position(pb.position().saturating_sub(bytes_downloaded_this_attempt));
-                return Err(e.into());
+            Ok(Some(buf)) => {
+                let len = buf.len();
+                file.write_all(&buf).await?;
+                pb.inc(len as u64);
             }
+            Ok(None) => break,
+            Err(e) => return Err(e.into()),
         }
     }
-    
+
     file.flush().await?;
-    
     Ok(())
 }
