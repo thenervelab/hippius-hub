@@ -23,7 +23,9 @@ def main():
 
     # Login command
     login_parser = subparsers.add_parser("login", help="Log in to Hippius Hub")
-    login_parser.add_argument("--token", type=str, required=True, help="Access token")
+    login_parser.add_argument("--username", type=str, help="Username")
+    login_parser.add_argument("--password", type=str, help="Password or CLI secret")
+    login_parser.add_argument("--token", type=str, help="Access token (alternative)")
 
     args = parser.parse_args()
 
@@ -55,8 +57,24 @@ def main():
             sys.exit(1)
 
     elif args.command == "login":
-        login(args.token)
-        print("✅ Login successful")
+        import getpass
+        username = args.username
+        password = args.password
+        token = args.token
+
+        if not token and not (username and password):
+            print("Login with your Harbor credentials (or press Enter to use a token instead).")
+            username = input("Username: ").strip()
+            if username:
+                password = getpass.getpass("Password or CLI secret: ").strip()
+            else:
+                token = getpass.getpass("Token: ").strip()
+
+        try:
+            login(username=username, password=password, token=token)
+        except ValueError as e:
+            print(f"❌ Login failed: {e}")
+            sys.exit(1)
 
     else:
         parser.print_help()

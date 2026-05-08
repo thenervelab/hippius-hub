@@ -5,11 +5,23 @@ from .constants import DEFAULT_CACHE_DIR, DEFAULT_REGISTRY_URL
 
 TOKEN_PATH = os.path.join(DEFAULT_CACHE_DIR, "token")
 
-def login(token: str):
+import base64
+
+def login(username: str = None, password: str = None, token: str = None):
     """Save token to ~/.cache/hippius/hub/token"""
     os.makedirs(DEFAULT_CACHE_DIR, exist_ok=True)
+    
+    auth_str = ""
+    if username and password:
+        basic_auth = base64.b64encode(f"{username}:{password}".encode()).decode()
+        auth_str = f"Basic {basic_auth}"
+    elif token:
+        auth_str = f"Bearer {token}"
+    else:
+        raise ValueError("Either username/password or token must be provided")
+        
     with open(TOKEN_PATH, "w") as f:
-        f.write(token)
+        f.write(auth_str)
     print(f"Token successfully saved to {TOKEN_PATH}")
 
 def get_token() -> str:
@@ -53,7 +65,11 @@ def get_oci_bearer_token(repo_id: str, token: str = None, push: bool = False) ->
             
     # 2. Fallback sur le token fourni (souvent utilisé comme Bearer ou Basic selon configuration Harbor)
     if not headers.get("Authorization") and token:
-        headers["Authorization"] = f"Bearer {token}"
+        if token.startswith("Basic ") or token.startswith("Bearer "):
+            headers["Authorization"] = token
+        else:
+            # Backward compatibility
+            headers["Authorization"] = f"Bearer {token}"
     
     resp = requests.get(auth_url, headers=headers)
     resp.raise_for_status()
