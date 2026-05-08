@@ -41,7 +41,7 @@ impl ChunkedDownloader {
     /// Crée une nouvelle instance de téléchargeur concurrent.
     pub fn new(url: String, auth_token: Option<String>, chunk_size_bytes: Option<u64>) -> Result<Self, DownloadError> {
         let client = Client::builder()
-            .timeout(Duration::from_secs(30))
+            .connect_timeout(Duration::from_secs(30))
             .build()?;
             
         Ok(Self {
@@ -249,10 +249,21 @@ async fn try_download_chunk(
         .open(chunk_path)
         .await?;
         
+    let mut bytes_downloaded_this_attempt = 0;
     // Stream des données dans le fichier temporaire pour limiter l'utilisation de RAM
-    while let Some(chunk) = res.chunk().await? {
-        file.write_all(&chunk).await?;
-        pb.inc(chunk.len() as u64);
+    loop {
+        match res.chunk().await {
+            Ok(Some(chunk)) => {
+                file.write_all(&chunk).await?;
+                bytes_downloaded_this_attempt += chunk.len() as u64;
+                pb.inc(chunk.len() as u64);
+            },
+            Ok(None) => break,
+            Err(e) => {
+                pb.set_position(pb.position().saturating_sub(bytes_downloaded_this_attempt));
+                return Err(e.into());
+            }
+        }
     }
     
     file.flush().await?;
