@@ -1,4 +1,4 @@
-use futures::future::join_all;
+use futures::stream::{self, StreamExt};
 use reqwest::{header, Client};
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
@@ -7,7 +7,8 @@ use indicatif::{ProgressBar, ProgressStyle};
 use tokio::fs::{File, OpenOptions};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-const DEFAULT_CHUNK_SIZE: u64 = 50 * 1024 * 1024; // 50 MB par défaut
+const DEFAULT_CHUNK_SIZE: u64 = 100 * 1024 * 1024; // 100 MB par défaut
+const MAX_CONCURRENT_DOWNLOADS: usize = 16;
 const MAX_RETRIES: u32 = 3;
 
 #[derive(Debug)]
@@ -69,7 +70,6 @@ impl ChunkedDownloader {
             .unwrap()
             .progress_chars("#>-"));
             
-        let mut tasks = Vec::new();
         let num_chunks = (content_length as f64 / self.chunk_size as f64).ceil() as usize;
         
         // Préparation du dossier d'accueil (habituellement blobs/)
@@ -79,8 +79,8 @@ impl ChunkedDownloader {
         // Nom de base pour les chunks temporaires
         let base_filename = dest_path.file_name().unwrap_or_default().to_string_lossy();
 
-        // 2. Division en N chunks et exécution concurrente
-        for i in 0..num_chunks {
+        // 2. Division en N chunks et exécution concurrente avec StreamExt pour limiter la concurrence
+        let mut stream = stream::iter(0..num_chunks).map(|i| {
             let start = i as u64 * self.chunk_size;
             let end = std::cmp::min(start + self.chunk_size - 1, content_length - 1);
             
@@ -91,18 +91,18 @@ impl ChunkedDownloader {
             
             let chunk_path = parent_dir.join(format!("{}.part_{}", base_filename, i));
             
-            let task = tokio::spawn(async move {
-                download_chunk_with_retry(client, url, token, start, end, i, chunk_path, chunk_pb).await
-            });
-            
-            tasks.push(task);
-        }
+            tokio::spawn(async move {
+                let res = download_chunk_with_retry(client, url, token, start, end, i, chunk_path, chunk_pb).await;
+                (i, res)
+            })
+        }).buffer_unordered(MAX_CONCURRENT_DOWNLOADS);
 
-        // Attente de l'exécution concurrente de tous les chunks via tokio::spawn
-        let results = join_all(tasks).await;
-        for (i, res) in results.into_iter().enumerate() {
-            let chunk_res = res.map_err(|_| DownloadError::ChunkFailed(i))?;
-            chunk_res?;
+        // Attente de l'exécution concurrente contrôlée
+        while let Some(res) = stream.next().await {
+            let (i, chunk_res) = res.map_err(|_| DownloadError::ChunkFailed(0))?; // 0 is placeholder
+            if let Err(e) = chunk_res {
+                return Err(DownloadError::ChunkFailed(i));
+            }
         }
 
         // 3. Assemblage des chunks et calcul du SHA256 à la volée
