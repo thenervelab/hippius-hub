@@ -74,7 +74,7 @@ def hippius_hub_download(
     # 2. Téléchargement concurrent via le moteur Rust
     temp_path = os.path.join(blobs_dir, f"tmp_{filename.replace('/', '_')}")
     
-    print(f"Téléchargement concurrent de {filename} via hippius_core (Rust)...")
+    print(f"Téléchargement concurrent de {filename}...")
     calculated_hash = download_file_native(
         url=url, 
         dest_path=temp_path, 

@@ -60,7 +60,7 @@ def hippius_hub_upload(
         resp_check = requests.head(check_url, headers=headers)
         
         if resp_check.status_code == 200:
-            tqdm.write(f"✅ Cache HIT (skipped): {rel_path}")
+            tqdm.write(f"✅ Already published (skipped): {rel_path}")
         else:
             tqdm.write(f"🚀 Uploading: {rel_path} ({file_size} bytes)...")
             # 3. Initiate upload
@@ -72,7 +72,7 @@ def hippius_hub_upload(
             
             location = resp_init.headers.get("Location")
             if not location:
-                raise ValueError("No Location header returned by Harbor for upload initiation")
+                raise ValueError("Registry did not return a Location header for upload initiation")
                 
             # If location is relative, make it absolute
             if location.startswith("/"):
