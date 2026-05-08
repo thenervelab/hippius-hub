@@ -1,4 +1,6 @@
-use reqwest::{Client, header};
+use futures::stream::StreamExt;
+use indicatif::{ProgressBar, ProgressStyle};
+use reqwest::{header, Client};
 use sha2::{Digest, Sha256};
 use std::path::Path;
 use std::time::Duration;
@@ -44,20 +46,45 @@ pub async fn hash_file_async(path: &Path) -> Result<(String, u64), UploadError> 
     Ok((hex::encode(hasher.finalize()), total_size))
 }
 
-/// Upload un fichier en mode streaming vers une URL OCI (souvent S3 ou Harbor)
+/// Upload un fichier en streaming vers une URL OCI (Harbor PUT /blobs/uploads/<uuid>?digest=...).
+/// Affiche une progress bar par appel — utile pour les gros blobs (multi-GB).
 pub async fn upload_blob_async(url: &str, path: &Path, auth_token: Option<&str>) -> Result<(), UploadError> {
     let client = Client::builder()
-        .timeout(Duration::from_secs(3600)) // 1 hour timeout for massive uploads
+        .timeout(Duration::from_secs(3600)) // 1h timeout pour les uploads massifs
         .build()?;
 
     let file = File::open(path).await?;
     let file_size = file.metadata().await?.len();
-    
-    // Convertit le fichier tokio asynchrone en un stream pour reqwest
-    let stream = FramedRead::new(file, BytesCodec::new());
+
+    // Progress bar — la stream wrapper la met à jour à chaque chunk émis vers reqwest.
+    let pb = ProgressBar::new(file_size);
+    pb.set_style(
+        ProgressStyle::default_bar()
+            .template(
+                "{msg} {spinner:.green} [{elapsed_precise}] [{bar:40.green/blue}] {bytes}/{total_bytes} ({bytes_per_sec}, {eta})",
+            )
+            .unwrap()
+            .progress_chars("#>-"),
+    );
+    let basename = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "blob".to_string());
+    pb.set_message(format!("📤 {}", basename));
+
+    // Wrappe le stream pour incrémenter la progress bar à chaque chunk de body
+    // émis vers reqwest. ProgressBar est Arc-internalement → clone bon marché.
+    let pb_stream = pb.clone();
+    let stream = FramedRead::new(file, BytesCodec::new()).map(move |chunk_result| {
+        if let Ok(ref bytes) = chunk_result {
+            pb_stream.inc(bytes.len() as u64);
+        }
+        chunk_result
+    });
     let body = reqwest::Body::wrap_stream(stream);
 
-    let mut req = client.put(url)
+    let mut req = client
+        .put(url)
         .header(header::CONTENT_LENGTH, file_size)
         .header(header::CONTENT_TYPE, "application/octet-stream")
         .body(body);
@@ -69,8 +96,13 @@ pub async fn upload_blob_async(url: &str, path: &Path, auth_token: Option<&str>)
     let res = req.send().await?;
 
     if !res.status().is_success() {
-        return Err(UploadError::ServerError(res.status().as_u16(), format!("Upload failed: {:?}", res.status())));
+        pb.finish_with_message(format!("❌ {} failed", basename));
+        return Err(UploadError::ServerError(
+            res.status().as_u16(),
+            format!("Upload failed: {:?}", res.status()),
+        ));
     }
 
+    pb.finish_with_message(format!("✅ {} uploaded", basename));
     Ok(())
 }
