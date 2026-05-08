@@ -3,6 +3,7 @@ use reqwest::{header, Client};
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
+use indicatif::{ProgressBar, ProgressStyle};
 use tokio::fs::{File, OpenOptions};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -62,6 +63,12 @@ impl ChunkedDownloader {
             return self.create_empty_file(dest_path).await;
         }
         
+        let pb = ProgressBar::new(content_length);
+        pb.set_style(ProgressStyle::default_bar()
+            .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({bytes_per_sec}, {eta})")
+            .unwrap()
+            .progress_chars("#>-"));
+            
         let mut tasks = Vec::new();
         let num_chunks = (content_length as f64 / self.chunk_size as f64).ceil() as usize;
         
@@ -80,11 +87,12 @@ impl ChunkedDownloader {
             let client = self.client.clone();
             let url = self.url.clone();
             let token = self.auth_token.clone();
+            let chunk_pb = pb.clone();
             
             let chunk_path = parent_dir.join(format!("{}.part_{}", base_filename, i));
             
             let task = tokio::spawn(async move {
-                download_chunk_with_retry(client, url, token, start, end, i, chunk_path).await
+                download_chunk_with_retry(client, url, token, start, end, i, chunk_path, chunk_pb).await
             });
             
             tasks.push(task);
@@ -98,7 +106,10 @@ impl ChunkedDownloader {
         }
 
         // 3. Assemblage des chunks et calcul du SHA256 à la volée
-        self.assemble_chunks(dest_path, num_chunks, parent_dir, &base_filename).await
+        let hash = self.assemble_chunks(dest_path, num_chunks, parent_dir, &base_filename).await?;
+        
+        pb.finish_with_message("Download complete");
+        Ok(hash)
     }
 
     /// Exécute une requête HEAD pour obtenir le Content-Length
@@ -186,11 +197,12 @@ async fn download_chunk_with_retry(
     end: u64,
     _chunk_index: usize,
     chunk_path: PathBuf,
+    pb: ProgressBar,
 ) -> Result<(), DownloadError> {
     let mut retries = 0;
     
     loop {
-        match try_download_chunk(&client, &url, &token, start, end, &chunk_path).await {
+        match try_download_chunk(&client, &url, &token, start, end, &chunk_path, &pb).await {
             Ok(_) => return Ok(()),
             Err(e) => {
                 retries += 1;
@@ -213,6 +225,7 @@ async fn try_download_chunk(
     start: u64,
     end: u64,
     chunk_path: &Path,
+    pb: &ProgressBar,
 ) -> Result<(), DownloadError> {
     // Header Range: bytes=start-end pour Apache Traffic Server (Edge Cache)
     let mut req = client.get(url)
@@ -239,6 +252,7 @@ async fn try_download_chunk(
     // Stream des données dans le fichier temporaire pour limiter l'utilisation de RAM
     while let Some(chunk) = res.chunk().await? {
         file.write_all(&chunk).await?;
+        pb.inc(chunk.len() as u64);
     }
     
     file.flush().await?;
