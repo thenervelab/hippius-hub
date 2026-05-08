@@ -1,0 +1,23 @@
+[build-system]
+requires = ["maturin>=1.4,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "hippius_hub"
+version = "0.1.0"
+description = "Drop-in replacement for huggingface_hub using a Rust backend for ultra-fast downloads"
+requires-python = ">=3.8"
+dependencies = [
+    "requests",
+    "typing_extensions",
+    "tqdm"
+]
+
+[project.scripts]
+hippius-hub = "hippius_hub.cli:main"
+
+[tool.maturin]
+features = ["pyo3/extension-module"]
+module-name = "hippius_hub.hippius_core"
+python-source = "."
+
