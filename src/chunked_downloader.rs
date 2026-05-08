@@ -55,7 +55,7 @@ impl ChunkedDownloader {
 
     /// Télécharge le fichier de manière concurrente en utilisant le Range Header
     /// Assemble ensuite les chunks et retourne le hash SHA256 final.
-    pub async fn download(&self, dest_path: &Path) -> Result<String, DownloadError> {
+    pub async fn download(&self, dest_path: &Path, verify_hash: bool) -> Result<String, DownloadError> {
         // 1. Récupération de la taille totale du blob
         let content_length = self.get_content_length().await?;
         
@@ -116,7 +116,7 @@ impl ChunkedDownloader {
         pb_asm.set_message("🧩 Assembling & Hashing");
 
         // 3. Assemblage des chunks et calcul du SHA256 à la volée
-        let hash = self.assemble_chunks(dest_path, num_chunks, parent_dir, &base_filename, &pb_asm).await?;
+        let hash = self.assemble_chunks(dest_path, num_chunks, parent_dir, &base_filename, &pb_asm, verify_hash).await?;
         
         pb_asm.finish_with_message("✅ Assembly complete");
         Ok(hash)
@@ -144,7 +144,7 @@ impl ChunkedDownloader {
     }
 
     /// Assemble tous les fichiers partiels en un fichier final tout en calculant le SHA256
-    async fn assemble_chunks(&self, dest_path: &Path, num_chunks: usize, parent_dir: &Path, base_filename: &str, pb: &ProgressBar) -> Result<String, DownloadError> {
+    async fn assemble_chunks(&self, dest_path: &Path, num_chunks: usize, parent_dir: &Path, base_filename: &str, pb: &ProgressBar, verify_hash: bool) -> Result<String, DownloadError> {
         let mut final_file = OpenOptions::new()
             .create(true)
             .write(true)
@@ -167,8 +167,10 @@ impl ChunkedDownloader {
                 }
                 
                 final_file.write_all(&buffer[..bytes_read]).await?;
-                // Mise à jour du hash SHA256 purement en Rust
-                hasher.update(&buffer[..bytes_read]);
+                // Mise à jour du hash SHA256 purement en Rust si demandé
+                if verify_hash {
+                    hasher.update(&buffer[..bytes_read]);
+                }
                 pb.inc(bytes_read as u64);
             }
             
@@ -179,8 +181,12 @@ impl ChunkedDownloader {
         final_file.flush().await?;
         
         // Finalisation et conversion en string hexadécimal
-        let result = hasher.finalize();
-        Ok(hex::encode(result)) // Requiert la crate 'hex'
+        if verify_hash {
+            let result = hasher.finalize();
+            Ok(hex::encode(result)) // Requiert la crate 'hex'
+        } else {
+            Ok(String::new())
+        }
     }
 
     /// Cas spécifique pour créer un fichier vide si la taille est de 0

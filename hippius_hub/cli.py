@@ -14,6 +14,7 @@ def main():
     download_parser.add_argument("--revision", type=str, default="main", help="Revision/branch")
     download_parser.add_argument("--chunk-size", type=int, default=50 * 1024 * 1024, help="Chunk size in bytes")
     download_parser.add_argument("--cache-dir", type=str, default=None, help="Path to the cache directory")
+    download_parser.add_argument("--verify-hash", action="store_true", help="Verify SHA256 hash locally (slower assembly)")
 
     # Upload command
     upload_parser = subparsers.add_parser("upload", help="Upload a file or folder to a repository")
@@ -37,7 +38,8 @@ def main():
                 filename=args.filename,
                 revision=args.revision,
                 chunk_size=args.chunk_size,
-                cache_dir=args.cache_dir
+                cache_dir=args.cache_dir,
+                verify_hash=args.verify_hash
             )
             print(f"✅ File downloaded to: {path}")
         except Exception as e:

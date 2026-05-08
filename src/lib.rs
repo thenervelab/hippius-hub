@@ -6,12 +6,13 @@ mod chunked_downloader;
 use chunked_downloader::ChunkedDownloader;
 
 #[pyfunction]
-#[pyo3(signature = (url, dest_path, auth_token=None, chunk_size=None))]
+#[pyo3(signature = (url, dest_path, auth_token=None, chunk_size=None, verify_hash=true))]
 fn download_file_native(
     url: String,
     dest_path: String,
     auth_token: Option<String>,
     chunk_size: Option<u64>,
+    verify_hash: bool,
 ) -> PyResult<String> {
     // Instanciation du runtime Tokio synchrone
     let rt = tokio::runtime::Runtime::new()
@@ -24,7 +25,7 @@ fn download_file_native(
     
     // Blocage du thread Python pendant que Rust fait l'I/O asynchrone concurrent
     let sha256_hash = rt.block_on(async {
-        downloader.download(&dest).await
+        downloader.download(&dest, verify_hash).await
     }).map_err(|e| PyRuntimeError::new_err(format!("Download failed: {:?}", e)))?;
     
     Ok(sha256_hash)
