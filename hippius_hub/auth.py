@@ -52,7 +52,7 @@ def get_docker_auth(registry_url: str) -> str:
     return None
 
 def get_oci_bearer_token(repo_id: str, token: str = None, push: bool = False) -> str:
-    """Fetch OCI bearer token for the given repository using Harbor/Registry v2 API."""
+    """Fetch an OCI bearer token from the Hippius registry token endpoint."""
     scope = f"repository:{repo_id}:pull,push" if push else f"repository:{repo_id}:pull"
     auth_url = f"{DEFAULT_REGISTRY_URL}/service/token?service=harbor-registry&scope={scope}"
     headers = {}
@@ -63,7 +63,7 @@ def get_oci_bearer_token(repo_id: str, token: str = None, push: bool = False) ->
         if docker_auth:
             headers["Authorization"] = f"Basic {docker_auth}"
             
-    # 2. Fallback sur le token fourni (souvent utilisé comme Bearer ou Basic selon configuration Harbor)
+    # 2. Fallback sur le token fourni (Bearer ou Basic selon la config registry)
     if not headers.get("Authorization") and token:
         if token.startswith("Basic ") or token.startswith("Bearer "):
             headers["Authorization"] = token

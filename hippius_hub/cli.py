@@ -65,7 +65,7 @@ def main():
         token = args.token
 
         if not token and not (username and password):
-            print("Login with your Harbor credentials (or press Enter to use a token instead).")
+            print("Login with your Hippius credentials (or press Enter to use a token instead).")
             username = input("Username: ").strip()
             if username:
                 password = getpass.getpass("Password or CLI secret: ").strip()

@@ -46,7 +46,7 @@ pub async fn hash_file_async(path: &Path) -> Result<(String, u64), UploadError> 
     Ok((hex::encode(hasher.finalize()), total_size))
 }
 
-/// Upload un fichier en streaming vers une URL OCI (Harbor PUT /blobs/uploads/<uuid>?digest=...).
+/// Upload un fichier en streaming vers l URL OCI retournée par /blobs/uploads/ (PUT digest finalise le blob).
 /// Affiche une progress bar par appel — utile pour les gros blobs (multi-GB).
 pub async fn upload_blob_async(url: &str, path: &Path, auth_token: Option<&str>) -> Result<(), UploadError> {
     let client = Client::builder()
