@@ -66,9 +66,10 @@ impl ChunkedDownloader {
         
         let pb = ProgressBar::new(content_length);
         pb.set_style(ProgressStyle::default_bar()
-            .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({bytes_per_sec}, {eta})")
+            .template("{msg} {spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({bytes_per_sec}, {eta})")
             .unwrap()
             .progress_chars("#>-"));
+        pb.set_message("📥 Downloading");
             
         let num_chunks = (content_length as f64 / self.chunk_size as f64).ceil() as usize;
         
@@ -105,10 +106,19 @@ impl ChunkedDownloader {
             }
         }
 
-        // 3. Assemblage des chunks et calcul du SHA256 à la volée
-        let hash = self.assemble_chunks(dest_path, num_chunks, parent_dir, &base_filename).await?;
+        pb.finish_with_message("✅ Download complete");
         
-        pb.finish_with_message("Download complete");
+        let pb_asm = ProgressBar::new(content_length);
+        pb_asm.set_style(ProgressStyle::default_bar()
+            .template("{msg} {spinner:.green} [{elapsed_precise}] [{bar:40.magenta/red}] {bytes}/{total_bytes} ({bytes_per_sec}, {eta})")
+            .unwrap()
+            .progress_chars("=>-"));
+        pb_asm.set_message("🧩 Assembling & Hashing");
+
+        // 3. Assemblage des chunks et calcul du SHA256 à la volée
+        let hash = self.assemble_chunks(dest_path, num_chunks, parent_dir, &base_filename, &pb_asm).await?;
+        
+        pb_asm.finish_with_message("✅ Assembly complete");
         Ok(hash)
     }
 
@@ -134,7 +144,7 @@ impl ChunkedDownloader {
     }
 
     /// Assemble tous les fichiers partiels en un fichier final tout en calculant le SHA256
-    async fn assemble_chunks(&self, dest_path: &Path, num_chunks: usize, parent_dir: &Path, base_filename: &str) -> Result<String, DownloadError> {
+    async fn assemble_chunks(&self, dest_path: &Path, num_chunks: usize, parent_dir: &Path, base_filename: &str, pb: &ProgressBar) -> Result<String, DownloadError> {
         let mut final_file = OpenOptions::new()
             .create(true)
             .write(true)
@@ -143,8 +153,8 @@ impl ChunkedDownloader {
             .await?;
             
         let mut hasher = Sha256::new();
-        // Utilisation d'un gros buffer pour maximiser la vitesse d'I/O disque
-        let mut buffer = vec![0u8; 64 * 1024]; // 64 KB
+        // Utilisation d'un gros buffer (2 MB) pour maximiser la vitesse d'I/O disque NVMe
+        let mut buffer = vec![0u8; 2 * 1024 * 1024]; 
         
         for i in 0..num_chunks {
             let chunk_path = parent_dir.join(format!("{}.part_{}", base_filename, i));
@@ -159,6 +169,7 @@ impl ChunkedDownloader {
                 final_file.write_all(&buffer[..bytes_read]).await?;
                 // Mise à jour du hash SHA256 purement en Rust
                 hasher.update(&buffer[..bytes_read]);
+                pb.inc(bytes_read as u64);
             }
             
             // Suppression du chunk temporaire pour libérer l'espace disque
