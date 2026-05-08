@@ -63,7 +63,9 @@ def hippius_hub_upload(
             print(f"🚀 Uploading: {rel_path} ({file_size} bytes)...")
             # 3. Initiate upload
             init_url = f"{DEFAULT_REGISTRY_URL}/v2/{repo_id}/blobs/uploads/"
-            resp_init = requests.post(init_url, headers=headers)
+            post_headers = headers.copy()
+            post_headers["Content-Length"] = "0"
+            resp_init = requests.post(init_url, headers=post_headers)
             resp_init.raise_for_status()
             
             location = resp_init.headers.get("Location")
@@ -103,7 +105,8 @@ def hippius_hub_upload(
     # Check and upload config blob
     check_config_url = f"{DEFAULT_REGISTRY_URL}/v2/{repo_id}/blobs/{config_digest}"
     if requests.head(check_config_url, headers=headers_manifest if 'headers_manifest' in locals() else {"Authorization": f"Bearer {oci_token}"}).status_code != 200:
-        resp_init = requests.post(f"{DEFAULT_REGISTRY_URL}/v2/{repo_id}/blobs/uploads/", headers={"Authorization": f"Bearer {oci_token}"})
+        post_headers = {"Authorization": f"Bearer {oci_token}", "Content-Length": "0"}
+        resp_init = requests.post(f"{DEFAULT_REGISTRY_URL}/v2/{repo_id}/blobs/uploads/", headers=post_headers)
         if resp_init.status_code in (200, 202):
             loc = resp_init.headers.get("Location")
             if loc.startswith("/"): loc = f"{DEFAULT_REGISTRY_URL}{loc}"
