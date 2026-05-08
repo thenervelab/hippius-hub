@@ -13,6 +13,7 @@ def main():
     download_parser.add_argument("filename", type=str, help="Filename to download")
     download_parser.add_argument("--revision", type=str, default="main", help="Revision/branch")
     download_parser.add_argument("--chunk-size", type=int, default=50 * 1024 * 1024, help="Chunk size in bytes")
+    download_parser.add_argument("--cache-dir", type=str, default=None, help="Path to the cache directory")
 
     # Login command
     login_parser = subparsers.add_parser("login", help="Log in to Hippius Hub")
@@ -27,7 +28,8 @@ def main():
                 repo_id=args.repo_id,
                 filename=args.filename,
                 revision=args.revision,
-                chunk_size=args.chunk_size
+                chunk_size=args.chunk_size,
+                cache_dir=args.cache_dir
             )
             print(f"✅ File downloaded to: {path}")
         except Exception as e:
