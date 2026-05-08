@@ -29,8 +29,31 @@ def hippius_hub_download(
         
     oci_token = get_oci_bearer_token(repo_id, token)
     
-    # Construction de l'URL pour un blob brut OCI
-    url = f"{DEFAULT_REGISTRY_URL}/v2/{repo_id}/raw/{revision}/{filename}"
+    import requests
+    # Récupération du manifest OCI pour trouver le digest exact du fichier
+    manifest_url = f"{DEFAULT_REGISTRY_URL}/v2/{repo_id}/manifests/{revision}"
+    headers = {"Authorization": f"Bearer {oci_token}", "Accept": "application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.v2+json"}
+    
+    resp = requests.get(manifest_url, headers=headers)
+    if resp.status_code == 404:
+        raise ValueError(f"Revision '{revision}' not found in repository '{repo_id}'")
+    resp.raise_for_status()
+    
+    manifest = resp.json()
+    layers = manifest.get("layers", [])
+    target_digest = None
+    
+    for layer in layers:
+        annotations = layer.get("annotations", {})
+        title = annotations.get("org.opencontainers.image.title")
+        if title == filename:
+            target_digest = layer.get("digest")
+            break
+            
+    if not target_digest:
+        raise ValueError(f"File '{filename}' not found in the OCI manifest of '{repo_id}:{revision}'")
+        
+    url = f"{DEFAULT_REGISTRY_URL}/v2/{repo_id}/blobs/{target_digest}"
     
     # Structure de cache calquée sur huggingface_hub
     repo_dir = os.path.join(cache_dir, f"models--{repo_id.replace('/', '--')}")
