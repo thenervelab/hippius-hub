@@ -46,6 +46,8 @@ def hippius_hub_upload(
 
     layers = []
     
+    from tqdm import tqdm
+    
     def process_file(file_path):
         rel_path = os.path.relpath(file_path, base_dir)
         # 1. Hashing local file (fast Rust)
@@ -58,9 +60,9 @@ def hippius_hub_upload(
         resp_check = requests.head(check_url, headers=headers)
         
         if resp_check.status_code == 200:
-            print(f"✅ Cache HIT (skipped): {rel_path}")
+            tqdm.write(f"✅ Cache HIT (skipped): {rel_path}")
         else:
-            print(f"🚀 Uploading: {rel_path} ({file_size} bytes)...")
+            tqdm.write(f"🚀 Uploading: {rel_path} ({file_size} bytes)...")
             # 3. Initiate upload
             init_url = f"{DEFAULT_REGISTRY_URL}/v2/{repo_id}/blobs/uploads/"
             post_headers = headers.copy()
@@ -81,7 +83,7 @@ def hippius_hub_upload(
             upload_url = f"{location}{separator}digest={digest}"
             
             upload_blob_native(upload_url, file_path, oci_token)
-            print(f"✅ Uploaded: {rel_path}")
+            tqdm.write(f"✅ Uploaded: {rel_path}")
             
         return {
             "mediaType": "application/octet-stream",
@@ -93,8 +95,14 @@ def hippius_hub_upload(
         }
 
     # Parallelize file checks and uploads
+    import concurrent.futures
+    from tqdm import tqdm
+    
+    layers = []
     with ThreadPoolExecutor(max_workers=8) as executor:
-        layers = list(executor.map(process_file, files_to_upload))
+        futures = [executor.submit(process_file, f) for f in files_to_upload]
+        for future in tqdm(concurrent.futures.as_completed(futures), total=len(files_to_upload), desc="Uploading", unit="file"):
+            layers.append(future.result())
 
     # Build and Push OCI Manifest
     config_data = b"{}"
