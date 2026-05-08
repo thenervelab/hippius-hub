@@ -39,9 +39,10 @@ def get_docker_auth(registry_url: str) -> str:
         pass
     return None
 
-def get_oci_bearer_token(repo_id: str, token: str = None) -> str:
+def get_oci_bearer_token(repo_id: str, token: str = None, push: bool = False) -> str:
     """Fetch OCI bearer token for the given repository using Harbor/Registry v2 API."""
-    auth_url = f"{DEFAULT_REGISTRY_URL}/service/token?service=harbor-registry&scope=repository:{repo_id}:pull"
+    scope = f"repository:{repo_id}:pull,push" if push else f"repository:{repo_id}:pull"
+    auth_url = f"{DEFAULT_REGISTRY_URL}/service/token?service=harbor-registry&scope={scope}"
     headers = {}
     
     # 1. Utilisation de ~/.docker/config.json en priorité (Basic Auth)

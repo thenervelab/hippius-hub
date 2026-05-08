@@ -15,6 +15,12 @@ def main():
     download_parser.add_argument("--chunk-size", type=int, default=50 * 1024 * 1024, help="Chunk size in bytes")
     download_parser.add_argument("--cache-dir", type=str, default=None, help="Path to the cache directory")
 
+    # Upload command
+    upload_parser = subparsers.add_parser("upload", help="Upload a file or folder to a repository")
+    upload_parser.add_argument("repo_id", type=str, help="Repository ID (e.g., org/model)")
+    upload_parser.add_argument("local_path", type=str, help="Path to the local file or folder")
+    upload_parser.add_argument("--revision", type=str, default="main", help="Revision/branch")
+
     # Login command
     login_parser = subparsers.add_parser("login", help="Log in to Hippius Hub")
     login_parser.add_argument("--token", type=str, required=True, help="Access token")
@@ -34,6 +40,18 @@ def main():
             print(f"✅ File downloaded to: {path}")
         except Exception as e:
             print(f"❌ Download failed: {e}")
+            sys.exit(1)
+
+    elif args.command == "upload":
+        from .file_upload import hippius_hub_upload
+        try:
+            hippius_hub_upload(
+                repo_id=args.repo_id,
+                local_path=args.local_path,
+                revision=args.revision
+            )
+        except Exception as e:
+            print(f"❌ Upload failed: {e}")
             sys.exit(1)
 
     elif args.command == "login":
