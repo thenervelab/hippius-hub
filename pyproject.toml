@@ -8,13 +8,14 @@ version = "0.2.2"
 description = "Drop-in replacement for huggingface_hub using a Rust backend for ultra-fast downloads"
 requires-python = ">=3.8"
 dependencies = [
-    "requests",
+    "httpx",
     "typing_extensions",
-    "tqdm"
+    "tqdm",
+    "huggingface_hub>=1.0"
 ]
 
 [project.optional-dependencies]
-test = ["pytest>=7", "huggingface_hub>=0.20"]
+test = ["pytest>=7"]
 
 [project.scripts]
 hippius-hub = "hippius_hub.cli:main"

@@ -89,35 +89,35 @@ def test_unicode_filename(tmp_path, cache_dir, logged_in, test_repo, revision):
     ],
     ids=["clean-2-chunks", "off-by-one-chunk", "exactly-one-chunk", "one-byte-tail"],
 )
-def test_chunk_size_boundary(tmp_path, cache_dir, logged_in, test_repo, revision, file_size, chunk_size):
+def test_chunk_size_boundary(tmp_path, cache_dir, logged_in, test_repo, revision, file_size, chunk_size, monkeypatch):
     src = tmp_path / "chunked.bin"
     expected = write_test_file(src, file_size, seed=f"chunk-{file_size}".encode())
 
     hippius_hub_upload(repo_id=test_repo, local_path=str(src), revision=revision)
 
+    monkeypatch.setenv("HIPPIUS_CHUNK_SIZE", str(chunk_size))
     out = hf_hub_download(
         repo_id=test_repo,
         filename="chunked.bin",
         revision=revision,
         cache_dir=cache_dir,
-        chunk_size=chunk_size,
     )
     assert sha256_of_file(out) == expected
     assert os.path.getsize(out) == file_size
 
 
-def test_verify_hash_true(tmp_path, cache_dir, logged_in, test_repo, revision):
+def test_verify_hash_true(tmp_path, cache_dir, logged_in, test_repo, revision, monkeypatch):
     src = tmp_path / "verify.bin"
     expected = write_test_file(src, 64 * 1024, seed=b"verify")
 
     hippius_hub_upload(repo_id=test_repo, local_path=str(src), revision=revision)
 
+    monkeypatch.setenv("HIPPIUS_VERIFY_HASH", "1")
     out = hf_hub_download(
         repo_id=test_repo,
         filename="verify.bin",
         revision=revision,
         cache_dir=cache_dir,
-        verify_hash=True,
     )
     assert sha256_of_file(out) == expected
 

@@ -1,4 +1,5 @@
 import argparse
+import os
 import sys
 from .file_download import hippius_hub_download
 from .auth import login
@@ -32,14 +33,16 @@ def main():
 
     if args.command == "download":
         print(f"Downloading {args.filename} from {args.repo_id} (revision: {args.revision})...")
+        if args.chunk_size:
+            os.environ["HIPPIUS_CHUNK_SIZE"] = str(args.chunk_size)
+        if args.verify_hash:
+            os.environ["HIPPIUS_VERIFY_HASH"] = "1"
         try:
             path = hippius_hub_download(
                 repo_id=args.repo_id,
                 filename=args.filename,
                 revision=args.revision,
-                chunk_size=args.chunk_size,
                 cache_dir=args.cache_dir,
-                verify_hash=args.verify_hash
             )
             print(f"✅ File downloaded to: {path}")
         except Exception as e:
