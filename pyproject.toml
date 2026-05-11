@@ -13,6 +13,9 @@ dependencies = [
     "tqdm"
 ]
 
+[project.optional-dependencies]
+test = ["pytest>=7", "huggingface_hub>=0.20"]
+
 [project.scripts]
 hippius-hub = "hippius_hub.cli:main"
 
@@ -20,4 +23,12 @@ hippius-hub = "hippius_hub.cli:main"
 features = ["pyo3/extension-module"]
 module-name = "hippius_hub.hippius_core"
 python-source = "."
+
+[tool.pytest.ini_options]
+addopts = "-m 'not e2e and not hf_parity'"
+markers = [
+    "e2e: tests that talk to registry.hippius.com (require HIPPIUS_TEST_USER/PASS)",
+    "hf_parity: tests that also hit huggingface.co (require network to HF)",
+    "slow: tests that move large amounts of data (excluded from PR runs)",
+]
 

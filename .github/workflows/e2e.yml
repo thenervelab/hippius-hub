@@ -1,0 +1,41 @@
+name: E2E
+
+on:
+  pull_request:
+  schedule:
+    - cron: '0 4 * * *'
+  workflow_dispatch:
+
+jobs:
+  e2e:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Build and install hippius_hub
+        run: |
+          python -m venv .venv
+          .venv/bin/pip install --upgrade pip maturin
+          .venv/bin/maturin develop --release
+          .venv/bin/pip install -e ".[test]"
+
+      - name: Run fast e2e suite
+        env:
+          HIPPIUS_TEST_USER: ${{ secrets.HIPPIUS_TEST_USER }}
+          HIPPIUS_TEST_PASS: ${{ secrets.HIPPIUS_TEST_PASS }}
+          HIPPIUS_TEST_TOKEN: ${{ secrets.HIPPIUS_TEST_TOKEN }}
+        run: .venv/bin/pytest -m "e2e and not slow" -v
+
+      - name: Run slow + parity (nightly / manual only)
+        if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+        env:
+          HIPPIUS_TEST_USER: ${{ secrets.HIPPIUS_TEST_USER }}
+          HIPPIUS_TEST_PASS: ${{ secrets.HIPPIUS_TEST_PASS }}
+          HIPPIUS_TEST_TOKEN: ${{ secrets.HIPPIUS_TEST_TOKEN }}
+        run: .venv/bin/pytest -m "e2e or hf_parity" -v
