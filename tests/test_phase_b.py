@@ -357,6 +357,57 @@ def test_delete_repo_repo_type_dataset_raises():
         delete_repo("any/repo", repo_type="dataset")
 
 
+# ---------- HF-only kwargs: warn vs raise ----------
+
+def test_upload_file_create_pr_warns_and_proceeds_to_validation(tmp_path):
+    """create_pr=True should emit a UserWarning (HF accept-and-ignore pattern),
+    not raise NotImplementedError. We call without creds so it'll fail at the
+    network/auth boundary later, but the warning must fire first."""
+    src = tmp_path / "f.bin"
+    src.write_bytes(b"x")
+    with pytest.warns(UserWarning, match="create_pr=True is ignored"):
+        # Will fail downstream (no creds), but we just care that it warns BEFORE failing.
+        try:
+            upload_file(
+                path_or_fileobj=str(src),
+                path_in_repo="f.bin",
+                repo_id="test/e2e-client",
+                create_pr=True,
+                token=False,
+            )
+        except Exception:
+            pass
+
+
+def test_upload_file_parent_commit_warns(tmp_path):
+    src = tmp_path / "f.bin"
+    src.write_bytes(b"x")
+    with pytest.warns(UserWarning, match="parent_commit is ignored"):
+        try:
+            upload_file(
+                path_or_fileobj=str(src),
+                path_in_repo="f.bin",
+                repo_id="test/e2e-client",
+                parent_commit="abc123",
+                token=False,
+            )
+        except Exception:
+            pass
+
+
+def test_upload_file_run_as_future_still_raises(tmp_path):
+    src = tmp_path / "f.bin"
+    src.write_bytes(b"x")
+    with pytest.raises(NotImplementedError, match="run_as_future"):
+        upload_file(
+            path_or_fileobj=str(src),
+            path_in_repo="f.bin",
+            repo_id="test/e2e-client",
+            run_as_future=True,
+            token=False,
+        )
+
+
 # ---------- backward compat: hippius_hub_upload ----------
 
 @pytest.mark.e2e

@@ -12,6 +12,7 @@ from huggingface_hub import ModelInfo, RepoUrl
 from huggingface_hub.hf_api import RepoSibling
 
 from ._harbor import (
+    FORBIDDEN,
     harbor_create_project,
     harbor_delete_repository,
     harbor_get_artifact,
@@ -235,19 +236,26 @@ def repo_info(
 
     last_modified = None
     created_at = None
-    if artifact:
+    # Distinguish "we read it and saw no value" from "we couldn't read it" so
+    # we don't mis-report a public repo as private when the caller's token
+    # lacks Harbor admin-API perms (e.g. robot accounts get 403 here).
+    if isinstance(artifact, dict):
         last_modified = artifact.get("push_time") or artifact.get("update_time")
-    if harbor_repo:
+    if isinstance(harbor_repo, dict):
         last_modified = last_modified or harbor_repo.get("update_time")
         created_at = harbor_repo.get("creation_time")
-    public_project = bool((harbor_project or {}).get("metadata", {}).get("public", False))
+    if isinstance(harbor_project, dict):
+        private = not bool(harbor_project.get("metadata", {}).get("public", False))
+    else:
+        # FORBIDDEN or None: leave as unknown rather than assuming private.
+        private = None
 
     return ModelInfo(
         id=repo_id,
         sha=manifest.get("config", {}).get("digest"),
         lastModified=last_modified,
         createdAt=created_at,
-        private=not public_project,
+        private=private,
         gated=False,
         disabled=False,
         siblings=siblings,

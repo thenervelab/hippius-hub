@@ -34,24 +34,37 @@ HF_REFERENCE_FILE = "config.json"
 pytestmark = [pytest.mark.e2e, pytest.mark.hf_parity]
 
 
-@pytest.fixture(scope="session")
-def parity_seed(creds, test_repo):
-    """Upload `config.json` + `tokenizer.json` to `test_repo` at a fresh session
-    revision. Yields the context dict; cleans up its own auth state after.
+def _hippius_creds_available() -> bool:
+    return bool(os.environ.get("HIPPIUS_TEST_TOKEN")) or (
+        bool(os.environ.get("HIPPIUS_TEST_USER")) and bool(os.environ.get("HIPPIUS_TEST_PASS"))
+    )
 
-    Session-scoped so all parametrizations share one upload — keeps wall time
-    proportional to test count, not test_count × backends.
+
+@pytest.fixture(scope="session")
+def parity_seed():
+    """Upload `config.json` + `tokenizer.json` to the Hippius test repo at a
+    fresh session revision and return the context dict. Returns None if
+    Hippius credentials are unavailable — the HF parametrization can still run.
+
+    Session-scoped: all parametrizations share one upload. Manages its own
+    auth state via a session-temp TOKEN_PATH so it doesn't depend on the
+    per-test `logged_in` fixture or pollute the user's saved token.
     """
+    if not _hippius_creds_available():
+        return None
+
     from hippius_hub import auth, upload_folder
+
+    test_repo = os.environ.get("HIPPIUS_TEST_REPO", "test/e2e-client")
 
     orig_token_path = auth.TOKEN_PATH
     sess_tok = tempfile.NamedTemporaryFile(delete=False, suffix=".token")
     sess_tok.close()
     auth.TOKEN_PATH = sess_tok.name
     auth.login(
-        username=creds["user"],
-        password=creds["password"],
-        token=creds["token"],
+        username=os.environ.get("HIPPIUS_TEST_USER"),
+        password=os.environ.get("HIPPIUS_TEST_PASS"),
+        token=os.environ.get("HIPPIUS_TEST_TOKEN"),
     )
 
     seed_dir = tempfile.mkdtemp(prefix="hippius-parity-")
@@ -74,10 +87,13 @@ def parity_seed(creds, test_repo):
 
 
 @pytest.fixture(params=["hippius", "hf"], ids=["hippius", "hf"])
-def client(request, parity_seed, logged_in):
-    """The system under test. Each parametrization yields a module + context
-    dict so test bodies are backend-agnostic."""
+def client(request, parity_seed):
+    """Backend under test. Each parametrization yields a module + context
+    dict so test bodies are backend-agnostic. The HF parametrization
+    runs even without Hippius creds — it only needs public HF access."""
     if request.param == "hippius":
+        if parity_seed is None:
+            pytest.skip("HIPPIUS_TEST_USER/PASS or HIPPIUS_TEST_TOKEN not set")
         return {
             "mod": hippius_hub,
             "repo_id": parity_seed["repo_id"],

@@ -99,23 +99,30 @@ def harbor_create_project(
     return -1
 
 
+FORBIDDEN = object()  # sentinel distinguishing "401/403, can't see" from "404, doesn't exist"
+
+
 def harbor_get_project(
     auth_header: str,
     project_name: str,
     *,
     endpoint: Optional[str] = None,
-) -> Optional[dict]:
-    """Return Harbor project info, or None if not visible.
+):
+    """Return Harbor project info dict, None if 404, or FORBIDDEN if 401/403.
 
-    Returns None for 404 (doesn't exist) and 401/403 (caller can't read — e.g.,
-    robot accounts often lack project-read perm). Genuine HTTP errors still raise.
+    Callers that only care about existence vs not-existence can check
+    `result is None`; callers building user-facing metadata (e.g. `private`
+    flag on ModelInfo) should treat FORBIDDEN as "unknown" rather than
+    inferring private/public from absent data.
     """
     resp = httpx.get(
         f"{_base(endpoint)}/api/v2.0/projects/{project_name}",
         headers=_headers(auth_header),
         timeout=30.0,
     )
-    if resp.status_code in (401, 403, 404):
+    if resp.status_code in (401, 403):
+        return FORBIDDEN
+    if resp.status_code == 404:
         return None
     resp.raise_for_status()
     return resp.json()
@@ -155,7 +162,9 @@ def harbor_get_repository(
         headers=_headers(auth_header),
         timeout=30.0,
     )
-    if resp.status_code in (401, 403, 404):
+    if resp.status_code in (401, 403):
+        return FORBIDDEN
+    if resp.status_code == 404:
         return None
     resp.raise_for_status()
     return resp.json()
@@ -201,7 +210,9 @@ def harbor_get_artifact(
         params=params,
         timeout=30.0,
     )
-    if resp.status_code in (401, 403, 404):
+    if resp.status_code in (401, 403):
+        return FORBIDDEN
+    if resp.status_code == 404:
         return None
     resp.raise_for_status()
     return resp.json()

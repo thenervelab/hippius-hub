@@ -3,6 +3,7 @@ import hashlib
 import json
 import os
 import tempfile
+import warnings
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import BinaryIO, Dict, List, Optional, Union
@@ -125,27 +126,39 @@ def _put_manifest(
 
 
 def _normalize_path_or_fileobj(path_or_fileobj) -> tuple:
-    """Coerce HF's path_or_fileobj (str/Path/bytes/BinaryIO) into a (filesystem_path, cleanup).
-    cleanup() must be called after use; it's a no-op for real paths."""
+    """Coerce HF's path_or_fileobj (str/Path/bytes/BinaryIO) into (filesystem_path, cleanup).
+    cleanup() must be called after use; it's a no-op for real paths.
+
+    Try/except here is load-bearing: a partial write (disk full, encoding error)
+    must not leak a temp file. The caller pattern is `path, cleanup = ...; try: use(path); finally: cleanup()`.
+    """
     if isinstance(path_or_fileobj, (str, Path)):
         return str(path_or_fileobj), lambda: None
 
-    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".bin")
-    if isinstance(path_or_fileobj, bytes):
-        tmp.write(path_or_fileobj)
-    elif hasattr(path_or_fileobj, "read"):
-        data = path_or_fileobj.read()
-        if isinstance(data, str):
-            data = data.encode("utf-8")
-        tmp.write(data)
-    else:
-        tmp.close()
-        os.unlink(tmp.name)
+    if not (isinstance(path_or_fileobj, bytes) or hasattr(path_or_fileobj, "read")):
         raise TypeError(
             f"path_or_fileobj must be str/Path/bytes/BinaryIO, got {type(path_or_fileobj).__name__}"
         )
-    tmp.flush()
-    tmp.close()
+
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".bin")
+    try:
+        if isinstance(path_or_fileobj, bytes):
+            tmp.write(path_or_fileobj)
+        else:
+            data = path_or_fileobj.read()
+            if isinstance(data, str):
+                data = data.encode("utf-8")
+            tmp.write(data)
+        tmp.flush()
+    except BaseException:
+        tmp.close()
+        if os.path.exists(tmp.name):
+            os.unlink(tmp.name)
+        raise
+    finally:
+        if not tmp.closed:
+            tmp.close()
+
     tmp_path = tmp.name
     return tmp_path, lambda: os.path.exists(tmp_path) and os.unlink(tmp_path)
 
@@ -214,11 +227,24 @@ def _build_commit_info(
     )
 
 
-def _warn_unsupported_kwargs(create_pr, parent_commit, run_as_future):
+def _handle_unsupported_kwargs(create_pr, parent_commit, run_as_future):
+    """`create_pr` and `parent_commit` are accept-and-warn (closest HF analog is
+    "no PR concept" and "no optimistic concurrency" — the upload still proceeds).
+    `run_as_future` would require returning a Future we can't fulfill — raise."""
     if create_pr:
-        raise NotImplementedError("create_pr=True is HF-specific; Hippius has no PR concept")
+        warnings.warn(
+            "create_pr=True is ignored: Hippius has no pull-request concept; "
+            "the upload writes directly to the revision.",
+            UserWarning,
+            stacklevel=3,
+        )
     if parent_commit:
-        raise NotImplementedError("parent_commit is HF-specific; Hippius revisions are OCI tags")
+        warnings.warn(
+            "parent_commit is ignored: Hippius revisions are OCI tags without "
+            "an HF-style optimistic-concurrency check.",
+            UserWarning,
+            stacklevel=3,
+        )
     if run_as_future:
         raise NotImplementedError("run_as_future is not yet supported by hippius_hub")
 
@@ -244,9 +270,15 @@ def upload_file(
 
     Merges with the existing manifest: any layer with the same title is replaced.
     bytes / file-like objects are written to a temp file before hashing.
+
+    Race window: this is a read-modify-write on the manifest with no
+    optimistic-concurrency check. Two concurrent uploads to the same
+    `repo_id:revision` race; the second PUT wins, silently dropping the
+    first uploader's layer. Serialize uploads-to-same-revision externally
+    if you need atomicity.
     """
     _validate_repo_type(repo_type)
-    _warn_unsupported_kwargs(create_pr, parent_commit, run_as_future)
+    _handle_unsupported_kwargs(create_pr, parent_commit, run_as_future)
     if revision is None:
         revision = "main"
     if commit_message is None:
@@ -309,9 +341,13 @@ def upload_folder(
     Honors HF allow_patterns/ignore_patterns/delete_patterns. Merges with the
     existing manifest — any layer with a matching title is replaced; titles
     matching delete_patterns are removed from the new manifest entirely.
+
+    Race window: same TOCTOU caveat as `upload_file` applies — manifest is
+    fetched once before the PUT with no If-Match check, so concurrent writers
+    to the same revision will lose each other's changes.
     """
     _validate_repo_type(repo_type)
-    _warn_unsupported_kwargs(create_pr, parent_commit, run_as_future)
+    _handle_unsupported_kwargs(create_pr, parent_commit, run_as_future)
     if revision is None:
         revision = "main"
     if commit_message is None:
@@ -361,19 +397,21 @@ def upload_folder(
             for fut in tqdm(as_completed(futures), total=len(filtered), desc="Uploading", unit="file"):
                 new_layers.append(fut.result())
 
-    # Compute titles to delete from the existing manifest
+    # Fetch the existing manifest once and reuse it for both delete-title
+    # computation and the merge — the previous double-fetch widened the
+    # window in which a concurrent PUT could race this one.
+    existing = _fetch_existing_manifest(registry, repo_id, revision, oci_token)
+    existing_layers = existing.get("layers", []) if existing else []
+
     delete_titles = set()
     if delete_patterns:
-        existing_preview = _fetch_existing_manifest(registry, repo_id, revision, oci_token)
         existing_titles = [
             layer.get("annotations", {}).get("org.opencontainers.image.title")
-            for layer in (existing_preview or {}).get("layers", [])
+            for layer in existing_layers
         ]
         existing_titles = [t for t in existing_titles if t]
         delete_titles = set(filter_repo_objects(items=existing_titles, allow_patterns=delete_patterns))
 
-    existing = _fetch_existing_manifest(registry, repo_id, revision, oci_token)
-    existing_layers = existing.get("layers", []) if existing else []
     merged_layers = _merge_layers(existing_layers, new_layers, delete_titles=delete_titles)
 
     config_digest, config_size = _ensure_config_blob_uploaded(registry, repo_id, oci_token)

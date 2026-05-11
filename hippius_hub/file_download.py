@@ -68,6 +68,8 @@ def hf_hub_download(
     endpoint: Optional[str] = None,
     tqdm_class: Optional[type] = None,
     dry_run: bool = False,
+    _resolved_manifest: Optional[Dict] = None,
+    _oci_token: Optional[str] = None,
 ) -> str:
     """Drop-in replacement for huggingface_hub.hf_hub_download against an
     OCI-backed Hippius registry.
@@ -79,6 +81,10 @@ def hf_hub_download(
     hippius_hub-specific overrides via env: HIPPIUS_CHUNK_SIZE, HIPPIUS_VERIFY_HASH.
     """
     _validate_repo_type(repo_type)
+    if force_download and local_files_only:
+        raise ValueError(
+            "Cannot pass 'force_download=True' and 'local_files_only=True' at the same time."
+        )
     if cache_dir is None:
         cache_dir = DEFAULT_CACHE_DIR
     cache_dir = str(cache_dir)
@@ -106,25 +112,31 @@ def hf_hub_download(
 
     registry = (endpoint or DEFAULT_REGISTRY_URL).rstrip("/")
     auth_token = _resolve_auth_token(token)
-    oci_token = get_oci_bearer_token(repo_id, auth_token)
+    # _oci_token + _resolved_manifest are internal kwargs used by
+    # snapshot_download to avoid N+1 token/manifest round-trips when
+    # downloading many files from the same repo:revision.
+    oci_token = _oci_token or get_oci_bearer_token(repo_id, auth_token)
 
-    import httpx
-    # Récupération du manifest OCI pour trouver le digest exact du fichier
-    manifest_url = f"{registry}/v2/{repo_id}/manifests/{revision}"
-    req_headers = {
-        "Authorization": f"Bearer {oci_token}",
-        "Accept": "application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.v2+json",
-    }
+    if _resolved_manifest is not None:
+        manifest = _resolved_manifest
+    else:
+        import httpx
+        # Récupération du manifest OCI pour trouver le digest exact du fichier
+        manifest_url = f"{registry}/v2/{repo_id}/manifests/{revision}"
+        req_headers = {
+            "Authorization": f"Bearer {oci_token}",
+            "Accept": "application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.v2+json",
+        }
 
-    resp = httpx.get(manifest_url, headers=req_headers)
-    if resp.status_code == 404:
-        raise RevisionNotFoundError(
-            f"Revision '{revision}' not found in repository '{repo_id}'",
-            response=resp,
-        )
-    resp.raise_for_status()
+        resp = httpx.get(manifest_url, headers=req_headers)
+        if resp.status_code == 404:
+            raise RevisionNotFoundError(
+                f"Revision '{revision}' not found in repository '{repo_id}'",
+                response=resp,
+            )
+        resp.raise_for_status()
 
-    manifest = resp.json()
+        manifest = resp.json()
     layers = manifest.get("layers", [])
     target_digest = None
 

@@ -11,7 +11,7 @@ dependencies = [
     "httpx",
     "typing_extensions",
     "tqdm",
-    "huggingface_hub>=1.0"
+    "huggingface_hub>=1.0,<2.0"
 ]
 
 [project.optional-dependencies]

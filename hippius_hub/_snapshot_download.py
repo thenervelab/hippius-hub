@@ -102,6 +102,9 @@ def snapshot_download(
         return snapshot_dir
 
     def _download_one(filename: str) -> str:
+        # Pass through the already-fetched manifest + OCI token so each worker
+        # avoids redoing the manifest GET and token-service round-trip — that
+        # was an N+1 latency cliff for large snapshots.
         return hf_hub_download(
             repo_id=repo_id,
             filename=filename,
@@ -112,6 +115,8 @@ def snapshot_download(
             force_download=force_download,
             token=token,
             endpoint=endpoint,
+            _resolved_manifest=manifest,
+            _oci_token=oci_token,
         )
 
     if filtered:

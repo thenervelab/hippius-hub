@@ -155,6 +155,16 @@ def test_hf_hub_download_local_files_only_miss_raises(tmp_path):
         )
 
 
+def test_hf_hub_download_force_download_and_local_files_only_raises_ValueError(tmp_path):
+    """HF raises ValueError when both flags are set; pin that behavior."""
+    with pytest.raises(ValueError, match="force_download.*local_files_only"):
+        hf_hub_download(
+            repo_id="any/repo", filename="x.bin", revision="rev",
+            cache_dir=str(tmp_path),
+            force_download=True, local_files_only=True,
+        )
+
+
 @pytest.mark.e2e
 def test_hf_hub_download_local_files_only_hit(tmp_path, cache_dir, logged_in, test_repo, revision):
     src = tmp_path / "lfo.bin"
