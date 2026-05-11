@@ -152,15 +152,23 @@ def _stub_method(method_name: str):
     return stub
 
 
-for _name in dir(HfApi):
-    if _name.startswith("_"):
-        continue
-    if _name in _OVERRIDDEN or _name in _INHERITED_OK:
-        continue
-    _attr = getattr(HfApi, _name, None)
-    if not callable(_attr) or isinstance(_attr, property):
-        continue
-    setattr(HippiusApi, _name, _stub_method(_name))
+def _install_stubs():
+    """Attach a NotImplementedError stub for every public HfApi method we
+    don't implement and don't inherit. Wrapped in a function so the loop
+    variables don't leak into the module namespace."""
+    for name in dir(HfApi):
+        if name.startswith("_"):
+            continue
+        if name in _OVERRIDDEN or name in _INHERITED_OK:
+            continue
+        attr = getattr(HfApi, name, None)
+        if not callable(attr) or isinstance(attr, property):
+            continue
+        setattr(HippiusApi, name, _stub_method(name))
+
+
+_install_stubs()
+del _install_stubs
 
 
 __all__ = ["HippiusApi", "ModelCard"]

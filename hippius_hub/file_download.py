@@ -3,6 +3,7 @@ import shutil
 from pathlib import Path
 from typing import Dict, Optional, Union
 
+from ._oci import fetch_manifest, layer_title
 from .auth import get_token, get_oci_bearer_token
 from .constants import DEFAULT_CACHE_DIR, DEFAULT_REGISTRY_URL
 from .errors import (
@@ -17,7 +18,7 @@ except ImportError:
     raise ImportError("hippius_core is not installed. Did you run `maturin develop`?")
 
 
-_VALID_REPO_TYPES = (None, "model", "models")
+_VALID_REPO_TYPES = (None, "model")
 _DEFAULT_CHUNK_SIZE = 100 * 1024 * 1024
 
 
@@ -120,30 +121,12 @@ def hf_hub_download(
     if _resolved_manifest is not None:
         manifest = _resolved_manifest
     else:
-        import httpx
         # Récupération du manifest OCI pour trouver le digest exact du fichier
-        manifest_url = f"{registry}/v2/{repo_id}/manifests/{revision}"
-        req_headers = {
-            "Authorization": f"Bearer {oci_token}",
-            "Accept": "application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.v2+json",
-        }
+        manifest = fetch_manifest(registry, repo_id, revision, oci_token)
 
-        resp = httpx.get(manifest_url, headers=req_headers)
-        if resp.status_code == 404:
-            raise RevisionNotFoundError(
-                f"Revision '{revision}' not found in repository '{repo_id}'",
-                response=resp,
-            )
-        resp.raise_for_status()
-
-        manifest = resp.json()
-    layers = manifest.get("layers", [])
     target_digest = None
-
-    for layer in layers:
-        annotations = layer.get("annotations", {})
-        title = annotations.get("org.opencontainers.image.title")
-        if title == filename:
+    for layer in manifest.get("layers", []):
+        if layer_title(layer) == filename:
             target_digest = layer.get("digest")
             break
 

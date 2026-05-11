@@ -20,8 +20,9 @@ from ._harbor import (
     harbor_get_repository,
     split_repo_id,
 )
+from ._oci import fetch_manifest, head_manifest, iter_titled_layers, layer_titles
 from .auth import get_oci_bearer_token, get_token
-from .constants import DEFAULT_REGISTRY_URL
+from .constants import DEFAULT_HTTP_TIMEOUT, DEFAULT_REGISTRY_URL
 from .errors import (
     EntryNotFoundError,
     LocalTokenNotFoundError,
@@ -48,51 +49,9 @@ def _full_auth_header(token: Union[bool, str, None]) -> Optional[str]:
     raise TypeError(f"Unsupported token type: {type(token).__name__}")
 
 
-def _accept_manifest() -> str:
-    return ("application/vnd.oci.image.manifest.v1+json, "
-            "application/vnd.docker.distribution.manifest.v2+json")
-
-
 def _build_repo_url(repo_id: str, endpoint: Optional[str]) -> RepoUrl:
     base = _registry(endpoint)
     return RepoUrl(f"{base}/v2/{repo_id}", endpoint=base)
-
-
-def _head_manifest(registry: str, repo_id: str, revision: str, oci_token: str) -> httpx.Response:
-    return httpx.head(
-        f"{registry}/v2/{repo_id}/manifests/{revision}",
-        headers={"Authorization": f"Bearer {oci_token}", "Accept": _accept_manifest()},
-        timeout=30.0,
-    )
-
-
-def _get_manifest_required(registry: str, repo_id: str, revision: str, oci_token: str) -> dict:
-    """Fetch manifest. Raises RevisionNotFoundError if absent."""
-    resp = httpx.get(
-        f"{registry}/v2/{repo_id}/manifests/{revision}",
-        headers={"Authorization": f"Bearer {oci_token}", "Accept": _accept_manifest()},
-        timeout=30.0,
-    )
-    if resp.status_code == 404:
-        raise RevisionNotFoundError(
-            f"Revision {revision!r} not found in repository {repo_id!r}",
-            response=resp,
-        )
-    resp.raise_for_status()
-    return resp.json()
-
-
-def _get_manifest_or_none(registry: str, repo_id: str, revision: str, oci_token: str) -> Optional[dict]:
-    """Fetch manifest. Returns None on 404."""
-    resp = httpx.get(
-        f"{registry}/v2/{repo_id}/manifests/{revision}",
-        headers={"Authorization": f"Bearer {oci_token}", "Accept": _accept_manifest()},
-        timeout=30.0,
-    )
-    if resp.status_code == 404:
-        return None
-    resp.raise_for_status()
-    return resp.json()
 
 
 def _list_tags(registry: str, repo_id: str, oci_token: str) -> Optional[list]:
@@ -104,7 +63,7 @@ def _list_tags(registry: str, repo_id: str, oci_token: str) -> Optional[list]:
     resp = httpx.get(
         f"{registry}/v2/{repo_id}/tags/list",
         headers={"Authorization": f"Bearer {oci_token}"},
-        timeout=30.0,
+        timeout=DEFAULT_HTTP_TIMEOUT,
     )
     if resp.status_code == 404:
         return None
@@ -217,19 +176,14 @@ def repo_info(
     harbor_project = harbor_get_project(auth_header, project, endpoint=endpoint) if auth_header else None
 
     oci_token = get_oci_bearer_token(repo_id, _resolve_auth_token(token), push=False)
-    manifest = _get_manifest_required(_registry(endpoint), repo_id, revision, oci_token)
+    manifest = fetch_manifest(_registry(endpoint), repo_id, revision, oci_token)
 
     # ModelInfo's __init__ treats each entry in `siblings` as a dict and
     # builds the RepoSibling internally — pass raw dicts here.
-    siblings = []
-    for layer in manifest.get("layers", []):
-        title = layer.get("annotations", {}).get("org.opencontainers.image.title")
-        if title:
-            siblings.append({
-                "rfilename": title,
-                "size": layer.get("size"),
-                "blobId": layer.get("digest"),
-            })
+    siblings = [
+        {"rfilename": title, "size": layer.get("size"), "blobId": layer.get("digest")}
+        for title, layer in iter_titled_layers(manifest)
+    ]
 
     # Per-revision metadata: artifact info has push_time
     artifact = harbor_get_artifact(auth_header, project, repo, revision, endpoint=endpoint) if auth_header else None
@@ -302,13 +256,8 @@ def list_repo_files(
         revision = "main"
 
     oci_token = get_oci_bearer_token(repo_id, _resolve_auth_token(token), push=False)
-    manifest = _get_manifest_required(_registry(endpoint), repo_id, revision, oci_token)
-
-    titles = [
-        layer.get("annotations", {}).get("org.opencontainers.image.title")
-        for layer in manifest.get("layers", [])
-    ]
-    return [t for t in titles if t]
+    manifest = fetch_manifest(_registry(endpoint), repo_id, revision, oci_token)
+    return layer_titles(manifest)
 
 
 def repo_exists(
@@ -335,7 +284,7 @@ def revision_exists(
 ) -> bool:
     _validate_repo_type(repo_type)
     oci_token = get_oci_bearer_token(repo_id, _resolve_auth_token(token), push=False)
-    head = _head_manifest(_registry(endpoint), repo_id, revision, oci_token)
+    head = head_manifest(_registry(endpoint), repo_id, revision, oci_token)
     return head.status_code == 200
 
 
@@ -352,10 +301,7 @@ def file_exists(
     if revision is None:
         revision = "main"
     oci_token = get_oci_bearer_token(repo_id, _resolve_auth_token(token), push=False)
-    manifest = _get_manifest_or_none(_registry(endpoint), repo_id, revision, oci_token)
+    manifest = fetch_manifest(_registry(endpoint), repo_id, revision, oci_token, missing_ok=True)
     if manifest is None:
         return False
-    for layer in manifest.get("layers", []):
-        if layer.get("annotations", {}).get("org.opencontainers.image.title") == filename:
-            return True
-    return False
+    return filename in layer_titles(manifest)

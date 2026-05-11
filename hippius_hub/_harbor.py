@@ -9,7 +9,7 @@ from typing import Optional
 
 import httpx
 
-from .constants import DEFAULT_REGISTRY_URL
+from .constants import DEFAULT_HTTP_TIMEOUT, DEFAULT_REGISTRY_URL
 from .errors import LocalTokenNotFoundError
 
 
@@ -118,7 +118,7 @@ def harbor_get_project(
     resp = httpx.get(
         f"{_base(endpoint)}/api/v2.0/projects/{project_name}",
         headers=_headers(auth_header),
-        timeout=30.0,
+        timeout=DEFAULT_HTTP_TIMEOUT,
     )
     if resp.status_code in (401, 403):
         return FORBIDDEN
@@ -160,7 +160,7 @@ def harbor_get_repository(
     resp = httpx.get(
         f"{_base(endpoint)}/api/v2.0/projects/{project_name}/repositories/{encoded}",
         headers=_headers(auth_header),
-        timeout=30.0,
+        timeout=DEFAULT_HTTP_TIMEOUT,
     )
     if resp.status_code in (401, 403):
         return FORBIDDEN
@@ -208,7 +208,7 @@ def harbor_get_artifact(
         f"{_base(endpoint)}/api/v2.0/projects/{project_name}/repositories/{encoded}/artifacts/{reference}",
         headers=_headers(auth_header),
         params=params,
-        timeout=30.0,
+        timeout=DEFAULT_HTTP_TIMEOUT,
     )
     if resp.status_code in (401, 403):
         return FORBIDDEN

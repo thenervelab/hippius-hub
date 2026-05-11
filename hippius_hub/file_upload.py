@@ -1,6 +1,5 @@
 import datetime
 import hashlib
-import json
 import os
 import tempfile
 import warnings
@@ -13,8 +12,9 @@ from huggingface_hub import CommitInfo
 from huggingface_hub.utils import filter_repo_objects
 from tqdm import tqdm
 
+from ._oci import fetch_manifest, layer_title
 from .auth import get_oci_bearer_token, get_token
-from .constants import DEFAULT_REGISTRY_URL
+from .constants import DEFAULT_HTTP_TIMEOUT, DEFAULT_REGISTRY_URL, LAYER_TITLE_KEY
 from .file_download import _resolve_auth_token, _validate_repo_type
 
 try:
@@ -33,22 +33,6 @@ def _oci_bearer(repo_id: str, token, push: bool = True) -> str:
     return get_oci_bearer_token(repo_id, _resolve_auth_token(token), push=push)
 
 
-def _accept_header() -> str:
-    return ("application/vnd.oci.image.manifest.v1+json, "
-            "application/vnd.docker.distribution.manifest.v2+json")
-
-
-def _fetch_existing_manifest(registry: str, repo_id: str, revision: str, oci_token: str) -> Optional[dict]:
-    """Return current manifest dict for repo_id:revision, or None if it doesn't exist."""
-    url = f"{registry}/v2/{repo_id}/manifests/{revision}"
-    headers = {"Authorization": f"Bearer {oci_token}", "Accept": _accept_header()}
-    resp = httpx.get(url, headers=headers, timeout=30.0)
-    if resp.status_code == 404:
-        return None
-    resp.raise_for_status()
-    return resp.json()
-
-
 def _empty_config_blob_descriptor() -> tuple:
     data = b"{}"
     digest = f"sha256:{hashlib.sha256(data).hexdigest()}"
@@ -62,16 +46,17 @@ def _ensure_blob_uploaded(
     file_path: str,
     sha256_hash: str,
     file_size: int,
-) -> None:
-    """POST/PUT a blob if not already present at its digest."""
+) -> bool:
+    """POST/PUT a blob if not already present at its digest. Returns True if a
+    new upload happened, False if the blob already existed and was skipped."""
     digest = f"sha256:{sha256_hash}"
     headers = {"Authorization": f"Bearer {oci_token}"}
-    check = httpx.head(f"{registry}/v2/{repo_id}/blobs/{digest}", headers=headers, timeout=30.0)
+    check = httpx.head(f"{registry}/v2/{repo_id}/blobs/{digest}", headers=headers, timeout=DEFAULT_HTTP_TIMEOUT)
     if check.status_code == 200:
-        return
+        return False
 
     init_headers = {**headers, "Content-Length": "0"}
-    init = httpx.post(f"{registry}/v2/{repo_id}/blobs/uploads/", headers=init_headers, timeout=30.0)
+    init = httpx.post(f"{registry}/v2/{repo_id}/blobs/uploads/", headers=init_headers, timeout=DEFAULT_HTTP_TIMEOUT)
     init.raise_for_status()
     location = init.headers.get("Location")
     if not location:
@@ -80,18 +65,19 @@ def _ensure_blob_uploaded(
         location = f"{registry}{location}"
     sep = "&" if "?" in location else "?"
     upload_blob_native(f"{location}{sep}digest={digest}", file_path, oci_token)
+    return True
 
 
 def _ensure_config_blob_uploaded(registry: str, repo_id: str, oci_token: str) -> tuple:
     """Push the empty-object config blob if missing. Returns (digest, size)."""
     data, digest, size = _empty_config_blob_descriptor()
     headers = {"Authorization": f"Bearer {oci_token}"}
-    check = httpx.head(f"{registry}/v2/{repo_id}/blobs/{digest}", headers=headers, timeout=30.0)
+    check = httpx.head(f"{registry}/v2/{repo_id}/blobs/{digest}", headers=headers, timeout=DEFAULT_HTTP_TIMEOUT)
     if check.status_code != 200:
         init = httpx.post(
             f"{registry}/v2/{repo_id}/blobs/uploads/",
             headers={**headers, "Content-Length": "0"},
-            timeout=30.0,
+            timeout=DEFAULT_HTTP_TIMEOUT,
         )
         init.raise_for_status()
         loc = init.headers.get("Location")
@@ -102,7 +88,7 @@ def _ensure_config_blob_uploaded(registry: str, repo_id: str, oci_token: str) ->
             f"{loc}{sep}digest={digest}",
             headers={**headers, "Content-Type": "application/octet-stream"},
             content=data,
-            timeout=30.0,
+            timeout=DEFAULT_HTTP_TIMEOUT,
         )
     return digest, size
 
@@ -120,7 +106,7 @@ def _put_manifest(
         "Authorization": f"Bearer {oci_token}",
         "Content-Type": "application/vnd.oci.image.manifest.v1+json",
     }
-    resp = httpx.put(url, headers=headers, json=manifest, timeout=60.0)
+    resp = httpx.put(url, headers=headers, json=manifest, timeout=DEFAULT_HTTP_TIMEOUT * 2)
     resp.raise_for_status()
     return resp
 
@@ -140,15 +126,20 @@ def _normalize_path_or_fileobj(path_or_fileobj) -> tuple:
             f"path_or_fileobj must be str/Path/bytes/BinaryIO, got {type(path_or_fileobj).__name__}"
         )
 
+    chunk_size = 4 * 1024 * 1024
     tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".bin")
     try:
         if isinstance(path_or_fileobj, bytes):
             tmp.write(path_or_fileobj)
         else:
-            data = path_or_fileobj.read()
-            if isinstance(data, str):
-                data = data.encode("utf-8")
-            tmp.write(data)
+            # Stream-read so multi-GB BinaryIO inputs don't materialize in memory.
+            while True:
+                chunk = path_or_fileobj.read(chunk_size)
+                if not chunk:
+                    break
+                if isinstance(chunk, str):
+                    chunk = chunk.encode("utf-8")
+                tmp.write(chunk)
         tmp.flush()
     except BaseException:
         tmp.close()
@@ -169,7 +160,7 @@ def _build_layer(sha256_hash: str, file_size: int, path_in_repo: str) -> dict:
         "size": file_size,
         "digest": f"sha256:{sha256_hash}",
         "annotations": {
-            "org.opencontainers.image.title": path_in_repo.replace("\\", "/"),
+            LAYER_TITLE_KEY: path_in_repo.replace("\\", "/"),
         },
     }
 
@@ -184,12 +175,11 @@ def _merge_layers(
     delete_titles = delete_titles or set()
     by_title = {}
     for layer in existing:
-        title = layer.get("annotations", {}).get("org.opencontainers.image.title")
+        title = layer_title(layer)
         if title and title not in delete_titles:
             by_title[title] = layer
     for layer in new_layers:
-        title = layer["annotations"]["org.opencontainers.image.title"]
-        by_title[title] = layer
+        by_title[layer["annotations"][LAYER_TITLE_KEY]] = layer
     return list(by_title.values())
 
 
@@ -297,7 +287,7 @@ def upload_file(
     finally:
         cleanup()
 
-    existing = _fetch_existing_manifest(registry, repo_id, revision, oci_token)
+    existing = fetch_manifest(registry, repo_id, revision, oci_token, missing_ok=True)
     existing_layers = existing.get("layers", []) if existing else []
     merged_layers = _merge_layers(existing_layers, [new_layer])
 
@@ -377,16 +367,15 @@ def upload_folder(
     def _process(rel_path: str) -> dict:
         abs_path = os.path.join(base_dir, rel_path)
         sha256_hash, file_size = hash_file_native(abs_path)
-        digest = f"sha256:{sha256_hash}"
-        headers = {"Authorization": f"Bearer {oci_token}"}
-        check = httpx.head(f"{registry}/v2/{repo_id}/blobs/{digest}", headers=headers, timeout=30.0)
         repo_title = f"{path_in_repo}/{rel_path}" if path_in_repo else rel_path
-        if check.status_code == 200:
-            tqdm.write(f"✅ Already published (skipped): {repo_title}")
-        else:
-            tqdm.write(f"🚀 Uploading: {repo_title} ({file_size} bytes)...")
-            _ensure_blob_uploaded(registry, repo_id, oci_token, abs_path, sha256_hash, file_size)
+        tqdm.write(f"🚀 Uploading: {repo_title} ({file_size} bytes)...")
+        uploaded = _ensure_blob_uploaded(
+            registry, repo_id, oci_token, abs_path, sha256_hash, file_size,
+        )
+        if uploaded:
             tqdm.write(f"✅ Uploaded: {repo_title}")
+        else:
+            tqdm.write(f"✅ Already published (skipped): {repo_title}")
         return _build_layer(sha256_hash, file_size, repo_title)
 
     new_layers = []
@@ -400,16 +389,12 @@ def upload_folder(
     # Fetch the existing manifest once and reuse it for both delete-title
     # computation and the merge — the previous double-fetch widened the
     # window in which a concurrent PUT could race this one.
-    existing = _fetch_existing_manifest(registry, repo_id, revision, oci_token)
+    existing = fetch_manifest(registry, repo_id, revision, oci_token, missing_ok=True)
     existing_layers = existing.get("layers", []) if existing else []
 
     delete_titles = set()
     if delete_patterns:
-        existing_titles = [
-            layer.get("annotations", {}).get("org.opencontainers.image.title")
-            for layer in existing_layers
-        ]
-        existing_titles = [t for t in existing_titles if t]
+        existing_titles = [t for t in (layer_title(l) for l in existing_layers) if t]
         delete_titles = set(filter_repo_objects(items=existing_titles, allow_patterns=delete_patterns))
 
     merged_layers = _merge_layers(existing_layers, new_layers, delete_titles=delete_titles)

@@ -3,12 +3,12 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Dict, List, Optional, Union
 
-import httpx
 from huggingface_hub.utils import filter_repo_objects
 
+from ._oci import fetch_manifest, layer_titles
 from .auth import get_oci_bearer_token
 from .constants import DEFAULT_CACHE_DIR, DEFAULT_REGISTRY_URL
-from .errors import LocalEntryNotFoundError, RevisionNotFoundError
+from .errors import LocalEntryNotFoundError
 from .file_download import _resolve_auth_token, _validate_repo_type, hf_hub_download
 
 
@@ -70,25 +70,8 @@ def snapshot_download(
     auth_token = _resolve_auth_token(token)
     oci_token = get_oci_bearer_token(repo_id, auth_token)
 
-    manifest_url = f"{registry}/v2/{repo_id}/manifests/{revision}"
-    req_headers = {
-        "Authorization": f"Bearer {oci_token}",
-        "Accept": "application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.v2+json",
-    }
-    resp = httpx.get(manifest_url, headers=req_headers)
-    if resp.status_code == 404:
-        raise RevisionNotFoundError(
-            f"Revision '{revision}' not found in repository '{repo_id}'",
-            response=resp,
-        )
-    resp.raise_for_status()
-
-    manifest = resp.json()
-    filenames = [
-        layer.get("annotations", {}).get("org.opencontainers.image.title")
-        for layer in manifest.get("layers", [])
-    ]
-    filenames = [f for f in filenames if f]
+    manifest = fetch_manifest(registry, repo_id, revision, oci_token)
+    filenames = layer_titles(manifest)
 
     filtered = list(
         filter_repo_objects(
