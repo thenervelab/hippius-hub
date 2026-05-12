@@ -5,7 +5,9 @@ edition = "2021"
 
 [lib]
 name = "hippius_core"
-crate-type = ["cdylib"]
+# rlib makes the crate consumable by Rust's own test harness (`cargo test`).
+# cdylib is the Python-extension target.
+crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 pyo3 = { version = "0.20", features = ["extension-module", "abi3", "abi3-py38"] }

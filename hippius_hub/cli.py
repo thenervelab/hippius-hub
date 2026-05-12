@@ -1,4 +1,5 @@
 import argparse
+import os
 import sys
 from .file_download import hippius_hub_download
 from .auth import login
@@ -12,7 +13,7 @@ def main():
     download_parser.add_argument("repo_id", type=str, help="Repository ID (e.g., org/model)")
     download_parser.add_argument("filename", type=str, help="Filename to download")
     download_parser.add_argument("--revision", type=str, default="main", help="Revision/branch")
-    download_parser.add_argument("--chunk-size", type=int, default=50 * 1024 * 1024, help="Chunk size in bytes")
+    download_parser.add_argument("--chunk-size", type=int, default=None, help="Chunk size in bytes (defaults to the library default)")
     download_parser.add_argument("--cache-dir", type=str, default=None, help="Path to the cache directory")
     download_parser.add_argument("--verify-hash", action="store_true", help="Verify SHA256 hash locally (slower assembly)")
 
@@ -32,14 +33,16 @@ def main():
 
     if args.command == "download":
         print(f"Downloading {args.filename} from {args.repo_id} (revision: {args.revision})...")
+        if args.chunk_size is not None:
+            os.environ["HIPPIUS_CHUNK_SIZE"] = str(args.chunk_size)
+        if args.verify_hash:
+            os.environ["HIPPIUS_VERIFY_HASH"] = "1"
         try:
             path = hippius_hub_download(
                 repo_id=args.repo_id,
                 filename=args.filename,
                 revision=args.revision,
-                chunk_size=args.chunk_size,
                 cache_dir=args.cache_dir,
-                verify_hash=args.verify_hash
             )
             print(f"✅ File downloaded to: {path}")
         except Exception as e:

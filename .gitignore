@@ -5,3 +5,6 @@ __pycache__/
 *.whl
 /dist/
 *.so
+.pytest_cache/
+.idea/
+.claude/

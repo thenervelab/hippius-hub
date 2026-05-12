@@ -8,10 +8,14 @@ version = "0.2.2"
 description = "Drop-in replacement for huggingface_hub using a Rust backend for ultra-fast downloads"
 requires-python = ">=3.8"
 dependencies = [
-    "requests",
+    "httpx",
     "typing_extensions",
-    "tqdm"
+    "tqdm",
+    "huggingface_hub>=1.0,<2.0"
 ]
+
+[project.optional-dependencies]
+test = ["pytest>=7"]
 
 [project.scripts]
 hippius-hub = "hippius_hub.cli:main"
@@ -20,4 +24,11 @@ hippius-hub = "hippius_hub.cli:main"
 features = ["pyo3/extension-module"]
 module-name = "hippius_hub.hippius_core"
 python-source = "."
+
+[tool.pytest.ini_options]
+# No default exclusion — CI runs the full suite. For fast local iteration,
+# pass `-m "not e2e"` to skip tests that hit the registry / huggingface.co.
+markers = [
+    "e2e: tests that hit the network (registry.hippius.com and/or huggingface.co)",
+]
 
