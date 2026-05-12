@@ -347,14 +347,14 @@ def test_create_repo_exist_ok_false_raises_on_existing(logged_in, test_repo):
         create_repo(test_repo, exist_ok=False)
 
 
-def test_create_repo_repo_type_dataset_raises():
+def test_create_repo_rejects_unknown_repo_type():
     with pytest.raises(NotImplementedError, match="repo_type"):
-        create_repo("any/repo", repo_type="dataset")
+        create_repo("any/repo", repo_type="bogus")
 
 
-def test_delete_repo_repo_type_dataset_raises():
+def test_delete_repo_rejects_unknown_repo_type():
     with pytest.raises(NotImplementedError, match="repo_type"):
-        delete_repo("any/repo", repo_type="dataset")
+        delete_repo("any/repo", repo_type="bogus")
 
 
 # ---------- HF-only kwargs: warn vs raise ----------

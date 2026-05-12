@@ -6,10 +6,10 @@ from typing import Dict, List, Optional, Union
 from huggingface_hub.utils import filter_repo_objects
 
 from ._oci import fetch_manifest, layer_titles
-from .auth import get_oci_bearer_token
+from .auth import get_oci_bearer_token, resolve_token_value
 from .constants import DEFAULT_CACHE_DIR, DEFAULT_REGISTRY_URL
 from .errors import LocalEntryNotFoundError
-from .file_download import _resolve_auth_token, _validate_repo_type, hf_hub_download
+from .file_download import _cache_dirname, _oci_repo_path, _validate_repo_type, hf_hub_download
 
 
 def snapshot_download(
@@ -53,7 +53,7 @@ def snapshot_download(
     else:
         snapshot_dir = os.path.join(
             cache_dir,
-            f"models--{repo_id.replace('/', '--')}",
+            _cache_dirname(repo_id, repo_type),
             "snapshots",
             revision,
         )
@@ -66,11 +66,12 @@ def snapshot_download(
             )
         return snapshot_dir
 
+    oci_repo = _oci_repo_path(repo_id, repo_type)
     registry = (endpoint or DEFAULT_REGISTRY_URL).rstrip("/")
-    auth_token = _resolve_auth_token(token)
-    oci_token = get_oci_bearer_token(repo_id, auth_token)
+    auth_token = resolve_token_value(token)
+    oci_token = get_oci_bearer_token(oci_repo, auth_token)
 
-    manifest = fetch_manifest(registry, repo_id, revision, oci_token)
+    manifest = fetch_manifest(registry, oci_repo, revision, oci_token)
     filenames = layer_titles(manifest)
 
     filtered = list(

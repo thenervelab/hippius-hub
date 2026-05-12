@@ -13,9 +13,9 @@ from huggingface_hub.utils import filter_repo_objects
 from tqdm import tqdm
 
 from ._oci import fetch_manifest, layer_title
-from .auth import get_oci_bearer_token, get_token
+from .auth import get_oci_bearer_token, get_token, resolve_token_value
 from .constants import DEFAULT_HTTP_TIMEOUT, DEFAULT_REGISTRY_URL, LAYER_TITLE_KEY
-from .file_download import _resolve_auth_token, _validate_repo_type
+from .file_download import _oci_repo_path, _validate_repo_type
 
 try:
     from .hippius_core import hash_file_native, upload_blob_native
@@ -30,7 +30,7 @@ def _registry(endpoint: Optional[str]) -> str:
 
 
 def _oci_bearer(repo_id: str, token, push: bool = True) -> str:
-    return get_oci_bearer_token(repo_id, _resolve_auth_token(token), push=push)
+    return get_oci_bearer_token(repo_id, resolve_token_value(token), push=push)
 
 
 def _empty_config_blob_descriptor() -> tuple:
@@ -276,22 +276,23 @@ def upload_file(
     if commit_description is None:
         commit_description = ""
 
+    oci_repo = _oci_repo_path(repo_id, repo_type)
     registry = _registry(endpoint)
-    oci_token = _oci_bearer(repo_id, token, push=True)
+    oci_token = _oci_bearer(oci_repo, token, push=True)
 
     file_path, cleanup = _normalize_path_or_fileobj(path_or_fileobj)
     try:
         sha256_hash, file_size = hash_file_native(file_path)
-        _ensure_blob_uploaded(registry, repo_id, oci_token, file_path, sha256_hash, file_size)
+        _ensure_blob_uploaded(registry, oci_repo, oci_token, file_path, sha256_hash, file_size)
         new_layer = _build_layer(sha256_hash, file_size, path_in_repo)
     finally:
         cleanup()
 
-    existing = fetch_manifest(registry, repo_id, revision, oci_token, missing_ok=True)
+    existing = fetch_manifest(registry, oci_repo, revision, oci_token, missing_ok=True)
     existing_layers = existing.get("layers", []) if existing else []
     merged_layers = _merge_layers(existing_layers, [new_layer])
 
-    config_digest, config_size = _ensure_config_blob_uploaded(registry, repo_id, oci_token)
+    config_digest, config_size = _ensure_config_blob_uploaded(registry, oci_repo, oci_token)
     manifest = {
         "schemaVersion": 2,
         "mediaType": "application/vnd.oci.image.manifest.v1+json",
@@ -304,7 +305,7 @@ def upload_file(
         "annotations": _commit_annotations(commit_message, commit_description),
     }
 
-    resp = _put_manifest(registry, repo_id, revision, oci_token, manifest)
+    resp = _put_manifest(registry, oci_repo, revision, oci_token, manifest)
     return _build_commit_info(registry, repo_id, revision, resp, commit_message, commit_description)
 
 
@@ -361,8 +362,9 @@ def upload_folder(
         ignore_patterns=ignore_patterns,
     ))
 
+    oci_repo = _oci_repo_path(repo_id, repo_type)
     registry = _registry(endpoint)
-    oci_token = _oci_bearer(repo_id, token, push=True)
+    oci_token = _oci_bearer(oci_repo, token, push=True)
 
     def _process(rel_path: str) -> dict:
         abs_path = os.path.join(base_dir, rel_path)
@@ -370,7 +372,7 @@ def upload_folder(
         repo_title = f"{path_in_repo}/{rel_path}" if path_in_repo else rel_path
         tqdm.write(f"🚀 Uploading: {repo_title} ({file_size} bytes)...")
         uploaded = _ensure_blob_uploaded(
-            registry, repo_id, oci_token, abs_path, sha256_hash, file_size,
+            registry, oci_repo, oci_token, abs_path, sha256_hash, file_size,
         )
         if uploaded:
             tqdm.write(f"✅ Uploaded: {repo_title}")
@@ -389,7 +391,7 @@ def upload_folder(
     # Fetch the existing manifest once and reuse it for both delete-title
     # computation and the merge — the previous double-fetch widened the
     # window in which a concurrent PUT could race this one.
-    existing = fetch_manifest(registry, repo_id, revision, oci_token, missing_ok=True)
+    existing = fetch_manifest(registry, oci_repo, revision, oci_token, missing_ok=True)
     existing_layers = existing.get("layers", []) if existing else []
 
     delete_titles = set()
@@ -399,7 +401,7 @@ def upload_folder(
 
     merged_layers = _merge_layers(existing_layers, new_layers, delete_titles=delete_titles)
 
-    config_digest, config_size = _ensure_config_blob_uploaded(registry, repo_id, oci_token)
+    config_digest, config_size = _ensure_config_blob_uploaded(registry, oci_repo, oci_token)
     manifest = {
         "schemaVersion": 2,
         "mediaType": "application/vnd.oci.image.manifest.v1+json",
@@ -413,7 +415,7 @@ def upload_folder(
     }
 
     print(f"📝 Publishing OCI Manifest for {revision}...")
-    resp = _put_manifest(registry, repo_id, revision, oci_token, manifest)
+    resp = _put_manifest(registry, oci_repo, revision, oci_token, manifest)
     print(f"🎉 Successfully pushed {len(new_layers)} file(s) to {repo_id}:{revision}")
     return _build_commit_info(registry, repo_id, revision, resp, commit_message, commit_description)
 

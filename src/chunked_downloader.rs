@@ -12,6 +12,26 @@ const MAX_CONCURRENT_DOWNLOADS: usize = 16;
 const MAX_RETRIES: u32 = 3;
 const VERIFY_READ_BUFFER: usize = 8 * 1024 * 1024; // 8 MB pour lecture de vérification SHA256
 
+/// Number of HTTP Range requests needed to cover `content_length` bytes when
+/// each chunk is `chunk_size` bytes. Returns 0 for empty files (caller is
+/// expected to handle that as a special case).
+fn num_chunks(content_length: u64, chunk_size: u64) -> usize {
+    if content_length == 0 {
+        return 0;
+    }
+    // Integer ceiling division — avoids the f64 round-trip the older code used.
+    ((content_length + chunk_size - 1) / chunk_size) as usize
+}
+
+/// Inclusive `(start, end)` byte range for chunk index `i` in a Range header.
+/// The last chunk is truncated at `content_length - 1` rather than running
+/// past EOF. Caller must ensure `i < num_chunks(content_length, chunk_size)`.
+fn chunk_bounds(content_length: u64, chunk_size: u64, i: usize) -> (u64, u64) {
+    let start = i as u64 * chunk_size;
+    let end = std::cmp::min(start + chunk_size - 1, content_length - 1);
+    (start, end)
+}
+
 #[derive(Debug)]
 pub enum DownloadError {
     ReqwestError(reqwest::Error),
@@ -74,7 +94,7 @@ impl ChunkedDownloader {
             .progress_chars("#>-"));
         pb.set_message("📥 Downloading");
 
-        let num_chunks = (content_length as f64 / self.chunk_size as f64).ceil() as usize;
+        let num_chunks = num_chunks(content_length, self.chunk_size);
 
         // Préparation du dossier d'accueil
         let parent_dir = dest_path.parent().unwrap_or_else(|| Path::new("."));
@@ -100,8 +120,7 @@ impl ChunkedDownloader {
         // 3. Lancement des téléchargements concurrents — chacun stream directement
         //    au bon offset dans le fichier final.
         let mut stream = stream::iter(0..num_chunks).map(|i| {
-            let start = i as u64 * self.chunk_size;
-            let end = std::cmp::min(start + self.chunk_size - 1, content_length - 1);
+            let (start, end) = chunk_bounds(content_length, self.chunk_size, i);
 
             let client = self.client.clone();
             let url = self.url.clone();
@@ -278,4 +297,78 @@ async fn try_download_chunk_to_offset(
 
     file.flush().await?;
     Ok(())
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn num_chunks_empty_file_is_zero() {
+        assert_eq!(num_chunks(0, 100), 0);
+    }
+
+    #[test]
+    fn num_chunks_smaller_than_chunk_is_one() {
+        assert_eq!(num_chunks(50, 100), 1);
+        assert_eq!(num_chunks(1, 100), 1);
+    }
+
+    #[test]
+    fn num_chunks_exact_multiple() {
+        assert_eq!(num_chunks(100, 100), 1);
+        assert_eq!(num_chunks(300, 100), 3);
+    }
+
+    #[test]
+    fn num_chunks_with_remainder() {
+        assert_eq!(num_chunks(101, 100), 2);
+        assert_eq!(num_chunks(301, 100), 4);
+    }
+
+    #[test]
+    fn num_chunks_handles_default_size_at_default_proportions() {
+        // 100 MiB chunk, 250 MiB file → 3 chunks (100+100+50)
+        let mib = 1024 * 1024;
+        assert_eq!(num_chunks(250 * mib, 100 * mib), 3);
+    }
+
+    #[test]
+    fn chunk_bounds_first_chunk_is_zero_based() {
+        assert_eq!(chunk_bounds(1000, 100, 0), (0, 99));
+    }
+
+    #[test]
+    fn chunk_bounds_middle_chunk_is_full_size() {
+        assert_eq!(chunk_bounds(1000, 100, 5), (500, 599));
+    }
+
+    #[test]
+    fn chunk_bounds_last_chunk_truncates_at_eof() {
+        // 1024 bytes, 1000-byte chunks → chunk 0 is 0-999, chunk 1 is 1000-1023.
+        assert_eq!(chunk_bounds(1024, 1000, 0), (0, 999));
+        assert_eq!(chunk_bounds(1024, 1000, 1), (1000, 1023));
+    }
+
+    #[test]
+    fn chunk_bounds_exact_multiple_full_last_chunk() {
+        // 300 bytes, 100-byte chunks → final chunk fills exactly.
+        assert_eq!(chunk_bounds(300, 100, 2), (200, 299));
+    }
+
+    #[test]
+    fn chunk_bounds_off_by_one_at_boundary() {
+        // The classic off-by-one: file size exactly equal to one chunk_size + 1.
+        // Should produce 2 chunks: 0..=99 and 100..=100.
+        assert_eq!(num_chunks(101, 100), 2);
+        assert_eq!(chunk_bounds(101, 100, 0), (0, 99));
+        assert_eq!(chunk_bounds(101, 100, 1), (100, 100));
+    }
+
+    #[test]
+    fn chunk_bounds_one_byte_file_one_chunk() {
+        assert_eq!(num_chunks(1, 100), 1);
+        assert_eq!(chunk_bounds(1, 100, 0), (0, 0));
+    }
 }

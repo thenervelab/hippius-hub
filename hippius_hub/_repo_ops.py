@@ -21,7 +21,7 @@ from ._harbor import (
     split_repo_id,
 )
 from ._oci import fetch_manifest, head_manifest, iter_titled_layers, layer_titles
-from .auth import get_oci_bearer_token, get_token
+from .auth import get_oci_bearer_token, get_token, resolve_auth_header, resolve_token_value
 from .constants import DEFAULT_HTTP_TIMEOUT, DEFAULT_REGISTRY_URL
 from .errors import (
     EntryNotFoundError,
@@ -29,24 +29,11 @@ from .errors import (
     RepositoryNotFoundError,
     RevisionNotFoundError,
 )
-from .file_download import _resolve_auth_token, _validate_repo_type
+from .file_download import _oci_repo_path, _validate_repo_type
 
 
 def _registry(endpoint: Optional[str]) -> str:
     return (endpoint or DEFAULT_REGISTRY_URL).rstrip("/")
-
-
-def _full_auth_header(token: Union[bool, str, None]) -> Optional[str]:
-    """Resolve a token argument into a Harbor-shaped Authorization header value."""
-    if token is False:
-        return None
-    if token is None or token is True:
-        return get_token()
-    if isinstance(token, str):
-        if token.startswith(("Basic ", "Bearer ")):
-            return token
-        return f"Bearer {token}"
-    raise TypeError(f"Unsupported token type: {type(token).__name__}")
 
 
 def _build_repo_url(repo_id: str, endpoint: Optional[str]) -> RepoUrl:
@@ -92,8 +79,9 @@ def create_repo(
     the token / robot account).
     """
     _validate_repo_type(repo_type)
-    project, _ = split_repo_id(repo_id)
-    auth_header = _full_auth_header(token)
+    oci_repo = _oci_repo_path(repo_id, repo_type)
+    project, _ = split_repo_id(oci_repo)
+    auth_header = resolve_auth_header(token)
     if auth_header is None:
         raise LocalTokenNotFoundError(
             "Authentication required; run `hippius-hub login` first."
@@ -101,8 +89,8 @@ def create_repo(
 
     # Use the OCI tags/list endpoint to detect existing repos — accessible to
     # any account with pull perms, unlike Harbor's admin project API.
-    oci_token = get_oci_bearer_token(repo_id, _resolve_auth_token(token), push=False)
-    tags = _list_tags(_registry(endpoint), repo_id, oci_token)
+    oci_token = get_oci_bearer_token(oci_repo, resolve_token_value(token), push=False)
+    tags = _list_tags(_registry(endpoint), oci_repo, oci_token)
 
     if tags is not None:
         # Repository already exists in the registry
@@ -114,7 +102,7 @@ def create_repo(
                 f"Repository {repo_id!r} already exists and exist_ok=False",
                 response=fake_resp,
             )
-        return _build_repo_url(repo_id, endpoint)
+        return _build_repo_url(oci_repo, endpoint)
 
     # Repository doesn't exist; ensure the underlying Harbor project exists.
     existing_project = harbor_get_project(auth_header, project, endpoint=endpoint)
@@ -122,7 +110,7 @@ def create_repo(
         public = (visibility == "public") if visibility else (not bool(private))
         harbor_create_project(auth_header, project, public=public, endpoint=endpoint)
 
-    return _build_repo_url(repo_id, endpoint)
+    return _build_repo_url(oci_repo, endpoint)
 
 
 def delete_repo(
@@ -135,8 +123,8 @@ def delete_repo(
 ) -> None:
     """Delete the Harbor repository (project/repo)."""
     _validate_repo_type(repo_type)
-    project, repo = split_repo_id(repo_id)
-    auth_header = _full_auth_header(token)
+    project, repo = split_repo_id(_oci_repo_path(repo_id, repo_type))
+    auth_header = resolve_auth_header(token)
     if auth_header is None:
         raise RepositoryNotFoundError("delete_repo requires authentication")
     harbor_delete_repository(
@@ -167,16 +155,17 @@ def repo_info(
     _validate_repo_type(repo_type)
     if revision is None:
         revision = "main"
-    project, repo = split_repo_id(repo_id)
+    oci_repo = _oci_repo_path(repo_id, repo_type)
+    project, repo = split_repo_id(oci_repo)
 
-    auth_header = _full_auth_header(token)
+    auth_header = resolve_auth_header(token)
     # Harbor lookups are best-effort: robot accounts often lack admin-API
     # perms (returns None). The OCI manifest fetch below is the source of truth.
     harbor_repo = harbor_get_repository(auth_header, project, repo, endpoint=endpoint) if auth_header else None
     harbor_project = harbor_get_project(auth_header, project, endpoint=endpoint) if auth_header else None
 
-    oci_token = get_oci_bearer_token(repo_id, _resolve_auth_token(token), push=False)
-    manifest = fetch_manifest(_registry(endpoint), repo_id, revision, oci_token)
+    oci_token = get_oci_bearer_token(oci_repo, resolve_token_value(token), push=False)
+    manifest = fetch_manifest(_registry(endpoint), oci_repo, revision, oci_token)
 
     # ModelInfo's __init__ treats each entry in `siblings` as a dict and
     # builds the RepoSibling internally — pass raw dicts here.
@@ -255,8 +244,9 @@ def list_repo_files(
     if revision is None:
         revision = "main"
 
-    oci_token = get_oci_bearer_token(repo_id, _resolve_auth_token(token), push=False)
-    manifest = fetch_manifest(_registry(endpoint), repo_id, revision, oci_token)
+    oci_repo = _oci_repo_path(repo_id, repo_type)
+    oci_token = get_oci_bearer_token(oci_repo, resolve_token_value(token), push=False)
+    manifest = fetch_manifest(_registry(endpoint), oci_repo, revision, oci_token)
     return layer_titles(manifest)
 
 
@@ -269,8 +259,9 @@ def repo_exists(
 ) -> bool:
     """True iff the OCI repository has ever been pushed to (any tag exists)."""
     _validate_repo_type(repo_type)
-    oci_token = get_oci_bearer_token(repo_id, _resolve_auth_token(token), push=False)
-    tags = _list_tags(_registry(endpoint), repo_id, oci_token)
+    oci_repo = _oci_repo_path(repo_id, repo_type)
+    oci_token = get_oci_bearer_token(oci_repo, resolve_token_value(token), push=False)
+    tags = _list_tags(_registry(endpoint), oci_repo, oci_token)
     return tags is not None and len(tags) > 0
 
 
@@ -283,8 +274,9 @@ def revision_exists(
     endpoint: Optional[str] = None,
 ) -> bool:
     _validate_repo_type(repo_type)
-    oci_token = get_oci_bearer_token(repo_id, _resolve_auth_token(token), push=False)
-    head = head_manifest(_registry(endpoint), repo_id, revision, oci_token)
+    oci_repo = _oci_repo_path(repo_id, repo_type)
+    oci_token = get_oci_bearer_token(oci_repo, resolve_token_value(token), push=False)
+    head = head_manifest(_registry(endpoint), oci_repo, revision, oci_token)
     return head.status_code == 200
 
 
@@ -300,8 +292,9 @@ def file_exists(
     _validate_repo_type(repo_type)
     if revision is None:
         revision = "main"
-    oci_token = get_oci_bearer_token(repo_id, _resolve_auth_token(token), push=False)
-    manifest = fetch_manifest(_registry(endpoint), repo_id, revision, oci_token, missing_ok=True)
+    oci_repo = _oci_repo_path(repo_id, repo_type)
+    oci_token = get_oci_bearer_token(oci_repo, resolve_token_value(token), push=False)
+    manifest = fetch_manifest(_registry(endpoint), oci_repo, revision, oci_token, missing_ok=True)
     if manifest is None:
         return False
     return filename in layer_titles(manifest)

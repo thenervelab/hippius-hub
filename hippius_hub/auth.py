@@ -1,5 +1,7 @@
 import os
 import json
+import threading
+import time
 import httpx
 from .constants import DEFAULT_CACHE_DIR, DEFAULT_REGISTRY_URL
 from .errors import LocalTokenNotFoundError
@@ -7,6 +9,29 @@ from .errors import LocalTokenNotFoundError
 TOKEN_PATH = os.path.join(DEFAULT_CACHE_DIR, "token")
 
 import base64
+
+
+# Per-(repo_id, push, auth_input) cache of OCI bearer JWTs.
+# Lock guards both insertion and eviction; reads of expired entries fall back
+# to a fresh fetch, so it's OK that the lookup-then-update is non-atomic.
+_OCI_TOKEN_CACHE = {}
+_OCI_TOKEN_CACHE_LOCK = threading.Lock()
+_OCI_TOKEN_LEEWAY_SECONDS = 30  # refresh tokens 30s before they actually expire
+
+
+def _jwt_expiration(jwt_str: str):
+    """Return the `exp` claim (Unix ts) of a JWT, or None if it can't be parsed."""
+    parts = jwt_str.split(".")
+    if len(parts) != 3:
+        return None
+    payload_b64 = parts[1]
+    padding = "=" * (-len(payload_b64) % 4)
+    try:
+        decoded = base64.urlsafe_b64decode(payload_b64 + padding)
+        payload = json.loads(decoded)
+    except (ValueError, json.JSONDecodeError):
+        return None
+    return payload.get("exp")
 
 
 def login(
@@ -56,6 +81,30 @@ def get_token() -> str:
     return None
 
 
+def resolve_token_value(token):
+    """Translate HF's three-state token argument (None/True=saved, False=no auth,
+    str=use literal) into the raw token / pre-wrapped header value used downstream
+    by `get_oci_bearer_token` (which accepts either form).
+    """
+    if token is False:
+        return None
+    if isinstance(token, str):
+        return token
+    return get_token()
+
+
+def resolve_auth_header(token):
+    """Same three-state input, but always returns a full Authorization header
+    (`Bearer ...` / `Basic ...`) or None. Use for direct Harbor admin-API calls
+    which need a complete header string."""
+    value = resolve_token_value(token)
+    if value is None:
+        return None
+    if value.startswith(("Basic ", "Bearer ")):
+        return value
+    return f"Bearer {value}"
+
+
 def whoami(token=None, *, endpoint: str = None) -> dict:
     """Return user info shaped like huggingface_hub.whoami.
 
@@ -103,8 +152,25 @@ def get_docker_auth(registry_url: str) -> str:
         pass
     return None
 
-def get_oci_bearer_token(repo_id: str, token: str = None, push: bool = False) -> str:
-    """Fetch an OCI bearer token from the Hippius registry token endpoint."""
+def get_oci_bearer_token(repo_id: str, token: str = None, push: bool = False, use_cache: bool = True) -> str:
+    """Fetch an OCI bearer token from the Hippius registry token endpoint.
+
+    Per-`(repo_id, push, auth_input)` cache, with TTL parsed from the JWT's
+    own `exp` claim minus a 30s leeway. Pass `use_cache=False` to bypass.
+    Reduces token-service round-trips when callers chain multiple ops on
+    the same repo (e.g. `repo_exists()` then `revision_exists()`).
+    """
+    cache_key = (repo_id, push, token)
+    now = time.time()
+
+    if use_cache:
+        with _OCI_TOKEN_CACHE_LOCK:
+            cached = _OCI_TOKEN_CACHE.get(cache_key)
+        if cached is not None:
+            cached_token, cached_exp = cached
+            if cached_exp - _OCI_TOKEN_LEEWAY_SECONDS > now:
+                return cached_token
+
     scope = f"repository:{repo_id}:pull,push" if push else f"repository:{repo_id}:pull"
     auth_url = f"{DEFAULT_REGISTRY_URL}/service/token?service=harbor-registry&scope={scope}"
     headers = {}
@@ -125,4 +191,18 @@ def get_oci_bearer_token(repo_id: str, token: str = None, push: bool = False) ->
 
     resp = httpx.get(auth_url, headers=headers)
     resp.raise_for_status()
-    return resp.json().get("token")
+    fresh_token = resp.json().get("token")
+
+    if use_cache and fresh_token:
+        exp = _jwt_expiration(fresh_token)
+        if exp is not None:
+            with _OCI_TOKEN_CACHE_LOCK:
+                _OCI_TOKEN_CACHE[cache_key] = (fresh_token, exp)
+
+    return fresh_token
+
+
+def clear_oci_token_cache():
+    """Drop all cached OCI bearer tokens. For tests that monkeypatch credentials."""
+    with _OCI_TOKEN_CACHE_LOCK:
+        _OCI_TOKEN_CACHE.clear()

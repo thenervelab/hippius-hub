@@ -26,10 +26,9 @@ module-name = "hippius_hub.hippius_core"
 python-source = "."
 
 [tool.pytest.ini_options]
-addopts = "-m 'not e2e and not hf_parity'"
+# No default exclusion — CI runs the full suite. For fast local iteration,
+# pass `-m "not e2e"` to skip tests that hit the registry / huggingface.co.
 markers = [
-    "e2e: tests that talk to registry.hippius.com (require HIPPIUS_TEST_USER/PASS)",
-    "hf_parity: tests that also hit huggingface.co (require network to HF)",
-    "slow: tests that move large amounts of data (excluded from PR runs)",
+    "e2e: tests that hit the network (registry.hippius.com and/or huggingface.co)",
 ]
 

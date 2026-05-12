@@ -122,7 +122,6 @@ def test_verify_hash_true(tmp_path, cache_dir, logged_in, test_repo, revision, m
     assert sha256_of_file(out) == expected
 
 
-@pytest.mark.slow
 def test_single_large_file(tmp_path, cache_dir, logged_in, test_repo, revision):
     size = 250 * 1024 * 1024
     src = tmp_path / "big.bin"

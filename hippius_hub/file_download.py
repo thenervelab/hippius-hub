@@ -4,7 +4,7 @@ from pathlib import Path
 from typing import Dict, Optional, Union
 
 from ._oci import fetch_manifest, layer_title
-from .auth import get_token, get_oci_bearer_token
+from .auth import get_oci_bearer_token, get_token, resolve_token_value
 from .constants import DEFAULT_CACHE_DIR, DEFAULT_REGISTRY_URL
 from .errors import (
     EntryNotFoundError,
@@ -18,7 +18,7 @@ except ImportError:
     raise ImportError("hippius_core is not installed. Did you run `maturin develop`?")
 
 
-_VALID_REPO_TYPES = (None, "model")
+_VALID_REPO_TYPES = (None, "model", "dataset", "space")
 _DEFAULT_CHUNK_SIZE = 100 * 1024 * 1024
 
 
@@ -32,21 +32,35 @@ def _resolve_verify_hash() -> bool:
     return raw in ("1", "true", "yes")
 
 
-def _resolve_auth_token(token: Union[bool, str, None]) -> Optional[str]:
-    """Resolve HF-style token argument: False=no auth, str=use literal, None/True=saved."""
-    if token is False:
-        return None
-    if isinstance(token, str):
-        return token
-    return get_token()
-
-
 def _validate_repo_type(repo_type: Optional[str]):
     if repo_type not in _VALID_REPO_TYPES:
         raise NotImplementedError(
             f"repo_type={repo_type!r} is not supported by hippius_hub. "
-            "Only model repositories are supported in this version."
+            f"Valid values: {', '.join(repr(t) for t in _VALID_REPO_TYPES)}."
         )
+
+
+def _oci_repo_path(repo_id: str, repo_type: Optional[str]) -> str:
+    """Translate (repo_id, repo_type) into the OCI-side repo path under `/v2/...`.
+
+    Models keep their repo_id as-is (back-compat). Datasets and spaces are
+    namespaced under the corresponding Harbor project so the same logical
+    repo_id can exist across types without collision.
+    """
+    if repo_type in (None, "model"):
+        return repo_id
+    if repo_type == "dataset":
+        return f"datasets/{repo_id}"
+    if repo_type == "space":
+        return f"spaces/{repo_id}"
+    # Already validated by _validate_repo_type; unreachable.
+    raise NotImplementedError(f"repo_type={repo_type!r}")
+
+
+def _cache_dirname(repo_id: str, repo_type: Optional[str]) -> str:
+    """HF cache convention: `{kind}s--{namespace}--{name}` per repo type."""
+    prefix = "models" if repo_type in (None, "model") else f"{repo_type}s"
+    return f"{prefix}--{repo_id.replace('/', '--')}"
 
 
 def hf_hub_download(
@@ -94,10 +108,12 @@ def hf_hub_download(
     if subfolder:
         filename = f"{subfolder}/{filename}"
 
+    oci_repo = _oci_repo_path(repo_id, repo_type)
+
     if local_dir is not None:
         dest_file = os.path.join(str(local_dir), filename)
     else:
-        repo_dir = os.path.join(cache_dir, f"models--{repo_id.replace('/', '--')}")
+        repo_dir = os.path.join(cache_dir, _cache_dirname(repo_id, repo_type))
         snapshots_dir = os.path.join(repo_dir, "snapshots", revision)
         dest_file = os.path.join(snapshots_dir, filename)
 
@@ -112,17 +128,17 @@ def hf_hub_download(
         )
 
     registry = (endpoint or DEFAULT_REGISTRY_URL).rstrip("/")
-    auth_token = _resolve_auth_token(token)
+    auth_token = resolve_token_value(token)
     # _oci_token + _resolved_manifest are internal kwargs used by
     # snapshot_download to avoid N+1 token/manifest round-trips when
     # downloading many files from the same repo:revision.
-    oci_token = _oci_token or get_oci_bearer_token(repo_id, auth_token)
+    oci_token = _oci_token or get_oci_bearer_token(oci_repo, auth_token)
 
     if _resolved_manifest is not None:
         manifest = _resolved_manifest
     else:
         # Récupération du manifest OCI pour trouver le digest exact du fichier
-        manifest = fetch_manifest(registry, repo_id, revision, oci_token)
+        manifest = fetch_manifest(registry, oci_repo, revision, oci_token)
 
     target_digest = None
     for layer in manifest.get("layers", []):
@@ -135,7 +151,7 @@ def hf_hub_download(
             f"File '{filename}' not found in the OCI manifest of '{repo_id}:{revision}'"
         )
 
-    blob_url = f"{registry}/v2/{repo_id}/blobs/{target_digest}"
+    blob_url = f"{registry}/v2/{oci_repo}/blobs/{target_digest}"
 
     if local_dir is not None:
         return _download_to_local_dir(blob_url, dest_file, oci_token)
@@ -243,7 +259,7 @@ def try_to_load_from_cache(
 
     file_path = os.path.join(
         str(cache_dir),
-        f"models--{repo_id.replace('/', '--')}",
+        _cache_dirname(repo_id, repo_type),
         "snapshots",
         revision,
         filename,
@@ -274,7 +290,7 @@ def hf_hub_url(
         filename = f"{subfolder}/{filename}"
     base = (endpoint or DEFAULT_REGISTRY_URL).rstrip("/")
     rev = revision or "main"
-    return f"{base}/v2/{repo_id}/manifests/{rev}"
+    return f"{base}/v2/{_oci_repo_path(repo_id, repo_type)}/manifests/{rev}"
 
 
 hippius_hub_download = hf_hub_download

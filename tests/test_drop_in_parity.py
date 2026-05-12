@@ -10,9 +10,8 @@ Only read-only operations live here — we can't push to arbitrary HF repos.
 Hippius-only behavior (upload_file/upload_folder/create_repo/etc.) stays in
 test_phase_b.py.
 
-Markers: every test is both `e2e` (hits registry.hippius.com) and `hf_parity`
-(hits huggingface.co). Default `pytest` skips both; `pytest -m e2e` or
-`-m hf_parity` runs them.
+Marker: every test is `e2e` (the suite hits both registry.hippius.com and
+huggingface.co). Local fast loop: `pytest -m "not e2e"`.
 """
 import os
 import shutil
@@ -31,7 +30,7 @@ HF_REFERENCE_REVISION = "main"
 HF_REFERENCE_FILE = "config.json"
 
 
-pytestmark = [pytest.mark.e2e, pytest.mark.hf_parity]
+pytestmark = pytest.mark.e2e
 
 
 def _hippius_creds_available() -> bool:

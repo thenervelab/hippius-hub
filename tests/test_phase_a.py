@@ -21,8 +21,31 @@ from hippius_hub import (
     whoami,
 )
 from hippius_hub.errors import EntryNotFoundError, LocalEntryNotFoundError
+from hippius_hub.file_download import _cache_dirname, _oci_repo_path
 
 from tests._helpers import sha256_of_file, write_test_file
+
+
+# ---------- repo_type mapping helpers ----------
+
+@pytest.mark.parametrize("repo_type,expected", [
+    (None,      "foo/bar"),
+    ("model",   "foo/bar"),
+    ("dataset", "datasets/foo/bar"),
+    ("space",   "spaces/foo/bar"),
+])
+def test_oci_repo_path_mapping(repo_type, expected):
+    assert _oci_repo_path("foo/bar", repo_type) == expected
+
+
+@pytest.mark.parametrize("repo_type,expected", [
+    (None,      "models--foo--bar"),
+    ("model",   "models--foo--bar"),
+    ("dataset", "datasets--foo--bar"),
+    ("space",   "spaces--foo--bar"),
+])
+def test_cache_dirname_mapping(repo_type, expected):
+    assert _cache_dirname("foo/bar", repo_type) == expected
 
 
 # ---------- signature & exception parity ----------
@@ -80,10 +103,23 @@ def test_try_to_load_from_cache_hit(tmp_path, cache_dir, logged_in, test_repo, r
     assert os.path.exists(result)
 
 
-def test_try_to_load_from_cache_repo_type_dataset_raises(tmp_path):
+def test_try_to_load_from_cache_uses_dataset_cache_dirname(tmp_path):
+    """Dataset cache lives under datasets--*--* per HF convention."""
+    repo = "foo/bar"
+    rev = "main"
+    target = tmp_path / "datasets--foo--bar" / "snapshots" / rev / "config.json"
+    target.parent.mkdir(parents=True)
+    target.write_text("{}")
+    result = try_to_load_from_cache(
+        repo, "config.json", cache_dir=str(tmp_path), revision=rev, repo_type="dataset",
+    )
+    assert result == str(target)
+
+
+def test_try_to_load_from_cache_rejects_unknown_repo_type(tmp_path):
     with pytest.raises(NotImplementedError, match="repo_type"):
         try_to_load_from_cache(
-            "any/repo", "x.bin", cache_dir=str(tmp_path), repo_type="dataset",
+            "any/repo", "x.bin", cache_dir=str(tmp_path), repo_type="bogus",
         )
 
 
@@ -107,9 +143,22 @@ def test_hf_hub_url_custom_endpoint():
     )
 
 
-def test_hf_hub_url_repo_type_dataset_raises():
+def test_hf_hub_url_dataset_namespaces_under_datasets():
+    """dataset repos resolve to /v2/datasets/{repo_id}/manifests/..."""
+    assert hf_hub_url("foo/bar", "model.bin", repo_type="dataset") == (
+        "https://registry.hippius.com/v2/datasets/foo/bar/manifests/main"
+    )
+
+
+def test_hf_hub_url_space_namespaces_under_spaces():
+    assert hf_hub_url("foo/bar", "model.bin", repo_type="space") == (
+        "https://registry.hippius.com/v2/spaces/foo/bar/manifests/main"
+    )
+
+
+def test_hf_hub_url_rejects_unknown_repo_type():
     with pytest.raises(NotImplementedError, match="repo_type"):
-        hf_hub_url("foo/bar", "model.bin", repo_type="dataset")
+        hf_hub_url("foo/bar", "model.bin", repo_type="bogus")
 
 
 # ---------- hf_hub_download new kwargs ----------
@@ -180,11 +229,11 @@ def test_hf_hub_download_local_files_only_hit(tmp_path, cache_dir, logged_in, te
     assert sha256_of_file(out) == expected
 
 
-def test_hf_hub_download_repo_type_dataset_raises(tmp_path):
+def test_hf_hub_download_rejects_unknown_repo_type(tmp_path):
     with pytest.raises(NotImplementedError, match="repo_type"):
         hf_hub_download(
             repo_id="any/repo", filename="x.bin",
-            cache_dir=str(tmp_path), repo_type="dataset",
+            cache_dir=str(tmp_path), repo_type="bogus",
         )
 
 

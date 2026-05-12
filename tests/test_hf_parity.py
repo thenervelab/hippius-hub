@@ -6,7 +6,7 @@ import pytest
 from tests._helpers import write_test_file
 
 
-pytestmark = pytest.mark.hf_parity
+pytestmark = pytest.mark.e2e
 
 
 HF_REFERENCE_REPO = "hf-internal-testing/tiny-random-gpt2"
