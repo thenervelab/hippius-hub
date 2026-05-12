@@ -7,7 +7,7 @@ from huggingface_hub.utils import filter_repo_objects
 
 from ._oci import fetch_manifest, layer_titles
 from .auth import get_oci_bearer_token, resolve_token_value
-from .constants import DEFAULT_CACHE_DIR, DEFAULT_REGISTRY_URL
+from .constants import DEFAULT_CACHE_DIR, resolve_registry
 from .errors import LocalEntryNotFoundError
 from .file_download import _cache_dirname, _oci_repo_path, _validate_repo_type, hf_hub_download
 
@@ -67,7 +67,7 @@ def snapshot_download(
         return snapshot_dir
 
     oci_repo = _oci_repo_path(repo_id, repo_type)
-    registry = (endpoint or DEFAULT_REGISTRY_URL).rstrip("/")
+    registry = resolve_registry(endpoint)
     auth_token = resolve_token_value(token)
     oci_token = get_oci_bearer_token(oci_repo, auth_token)
 

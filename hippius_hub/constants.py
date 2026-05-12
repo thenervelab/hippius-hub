@@ -1,7 +1,13 @@
 import os
+from typing import Optional
 
 DEFAULT_CACHE_DIR = os.path.expanduser("~/.cache/hippius/hub")
 DEFAULT_REGISTRY_URL = "https://registry.hippius.com"
+
+
+def resolve_registry(endpoint: Optional[str]) -> str:
+    """Return the user-provided endpoint (trailing slash trimmed) or the default."""
+    return (endpoint or DEFAULT_REGISTRY_URL).rstrip("/")
 
 # httpx timeout for control-plane calls (manifest fetch, blob HEAD, Harbor admin
 # API). Long enough to absorb ATS proxy stalls; not used by the Rust blob fetcher.

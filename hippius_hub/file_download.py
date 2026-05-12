@@ -5,7 +5,7 @@ from typing import Dict, Optional, Union
 
 from ._oci import fetch_manifest, layer_title
 from .auth import get_oci_bearer_token, get_token, resolve_token_value
-from .constants import DEFAULT_CACHE_DIR, DEFAULT_REGISTRY_URL
+from .constants import DEFAULT_CACHE_DIR, resolve_registry
 from .errors import (
     EntryNotFoundError,
     LocalEntryNotFoundError,
@@ -24,7 +24,12 @@ _DEFAULT_CHUNK_SIZE = 100 * 1024 * 1024
 
 def _resolve_chunk_size() -> int:
     raw = os.environ.get("HIPPIUS_CHUNK_SIZE")
-    return int(raw) if raw else _DEFAULT_CHUNK_SIZE
+    if not raw:
+        return _DEFAULT_CHUNK_SIZE
+    size = int(raw)
+    if size <= 0:
+        raise ValueError(f"HIPPIUS_CHUNK_SIZE must be a positive integer, got {size}")
+    return size
 
 
 def _resolve_verify_hash() -> bool:
@@ -46,13 +51,20 @@ def _oci_repo_path(repo_id: str, repo_type: Optional[str]) -> str:
     Models keep their repo_id as-is (back-compat). Datasets and spaces are
     namespaced under the corresponding Harbor project so the same logical
     repo_id can exist across types without collision.
+
+    Rejects already-prefixed repo_ids (`datasets/foo` with `repo_type="dataset"`)
+    rather than producing a double-prefixed `datasets/datasets/foo` path.
     """
     if repo_type in (None, "model"):
         return repo_id
-    if repo_type == "dataset":
-        return f"datasets/{repo_id}"
-    if repo_type == "space":
-        return f"spaces/{repo_id}"
+    if repo_type in ("dataset", "space"):
+        prefix = f"{repo_type}s"  # datasets, spaces
+        if repo_id.startswith(f"{prefix}/"):
+            raise ValueError(
+                f"repo_id={repo_id!r} already starts with {prefix + '/'!r}; "
+                f"pass repo_id without the prefix when using repo_type={repo_type!r}"
+            )
+        return f"{prefix}/{repo_id}"
     # Already validated by _validate_repo_type; unreachable.
     raise NotImplementedError(f"repo_type={repo_type!r}")
 
@@ -127,7 +139,7 @@ def hf_hub_download(
             f"and local_files_only=True"
         )
 
-    registry = (endpoint or DEFAULT_REGISTRY_URL).rstrip("/")
+    registry = resolve_registry(endpoint)
     auth_token = resolve_token_value(token)
     # _oci_token + _resolved_manifest are internal kwargs used by
     # snapshot_download to avoid N+1 token/manifest round-trips when
@@ -288,7 +300,7 @@ def hf_hub_url(
     _validate_repo_type(repo_type)
     if subfolder:
         filename = f"{subfolder}/{filename}"
-    base = (endpoint or DEFAULT_REGISTRY_URL).rstrip("/")
+    base = resolve_registry(endpoint)
     rev = revision or "main"
     return f"{base}/v2/{_oci_repo_path(repo_id, repo_type)}/manifests/{rev}"
 

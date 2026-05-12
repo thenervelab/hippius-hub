@@ -14,7 +14,7 @@ from tqdm import tqdm
 
 from ._oci import fetch_manifest, layer_title
 from .auth import get_oci_bearer_token, get_token, resolve_token_value
-from .constants import DEFAULT_HTTP_TIMEOUT, DEFAULT_REGISTRY_URL, LAYER_TITLE_KEY
+from .constants import DEFAULT_HTTP_TIMEOUT, LAYER_TITLE_KEY, resolve_registry
 from .file_download import _oci_repo_path, _validate_repo_type
 
 try:
@@ -24,10 +24,6 @@ except ImportError:
 
 
 # ---- helpers ----
-
-def _registry(endpoint: Optional[str]) -> str:
-    return (endpoint or DEFAULT_REGISTRY_URL).rstrip("/")
-
 
 def _oci_bearer(repo_id: str, token, push: bool = True) -> str:
     return get_oci_bearer_token(repo_id, resolve_token_value(token), push=push)
@@ -277,7 +273,7 @@ def upload_file(
         commit_description = ""
 
     oci_repo = _oci_repo_path(repo_id, repo_type)
-    registry = _registry(endpoint)
+    registry = resolve_registry(endpoint)
     oci_token = _oci_bearer(oci_repo, token, push=True)
 
     file_path, cleanup = _normalize_path_or_fileobj(path_or_fileobj)
@@ -363,7 +359,7 @@ def upload_folder(
     ))
 
     oci_repo = _oci_repo_path(repo_id, repo_type)
-    registry = _registry(endpoint)
+    registry = resolve_registry(endpoint)
     oci_token = _oci_bearer(oci_repo, token, push=True)
 
     def _process(rel_path: str) -> dict:

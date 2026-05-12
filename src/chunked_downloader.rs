@@ -14,9 +14,11 @@ const VERIFY_READ_BUFFER: usize = 8 * 1024 * 1024; // 8 MB pour lecture de véri
 
 /// Number of HTTP Range requests needed to cover `content_length` bytes when
 /// each chunk is `chunk_size` bytes. Returns 0 for empty files (caller is
-/// expected to handle that as a special case).
+/// expected to handle that as a special case). Returns 0 for `chunk_size == 0`
+/// to avoid a division-by-zero panic if a caller sets `HIPPIUS_CHUNK_SIZE=0` —
+/// the Python layer also validates this, but defense-in-depth.
 fn num_chunks(content_length: u64, chunk_size: u64) -> usize {
-    if content_length == 0 {
+    if content_length == 0 || chunk_size == 0 {
         return 0;
     }
     // Integer ceiling division — avoids the f64 round-trip the older code used.
@@ -325,6 +327,12 @@ mod tests {
     fn num_chunks_with_remainder() {
         assert_eq!(num_chunks(101, 100), 2);
         assert_eq!(num_chunks(301, 100), 4);
+    }
+
+    #[test]
+    fn num_chunks_zero_chunk_size_does_not_panic() {
+        // Defense in depth: Python validates this, but keep the Rust side safe.
+        assert_eq!(num_chunks(1000, 0), 0);
     }
 
     #[test]

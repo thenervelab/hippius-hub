@@ -9,12 +9,12 @@ from typing import Optional
 
 import httpx
 
-from .constants import DEFAULT_HTTP_TIMEOUT, DEFAULT_REGISTRY_URL
+from .constants import DEFAULT_HTTP_TIMEOUT, resolve_registry
 from .errors import LocalTokenNotFoundError
 
 
 def _base(endpoint: Optional[str]) -> str:
-    return (endpoint or DEFAULT_REGISTRY_URL).rstrip("/")
+    return resolve_registry(endpoint)
 
 
 def _headers(auth_header: str, *, json: bool = False) -> dict:

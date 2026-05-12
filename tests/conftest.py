@@ -4,6 +4,22 @@ import uuid
 import pytest
 
 
+@pytest.fixture(autouse=True)
+def _clear_oci_token_cache():
+    """Prevent cross-test contamination of the global OCI bearer-token cache.
+
+    `auth._OCI_TOKEN_CACHE` is module-level and survives across tests. Some
+    tests monkeypatch `auth.TOKEN_PATH` per-test — the cache key includes the
+    auth-input string so divergent saved tokens get separate entries, but
+    clearing between tests is defense in depth against future regressions.
+    """
+    from hippius_hub.auth import clear_oci_token_cache
+
+    clear_oci_token_cache()
+    yield
+    clear_oci_token_cache()
+
+
 def _have_creds():
     return bool(os.environ.get("HIPPIUS_TEST_TOKEN")) or (
             bool(os.environ.get("HIPPIUS_TEST_USER")) and bool(os.environ.get("HIPPIUS_TEST_PASS")))

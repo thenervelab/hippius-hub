@@ -38,6 +38,16 @@ def test_oci_repo_path_mapping(repo_type, expected):
     assert _oci_repo_path("foo/bar", repo_type) == expected
 
 
+@pytest.mark.parametrize("repo_type,repo_id", [
+    ("dataset", "datasets/foo"),
+    ("space",   "spaces/foo"),
+])
+def test_oci_repo_path_rejects_double_prefix(repo_type, repo_id):
+    """Catch the foot-gun where a user passes the prefix in repo_id."""
+    with pytest.raises(ValueError, match="already starts with"):
+        _oci_repo_path(repo_id, repo_type)
+
+
 @pytest.mark.parametrize("repo_type,expected", [
     (None,      "models--foo--bar"),
     ("model",   "models--foo--bar"),

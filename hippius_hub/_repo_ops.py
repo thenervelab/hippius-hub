@@ -22,7 +22,7 @@ from ._harbor import (
 )
 from ._oci import fetch_manifest, head_manifest, iter_titled_layers, layer_titles
 from .auth import get_oci_bearer_token, get_token, resolve_auth_header, resolve_token_value
-from .constants import DEFAULT_HTTP_TIMEOUT, DEFAULT_REGISTRY_URL
+from .constants import DEFAULT_HTTP_TIMEOUT, resolve_registry
 from .errors import (
     EntryNotFoundError,
     LocalTokenNotFoundError,
@@ -32,12 +32,8 @@ from .errors import (
 from .file_download import _oci_repo_path, _validate_repo_type
 
 
-def _registry(endpoint: Optional[str]) -> str:
-    return (endpoint or DEFAULT_REGISTRY_URL).rstrip("/")
-
-
 def _build_repo_url(repo_id: str, endpoint: Optional[str]) -> RepoUrl:
-    base = _registry(endpoint)
+    base = resolve_registry(endpoint)
     return RepoUrl(f"{base}/v2/{repo_id}", endpoint=base)
 
 
@@ -90,14 +86,14 @@ def create_repo(
     # Use the OCI tags/list endpoint to detect existing repos — accessible to
     # any account with pull perms, unlike Harbor's admin project API.
     oci_token = get_oci_bearer_token(oci_repo, resolve_token_value(token), push=False)
-    tags = _list_tags(_registry(endpoint), oci_repo, oci_token)
+    tags = _list_tags(resolve_registry(endpoint), oci_repo, oci_token)
 
     if tags is not None:
         # Repository already exists in the registry
         if tags and not exist_ok:
             from .errors import HfHubHTTPError
             from httpx import Response, Request
-            fake_resp = Response(409, request=Request("GET", _registry(endpoint)))
+            fake_resp = Response(409, request=Request("GET", resolve_registry(endpoint)))
             raise HfHubHTTPError(
                 f"Repository {repo_id!r} already exists and exist_ok=False",
                 response=fake_resp,
@@ -165,7 +161,7 @@ def repo_info(
     harbor_project = harbor_get_project(auth_header, project, endpoint=endpoint) if auth_header else None
 
     oci_token = get_oci_bearer_token(oci_repo, resolve_token_value(token), push=False)
-    manifest = fetch_manifest(_registry(endpoint), oci_repo, revision, oci_token)
+    manifest = fetch_manifest(resolve_registry(endpoint), oci_repo, revision, oci_token)
 
     # ModelInfo's __init__ treats each entry in `siblings` as a dict and
     # builds the RepoSibling internally — pass raw dicts here.
@@ -246,7 +242,7 @@ def list_repo_files(
 
     oci_repo = _oci_repo_path(repo_id, repo_type)
     oci_token = get_oci_bearer_token(oci_repo, resolve_token_value(token), push=False)
-    manifest = fetch_manifest(_registry(endpoint), oci_repo, revision, oci_token)
+    manifest = fetch_manifest(resolve_registry(endpoint), oci_repo, revision, oci_token)
     return layer_titles(manifest)
 
 
@@ -261,7 +257,7 @@ def repo_exists(
     _validate_repo_type(repo_type)
     oci_repo = _oci_repo_path(repo_id, repo_type)
     oci_token = get_oci_bearer_token(oci_repo, resolve_token_value(token), push=False)
-    tags = _list_tags(_registry(endpoint), oci_repo, oci_token)
+    tags = _list_tags(resolve_registry(endpoint), oci_repo, oci_token)
     return tags is not None and len(tags) > 0
 
 
@@ -276,7 +272,7 @@ def revision_exists(
     _validate_repo_type(repo_type)
     oci_repo = _oci_repo_path(repo_id, repo_type)
     oci_token = get_oci_bearer_token(oci_repo, resolve_token_value(token), push=False)
-    head = head_manifest(_registry(endpoint), oci_repo, revision, oci_token)
+    head = head_manifest(resolve_registry(endpoint), oci_repo, revision, oci_token)
     return head.status_code == 200
 
 
@@ -294,7 +290,7 @@ def file_exists(
         revision = "main"
     oci_repo = _oci_repo_path(repo_id, repo_type)
     oci_token = get_oci_bearer_token(oci_repo, resolve_token_value(token), push=False)
-    manifest = fetch_manifest(_registry(endpoint), oci_repo, revision, oci_token, missing_ok=True)
+    manifest = fetch_manifest(resolve_registry(endpoint), oci_repo, revision, oci_token, missing_ok=True)
     if manifest is None:
         return False
     return filename in layer_titles(manifest)
