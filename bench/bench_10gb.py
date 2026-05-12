@@ -32,6 +32,10 @@ HIPPIUS_REVISION = os.environ.get("BENCH_HIPPIUS_REVISION", "10gb")
 HIPPIUS_FILE = os.environ.get("BENCH_HIPPIUS_FILE", "pytorch_model.bin")
 SEED_SIZE_BYTES = int(os.environ.get("BENCH_SEED_SIZE", 10 * 1024 * 1024 * 1024))
 DO_SEED = os.environ.get("SEED", "").lower() in ("1", "true", "yes")
+# Each client runs N times back-to-back with a fresh local cache_dir between
+# runs. The local-disk wipe means we're measuring server-side caching
+# (ATS in front of Harbor, CloudFront in front of HF) — not OS-page-cache reuse.
+BENCH_RUNS = max(1, int(os.environ.get("BENCH_RUNS", 2)))
 
 
 def fmt_size(n: int) -> str:
@@ -55,14 +59,6 @@ def write_seed_blob(path: Path, size: int) -> None:
             n = min(len(block), size - written)
             f.write(block[:n])
             written += n
-
-
-def time_op(label: str, fn):
-    print(f"=> {label} ...", flush=True)
-    t0 = time.perf_counter()
-    result = fn()
-    dt = time.perf_counter() - t0
-    return result, dt
 
 
 def seed_hippius_blob():
@@ -89,16 +85,12 @@ def seed_hippius_blob():
     return SEED_SIZE_BYTES, dt
 
 
-def time_download_hf(cache_dir: Path):
-    path = hf_hub_download_real(
-        repo_id=HF_REPO,
-        filename=HF_FILE,
-        cache_dir=str(cache_dir),
-    )
+def _do_hf_download(cache_dir: Path):
+    path = hf_hub_download_real(repo_id=HF_REPO, filename=HF_FILE, cache_dir=str(cache_dir))
     return os.path.getsize(path)
 
 
-def time_download_hippius(cache_dir: Path):
+def _do_hippius_download(cache_dir: Path):
     path = hippius_download(
         repo_id=HIPPIUS_REPO,
         filename=HIPPIUS_FILE,
@@ -108,33 +100,80 @@ def time_download_hippius(cache_dir: Path):
     return os.path.getsize(path)
 
 
+def run_n_times(label: str, downloader, cache_root: Path, n: int) -> list:
+    """Run `downloader` n times, wiping the local cache between runs so each
+    network call goes through to the server. The cache-hit speedup we want to
+    observe is in the server's edge cache (ATS / CloudFront), not local disk."""
+    results = []
+    for i in range(1, n + 1):
+        cache_dir = cache_root / f"{label}-run{i}"
+        tag = "cold" if i == 1 else f"warm-{i - 1}"
+        print(f"=> {label} run {i}/{n} ({tag}) ...", flush=True)
+        t0 = time.perf_counter()
+        size = downloader(cache_dir)
+        dt = time.perf_counter() - t0
+        results.append({"run": i, "tag": tag, "size": size, "dt": dt})
+        print(f"   {fmt_size(size)} in {dt:.2f}s ({fmt_throughput(size, dt)})", flush=True)
+        shutil.rmtree(cache_dir, ignore_errors=True)
+    return results
+
+
+def _throughput_mbs(byts: int, seconds: float) -> float:
+    return (byts / 1024 / 1024) / seconds
+
+
 def write_summary(results: dict, seed_result):
     lines = []
     lines.append("# Benchmark — ~10 GiB single-file download\n")
     lines.append(f"- HF source: `{HF_REPO}/{HF_FILE}`\n")
-    lines.append(f"- Hippius source: `{HIPPIUS_REPO}:{HIPPIUS_REVISION}/{HIPPIUS_FILE}`\n\n")
+    lines.append(f"- Hippius source: `{HIPPIUS_REPO}:{HIPPIUS_REVISION}/{HIPPIUS_FILE}`\n")
+    lines.append(f"- Each client run **{BENCH_RUNS}×** back-to-back; local cache wiped between runs "
+                 "so any speedup is server-side edge caching (ATS / CloudFront).\n\n")
 
     if seed_result is not None:
         size, dt = seed_result
         lines.append(f"**Seed step**: uploaded {fmt_size(size)} to Hippius in "
                      f"{dt:.1f}s ({fmt_throughput(size, dt)})\n\n")
 
-    lines.append("## Download throughput\n\n")
-    lines.append("| client | size | time | throughput |\n")
-    lines.append("|---|---:|---:|---:|\n")
+    lines.append("## Per-run timings\n\n")
+    lines.append("| client | run | tag | time | throughput |\n")
+    lines.append("|---|---:|:---:|---:|---:|\n")
     for label in ("hippius_hub", "huggingface_hub"):
-        size = results[label]["size"]
-        dt = results[label]["dt"]
-        lines.append(f"| {label} | {fmt_size(size)} | {dt:.2f}s | {fmt_throughput(size, dt)} |\n")
+        for r in results[label]:
+            lines.append(
+                f"| {label} | {r['run']} | {r['tag']} | {r['dt']:.2f}s "
+                f"| {fmt_throughput(r['size'], r['dt'])} |\n"
+            )
 
-    hf_mbs = (results["huggingface_hub"]["size"] / 1024 / 1024) / results["huggingface_hub"]["dt"]
-    hp_mbs = (results["hippius_hub"]["size"] / 1024 / 1024) / results["hippius_hub"]["dt"]
+    if BENCH_RUNS >= 2:
+        lines.append("\n## Cache warmth (last run vs first run)\n\n")
+        lines.append("| client | cold throughput | warm throughput | warm speedup |\n")
+        lines.append("|---|---:|---:|---:|\n")
+        for label in ("hippius_hub", "huggingface_hub"):
+            cold = results[label][0]
+            warm = results[label][-1]
+            cold_mbs = _throughput_mbs(cold["size"], cold["dt"])
+            warm_mbs = _throughput_mbs(warm["size"], warm["dt"])
+            lines.append(
+                f"| {label} | {cold_mbs:.1f} MiB/s | {warm_mbs:.1f} MiB/s "
+                f"| {warm_mbs / cold_mbs:.2f}× |\n"
+            )
+        lines.append(
+            "\nA warm speedup > 1.1× means the server-side cache is serving the second pull; "
+            "≈ 1.0× means the cache isn't helping (or first pull already hit a warm cache).\n"
+        )
+
+    lines.append("\n## Warm-vs-warm client comparison\n\n")
+    hf_warm = results["huggingface_hub"][-1]
+    hp_warm = results["hippius_hub"][-1]
+    hf_mbs = _throughput_mbs(hf_warm["size"], hf_warm["dt"])
+    hp_mbs = _throughput_mbs(hp_warm["size"], hp_warm["dt"])
     ratio = hp_mbs / hf_mbs
-    lines.append(f"\n**hippius_hub vs huggingface_hub**: {ratio:.2f}× ")
-    lines.append(f"({'faster' if ratio > 1 else 'slower'})\n")
+    lines.append(f"On the warm pull, **hippius_hub vs huggingface_hub** = {ratio:.2f}× "
+                 f"({'faster' if ratio > 1 else 'slower'})\n")
     lines.append("\n> Caveat: this measures client + network + server end-to-end. "
-                 "HF.co fronts with CloudFront; Hippius is one Harbor instance. "
-                 "Geo-routing and server bandwidth differences are folded in.\n")
+                 "HF.co fronts with CloudFront; Hippius is one Harbor instance behind "
+                 "ATS. Geo-routing and per-edge bandwidth differences are folded in.\n")
 
     text = "".join(lines)
     print()
@@ -162,28 +201,13 @@ def main():
         if DO_SEED:
             seed_result = seed_hippius_blob()
 
-        work = tempfile.mkdtemp(prefix="bench-10gb-")
+        work = Path(tempfile.mkdtemp(prefix="bench-10gb-"))
         try:
-            hf_cache = Path(work) / "hf"
-            hippius_cache = Path(work) / "hippius"
-
-            hf_size, hf_dt = time_op(
-                f"HF download ({HF_REPO}/{HF_FILE})",
-                lambda: time_download_hf(hf_cache),
-            )
-            print(f"   {fmt_size(hf_size)} in {hf_dt:.2f}s ({fmt_throughput(hf_size, hf_dt)})", flush=True)
-            shutil.rmtree(hf_cache, ignore_errors=True)
-
-            hp_size, hp_dt = time_op(
-                f"Hippius download ({HIPPIUS_REPO}:{HIPPIUS_REVISION}/{HIPPIUS_FILE})",
-                lambda: time_download_hippius(hippius_cache),
-            )
-            print(f"   {fmt_size(hp_size)} in {hp_dt:.2f}s ({fmt_throughput(hp_size, hp_dt)})", flush=True)
-            shutil.rmtree(hippius_cache, ignore_errors=True)
-
+            hf_runs = run_n_times("huggingface_hub", _do_hf_download, work, BENCH_RUNS)
+            hippius_runs = run_n_times("hippius_hub", _do_hippius_download, work, BENCH_RUNS)
             results = {
-                "huggingface_hub": {"size": hf_size, "dt": hf_dt},
-                "hippius_hub": {"size": hp_size, "dt": hp_dt},
+                "huggingface_hub": hf_runs,
+                "hippius_hub": hippius_runs,
             }
             write_summary(results, seed_result)
         finally:
