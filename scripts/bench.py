@@ -24,7 +24,11 @@ Examples:
     # Different HF reference file.
     python scripts/bench.py --hf-repo bigscience/bloom-560m --hf-file pytorch_model.bin
 
-Auth: set `HIPPIUS_TEST_USER` + `HIPPIUS_TEST_PASS`, or `HIPPIUS_TEST_TOKEN`.
+Auth:
+- Hippius: `HIPPIUS_TEST_USER` + `HIPPIUS_TEST_PASS`, or `HIPPIUS_TEST_TOKEN`.
+- HF (optional): `HF_TOKEN` lifts the anonymous rate limit so warm-cache
+  measurements aren't dominated by token-bucket throttling. Without it the
+  bench still works but HF speeds will reflect the anonymous tier.
 """
 import argparse
 import atexit
@@ -191,8 +195,20 @@ def run_n_times(label: str, downloader, cache_root: Path, n: int) -> list:
 
 
 def hf_downloader(args):
+    # Use the authenticated tier when HF_TOKEN is set; otherwise anonymous.
+    # Anonymous downloads are rate-limited (~30-130 MiB/s sustained on a fresh
+    # IP, dropping further as the bucket depletes), which makes warm-cache
+    # measurements noisy. With a token HF lifts the limit and the bench shows
+    # real CDN throughput.
+    hf_token = os.environ.get("HF_TOKEN")
+
     def _dl(cache_dir):
-        path = hf_hub_download_real(repo_id=args.hf_repo, filename=args.hf_file, cache_dir=str(cache_dir))
+        path = hf_hub_download_real(
+            repo_id=args.hf_repo,
+            filename=args.hf_file,
+            cache_dir=str(cache_dir),
+            token=hf_token,
+        )
         return os.path.getsize(path)
     return _dl
 
