@@ -5,7 +5,7 @@ use std::path::Path;
 use std::time::Duration;
 use indicatif::{ProgressBar, ProgressStyle};
 use tokio::fs::OpenOptions;
-use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt, SeekFrom};
+use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt, SeekFrom, BufWriter};
 
 const DEFAULT_CHUNK_SIZE: u64 = 100 * 1024 * 1024; // 100 MB par défaut
 const MAX_CONCURRENT_DOWNLOADS: usize = 16;
@@ -283,13 +283,16 @@ async fn try_download_chunk_to_offset(
         .await?;
     file.seek(SeekFrom::Start(start)).await?;
 
+    // Wrap the file handle in a 2MB BufWriter to avoid thousands of small unbuffered write syscalls
+    let mut buf_writer = BufWriter::with_capacity(2 * 1024 * 1024, file);
+
     // Stream HTTP body chunks directly to disk at our position.
     // No temp file, no assembly phase.
     loop {
         match res.chunk().await {
             Ok(Some(buf)) => {
                 let len = buf.len();
-                file.write_all(&buf).await?;
+                buf_writer.write_all(&buf).await?;
                 pb.inc(len as u64);
             }
             Ok(None) => break,
@@ -297,7 +300,7 @@ async fn try_download_chunk_to_offset(
         }
     }
 
-    file.flush().await?;
+    buf_writer.flush().await?;
     Ok(())
 }
 
