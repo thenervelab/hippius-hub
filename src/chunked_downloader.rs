@@ -8,7 +8,7 @@ use tokio::fs::OpenOptions;
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt, SeekFrom, BufWriter};
 
 const DEFAULT_CHUNK_SIZE: u64 = 100 * 1024 * 1024; // 100 MB par défaut
-const MAX_CONCURRENT_DOWNLOADS: usize = 16;
+const MAX_CONCURRENT_DOWNLOADS: usize = 32;
 const MAX_RETRIES: u32 = 3;
 const VERIFY_READ_BUFFER: usize = 8 * 1024 * 1024; // 8 MB pour lecture de vérification SHA256
 
@@ -64,8 +64,15 @@ pub struct ChunkedDownloader {
 impl ChunkedDownloader {
     /// Crée une nouvelle instance de téléchargeur concurrent.
     pub fn new(url: String, auth_token: Option<String>, chunk_size_bytes: Option<u64>) -> Result<Self, DownloadError> {
+        // Force HTTP/1.1: with h2 reqwest multiplexes all chunks on a single TCP,
+        // which caps aggregate throughput at the per-connection BBR ceiling (~150 MB/s
+        // even on a fast edge). Forcing h1 makes each parallel chunk get its own TCP,
+        // letting the kernel/qdisc fan out across the available bandwidth.
         let client = Client::builder()
             .connect_timeout(Duration::from_secs(30))
+            .http1_only()
+            .pool_max_idle_per_host(MAX_CONCURRENT_DOWNLOADS)
+            .tcp_keepalive(Duration::from_secs(30))
             .build()?;
 
         Ok(Self {
