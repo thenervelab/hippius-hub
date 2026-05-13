@@ -1,1 +1,1 @@
-hippius_hub==0.3.0
+hippius_hub==0.3.2
