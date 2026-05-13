@@ -49,8 +49,13 @@ pub async fn hash_file_async(path: &Path) -> Result<(String, u64), UploadError> 
 /// Upload un fichier en streaming vers l URL OCI retournée par /blobs/uploads/ (PUT digest finalise le blob).
 /// Affiche une progress bar par appel — utile pour les gros blobs (multi-GB).
 pub async fn upload_blob_async(url: &str, path: &Path, auth_token: Option<&str>) -> Result<(), UploadError> {
+    // Force HTTP/1.1 for the same reason as the downloader: avoids h2 single-TCP
+    // multiplexing, lets uploads spread across multiple connections if the caller
+    // parallelizes.
     let client = Client::builder()
         .timeout(Duration::from_secs(3600)) // 1h timeout pour les uploads massifs
+        .http1_only()
+        .tcp_keepalive(Duration::from_secs(30))
         .build()?;
 
     let file = File::open(path).await?;
