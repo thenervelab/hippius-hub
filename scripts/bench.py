@@ -41,17 +41,21 @@ from pathlib import Path
 
 # ---- HF cache isolation (must run before importing huggingface_hub) ---------
 # `hf_hub_download(cache_dir=...)` only controls the Hub cache (the `models--*`
-# tree). `hf_xet` keeps a separate **chunk cache** at `$HF_HOME/xet/` that the
-# `cache_dir` argument doesn't touch. Without isolation, a "warm" HF run can
-# silently hit local chunk cache populated by a previous bench invocation —
-# turning a server-cache benchmark into a local-disk benchmark.
+# tree). `hf_xet` keeps multiple caches under `$HF_HOME/xet/`:
+#   - `chunk_cache/`   — content-addressed block store
+#   - `shard/`         — deduplication shard index (per `HF_XET_SHARD_CACHE_SIZE_LIMIT`)
+#   - `reconstruction/`— per-file reconstruction manifests
+# None of these are touched by the `cache_dir` arg. Without isolation, a "warm"
+# HF run silently hits local chunks / shards / manifests and the benchmark
+# becomes a local-disk read instead of a server-cache hit.
 #
-# Fix: route every HF cache (hub + xet + tokens) into a per-bench temp
-# directory we control. Wiped between runs in `run_n_times`; full tree
-# `rmtree`'d at process exit.
+# Fix: route every HF cache (hub, xet/*, assets) into a per-bench temp dir we
+# control by setting HF_HOME *before* huggingface_hub is imported (HF reads
+# the env at module load and caches the resolved paths). Between runs we
+# rmtree the cache subtrees so the next pull is a true cold start at the
+# server. At process exit, atexit removes the entire temp tree.
 _BENCH_HF_HOME = tempfile.mkdtemp(prefix="bench-hf-home-")
 os.environ["HF_HOME"] = _BENCH_HF_HOME
-os.environ["HF_XET_CACHE_DIR"] = str(Path(_BENCH_HF_HOME) / "xet")
 atexit.register(lambda: shutil.rmtree(_BENCH_HF_HOME, ignore_errors=True))
 # -----------------------------------------------------------------------------
 
@@ -165,13 +169,21 @@ def seed_hippius(args) -> tuple:
     return args.size_bytes, dt
 
 
-def _wipe_hf_xet_cache():
-    """Clear `hf_xet`'s block cache between runs. Without this the second pull
-    would hit local chunks and report inflated "warm" throughput that has
-    nothing to do with the CDN edge cache we actually want to benchmark."""
-    xet_cache = os.environ.get("HF_XET_CACHE_DIR")
-    if xet_cache:
-        shutil.rmtree(xet_cache, ignore_errors=True)
+def _wipe_hf_caches():
+    """Clear every HF cache subtree between runs. Covers:
+      - $HF_HOME/hub   (Hub blob/snapshot cache, default for hf_hub_download
+                        when cache_dir isn't passed — defensive)
+      - $HF_HOME/xet   (hf_xet's chunk_cache + shard + reconstruction stores)
+      - $HF_HOME/assets (HF asset cache, mostly for datasets but possible)
+
+    Without this, the second pull would hit local chunks/shards/manifests and
+    the "warm" measurement would be a local-disk read, not a server-cache hit.
+    """
+    hf_home = os.environ.get("HF_HOME")
+    if not hf_home:
+        return
+    for sub in ("hub", "xet", "assets"):
+        shutil.rmtree(Path(hf_home) / sub, ignore_errors=True)
 
 
 def run_n_times(label: str, downloader, cache_root: Path, n: int) -> list:
@@ -186,11 +198,12 @@ def run_n_times(label: str, downloader, cache_root: Path, n: int) -> list:
         results.append({"run": i, "tag": tag, "size": size, "dt": dt})
         print(f"   {fmt_size(size)} in {dt:.2f}s ({fmt_throughput(size, dt)})", flush=True)
         shutil.rmtree(cache_dir, ignore_errors=True)
-        # The HF Hub cache (cache_dir) and the xet block cache are separate
-        # stores. Wipe the xet cache too so warm pulls measure server-side
-        # caching, not local chunks left by run i.
+        # cache_dir (= HF Hub cache for this run) is wiped above. HF's other
+        # caches (xet chunk/shard/reconstruction + assets + the default hub
+        # location $HF_HOME/hub) live outside cache_dir and would otherwise
+        # turn the "warm" pull into a local-disk read. Wipe them too.
         if label == "huggingface_hub":
-            _wipe_hf_xet_cache()
+            _wipe_hf_caches()
     return results
 
 
