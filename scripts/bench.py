@@ -27,12 +27,29 @@ Examples:
 Auth: set `HIPPIUS_TEST_USER` + `HIPPIUS_TEST_PASS`, or `HIPPIUS_TEST_TOKEN`.
 """
 import argparse
+import atexit
 import os
 import shutil
 import sys
 import tempfile
 import time
 from pathlib import Path
+
+# ---- HF cache isolation (must run before importing huggingface_hub) ---------
+# `hf_hub_download(cache_dir=...)` only controls the Hub cache (the `models--*`
+# tree). `hf_xet` keeps a separate **chunk cache** at `$HF_HOME/xet/` that the
+# `cache_dir` argument doesn't touch. Without isolation, a "warm" HF run can
+# silently hit local chunk cache populated by a previous bench invocation —
+# turning a server-cache benchmark into a local-disk benchmark.
+#
+# Fix: route every HF cache (hub + xet + tokens) into a per-bench temp
+# directory we control. Wiped between runs in `run_n_times`; full tree
+# `rmtree`'d at process exit.
+_BENCH_HF_HOME = tempfile.mkdtemp(prefix="bench-hf-home-")
+os.environ["HF_HOME"] = _BENCH_HF_HOME
+os.environ["HF_XET_CACHE_DIR"] = str(Path(_BENCH_HF_HOME) / "xet")
+atexit.register(lambda: shutil.rmtree(_BENCH_HF_HOME, ignore_errors=True))
+# -----------------------------------------------------------------------------
 
 from huggingface_hub import hf_hub_download as hf_hub_download_real
 
@@ -144,6 +161,15 @@ def seed_hippius(args) -> tuple:
     return args.size_bytes, dt
 
 
+def _wipe_hf_xet_cache():
+    """Clear `hf_xet`'s block cache between runs. Without this the second pull
+    would hit local chunks and report inflated "warm" throughput that has
+    nothing to do with the CDN edge cache we actually want to benchmark."""
+    xet_cache = os.environ.get("HF_XET_CACHE_DIR")
+    if xet_cache:
+        shutil.rmtree(xet_cache, ignore_errors=True)
+
+
 def run_n_times(label: str, downloader, cache_root: Path, n: int) -> list:
     results = []
     for i in range(1, n + 1):
@@ -156,6 +182,11 @@ def run_n_times(label: str, downloader, cache_root: Path, n: int) -> list:
         results.append({"run": i, "tag": tag, "size": size, "dt": dt})
         print(f"   {fmt_size(size)} in {dt:.2f}s ({fmt_throughput(size, dt)})", flush=True)
         shutil.rmtree(cache_dir, ignore_errors=True)
+        # The HF Hub cache (cache_dir) and the xet block cache are separate
+        # stores. Wipe the xet cache too so warm pulls measure server-side
+        # caching, not local chunks left by run i.
+        if label == "huggingface_hub":
+            _wipe_hf_xet_cache()
     return results
 
 
