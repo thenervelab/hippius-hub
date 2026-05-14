@@ -27,7 +27,7 @@ impl From<std::io::Error> for UploadError {
     }
 }
 
-/// Calcule le SHA256 et la taille totale d'un fichier local
+/// Compute the SHA256 and total size of a local file
 pub async fn hash_file_async(path: &Path) -> Result<(String, u64), UploadError> {
     let mut file = File::open(path).await?;
     let mut hasher = Sha256::new();
@@ -46,14 +46,14 @@ pub async fn hash_file_async(path: &Path) -> Result<(String, u64), UploadError> 
     Ok((hex::encode(hasher.finalize()), total_size))
 }
 
-/// Upload un fichier en streaming vers l URL OCI retournée par /blobs/uploads/ (PUT digest finalise le blob).
-/// Affiche une progress bar par appel — utile pour les gros blobs (multi-GB).
+/// Stream-upload a file to the OCI URL returned by /blobs/uploads/ (the PUT-with-digest finalises the blob).
+/// Shows a per-call progress bar — useful for large blobs (multi-GB).
 pub async fn upload_blob_async(url: &str, path: &Path, auth_token: Option<&str>) -> Result<(), UploadError> {
     // Force HTTP/1.1 for the same reason as the downloader: avoids h2 single-TCP
     // multiplexing, lets uploads spread across multiple connections if the caller
     // parallelizes.
     let client = Client::builder()
-        .timeout(Duration::from_secs(3600)) // 1h timeout pour les uploads massifs
+        .timeout(Duration::from_secs(3600)) // 1h timeout for very large uploads
         .http1_only()
         .tcp_keepalive(Duration::from_secs(30))
         .build()?;
@@ -61,7 +61,7 @@ pub async fn upload_blob_async(url: &str, path: &Path, auth_token: Option<&str>)
     let file = File::open(path).await?;
     let file_size = file.metadata().await?.len();
 
-    // Progress bar — la stream wrapper la met à jour à chaque chunk émis vers reqwest.
+    // Progress bar — the stream wrapper updates it on every chunk emitted to reqwest.
     let pb = ProgressBar::new(file_size);
     pb.set_style(
         ProgressStyle::default_bar()
@@ -77,8 +77,8 @@ pub async fn upload_blob_async(url: &str, path: &Path, auth_token: Option<&str>)
         .unwrap_or_else(|| "blob".to_string());
     pb.set_message(format!("📤 {}", basename));
 
-    // Wrappe le stream pour incrémenter la progress bar à chaque chunk de body
-    // émis vers reqwest. ProgressBar est Arc-internalement → clone bon marché.
+    // Wrap the stream so we tick the progress bar on every body chunk emitted
+    // to reqwest. ProgressBar is Arc-internally → cloning is cheap.
     let pb_stream = pb.clone();
     let stream = FramedRead::new(file, BytesCodec::new()).map(move |chunk_result| {
         if let Ok(ref bytes) = chunk_result {

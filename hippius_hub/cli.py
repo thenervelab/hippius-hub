@@ -63,13 +63,20 @@ def cmd_registry_check(args):
 
 
 def _maybe_docker_login(host: str, user: str, secret: str, *, auto: bool):
+    # Always persist creds to hippius-hub's own cache (~/.cache/hippius/hub/token).
+    # The robot secret is shown only once by the API; if we don't save it here the
+    # user has to rerun `hippius-hub login --username --password` by hand before
+    # the next upload/download, which is a footgun.
+    login(username=user, password=secret)
+
     if not auto:
-        print("\nTo finish setup, run:")
+        print("\nTo also enable `docker push`/`pull`, run:")
         print(f"  docker login {host} -u '{user}' -p '<secret-printed-above>'")
         return
     if not shutil.which("docker"):
-        print("\n⚠️  docker CLI not found in PATH — skipping auto docker login.")
-        print(f"  Run manually: docker login {host} -u '{user}' -p '...'")
+        print("\nℹ️  docker CLI not found in PATH — skipping `docker login`.")
+        print("    hippius-hub's own auth is set up; only `docker push`/`pull` will be unavailable.")
+        print(f"    Run manually if you install docker later: docker login {host} -u '{user}' -p '...'")
         return
     p = subprocess.run(
         ["docker", "login", host, "-u", user, "--password-stdin"],
@@ -171,13 +178,22 @@ def cmd_registry_repos(args):
 
 
 def cmd_registry_artifacts(args):
-    res = console.list_artifacts(args.repo, page=args.page, page_size=args.page_size)
+    if "/" not in args.repo:
+        print(f"❌ Repo must be '<project>/<repo>', got '{args.repo}'.")
+        print(f"   Example: hippius-hub registry artifacts {args.repo}/some-repo")
+        sys.exit(2)
+    project, repo = args.repo.split("/", 1)
+    res = console.list_artifacts(project, repo, page=args.page, page_size=args.page_size)
     if not res:
         print("No artifacts.")
         return
     for a in res:
-        tags = ", ".join((t.get("name", "") for t in (a.get("tags") or []))) or "-"
-        print(f"  {a.get('digest', '')[:24]:24} tags={tags:20} size={_fmt_bytes(a.get('size')):>10}  pushed={a.get('push_time', '—')}")
+        tags = ", ".join(t for t in (a.get("all_tags") or []) if t) \
+            or a.get("primary_tag") or "-"
+        size = a.get("total_size_bytes")
+        digest = a.get("digest", "")
+        print(f"  {digest[:24]:24} tags={tags:20} size={_fmt_bytes(size):>10}  "
+              f"indexed={a.get('indexed_at', '—')}")
 
 
 def cmd_registry_usage(_args):
@@ -309,7 +325,8 @@ def main():
     rp = regsub.add_parser("provision", help="Provision your registry namespace")
     rp.add_argument("namespace")
     rp.add_argument("--docker-login", action="store_true",
-                    help="Automatically run `docker login` with the returned credentials")
+                    help="Also run `docker login` so `docker push`/`pull` works "
+                         "(hippius-hub's own auth is always persisted regardless)")
     rp.set_defaults(func=cmd_registry_provision)
 
     regsub.add_parser("status", help="Polling status for in-flight provisioning"
@@ -317,7 +334,9 @@ def main():
     regsub.add_parser("me", help="Show my active project").set_defaults(func=cmd_registry_me)
 
     rr = regsub.add_parser("rotate-token", help="Issue a new docker secret")
-    rr.add_argument("--docker-login", action="store_true")
+    rr.add_argument("--docker-login", action="store_true",
+                    help="Also run `docker login` so `docker push`/`pull` works "
+                         "(hippius-hub's own auth is always re-persisted regardless)")
     rr.set_defaults(func=cmd_registry_rotate)
 
     rrepos = regsub.add_parser("repos", help="List my repositories")
@@ -326,7 +345,8 @@ def main():
     rrepos.set_defaults(func=cmd_registry_repos)
 
     rart = regsub.add_parser("artifacts", help="List artifacts in one repo")
-    rart.add_argument("repo")
+    rart.add_argument("repo", metavar="<project>/<repo>",
+                      help="Two-segment repo path, e.g. veggies-test/fake-model")
     rart.add_argument("--page", type=int, default=1)
     rart.add_argument("--page-size", type=int, default=50)
     rart.set_defaults(func=cmd_registry_artifacts)

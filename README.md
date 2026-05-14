@@ -33,9 +33,23 @@ hippius-hub --version   # confirm the install
 hippius-hub --help      # discover commands
 ```
 
-Or from source (requires Rust + maturin):
+Or from source. `hippius_hub` ships a Rust extension (`hippius_core`) — published wheels include a pre-built binary for your platform, but `pip install git+…` or `maturin develop` will compile it locally and needs a working Rust toolchain.
+
+**Prerequisite — install Rust via `rustup`** (not Homebrew). `rustup` ships the correct stdlib for your host triple; Homebrew's `rust` formula installs to the prefix it was built for, so on Apple Silicon an Intel-prefix (`/usr/local`) Homebrew rust will fail to build for `aarch64-apple-darwin` with `error[E0463]: can't find crate for 'core'`.
 
 ```bash
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+source "$HOME/.cargo/env"
+rustc --version   # should print your host triple, e.g. aarch64-apple-darwin
+```
+
+Then either:
+
+```bash
+# A) Install the latest main directly
+pip install "git+https://github.com/thenervelab/hippius-hub.git@main"
+
+# B) Editable dev install
 git clone https://github.com/thenervelab/hippius-hub
 cd hippius-hub
 python -m venv .venv && source .venv/bin/activate
@@ -60,7 +74,9 @@ login(token="hf_xxx")                  # HF-shape: positional token (docker regi
 login(username="me", password="pwd")   # Basic auth (docker registry)
 ```
 
-You typically only need the API token — running `hippius-hub registry provision <namespace>` returns docker credentials that you can keep or rotate with `hippius-hub registry rotate-token`.
+In practice the API token is all you save by hand. `hippius-hub registry provision <namespace>` mints the docker credentials *and* writes them into `~/.cache/hippius/hub/token` for you, so the next `upload`/`download` works without a second `hippius-hub login` step. Pass `--docker-login` to also run `docker login` so `docker push`/`pull` work; either way, hippius-hub's own auth is persisted.
+
+The robot secret is printed **once** on first provision. If you lose it, rotate with `hippius-hub registry rotate-token` (also re-writes the local cache).
 
 ## Onboard from the terminal (no UI required)
 
