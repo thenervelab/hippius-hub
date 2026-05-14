@@ -346,7 +346,7 @@ def main():
 
     rart = regsub.add_parser("artifacts", help="List artifacts in one repo")
     rart.add_argument("repo", metavar="<project>/<repo>",
-                      help="Two-segment repo path, e.g. veggies-test/fake-model")
+                      help="Two-segment repo path, e.g. myorg/my-models")
     rart.add_argument("--page", type=int, default=1)
     rart.add_argument("--page-size", type=int, default=50)
     rart.set_defaults(func=cmd_registry_artifacts)
