@@ -102,9 +102,20 @@ def cmd_registry_provision(args):
 
     if res.get("pending"):
         print(f"⏳ {res.get('message') or 'Provisioning started in the background.'}")
+        if res.get("details"):
+            print(f"   {res['details']}")
         print("    Poll `hippius-hub registry status`.")
         return
 
+    # A stuck row that the server self-recovered on this POST. The robot
+    # secret stays encrypted at rest, so it's not in the response — we
+    # tell the user to rotate to get a fresh one.
+    if res.get("recovered"):
+        print(f"✅ Recovered '{res['project_name']}' — now {res.get('status')}.")
+        print(f"   {res.get('message') or 'Run `hippius-hub registry rotate-token` to get docker credentials.'}")
+        return
+
+    # Fresh provision: creds are returned exactly once.
     print(f"✅ Created '{res['project_name']}' on the {res['plan_name']} plan.")
     print(f"   Quota: {_fmt_bytes(res.get('storage_quota_bytes'))}")
     print()
