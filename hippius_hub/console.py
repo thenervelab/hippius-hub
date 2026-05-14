@@ -127,17 +127,35 @@ def list_repositories(page: int = 1, page_size: int = 50):
                     params={"page": page, "page_size": page_size})
 
 
+def _split_project_repo(repo: str) -> tuple:
+    if "/" not in repo:
+        raise ValueError(f"repo must be '<project>/<repo>', got {repo!r}")
+    project, name = repo.split("/", 1)
+    return project, name
+
+
 def list_artifacts(repo: str, page: int = 1, page_size: int = 50):
-    return _request("GET", f"/api/registry/repositories/{repo}/artifacts/",
-                    params={"page": page, "page_size": page_size})
+    # The registry path `/api/registry/repositories/<project>/<repo>/artifacts/`
+    # exists but only accepts DELETE. Listing artifacts is served by the model
+    # index, which returns the same per-revision data plus the indexer's
+    # parsed format/architecture/params/quantization.
+    project, name = _split_project_repo(repo)
+    res = _request("GET", f"/api/models/{project}/{name}/",
+                   params={"page": page, "page_size": page_size})
+    return (res or {}).get("artifacts", [])
 
 
 def get_artifact(repo: str, reference: str):
-    return _request("GET", f"/api/registry/repositories/{repo}/artifacts/{reference}/")
+    # Same routing story as list_artifacts: the registry GET returns 405, the
+    # model-index endpoint serves the artifact detail.
+    project, name = _split_project_repo(repo)
+    return _request("GET", f"/api/models/{project}/{name}/{reference}/")
 
 
 def delete_artifact(repo: str, reference: str):
-    return _request("DELETE", f"/api/registry/repositories/{repo}/artifacts/{reference}/")
+    project, name = _split_project_repo(repo)
+    return _request("DELETE",
+                    f"/api/registry/repositories/{project}/{name}/artifacts/{reference}/")
 
 
 def usage():

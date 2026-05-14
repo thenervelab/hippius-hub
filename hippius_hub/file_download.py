@@ -129,7 +129,7 @@ def hf_hub_download(
         snapshots_dir = os.path.join(repo_dir, "snapshots", revision)
         dest_file = os.path.join(snapshots_dir, filename)
 
-    # 1. Vérification du cache : ne jamais retélécharger un fichier existant
+    # 1. Cache check: never redownload an existing file
     if not force_download and os.path.exists(dest_file):
         return dest_file
 
@@ -149,7 +149,7 @@ def hf_hub_download(
     if _resolved_manifest is not None:
         manifest = _resolved_manifest
     else:
-        # Récupération du manifest OCI pour trouver le digest exact du fichier
+        # Fetch the OCI manifest to find the file's exact digest
         manifest = fetch_manifest(registry, oci_repo, revision, oci_token)
 
     target_digest = None
@@ -180,7 +180,7 @@ def hf_hub_download(
 
 def _download_to_cache(blob_url, repo_dir, snapshots_dir, filename, oci_token, target_digest):
     """Cache-structured download mirroring huggingface_hub's layout."""
-    # Structure de cache calquée sur huggingface_hub
+    # Cache layout modeled on huggingface_hub
     blobs_dir = os.path.join(repo_dir, "blobs")
     os.makedirs(blobs_dir, exist_ok=True)
     os.makedirs(snapshots_dir, exist_ok=True)
@@ -188,8 +188,8 @@ def _download_to_cache(blob_url, repo_dir, snapshots_dir, filename, oci_token, t
     file_path = os.path.join(snapshots_dir, filename)
     temp_path = os.path.join(blobs_dir, f"tmp_{filename.replace('/', '_')}")
 
-    # 2. Téléchargement concurrent via le moteur Rust
-    print(f"Téléchargement concurrent de {filename}...")
+    # 2. Concurrent download via the Rust engine
+    print(f"Downloading {filename} (parallel)...")
     verify_hash = _resolve_verify_hash()
     calculated_hash = download_file_native(
         url=blob_url,
@@ -199,17 +199,17 @@ def _download_to_cache(blob_url, repo_dir, snapshots_dir, filename, oci_token, t
         verify_hash=verify_hash,
     )
 
-    # Si on ne vérifie pas le hash, on utilise le digest connu du manifeste OCI
+    # If we skip hash verification, fall back to the digest from the OCI manifest
     final_hash = calculated_hash if verify_hash else target_digest.replace("sha256:", "")
 
-    # 3. Renommage atomique du fichier temporaire vers le blob SHA256
+    # 3. Atomic rename of the temp file into the SHA256 blob
     blob_path = os.path.join(blobs_dir, f"sha256:{final_hash}")
     if not os.path.exists(blob_path):
         os.rename(temp_path, blob_path)
     elif os.path.exists(temp_path):
         os.remove(temp_path)
 
-    # 4. Création du symlink dans le snapshot
+    # 4. Create the symlink in the snapshot
     _create_symlink(blob_path, file_path)
     return file_path
 
@@ -219,7 +219,7 @@ def _download_to_local_dir(blob_url, dest_file, oci_token):
     parent = os.path.dirname(dest_file)
     if parent:
         os.makedirs(parent, exist_ok=True)
-    print(f"Téléchargement concurrent de {os.path.basename(dest_file)}...")
+    print(f"Downloading {os.path.basename(dest_file)} (parallel)...")
     download_file_native(
         url=blob_url,
         dest_path=dest_file,
@@ -231,14 +231,14 @@ def _download_to_local_dir(blob_url, dest_file, oci_token):
 
 
 def _create_symlink(src: str, dst: str):
-    """Crée un lien symbolique avec fallback silencieux pour Windows ou systèmes restreints."""
+    """Create a symlink with silent fallback for Windows or restricted filesystems."""
     if os.path.exists(dst):
         os.remove(dst)
 
     os.makedirs(os.path.dirname(dst), exist_ok=True)
 
     try:
-        # Chemin relatif depuis le dossier du snapshot vers le blob
+        # Relative path from the snapshot directory to the blob
         rel_src = os.path.relpath(src, os.path.dirname(dst))
         os.symlink(rel_src, dst)
     except OSError:
@@ -246,7 +246,7 @@ def _create_symlink(src: str, dst: str):
         try:
             os.link(src, dst)
         except OSError:
-            # Fallback 2: Copie standard complète (silencieuse)
+            # Fallback 2: Full plain copy (silent)
             shutil.copy2(src, dst)
 
 

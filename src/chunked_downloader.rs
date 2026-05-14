@@ -7,10 +7,10 @@ use indicatif::{ProgressBar, ProgressStyle};
 use tokio::fs::OpenOptions;
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt, SeekFrom, BufWriter};
 
-const DEFAULT_CHUNK_SIZE: u64 = 100 * 1024 * 1024; // 100 MB par défaut
+const DEFAULT_CHUNK_SIZE: u64 = 100 * 1024 * 1024; // 100 MB default
 const MAX_CONCURRENT_DOWNLOADS: usize = 32;
 const MAX_RETRIES: u32 = 3;
-const VERIFY_READ_BUFFER: usize = 8 * 1024 * 1024; // 8 MB pour lecture de vérification SHA256
+const VERIFY_READ_BUFFER: usize = 8 * 1024 * 1024; // 8 MB read buffer for SHA256 verification
 
 /// Number of HTTP Range requests needed to cover `content_length` bytes when
 /// each chunk is `chunk_size` bytes. Returns 0 for empty files (caller is
@@ -62,7 +62,7 @@ pub struct ChunkedDownloader {
 }
 
 impl ChunkedDownloader {
-    /// Crée une nouvelle instance de téléchargeur concurrent.
+    /// Construct a new concurrent downloader.
     pub fn new(url: String, auth_token: Option<String>, chunk_size_bytes: Option<u64>) -> Result<Self, DownloadError> {
         // Force HTTP/1.1: with h2 reqwest multiplexes all chunks on a single TCP,
         // which caps aggregate throughput at the per-connection BBR ceiling (~150 MB/s
@@ -83,15 +83,15 @@ impl ChunkedDownloader {
         })
     }
 
-    /// Télécharge le fichier de manière concurrente en streamant chaque chunk
-    /// directement à son offset dans le fichier final (sparse pre-allocated).
-    /// Si verify_hash est vrai, lit le fichier complet en fin de course pour
-    /// produire le SHA256. Sinon retourne une chaîne vide.
+    /// Downloads the file concurrently by streaming each chunk directly to its
+    /// offset in the final file (sparse pre-allocated). If `verify_hash` is
+    /// true, reads the full file at the end to produce a SHA256. Otherwise
+    /// returns an empty string.
     pub async fn download(&self, dest_path: &Path, verify_hash: bool) -> Result<String, DownloadError> {
-        // 1. Récupération de la taille totale du blob
+        // 1. Fetch the total blob size
         let content_length = self.get_content_length().await?;
 
-        // Gérer le cas des fichiers vides
+        // Handle the empty-file case
         if content_length == 0 {
             return self.create_empty_file(dest_path).await;
         }
@@ -105,14 +105,14 @@ impl ChunkedDownloader {
 
         let num_chunks = num_chunks(content_length, self.chunk_size);
 
-        // Préparation du dossier d'accueil
+        // Prepare the destination directory
         let parent_dir = dest_path.parent().unwrap_or_else(|| Path::new("."));
         tokio::fs::create_dir_all(parent_dir).await?;
 
-        // 2. Pré-allocation du fichier final à la taille exacte (sparse OK)
-        //    Chaque chunk task ouvrira son propre handle et seekera à son offset.
-        //    Les writes concurrents avec handles distincts sur des ranges disjointes
-        //    sont safe au niveau OS (chaque handle a son propre file pointer).
+        // 2. Pre-allocate the final file at the exact size (sparse OK).
+        //    Each chunk task opens its own file handle and seeks to its offset.
+        //    Concurrent writes via distinct handles to disjoint ranges are
+        //    OS-safe (each handle has its own file pointer).
         {
             let f = OpenOptions::new()
                 .create(true)
@@ -121,13 +121,13 @@ impl ChunkedDownloader {
                 .open(dest_path)
                 .await?;
             f.set_len(content_length).await?;
-            f.sync_all().await?; // S'assurer que la taille est persistée avant les writes parallèles
+            f.sync_all().await?; // Ensure the size is persisted before parallel writes
         }
 
         let dest_path_buf = dest_path.to_path_buf();
 
-        // 3. Lancement des téléchargements concurrents — chacun stream directement
-        //    au bon offset dans le fichier final.
+        // 3. Launch concurrent downloads — each streams directly to its
+        //    correct offset in the final file.
         let mut stream = stream::iter(0..num_chunks).map(|i| {
             let (start, end) = chunk_bounds(content_length, self.chunk_size, i);
 
@@ -152,8 +152,8 @@ impl ChunkedDownloader {
 
         pb.finish_with_message("✅ Download complete");
 
-        // 4. SHA256 optionnel — un seul read-pass séquentiel sur le fichier final.
-        //    Bien plus rapide que l'ancienne assembly phase (pas de réécriture).
+        // 4. Optional SHA256 — a single sequential read-pass over the final file.
+        //    Much faster than the old assembly phase (no rewrite).
         if verify_hash {
             let pb_hash = ProgressBar::new(content_length);
             pb_hash.set_style(ProgressStyle::default_bar()
@@ -170,7 +170,7 @@ impl ChunkedDownloader {
         }
     }
 
-    /// Exécute une requête HEAD pour obtenir le Content-Length
+    /// Issue a HEAD request to obtain Content-Length
     async fn get_content_length(&self) -> Result<u64, DownloadError> {
         let mut req = self.client.head(&self.url);
         if let Some(ref token) = self.auth_token {
@@ -191,7 +191,7 @@ impl ChunkedDownloader {
         Ok(content_length)
     }
 
-    /// Cas spécifique pour créer un fichier vide si la taille est de 0
+    /// Special case: create an empty file when the size is 0
     async fn create_empty_file(&self, dest_path: &Path) -> Result<String, DownloadError> {
         let f = OpenOptions::new()
             .create(true)
@@ -208,7 +208,7 @@ impl ChunkedDownloader {
     }
 }
 
-/// Calcule le SHA256 du fichier final en un seul read-pass séquentiel.
+/// Compute the SHA256 of the final file in a single sequential read-pass.
 async fn compute_sha256(path: &Path, pb: &ProgressBar) -> Result<String, DownloadError> {
     let mut file = OpenOptions::new().read(true).open(path).await?;
     let mut hasher = Sha256::new();
@@ -226,7 +226,7 @@ async fn compute_sha256(path: &Path, pb: &ProgressBar) -> Result<String, Downloa
     Ok(hex::encode(hasher.finalize()))
 }
 
-/// Wrapper avec retry exponential-backoff pour le download d'un chunk.
+/// Wrapper with exponential-backoff retry for a single chunk download.
 async fn download_chunk_with_retry(
     client: Client,
     url: String,
@@ -254,10 +254,10 @@ async fn download_chunk_with_retry(
     }
 }
 
-/// Téléchargement d'un chunk en streaming direct vers son offset dans le fichier
-/// final (déjà pré-alloué). Chaque task ouvre son propre handle, seek à son offset,
-/// et écrit les bytes au fur et à mesure qu'ils arrivent du stream HTTP.
-/// Les writes parallèles sur des ranges disjointes sont safe.
+/// Streaming download of a chunk directly to its offset in the final file
+/// (already pre-allocated). Each task opens its own file handle, seeks to its
+/// offset, and writes bytes as they arrive from the HTTP stream.
+/// Parallel writes to disjoint ranges are safe.
 async fn try_download_chunk_to_offset(
     client: &Client,
     url: &str,

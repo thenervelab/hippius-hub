@@ -175,13 +175,13 @@ def get_oci_bearer_token(repo_id: str, token: str = None, push: bool = False, us
     auth_url = f"{DEFAULT_REGISTRY_URL}/service/token?service=harbor-registry&scope={scope}"
     headers = {}
 
-    # 1. Utilisation de ~/.docker/config.json en priorité (Basic Auth)
+    # 1. Prefer ~/.docker/config.json if present (Basic Auth)
     if not token:
         docker_auth = get_docker_auth(DEFAULT_REGISTRY_URL)
         if docker_auth:
             headers["Authorization"] = f"Basic {docker_auth}"
 
-    # 2. Fallback sur le token fourni (Bearer ou Basic selon la config registry)
+    # 2. Fall back to the provided token (Bearer or Basic depending on registry config)
     if not headers.get("Authorization") and token:
         if token.startswith("Basic ") or token.startswith("Bearer "):
             headers["Authorization"] = token
