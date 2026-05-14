@@ -1,0 +1,171 @@
+# hippius_hub
+
+> Drop-in Python replacement for `huggingface_hub`, backed by an OCI registry at `registry.hippius.com`. Same import paths, same function signatures, same exception types — byte movement is done by a Rust extension that parallelizes Range downloads. A `hippius-hub` CLI also wraps the Hippius console API for namespace + model-index management.
+
+When a user asks to "download a model", "upload a checkpoint", "mirror a HuggingFace repo to my own registry", or "swap huggingface_hub for the Hippius version", this is the right library. If the user mentions `console.hippius.com`, `registry.hippius.com`, or `oras push ... registry.hippius.com/...`, they are in this ecosystem.
+
+The README at https://github.com/thenervelab/hippius-hub/blob/main/README.md is the authoritative human-facing reference. Below is what an agent needs to act.
+
+## Install
+
+```bash
+pip install hippius_hub
+hippius-hub --version
+```
+
+## Auth (do this once)
+
+There are **two credentials** the user might need:
+
+- **API token** (for `hippius-hub registry` and `hippius-hub models` CLI subtrees, and any wrap of the console API). Issued at https://console.hippius.com/dashboard/settings . Store with:
+  ```bash
+  hippius-hub login --hippius-token <token>      # writes ~/.cache/hippius/hub/api_token
+  ```
+- **Docker registry credentials** (for `download` / `upload` / `docker push` / `oras push`). Issued by `hippius-hub registry provision <namespace>` (printed once) or rotated with `hippius-hub registry rotate-token`. Store with:
+  ```bash
+  hippius-hub login --username 'robot$ns+bot' --password <secret>     # writes ~/.cache/hippius/hub/token
+  ```
+  Or in Python: `login(token="...")` (HF-shape positional) / `login(username=..., password=...)`.
+
+`hippius-hub registry provision <ns> --docker-login` does both: provisions the namespace and runs `docker login` so subsequent oras/docker commands work without extra steps. Requires docker CLI on PATH.
+
+## Python API (drop-in for huggingface_hub)
+
+Replace `from huggingface_hub import ...` with `from hippius_hub import ...`. No other code changes.
+
+```python
+from hippius_hub import (
+    hf_hub_download, snapshot_download,
+    upload_file, upload_folder,
+    create_repo, delete_repo,
+    repo_info, model_info, list_repo_files,
+    repo_exists, revision_exists, file_exists,
+    login,
+)
+from hippius_hub import HippiusApi   # subclass of huggingface_hub.HfApi
+
+# Same signatures as HF
+path = hf_hub_download(repo_id="myorg/my-model", filename="config.json", revision="v1")
+
+snapshot_download(
+    repo_id="myorg/my-model", revision="v1",
+    allow_patterns=["*.safetensors", "*.json"],
+    ignore_patterns="optimizer*",
+    max_workers=8,
+)
+
+upload_folder(
+    folder_path="./checkpoints",
+    repo_id="myorg/my-model",
+    revision="v1",
+    allow_patterns=["*.safetensors", "*.json"],
+    delete_patterns="*.tmp",   # prune from existing revision
+)
+
+upload_file(
+    path_or_fileobj="./README.md",
+    path_in_repo="README.md",
+    repo_id="myorg/my-model",
+    revision="v1",
+)
+
+# Cache layout matches HF byte-for-byte
+import hippius_hub as huggingface_hub
+from transformers import AutoModel
+model = AutoModel.from_pretrained("myorg/my-model")
+```
+
+Exceptions are HF's typed exceptions, **re-exported verbatim** — `except RepositoryNotFoundError:` keeps working after the swap:
+
+```python
+from hippius_hub.errors import RepositoryNotFoundError, RevisionNotFoundError, EntryNotFoundError
+# These are literally `huggingface_hub.errors.*`
+```
+
+## CLI cheat sheet
+
+```bash
+# --- namespace + plan management (uses API token) ---
+hippius-hub registry plans                       # pricing tiers
+hippius-hub registry check <namespace>           # is name available?
+hippius-hub registry provision <namespace> [--docker-login]
+hippius-hub registry me                          # plan, quota, status, robot login
+hippius-hub registry status                      # poll while provisioning
+hippius-hub registry rotate-token [--docker-login]   # new docker secret (old stops working)
+hippius-hub registry publicity public|private    # toggle anon pull + resize quota
+hippius-hub registry repos [--page N --page-size M]
+hippius-hub registry artifacts <repo> [--page N --page-size M]
+hippius-hub registry usage                       # storage used + 7-day history
+
+# --- AI model index (server-side parser: GGUF, safetensors, ONNX, Diffusers) ---
+hippius-hub models list [--format gguf|safetensors|onnx|diffusers] \
+                        [--arch llama|qwen|...] [--quant int4|int8|fp16|bf16|fp8] \
+                        [--min-params N] [--max-params N] [-q "free text"] \
+                        [--mine] [--page N --page-size M] [--json]
+hippius-hub models show <project>/<repo>                        # all versions
+hippius-hub models show <project>/<repo> <tag-or-digest>        # one version + per-file breakdown + pull cmd
+hippius-hub models formats                                       # available filter values
+
+# --- raw byte ops (uses docker credentials, parallel Rust path) ---
+hippius-hub upload <project>/<repo> <local-path> [--revision <tag>]
+hippius-hub download <project>/<repo> <filename> [--revision <tag>] [--verify-hash] [--chunk-size <bytes>] [--cache-dir <path>]
+```
+
+## Common workflows
+
+### Mirror a HuggingFace model into your namespace
+
+```bash
+pip install -U "huggingface_hub[cli]" hf_transfer
+HF_HUB_ENABLE_HF_TRANSFER=1 hf download Qwen/Qwen2.5-7B-Instruct --local-dir ./model
+hippius-hub upload myns/qwen-7b ./model --revision v1
+hippius-hub models show myns/qwen-7b v1     # confirm indexed (~few seconds after push)
+```
+
+### Swap a script from huggingface_hub to hippius_hub
+
+```python
+# Single line of import change:
+# from huggingface_hub import hf_hub_download
+from hippius_hub   import hf_hub_download
+```
+
+Then run `hippius-hub login` (API token + docker creds) once. No other code change is needed for download / upload / repo CRUD.
+
+### Index a freshly pushed model into the search index
+
+Nothing to do — `oras push` / `docker push` / `hippius-hub upload` fires a Harbor webhook that hits a dedicated `model_index` Celery worker which parses GGUF / safetensors / ONNX / Diffusers and writes the row. Visible in `hippius-hub models list` within a few seconds.
+
+## What is NOT supported (raises `NotImplementedError`)
+
+These are HF concepts that don't map to an OCI registry. Don't try them:
+
+- Inference Endpoints (`create_inference_endpoint`, etc.)
+- Spaces (`request_space_hardware`, `enable_space_dev_mode`, etc.)
+- Webhooks (HF webhooks — Harbor's own webhooks are server-side)
+- Collections, Discussions / PRs
+- HF git refs like `refs/pr/3` — only OCI tags work as `revision=`
+
+Fields with no OCI analog return `None`: `pipeline_tag`, `library_name`, `tags`, `downloads`, `likes`.
+
+`hf_hub_url` returns an OCI manifest URL — usable for inspection but NOT a CDN download URL.
+
+## Concurrency caveat
+
+Multiple parallel `upload_file` calls to the same `repo_id:revision` race on the manifest with no `If-Match` check. Last writer wins. Serialize same-revision uploads in the caller if it matters.
+
+## Environment variables
+
+- `HIPPIUS_CHUNK_SIZE` (default `104857600` = 100 MiB) — per-chunk size for the parallel Rust downloader
+- `HIPPIUS_VERIFY_HASH` (default off) — set to `1`/`true` to SHA256-verify downloads locally
+- `HIPPIUS_API_URL` (default `https://api.hippius.com`) — console API base for the `registry` + `models` CLI subtrees
+- `HIPPIUS_TEST_REPO` (default `test/e2e-client`) — only used by the e2e test suite
+
+The `endpoint=` kwarg on every function lets you point at an alternative Hippius registry programmatically.
+
+## When to use what
+
+- "I want to download / upload model files" → Python `hf_hub_download` / `upload_folder`, OR CLI `hippius-hub download` / `upload`
+- "I want to manage my namespace, plan, docker creds" → CLI `hippius-hub registry ...`
+- "I want to search/browse models by architecture/quantization/etc." → CLI `hippius-hub models ...` or `from hippius_hub import console; console.models_list(...)`
+- "I'm running a script that already uses `huggingface_hub`" → change the import line, log in once, done
