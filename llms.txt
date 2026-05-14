@@ -111,6 +111,39 @@ hippius-hub upload <project>/<repo> <local-path> [--revision <tag>]
 hippius-hub download <project>/<repo> <filename> [--revision <tag>] [--verify-hash] [--chunk-size <bytes>] [--cache-dir <path>]
 ```
 
+## Create a namespace and a repo
+
+A **namespace** (called "project" in OCI terms) is the first segment of every repo path — `myns/qwen-7b`. Each user gets their own namespace via `provision`. Without it, pushes fail with auth errors because there's no quota/robot to back them.
+
+```bash
+# 1. Check the name is available (lowercase alnum + dash, 1-63 chars)
+hippius-hub registry check myns
+
+# 2. Provision it. This:
+#    - reserves the namespace on the OCI registry
+#    - issues a one-time docker secret (printed once, save it)
+#    - registers the model-index webhook for the namespace
+#    - optionally runs `docker login` so subsequent pushes Just Work
+hippius-hub registry provision myns --docker-login
+
+# 3. Confirm
+hippius-hub registry me
+```
+
+A **repo** under that namespace is created implicitly on the first push — there is no separate "make a repo" step in OCI; the registry creates `myns/qwen-7b` the first time an artifact is pushed to that path. For HF-API compatibility a Python `create_repo` exists:
+
+```python
+from hippius_hub import create_repo, delete_repo
+
+# No-op if the OCI repo already exists; idempotent under exist_ok=True.
+create_repo("myns/qwen-7b", exist_ok=True)
+
+# Deletes the OCI repository AND all its artifacts. Irreversible.
+delete_repo("myns/qwen-7b")
+```
+
+After `provision`, every subsequent push under `myns/...` reuses the same docker credentials — you don't re-provision per repo.
+
 ## Push and pull models — concrete examples
 
 ### Push from the CLI
