@@ -4,6 +4,24 @@ Drop-in replacement for [`huggingface_hub`](https://github.com/huggingface/huggi
 
 The CLI also wraps the Hippius console API: register a namespace, manage docker credentials, browse repositories, and search the AI model index without leaving the terminal.
 
+## Quickstart
+
+```bash
+# 1. Install
+pip install hippius_hub
+
+# 2. Get your API token at https://console.hippius.com/dashboard/settings
+hippius-hub login --hippius-token <paste-token-here>
+
+# 3. Provision a namespace + docker login (one shot)
+hippius-hub registry provision my-models --docker-login
+
+# 4. You're set — push, pull, search.
+hippius-hub upload my-models/qwen-7b ./checkpoints/v1
+hippius-hub download my-models/qwen-7b model.safetensors
+hippius-hub models list --mine
+```
+
 ## Install
 
 ```bash
@@ -29,7 +47,7 @@ There are **two kinds of credentials**, depending on what you're doing:
 
 | For… | Use | Where |
 |---|---|---|
-| `registry` and `models` CLI commands (manage your namespace, list models, …) | **API token** from [console.hippius.com](https://console.hippius.com) | `hippius-hub login --hippius-token <token>` → `~/.cache/hippius/hub/api_token` |
+| `registry` and `models` CLI commands (manage your namespace, list models, …) | **API token** from [console.hippius.com/dashboard/settings](https://console.hippius.com/dashboard/settings) | `hippius-hub login --hippius-token <token>` → `~/.cache/hippius/hub/api_token` |
 | `download` / `upload` (raw OCI registry IO) | Docker registry credentials | `hippius-hub login --username <you> --password <secret>` → `~/.cache/hippius/hub/token` |
 
 In Python:
@@ -45,7 +63,7 @@ You typically only need the API token — running `hippius-hub registry provisio
 ## Onboard from the terminal (no UI required)
 
 ```bash
-# 1. Save your API token (grab it on console.hippius.com)
+# 1. Save your API token (grab it at https://console.hippius.com/dashboard/settings)
 hippius-hub login --hippius-token <token>
 
 # 2. See what plans exist and what your namespace name should look like
