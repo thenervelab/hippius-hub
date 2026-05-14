@@ -20,19 +20,75 @@ maturin develop --release
 
 ## Authenticate
 
-```bash
-hippius-hub login --username <you> --password <secret>
-# or
-hippius-hub login --token <bearer-token>
-```
+There are **two kinds of credentials**, depending on what you're doing:
 
-The token is saved to `~/.cache/hippius/hub/token`. In Python:
+| For… | Use | Where |
+|---|---|---|
+| `registry` and `models` CLI commands (manage your namespace, list models, …) | **API token** from [console.hippius.com](https://console.hippius.com) | `hippius-hub login --hippius-token <token>` → `~/.cache/hippius/hub/api_token` |
+| `download` / `upload` (raw OCI registry IO) | Docker registry credentials | `hippius-hub login --username <you> --password <secret>` → `~/.cache/hippius/hub/token` |
+
+In Python:
 
 ```python
 from hippius_hub import login
-login(token="hf_xxx")                  # HF-shape: positional token
-login(username="me", password="pwd")   # Hippius/Harbor Basic auth
+login(token="hf_xxx")                  # HF-shape: positional token (docker registry)
+login(username="me", password="pwd")   # Basic auth (docker registry)
 ```
+
+You typically only need the API token — running `hippius-hub registry provision <namespace>` returns docker credentials that you can keep or rotate with `hippius-hub registry rotate-token`.
+
+## Onboard from the terminal (no UI required)
+
+```bash
+# 1. Save your API token (grab it on console.hippius.com)
+hippius-hub login --hippius-token <token>
+
+# 2. See what plans exist and what your namespace name should look like
+hippius-hub registry plans
+hippius-hub registry check my-models
+
+# 3. Create your namespace + optionally run `docker login` in one shot
+hippius-hub registry provision my-models --docker-login
+
+# 4. Push an image
+docker tag my-image registry.hippius.com/my-models/qwen-7b:v1
+docker push registry.hippius.com/my-models/qwen-7b:v1
+
+# 5. Inspect what's in your namespace
+hippius-hub registry repos
+hippius-hub registry artifacts qwen-7b
+hippius-hub registry usage
+hippius-hub registry me
+```
+
+The full `registry` sub-tree:
+
+| Command | Purpose |
+|---|---|
+| `registry plans` | List pricing tiers and quotas |
+| `registry check <name>` | Is a namespace available? |
+| `registry provision <ns> [--docker-login]` | Create your namespace and get docker credentials |
+| `registry status` | Poll while provisioning is in flight |
+| `registry me` | Plan, quota, status of your active project |
+| `registry rotate-token [--docker-login]` | Issue a new docker secret |
+| `registry repos` | List your repositories |
+| `registry artifacts <repo>` | List artifacts in one repo |
+| `registry usage` | Storage used + 7-day history |
+| `registry publicity public|private` | Toggle anonymous-pull access |
+
+## Search the AI model index
+
+Every artifact pushed to the registry is indexed (format / architecture / parameter count / quantization) and exposed under `hippius-hub models`:
+
+```bash
+hippius-hub models list --format gguf --arch llama --max-params 8000000000
+hippius-hub models show my-models/qwen-7b           # all versions of a repo
+hippius-hub models show my-models/qwen-7b v1        # one version, with file breakdown
+hippius-hub models formats                          # available filter values
+hippius-hub models list --mine                      # restrict to your own
+```
+
+Add `--json` on `models list` and `models show` for machine-readable output.
 
 ## Quick start: download a model
 
