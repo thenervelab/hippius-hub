@@ -10,6 +10,19 @@ methods.
 
 from . import errors
 
+# Resolve the installed package version. Falls back to "0.0.0+unknown" when
+# running from a source tree without metadata (e.g. `pytest` against an
+# in-tree checkout that wasn't `pip install -e`'d). Either way, no import
+# error.
+try:
+    from importlib.metadata import version as _pkg_version, PackageNotFoundError
+    try:
+        __version__ = _pkg_version("hippius_hub")
+    except PackageNotFoundError:
+        __version__ = "0.0.0+unknown"
+except ImportError:  # Python < 3.8 — not supported, but be defensive
+    __version__ = "0.0.0+unknown"
+
 from .file_download import (
     hf_hub_download,
     hf_hub_url,
@@ -72,6 +85,7 @@ from huggingface_hub.hf_api import RepoSibling
 
 
 __all__ = [
+    "__version__",
     # Phase A public API
     "hf_hub_download",
     "hippius_hub_download",

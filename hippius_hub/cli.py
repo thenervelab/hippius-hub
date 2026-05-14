@@ -7,6 +7,7 @@ import subprocess
 import sys
 from typing import Any
 
+from . import __version__
 from .auth import login
 from .file_download import hippius_hub_download
 from . import console
@@ -256,8 +257,12 @@ def cmd_models_formats(_args):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Hippius Hub CLI — registry namespaces, AI model index, and fast model downloads."
+        prog="hippius-hub",
+        description=f"Hippius Hub CLI v{__version__} — registry namespaces, AI model index, "
+                    f"and fast model downloads.",
     )
+    parser.add_argument("-V", "--version", action="version",
+                        version=f"hippius-hub {__version__}")
     sub = parser.add_subparsers(dest="command", help="Available commands")
 
     # Download (existing)
