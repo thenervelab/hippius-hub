@@ -219,7 +219,7 @@ Programmatic overrides via the `endpoint=` kwarg on any function let you point a
 
 Also known semantic divergences:
 
-- `model_info` fills `id`, `sha`, `lastModified`, `siblings`, `private`. Fields with no OCI/Harbor analog (`pipeline_tag`, `library_name`, `tags`, `downloads`, `likes`) are `None`.
+- `model_info` fills `id`, `sha`, `lastModified`, `siblings`, `private`. Fields with no OCI-registry analog (`pipeline_tag`, `library_name`, `tags`, `downloads`, `likes`) are `None`.
 - `hf_hub_url` returns the OCI manifest URL — usable for inspection but not a direct CDN download URL like HF's.
 - Concurrent `upload_file` calls to the same `repo_id:revision` race on the manifest with no If-Match check (last writer wins). Serialize same-revision uploads externally.
 
