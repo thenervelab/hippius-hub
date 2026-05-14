@@ -93,6 +93,9 @@ hippius-hub registry me                          # plan, quota, status, robot lo
 hippius-hub registry status                      # poll while provisioning
 hippius-hub registry rotate-token [--docker-login]   # new docker secret (old stops working)
 hippius-hub registry publicity public|private    # toggle anon pull + resize quota
+hippius-hub registry subscribe <plan> [--pay-upfront 1-24]   # on-chain purchase_plan (signer = whitelisted backend, owner = you, your credits)
+hippius-hub registry subscriptions                            # list local mirror of on-chain subs (synced every ~3 min)
+hippius-hub registry unsubscribe <sub-id>                     # cancel_user_subscription; 30-day grace before project is hard-deleted
 hippius-hub registry repos [--page N --page-size M]
 hippius-hub registry artifacts <repo> [--page N --page-size M]
 hippius-hub registry usage                       # storage used + 7-day history

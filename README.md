@@ -116,6 +116,9 @@ The full `registry` sub-tree:
 | `registry artifacts <repo> [--page N --page-size M]` | List artifacts in one repo |
 | `registry usage` | Storage used + 7-day history |
 | `registry publicity public\|private` | Toggle anonymous-pull access (also resizes quota to the plan's public/private tier) |
+| `registry subscribe <plan> [--pay-upfront N]` | Subscribe to a plan on-chain. `<plan>` is the name (e.g. `Builder`) or numeric id. Debits your own credits — backend is just the whitelisted relayer. |
+| `registry subscriptions` | List your current subscriptions (synced from chain every ~3 min) |
+| `registry unsubscribe <sub-id>` | Cancel a subscription by its on-chain `SubscriptionId`. 30-day grace before the project is hard-deleted; re-subscribe within that window to keep everything. |
 
 ## Search the AI model index
 

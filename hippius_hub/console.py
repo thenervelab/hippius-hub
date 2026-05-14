@@ -175,6 +175,23 @@ def toggle_publicity(public: bool):
     return _request("PATCH", "/api/registry/me/publicity/", json_body={"public": public})
 
 
+# -------- Subscriptions (marketplace pallet) --------
+
+def subscribe(plan_id: int, pay_upfront: Optional[int] = None):
+    body: dict = {"plan_id": plan_id}
+    if pay_upfront is not None:
+        body["pay_upfront"] = pay_upfront
+    return _request("POST", "/api/registry/subscribe/", json_body=body)
+
+
+def list_subscriptions():
+    return _request("GET", "/api/registry/subscriptions/")
+
+
+def cancel_subscription(subscription_id: int):
+    return _request("DELETE", f"/api/registry/subscriptions/{subscription_id}/")
+
+
 # -------- Model index --------
 
 def models_list(*, fmt: Optional[str] = None, architecture: Optional[str] = None,

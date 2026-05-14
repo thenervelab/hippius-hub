@@ -217,6 +217,56 @@ def cmd_registry_publicity(args):
     print(f"   Quota: {_fmt_bytes(res.get('storage_quota_bytes'))}")
 
 
+def _resolve_plan_id(plan_arg: str) -> int:
+    """Accept either an integer plan_id or a plan name (case-insensitive)."""
+    if plan_arg.isdigit():
+        return int(plan_arg)
+    plans = console.list_plans() or []
+    for p in plans:
+        if p.get("name", "").lower() == plan_arg.lower():
+            return p["id"]
+    avail = ", ".join(p.get("name", "?") for p in plans) or "(no plans)"
+    raise SystemExit(f"❌ Unknown plan: {plan_arg!r}. Available: {avail}")
+
+
+def cmd_registry_subscribe(args):
+    plan_id = _resolve_plan_id(args.plan)
+    res = console.subscribe(plan_id, pay_upfront=args.pay_upfront)
+    print(f"✅ Subscription submitted for plan '{res.get('plan_name', plan_id)}'")
+    print(f"   owner:          {res.get('owner') or '—'}")
+    print(f"   extrinsic_hash: {res.get('extrinsic_hash')}")
+    print(f"   block_hash:     {res.get('block_hash')}")
+    print()
+    print("Chain state will reflect in the next sync (~3 min).")
+    print("Watch with: hippius-hub registry subscriptions")
+
+
+def cmd_registry_subscriptions(_args):
+    rows = console.list_subscriptions() or []
+    if not rows:
+        print("No subscriptions yet. Run `hippius-hub registry subscribe <plan>`.")
+        return
+    for r in rows:
+        mark = "✅" if r.get("active") else "❌"
+        nxt = r.get("next_charge_unix_day")
+        print(f"  {mark} #{r['subscription_id']:<6} {r['plan_name']:20} "
+              f"paid/mo={r.get('paid_per_month', 0)}  "
+              f"next_unix_day={nxt or '—'}  synced={r.get('synced_at')}")
+        if not r.get("active") and r.get("cancelled_at"):
+            print(f"     (cancelled at {r['cancelled_at']} — 30-day grace running)")
+
+
+def cmd_registry_unsubscribe(args):
+    res = console.cancel_subscription(args.subscription_id)
+    print(f"✅ Cancel submitted for subscription #{res.get('subscription_id', args.subscription_id)}")
+    print(f"   extrinsic_hash: {res.get('extrinsic_hash')}")
+    print(f"   block_hash:     {res.get('block_hash')}")
+    print()
+    print("Grace period: 30 days. Robot/docker login stops working on the")
+    print("next sync (~3 min). Artifacts + project survive until grace expires.")
+    print("Re-subscribe within 30 days to keep everything.")
+
+
 # ----- models sub-commands -----
 
 def cmd_models_list(args):
@@ -357,6 +407,22 @@ def main():
     rpub = regsub.add_parser("publicity", help="Toggle public/private (quota changes)")
     rpub.add_argument("value", choices=["public", "private"])
     rpub.set_defaults(func=cmd_registry_publicity)
+
+    rs = regsub.add_parser("subscribe",
+                           help="Subscribe to a plan on-chain (debits your own credits)")
+    rs.add_argument("plan", help="Plan name (e.g. 'Free', 'Builder', 'Pro') or numeric plan_id")
+    rs.add_argument("--pay-upfront", type=int, default=None,
+                    help="Pay upfront for N months (1-24). Default = monthly.")
+    rs.set_defaults(func=cmd_registry_subscribe)
+
+    regsub.add_parser("subscriptions",
+                      help="List my current subscriptions (synced from chain every ~3 min)"
+                      ).set_defaults(func=cmd_registry_subscriptions)
+
+    ru = regsub.add_parser("unsubscribe",
+                           help="Cancel a subscription by its on-chain ID. 30-day grace.")
+    ru.add_argument("subscription_id", type=int, help="On-chain SubscriptionId (u32)")
+    ru.set_defaults(func=cmd_registry_unsubscribe)
 
     # Models sub-tree
     mod = sub.add_parser("models", help="Search and inspect the AI model index")
