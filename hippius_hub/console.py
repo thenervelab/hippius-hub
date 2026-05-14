@@ -16,9 +16,9 @@ import json
 import os
 from typing import Any, Optional
 
-import requests
+import httpx
 
-from .constants import API_TOKEN_PATH, DEFAULT_API_URL, DEFAULT_CACHE_DIR
+from .constants import API_TOKEN_PATH, DEFAULT_API_URL, DEFAULT_CACHE_DIR, DEFAULT_HTTP_TIMEOUT
 
 
 class ConsoleError(Exception):
@@ -64,14 +64,18 @@ def _request(method: str, path: str, *, token: Optional[str] = None,
              json_body: Any = None, params: Optional[dict] = None,
              require_auth: bool = True, base_url: Optional[str] = None) -> Any:
     url = (base_url or DEFAULT_API_URL).rstrip("/") + path
-    r = requests.request(
-        method,
-        url,
-        headers=_headers(token, require=require_auth),
-        json=json_body,
-        params=params,
-        timeout=30,
-    )
+    try:
+        r = httpx.request(
+            method,
+            url,
+            headers=_headers(token, require=require_auth),
+            json=json_body,
+            params=params,
+            timeout=DEFAULT_HTTP_TIMEOUT,
+        )
+    except httpx.RequestError as e:
+        raise ConsoleError(0, f"network error: {e}")
+
     if r.status_code >= 400:
         try:
             body = r.json()
