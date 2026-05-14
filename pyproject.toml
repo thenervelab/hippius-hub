@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "hippius_hub"
-version = "0.3.2"
+version = "0.4.0"
 description = "Drop-in replacement for huggingface_hub using a Rust backend for ultra-fast downloads"
 requires-python = ">=3.8"
 dependencies = [
