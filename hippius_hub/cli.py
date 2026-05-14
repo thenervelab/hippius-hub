@@ -180,10 +180,10 @@ def cmd_registry_repos(args):
 def cmd_registry_artifacts(args):
     if "/" not in args.repo:
         print(f"❌ Repo must be '<project>/<repo>', got '{args.repo}'.")
-        print(f"   Example: hippius-hub registry artifacts {args.repo}/some-repo")
+        print(f"   Example: hippius-hub registry artifacts myorg/my-models")
+        print(f"   (run `hippius-hub registry me` to see your project name)")
         sys.exit(2)
-    project, repo = args.repo.split("/", 1)
-    res = console.list_artifacts(project, repo, page=args.page, page_size=args.page_size)
+    res = console.list_artifacts(args.repo, page=args.page, page_size=args.page_size)
     if not res:
         print("No artifacts.")
         return
