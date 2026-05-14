@@ -111,6 +111,93 @@ hippius-hub upload <project>/<repo> <local-path> [--revision <tag>]
 hippius-hub download <project>/<repo> <filename> [--revision <tag>] [--verify-hash] [--chunk-size <bytes>] [--cache-dir <path>]
 ```
 
+## Push and pull models — concrete examples
+
+### Push from the CLI
+
+```bash
+# Push an entire folder as `:v1`. Folder pushes merge into the existing
+# manifest at the revision — re-running adds/replaces individual files
+# without wiping the rest.
+hippius-hub upload myns/qwen-7b ./qwen-7b --revision v1
+
+# Push a single file into an existing revision
+hippius-hub upload myns/qwen-7b ./README.md --revision v1
+
+# Push as the default `:main` revision
+hippius-hub upload myns/qwen-7b ./qwen-7b
+```
+
+### Push from Python
+
+```python
+from hippius_hub import upload_file, upload_folder
+
+upload_folder(
+    folder_path="./qwen-7b",
+    repo_id="myns/qwen-7b",
+    revision="v1",
+    allow_patterns=["*.safetensors", "*.json", "tokenizer.*"],
+    delete_patterns="*.tmp",   # prune from the existing revision
+    commit_message="Initial checkpoint",
+)
+
+upload_file(
+    path_or_fileobj="./model.safetensors",   # also accepts bytes or BinaryIO
+    path_in_repo="model.safetensors",
+    repo_id="myns/qwen-7b",
+    revision="v1",
+)
+```
+
+After any push, the server-side webhook → indexer chain parses GGUF / safetensors / ONNX / Diffusers and the model shows up in `hippius-hub models list` within a few seconds.
+
+### Pull from the CLI
+
+```bash
+# Single file via the parallel Rust path
+hippius-hub download myns/qwen-7b model-00001-of-00003.safetensors
+
+# Specific revision (= OCI tag)
+hippius-hub download myns/qwen-7b config.json --revision v1
+
+# SHA256-verify after download
+hippius-hub download myns/qwen-7b model.safetensors --verify-hash
+
+# Override cache + chunk size
+hippius-hub download myns/qwen-7b model.safetensors \
+    --cache-dir /data/models --chunk-size 209715200
+```
+
+The CLI handles one file per invocation. For pulling an entire revision use the Python `snapshot_download` (parallelized).
+
+### Pull from Python
+
+```python
+from hippius_hub import hf_hub_download, snapshot_download
+
+# One file (same signature as HF)
+path = hf_hub_download(
+    repo_id="myns/qwen-7b",
+    filename="config.json",
+    revision="v1",
+)
+
+# Entire repo at a revision with pattern filters
+local_dir = snapshot_download(
+    repo_id="myns/qwen-7b",
+    revision="v1",
+    allow_patterns=["*.safetensors", "*.json"],
+    ignore_patterns="optimizer*",
+    max_workers=8,
+)
+
+# Then transformers / diffusers load it natively — cache layout is HF-compatible
+import hippius_hub as huggingface_hub
+from transformers import AutoModel
+model = AutoModel.from_pretrained("myns/qwen-7b")
+```
+
 ## Common workflows
 
 ### Mirror a HuggingFace model into your namespace

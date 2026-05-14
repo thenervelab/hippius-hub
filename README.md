@@ -4,6 +4,8 @@ Drop-in replacement for [`huggingface_hub`](https://github.com/huggingface/huggi
 
 The CLI also wraps the Hippius console API: register a namespace, manage docker credentials, browse repositories, and search the AI model index without leaving the terminal.
 
+> **AI agents / coding assistants**: a self-contained reference (install, auth, CLI surface, Python API, workflows, what raises `NotImplementedError`) lives at [`llms.txt`](./llms.txt) — point your agent at it instead of this README.
+
 ## Quickstart
 
 ```bash
