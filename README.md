@@ -120,20 +120,55 @@ hippius-hub models formats                              # available filter value
 
 Add `--json` to `models list` / `models show` for machine-readable output.
 
-## Pull/push from the CLI (no Python)
-
-The same byte movement Python uses is exposed as plain CLI commands. Useful for scripts and one-offs.
+## Push a model from the CLI
 
 ```bash
-# Single-file download. Uses the parallel Rust path, picks up auth from the docker creds.
-hippius-hub download myorg/qwen-7b model-00001-of-00003.safetensors
+# Upload an entire model folder (every file under ./qwen-7b/) as `:v1`.
+# Folder uploads merge into the existing manifest at that revision — re-running
+# adds/replaces individual files without wiping the rest.
+hippius-hub upload myorg/qwen-7b ./qwen-7b --revision v1
 
-# Upload a file or folder. Folders merge into the existing manifest (won't wipe other files).
-hippius-hub upload myorg/qwen-7b ./checkpoints/v2
-hippius-hub upload myorg/qwen-7b ./README.md --revision main
+# Upload a single file (e.g. add a README to an existing revision)
+hippius-hub upload myorg/qwen-7b ./README.md --revision v1
+
+# Tag a folder as the default `:main` revision
+hippius-hub upload myorg/qwen-7b ./qwen-7b
 ```
 
-Optional flags worth knowing: `--revision <tag>`, `--chunk-size <bytes>` (defaults to `HIPPIUS_CHUNK_SIZE`), `--verify-hash` (SHA256 the payload after download), `--cache-dir <path>`.
+Once the push completes, the Harbor webhook fires the model index pipeline — the model shows up in `hippius-hub models list` within a few seconds with format/architecture/parameter-count/quantization parsed out of the bytes server-side.
+
+### Mirroring a HuggingFace model to your namespace
+
+```bash
+# 1. Grab the model from HF (uses huggingface_hub's CLI)
+pip install -U "huggingface_hub[cli]" hf_transfer
+HF_HUB_ENABLE_HF_TRANSFER=1 hf download Qwen/Qwen2.5-7B-Instruct --local-dir ./qwen-7b
+
+# 2. Push the whole folder under your namespace as :v1
+hippius-hub upload myorg/qwen-7b ./qwen-7b --revision v1
+
+# 3. Confirm it landed + got indexed
+hippius-hub registry repos
+hippius-hub models show myorg/qwen-7b v1
+```
+
+## Pull a model from the CLI
+
+```bash
+# One file — uses the parallel Rust downloader, picks up auth from
+# ~/.cache/hippius/hub/token (set by `provision --docker-login` or `login`).
+hippius-hub download myorg/qwen-7b model-00001-of-00003.safetensors
+
+# Specific revision (= OCI tag)
+hippius-hub download myorg/qwen-7b config.json --revision v1
+
+# Verify the SHA256 of the bytes after download
+hippius-hub download myorg/qwen-7b model.safetensors --verify-hash
+```
+
+For pulling **every file in a revision**, prefer the Python `snapshot_download` API below — it parallelizes across files and matches the HF cache layout that `transformers` / `diffusers` expect.
+
+Optional flags: `--revision <tag>`, `--chunk-size <bytes>` (defaults to `HIPPIUS_CHUNK_SIZE`), `--verify-hash` (SHA256 after download), `--cache-dir <path>`.
 
 ## Quick start: download a model
 
