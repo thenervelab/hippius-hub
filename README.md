@@ -2,10 +2,15 @@
 
 Drop-in replacement for [`huggingface_hub`](https://github.com/huggingface/huggingface_hub) backed by an OCI registry (`registry.hippius.com` by default). Same Python API as the official client — `from hippius_hub import hf_hub_download` works where `from huggingface_hub import hf_hub_download` worked — with byte movement done by a Rust extension.
 
+The CLI also wraps the Hippius console API: register a namespace, manage docker credentials, browse repositories, and search the AI model index without leaving the terminal.
+
 ## Install
 
 ```bash
 pip install hippius_hub
+
+hippius-hub --version   # confirm the install
+hippius-hub --help      # discover commands
 ```
 
 Or from source (requires Rust + maturin):
@@ -67,28 +72,50 @@ The full `registry` sub-tree:
 |---|---|
 | `registry plans` | List pricing tiers and quotas |
 | `registry check <name>` | Is a namespace available? |
-| `registry provision <ns> [--docker-login]` | Create your namespace and get docker credentials |
+| `registry provision <ns> [--docker-login]` | Create your namespace and get docker credentials. New projects are public by default; toggle with `registry publicity`. |
 | `registry status` | Poll while provisioning is in flight |
-| `registry me` | Plan, quota, status of your active project |
-| `registry rotate-token [--docker-login]` | Issue a new docker secret |
-| `registry repos` | List your repositories |
-| `registry artifacts <repo>` | List artifacts in one repo |
+| `registry me` | Plan, quota, status, and robot login of your active project |
+| `registry rotate-token [--docker-login]` | Issue a new docker secret (old one stops working immediately) |
+| `registry repos [--page N --page-size M]` | List your repositories |
+| `registry artifacts <repo> [--page N --page-size M]` | List artifacts in one repo |
 | `registry usage` | Storage used + 7-day history |
-| `registry publicity public|private` | Toggle anonymous-pull access |
+| `registry publicity public\|private` | Toggle anonymous-pull access (also resizes quota to the plan's public/private tier) |
 
 ## Search the AI model index
 
-Every artifact pushed to the registry is indexed (format / architecture / parameter count / quantization) and exposed under `hippius-hub models`:
+Every artifact pushed to the registry is parsed server-side (GGUF, safetensors, ONNX, Diffusers) and indexed by format / architecture / parameter count / quantization. The `models` sub-tree exposes that index:
+
+| Command | Purpose |
+|---|---|
+| `models list [filters] [--json]` | Search across all public models + your own. Filters: `--format`, `--arch`, `--quant`, `--min-params`, `--max-params`, `-q <text>`, `--mine`, `--page`, `--page-size` |
+| `models show <project>/<repo>` | All indexed versions of a repo |
+| `models show <project>/<repo> <tag-or-digest>` | One version with per-file breakdown + `docker pull` command |
+| `models formats` | Available filter values (formats, architectures, quantizations) |
 
 ```bash
 hippius-hub models list --format gguf --arch llama --max-params 8000000000
-hippius-hub models show my-models/qwen-7b           # all versions of a repo
-hippius-hub models show my-models/qwen-7b v1        # one version, with file breakdown
-hippius-hub models formats                          # available filter values
-hippius-hub models list --mine                      # restrict to your own
+hippius-hub models show my-models/qwen-7b              # all versions of a repo
+hippius-hub models show my-models/qwen-7b v1           # one version, with file breakdown
+hippius-hub models list --mine                          # restrict to your own
+hippius-hub models formats                              # available filter values
 ```
 
-Add `--json` on `models list` and `models show` for machine-readable output.
+Add `--json` to `models list` / `models show` for machine-readable output.
+
+## Pull/push from the CLI (no Python)
+
+The same byte movement Python uses is exposed as plain CLI commands. Useful for scripts and one-offs.
+
+```bash
+# Single-file download. Uses the parallel Rust path, picks up auth from the docker creds.
+hippius-hub download myorg/qwen-7b model-00001-of-00003.safetensors
+
+# Upload a file or folder. Folders merge into the existing manifest (won't wipe other files).
+hippius-hub upload myorg/qwen-7b ./checkpoints/v2
+hippius-hub upload myorg/qwen-7b ./README.md --revision main
+```
+
+Optional flags worth knowing: `--revision <tag>`, `--chunk-size <bytes>` (defaults to `HIPPIUS_CHUNK_SIZE`), `--verify-hash` (SHA256 the payload after download), `--cache-dir <path>`.
 
 ## Quick start: download a model
 
@@ -202,6 +229,7 @@ Existing code that catches HF's exceptions keeps working.
 |---|---|---|
 | `HIPPIUS_CHUNK_SIZE` | `104857600` (100 MiB) | Per-chunk size for the parallel Rust downloader |
 | `HIPPIUS_VERIFY_HASH` | unset (off) | Set to `1`/`true` to SHA256-verify downloads locally |
+| `HIPPIUS_API_URL` | `https://api.hippius.com` | Console API base used by the `registry` + `models` CLI subtrees |
 | `HIPPIUS_TEST_REPO` | `test/e2e-client` | Override the test repo used by the e2e suite |
 
 Programmatic overrides via the `endpoint=` kwarg on any function let you point at an alternative Hippius registry.
