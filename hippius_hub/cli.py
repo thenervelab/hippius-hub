@@ -267,6 +267,60 @@ def cmd_registry_unsubscribe(args):
     print("Re-subscribe within 30 days to keep everything.")
 
 
+# ----- registry keys sub-commands -----
+
+_ROLE_CHOICES = ["read", "push", "push-delete", "admin"]
+
+
+def _print_key_row(k: dict) -> None:
+    exp = k.get("expires_at") or "never"
+    last_used = k.get("last_used_at") or "—"
+    print(f"  #{k['id']:<5} {k['name']:20} role={k['role']:12} "
+          f"expires={exp:<25} last_used={last_used}")
+    print(f"        login={k['login']}")
+
+
+def cmd_registry_keys_list(_args):
+    rows = console.list_keys() or []
+    if not rows:
+        print("No keys yet. Create one with: hippius-hub registry keys create <name> --role read")
+        return
+    print(f"{len(rows)} key(s):")
+    for r in rows:
+        _print_key_row(r)
+
+
+def cmd_registry_keys_create(args):
+    res = console.create_key(args.name, args.role, expires_days=args.expires_days)
+    print(f"✅ Key '{res['name']}' created — role={res['role']}")
+    print(f"  Login:  {res['login']}")
+    print(f"  Secret: {res['secret']}")
+    print("  ⚠ Save the secret now — it won't be shown again. Rotate to recover.")
+    print()
+    print(f"  docker login: {res['docker_login_cmd']}")
+    if args.docker_login:
+        host = res["docker_login_cmd"].split(" ")[2]
+        _maybe_docker_login(host, res["login"], res["secret"], auto=True)
+
+
+def cmd_registry_keys_show(args):
+    res = console.show_key(args.key_id)
+    _print_key_row(res)
+
+
+def cmd_registry_keys_rotate(args):
+    res = console.rotate_key(args.key_id)
+    print(f"✅ Key '{res['name']}' rotated")
+    print(f"  Login:  {res['login']}")
+    print(f"  Secret: {res['secret']}")
+    print("  ⚠ Save the secret now — it won't be shown again.")
+
+
+def cmd_registry_keys_revoke(args):
+    console.revoke_key(args.key_id)
+    print(f"✅ Key #{args.key_id} revoked. Its docker login will stop working immediately.")
+
+
 # ----- models sub-commands -----
 
 def cmd_models_list(args):
@@ -423,6 +477,38 @@ def main():
                            help="Cancel a subscription by its on-chain ID. 30-day grace.")
     ru.add_argument("subscription_id", type=int, help="On-chain SubscriptionId (u32)")
     ru.set_defaults(func=cmd_registry_unsubscribe)
+
+    # Per-project API keys (role-scoped Harbor robots). The bootstrap admin
+    # robot from `registry provision` is separate; `rotate-token` still
+    # rotates that one. These commands manage the EXTRA keys.
+    rkeys = regsub.add_parser("keys", help="Per-project API keys (CI, read-only, etc.)")
+    rkeyssub = rkeys.add_subparsers(dest="keys_cmd")
+
+    rkeyssub.add_parser("list", help="List keys for the active project"
+                       ).set_defaults(func=cmd_registry_keys_list)
+
+    rkc = rkeyssub.add_parser("create", help="Create a new key (returns secret ONCE)")
+    rkc.add_argument("name", help="Short slug; becomes `robot$<project>+<name>` on the registry")
+    rkc.add_argument("--role", required=True, choices=_ROLE_CHOICES,
+                     help="ACL preset: read = pull/list; push = read + push/create; "
+                          "push-delete = push + delete; admin = full project")
+    rkc.add_argument("--expires-days", type=int, default=None,
+                     help="Days until the key expires. Omit for no expiry.")
+    rkc.add_argument("--docker-login", action="store_true",
+                     help="Also run `docker login` so `docker push`/`pull` works")
+    rkc.set_defaults(func=cmd_registry_keys_create)
+
+    rks = rkeyssub.add_parser("show", help="Show one key (no secret)")
+    rks.add_argument("key_id", type=int)
+    rks.set_defaults(func=cmd_registry_keys_show)
+
+    rkr = rkeyssub.add_parser("rotate", help="Rotate the secret for one key")
+    rkr.add_argument("key_id", type=int)
+    rkr.set_defaults(func=cmd_registry_keys_rotate)
+
+    rkrv = rkeyssub.add_parser("revoke", help="Delete a key (irreversible)")
+    rkrv.add_argument("key_id", type=int)
+    rkrv.set_defaults(func=cmd_registry_keys_revoke)
 
     # Models sub-tree
     mod = sub.add_parser("models", help="Search and inspect the AI model index")

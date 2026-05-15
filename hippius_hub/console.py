@@ -192,6 +192,31 @@ def cancel_subscription(subscription_id: int):
     return _request("DELETE", f"/api/registry/subscriptions/{subscription_id}/")
 
 
+# -------- Per-project API keys --------
+
+def list_keys():
+    return _request("GET", "/api/registry/keys/")
+
+
+def create_key(name: str, role: str, expires_days: Optional[int] = None):
+    body: dict = {"name": name, "role": role}
+    if expires_days is not None:
+        body["expires_days"] = expires_days
+    return _request("POST", "/api/registry/keys/", json_body=body)
+
+
+def show_key(key_id: int):
+    return _request("GET", f"/api/registry/keys/{key_id}/")
+
+
+def rotate_key(key_id: int):
+    return _request("POST", f"/api/registry/keys/{key_id}/rotate/")
+
+
+def revoke_key(key_id: int):
+    return _request("DELETE", f"/api/registry/keys/{key_id}/")
+
+
 # -------- Model index --------
 
 def models_list(*, fmt: Optional[str] = None, architecture: Optional[str] = None,
