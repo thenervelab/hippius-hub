@@ -1,0 +1,76 @@
+# Cachet health monitor for registry.hippius.com.
+#
+# Polls https://api.hippius.com/api/registry/health/ every POLL_INTERVAL_SECONDS
+# and PUTs the result to the Cachet component identified by CACHET_COMPONENT_ID.
+# Cachet runs in the `monitoring` namespace; the monitor itself runs here in
+# `hippius-hub` and talks to Cachet over the cluster network.
+#
+# Before applying:
+#   1. Set CACHET_TOKEN and CACHET_COMPONENT_ID in the Secret below
+#      (or apply the Secret separately, out-of-band, and remove the stub).
+#   2. Bump `image:` to the released version tag (see
+#      .github/workflows/health-image.yml).
+#   3. Confirm the Cachet service DNS name — `kubectl get svc -n monitoring`.
+
+apiVersion: v1
+kind: Secret
+metadata:
+  name: cachet-health-monitor
+  namespace: hippius-hub
+type: Opaque
+stringData:
+  CACHET_TOKEN: REPLACE_ME
+  CACHET_COMPONENT_ID: REPLACE_ME
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: registry-health-monitor
+  namespace: hippius-hub
+  labels:
+    app: registry-health-monitor
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: registry-health-monitor
+  template:
+    metadata:
+      labels:
+        app: registry-health-monitor
+    spec:
+      containers:
+        - name: monitor
+          image: registry.hippius.com/hippius-hub-health:latest
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: HIPPIUS_HEALTH_URL
+              value: "https://api.hippius.com/api/registry/health/"
+            - name: CACHET_URL
+              value: "http://cachet.monitoring.svc.cluster.local"
+            - name: POLL_INTERVAL_SECONDS
+              value: "60"
+            - name: REQUEST_TIMEOUT_SECONDS
+              value: "10"
+            - name: CACHET_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: cachet-health-monitor
+                  key: CACHET_TOKEN
+            - name: CACHET_COMPONENT_ID
+              valueFrom:
+                secretKeyRef:
+                  name: cachet-health-monitor
+                  key: CACHET_COMPONENT_ID
+          resources:
+            requests:
+              cpu: "10m"
+              memory: "64Mi"
+            limits:
+              cpu: "100m"
+              memory: "128Mi"
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
