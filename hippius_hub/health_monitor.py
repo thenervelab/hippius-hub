@@ -21,7 +21,7 @@ import sys
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Optional, Tuple
 
 import httpx
 
@@ -66,7 +66,7 @@ def _log(msg: str) -> None:
     print(f"{ts} {msg}", flush=True)
 
 
-def _probe_health(client: httpx.Client, url: str, timeout: float) -> tuple[bool, Optional[int], str]:
+def _probe_health(client: httpx.Client, url: str, timeout: float) -> Tuple[bool, Optional[int], str]:
     """Returns (healthy, latency_ms_reported_by_server, detail).
 
     `healthy` is True iff HTTP 200 and the JSON body has `ok == true`.
