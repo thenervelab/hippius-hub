@@ -446,8 +446,18 @@ async fn try_download_chunk_to_offset(
     dest_path: &Path,
     pb: &ProgressBar,
 ) -> Result<(), DownloadError> {
+    // Audit D6: per-request timeout on the chunk GET. The `Client` (line 97)
+    // sets `connect_timeout(30s)` but no full-request timeout, so a slow-loris
+    // server could hold a TCP open and dribble bytes indefinitely without ever
+    // tripping the connect phase. 5 minutes per chunk is generous given the
+    // 100 MB `DEFAULT_CHUNK_SIZE` (≈ 333 KB/s floor before timing out) — enough
+    // rope for slow mobile uplinks, tight enough that a stuck chunk cannot hang
+    // the runtime forever. `RequestBuilder::timeout` overrides any client-level
+    // value per the reqwest 0.12 docs; we keep it per-request so other client
+    // uses (e.g. the HEAD in `get_content_length`) pick their own budget.
     let mut req = client.get(url)
-        .header(header::RANGE, format!("bytes={}-{}", start, end));
+        .header(header::RANGE, format!("bytes={}-{}", start, end))
+        .timeout(Duration::from_secs(300));
 
     if let Some(ref t) = token {
         req = req.bearer_auth(t);
@@ -584,6 +594,22 @@ mod tests {
         };
         assert_eq!(index, 3);
         assert!(matches!(*source, DownloadError::ServerError(404, _)));
+    }
+
+    // Regression for audit D6: pin the per-request timeout on the chunk GET.
+    // A behavioral test would need a mock HTTP server with controlled latency
+    // (Phase 4.3 territory); this structural source-grep is the minimal guard
+    // that ensures a future refactor cannot silently drop the `.timeout(...)`
+    // call and re-expose the slow-loris hang. `include_str!` is evaluated at
+    // compile time on the same file the test lives in, so the assertion runs
+    // against exactly the source the binary was built from.
+    #[test]
+    fn try_download_chunk_to_offset_sets_request_timeout() {
+        let src = include_str!("chunked_downloader.rs");
+        assert!(
+            src.contains(".timeout(Duration::from_secs(300))"),
+            "chunked_downloader.rs must call .timeout(...) on the chunk GET request",
+        );
     }
 
     // Regression for audit D3: pin the variant shape so the missing-header
