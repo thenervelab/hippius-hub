@@ -62,6 +62,31 @@ fn shared_runtime() -> &'static tokio::runtime::Runtime {
     })
 }
 
+/// Download a file from `url` to `dest_path` using the shared tokio runtime.
+///
+/// # Arguments
+/// - `url`: HTTPS URL of the blob to download.
+/// - `dest_path`: Local filesystem path where the blob is written.
+/// - `auth_token`: Optional bearer token; `None` means anonymous.
+/// - `chunk_size`: Optional bytes per HTTP Range request; defaults to the
+///   value chosen by `ChunkedDownloader::new` (100 MB at time of writing).
+/// - `verify_hash`: When `true`, re-reads the file post-download and returns
+///   its SHA-256. When `false`, returns `None` and skips the verification pass.
+///
+/// # Returns
+/// `Optional[str]` on the Python side -- the lowercase hex SHA-256 of the
+/// file when `verify_hash=True`, otherwise `None`. The `Option<String>`
+/// return type makes the "skipped" case unambiguous (audit L6 / Phase 3.12);
+/// the previous `""` sentinel collided with any legitimately empty digest.
+///
+/// # Errors
+/// Raises `PyRuntimeError` on any download failure. The exception message
+/// includes the full `source()` chain via `\ncaused by:` lines (see
+/// `core_err_to_py` in this file).
+///
+/// # GIL
+/// Releases the Python GIL across the blocking I/O via `py.allow_threads`
+/// so other Python threads can make progress during the download.
 #[pyfunction]
 #[pyo3(signature = (url, dest_path, auth_token=None, chunk_size=None, verify_hash=true))]
 fn download_file_native(
@@ -95,6 +120,27 @@ fn download_file_native(
     })
 }
 
+/// Compute the SHA-256 and byte length of a local file.
+///
+/// # Arguments
+/// - `path`: Local filesystem path of the file to hash.
+///
+/// # Returns
+/// `tuple[str, int]` on the Python side -- a 2-tuple of
+/// `(lowercase-hex-sha256, byte_length)`. The byte length is taken from
+/// the same read pass that produced the digest, so the two values are
+/// guaranteed consistent even if another writer concurrently truncates
+/// or extends the file mid-call.
+///
+/// # Errors
+/// Raises `PyRuntimeError` if the file cannot be opened or read. The
+/// exception message includes the full `source()` chain via
+/// `\ncaused by:` lines (see `core_err_to_py` in this file).
+///
+/// # GIL
+/// Releases the Python GIL across the blocking hash via
+/// `py.allow_threads` so other Python threads can run while the file is
+/// being read.
 #[pyfunction]
 #[pyo3(signature = (path))]
 fn hash_file_native(py: Python<'_>, path: String) -> PyResult<(String, u64)> {
@@ -108,6 +154,29 @@ fn hash_file_native(py: Python<'_>, path: String) -> PyResult<(String, u64)> {
     })
 }
 
+/// Upload a local file to `url` as the body of a chunked HTTP PUT.
+///
+/// # Arguments
+/// - `url`: HTTPS URL receiving the blob (typically an OCI registry
+///   upload-location URL returned by a prior `POST .../blobs/uploads/`).
+/// - `path`: Local filesystem path of the file to upload.
+/// - `auth_token`: Optional bearer token; `None` means anonymous.
+///
+/// # Returns
+/// `None` on the Python side. Success is indicated by the absence of an
+/// exception; the digest is not returned here -- callers compute it
+/// separately via `hash_file_native` when they need it.
+///
+/// # Errors
+/// Raises `PyRuntimeError` on any upload failure (network error, non-2xx
+/// response after retries, local file I/O error). The exception message
+/// includes the full `source()` chain via `\ncaused by:` lines (see
+/// `core_err_to_py` in this file).
+///
+/// # GIL
+/// Releases the Python GIL across the blocking upload via
+/// `py.allow_threads` so other Python threads can make progress while
+/// the file is being streamed.
 #[pyfunction]
 #[pyo3(signature = (url, path, auth_token=None))]
 fn upload_blob_native(
