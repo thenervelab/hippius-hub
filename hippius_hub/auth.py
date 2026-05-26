@@ -141,12 +141,12 @@ def resolve_token_value(token):
     `is False` checks — the public contract (input shape + return values) is
     unchanged.
     """
-    from ._token import from_hf, Anonymous, Literal
+    from ._token import from_hf, Anonymous, Literal as TokenLiteral
 
     parsed = from_hf(token)
     if isinstance(parsed, Anonymous):
         return False  # propagate the anonymous sentinel
-    if isinstance(parsed, Literal):
+    if isinstance(parsed, TokenLiteral):
         return parsed.value
     # UseStored
     return get_token()
@@ -182,7 +182,7 @@ def whoami(token=None, *, endpoint: str = None) -> dict:
     inline here.
     """
     from ._harbor import harbor_whoami
-    from ._token import from_hf, Anonymous, UseStored, Literal
+    from ._token import from_hf, Anonymous, UseStored, Literal as TokenLiteral
 
     parsed = from_hf(token)
     if isinstance(parsed, Anonymous):
@@ -194,9 +194,9 @@ def whoami(token=None, *, endpoint: str = None) -> dict:
                 "No saved token found; run `hippius-hub login` first."
             )
     else:
-        # Literal — narrowed by from_hf; mypy/ty can prove this is the only
+        # TokenLiteral — narrowed by from_hf; mypy/ty can prove this is the only
         # remaining variant given Anonymous and UseStored are handled above.
-        assert isinstance(parsed, Literal)
+        assert isinstance(parsed, TokenLiteral)
         if parsed.value.startswith(("Basic ", "Bearer ")):
             auth_header = parsed.value
         else:
@@ -220,7 +220,6 @@ def get_docker_auth(registry_url: str) -> Optional[str]:
         with open(docker_config, "r") as f:
             config = json.load(f)
     except (OSError, json.JSONDecodeError) as e:
-        import warnings
         warnings.warn(
             f"docker config at {docker_config} is unreadable ({e}); "
             "treating as no creds.",
