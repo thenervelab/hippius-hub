@@ -8,6 +8,8 @@ use tokio::fs::OpenOptions;
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt, SeekFrom, BufWriter};
 use tokio::task::AbortHandle;
 
+use crate::error::CoreError;
+
 const DEFAULT_CHUNK_SIZE: u64 = 100 * 1024 * 1024; // 100 MB default
 const MAX_CONCURRENT_DOWNLOADS: usize = 32;
 const MAX_RETRIES: u32 = 3;
@@ -35,49 +37,11 @@ fn chunk_bounds(content_length: u64, chunk_size: u64, i: usize) -> (u64, u64) {
     (start, end)
 }
 
-#[derive(Debug)]
-pub enum DownloadError {
-    ReqwestError(reqwest::Error),
-    IoError(std::io::Error),
-    ServerError(u16, String),
-    // `Box<DownloadError>` is the canonical recursive-enum boxing pattern: without
-    // indirection, `DownloadError` containing itself would be infinite-sized. The
-    // boxed `source` carries the real cause of a chunk failure (HTTP error, I/O
-    // error, server status) so callers can see WHY chunk N failed, not just that
-    // it did. Earlier shape `ChunkFailed(usize)` discarded the cause.
-    ChunkFailed {
-        index: usize,
-        source: Box<DownloadError>,
-    },
-    // Distinct from `ChunkFailed`: `JoinError` reports tokio-task-level failure
-    // (panic in the spawned future, cancellation) — qualitatively different from
-    // a download-layer error. `JoinError` is foreign and sized, so no boxing.
-    JoinFailed {
-        index: usize,
-        source: tokio::task::JoinError,
-    },
-    // Audit D3: HEAD response lacked a parseable `Content-Length` header.
-    // Previously the missing-header path collapsed into `Ok(0)` via
-    // `unwrap_or(0)`, indistinguishable from a legitimate empty blob — so
-    // `download()` would truncate the destination to 0 bytes and return
-    // sha256 of empty. This variant separates "server says the blob is
-    // empty" (Ok(0) -> create_empty_file) from "server did not tell us the
-    // size" (this error). Unit variant: the failure IS the absence; there
-    // is no inspectable field a caller could use beyond the variant tag.
-    MissingContentLength,
-}
-
-impl From<reqwest::Error> for DownloadError {
-    fn from(err: reqwest::Error) -> Self {
-        DownloadError::ReqwestError(err)
-    }
-}
-
-impl From<std::io::Error> for DownloadError {
-    fn from(err: std::io::Error) -> Self {
-        DownloadError::IoError(err)
-    }
-}
+// Phase 3.8 (audit D8): the local DownloadError + UploadError enums
+// were unified into `crate::error::CoreError`. The old enum had no
+// `Display`/`Error`/`source()` impl, so Python callers saw flattened
+// Debug output; the thiserror-derived replacement preserves the cause
+// chain through `core_err_to_py`.
 
 pub struct ChunkedDownloader {
     client: Client,
@@ -88,7 +52,7 @@ pub struct ChunkedDownloader {
 
 impl ChunkedDownloader {
     /// Construct a new concurrent downloader.
-    pub fn new(url: String, auth_token: Option<String>, chunk_size_bytes: Option<u64>) -> Result<Self, DownloadError> {
+    pub fn new(url: String, auth_token: Option<String>, chunk_size_bytes: Option<u64>) -> Result<Self, CoreError> {
         // Force HTTP/1.1: with h2 reqwest multiplexes all chunks on a single TCP,
         // which caps aggregate throughput at the per-connection BBR ceiling (~150 MB/s
         // even on a fast edge). Forcing h1 makes each parallel chunk get its own TCP,
@@ -112,7 +76,7 @@ impl ChunkedDownloader {
     /// offset in the final file (sparse pre-allocated). If `verify_hash` is
     /// true, reads the full file at the end to produce a SHA256. Otherwise
     /// returns an empty string.
-    pub async fn download(&self, dest_path: &Path, verify_hash: bool) -> Result<String, DownloadError> {
+    pub async fn download(&self, dest_path: &Path, verify_hash: bool) -> Result<String, CoreError> {
         // 1. Fetch the total blob size
         let content_length = self.get_content_length().await?;
 
@@ -168,7 +132,7 @@ impl ChunkedDownloader {
         // reqwest client (line 98) — beyond pool capacity, reqwest queues HTTP
         // requests on the existing connections, so eager spawn does not multiply
         // network concurrency.
-        let mut joins: FuturesUnordered<tokio::task::JoinHandle<(usize, Result<(), DownloadError>)>> =
+        let mut joins: FuturesUnordered<tokio::task::JoinHandle<(usize, Result<(), CoreError>)>> =
             FuturesUnordered::new();
         let mut abort_handles: Vec<AbortHandle> = Vec::with_capacity(num_chunks);
 
@@ -194,10 +158,11 @@ impl ChunkedDownloader {
         // Drain the `FuturesUnordered` of `JoinHandle`s. Exhaustive match preserves
         // both the spawn-side (`JoinError`) and the download-layer cause: previously
         // both collapsed into a bare `ChunkFailed(usize)`, hiding which chunk failed
-        // AND why. `usize::MAX` is the documented sentinel for "index unknown" —
-        // the chunk index lives inside the future's return, which `JoinError` did
-        // not preserve. Phase 3.8 will replace this enum with a thiserror-based
-        // hierarchy; the sentinel survives until then.
+        // AND why. Phase 3.8 replaced the `usize::MAX` sentinel with
+        // `JoinFailed.index: Option<usize>` — `None` here because the chunk index
+        // lives inside the future's return tuple, and a `JoinError` that escapes
+        // before the tuple is constructed has lost that identity. The thiserror
+        // `Display` renders `None` as `<unknown>`.
         //
         // On any error we abort every collected handle before returning. Aborting
         // an already-completed handle is a documented no-op (tokio), so iterating
@@ -212,8 +177,8 @@ impl ChunkedDownloader {
                     for a in &abort_handles {
                         a.abort();
                     }
-                    return Err(DownloadError::JoinFailed {
-                        index: usize::MAX,
+                    return Err(CoreError::JoinFailed {
+                        index: None,
                         source: join_err,
                     });
                 }
@@ -221,7 +186,7 @@ impl ChunkedDownloader {
                     for a in &abort_handles {
                         a.abort();
                     }
-                    return Err(DownloadError::ChunkFailed {
+                    return Err(CoreError::ChunkFailed {
                         index: i,
                         source: Box::new(chunk_err),
                     });
@@ -251,7 +216,7 @@ impl ChunkedDownloader {
     }
 
     /// Issue a HEAD request to obtain Content-Length
-    async fn get_content_length(&self) -> Result<u64, DownloadError> {
+    async fn get_content_length(&self) -> Result<u64, CoreError> {
         let mut req = self.client.head(&self.url);
         if let Some(ref token) = self.auth_token {
             req = req.bearer_auth(token);
@@ -259,7 +224,7 @@ impl ChunkedDownloader {
 
         let res = req.send().await?;
         if !res.status().is_success() {
-            return Err(DownloadError::ServerError(res.status().as_u16(), format!("Failed HEAD request: {:?}", res.status())));
+            return Err(CoreError::ServerError(res.status().as_u16(), format!("Failed HEAD request: {:?}", res.status())));
         }
 
         // Audit D3: a missing/unparseable Content-Length previously fell through
@@ -271,13 +236,13 @@ impl ChunkedDownloader {
             .get(header::CONTENT_LENGTH)
             .and_then(|val| val.to_str().ok())
             .and_then(|val| val.parse::<u64>().ok())
-            .ok_or(DownloadError::MissingContentLength)?;
+            .ok_or(CoreError::MissingContentLength)?;
 
         Ok(content_length)
     }
 
     /// Special case: create an empty file when the size is 0
-    async fn create_empty_file(&self, dest_path: &Path) -> Result<String, DownloadError> {
+    async fn create_empty_file(&self, dest_path: &Path) -> Result<String, CoreError> {
         let f = OpenOptions::new()
             .create(true)
             .write(true)
@@ -304,14 +269,14 @@ impl ChunkedDownloader {
 /// safe — `pb.inc` is thread-safe and now runs from the blocking thread.
 ///
 /// The double `?` mirrors `hash_file_async`: outer `?` flattens
-/// `JoinError → DownloadError::IoError`, inner `?` propagates `io::Error`
-/// from the closure body.
-async fn compute_sha256(path: &Path, pb: &ProgressBar) -> Result<String, DownloadError> {
+/// `JoinError → CoreError::Io`, inner `?` propagates `io::Error` from
+/// the closure body.
+async fn compute_sha256(path: &Path, pb: &ProgressBar) -> Result<String, CoreError> {
     use std::io::Read;
 
     let path = path.to_path_buf();
     let pb = pb.clone(); // indicatif::ProgressBar clones cheaply via internal Arc.
-    tokio::task::spawn_blocking(move || -> Result<String, DownloadError> {
+    tokio::task::spawn_blocking(move || -> Result<String, CoreError> {
         let mut file = std::fs::File::open(&path)?;
         let mut hasher = Sha256::new();
         let mut buf = vec![0u8; VERIFY_READ_BUFFER];
@@ -328,17 +293,17 @@ async fn compute_sha256(path: &Path, pb: &ProgressBar) -> Result<String, Downloa
         Ok(hex::encode(hasher.finalize()))
     })
     .await
-    .map_err(|join_err| DownloadError::IoError(std::io::Error::other(join_err)))?
+    .map_err(|join_err| CoreError::Io(std::io::Error::other(join_err)))?
 }
 
-/// Classify a `DownloadError` for the retry loop.
+/// Classify a `CoreError` for the retry loop.
 ///
 /// Audit D5: previously `download_chunk_with_retry` retried EVERY error variant
 /// up to `MAX_RETRIES=3`, so a permanent 401/403/404 burned 200+400+800+1600 ms
 /// of exponential backoff before surfacing — and never succeeded. We now retry
 /// only transient causes:
 ///
-/// * `ReqwestError` / `IoError` — network or local-IO blips; retry.
+/// * `Reqwest` / `Io` — network or local-IO blips; retry.
 /// * `ServerError(500..600, _)` — server-side faults documented as retryable by
 ///   RFC 9110 §15.6; retry.
 ///
@@ -347,26 +312,27 @@ async fn compute_sha256(path: &Path, pb: &ProgressBar) -> Result<String, Downloa
 /// per-chunk retry loop has already exhausted, so retrying here would double-
 /// count), and `MissingContentLength` (HEAD response shape, not transient).
 ///
-/// The match is intentionally exhaustive (no wildcard arm): any future variant
-/// added to `DownloadError` will force this classifier to be revisited rather
+/// The match is intentionally exhaustive (no wildcard arm). `CoreError`
+/// is `#[non_exhaustive]` for *external* callers, but this function lives
+/// in the same crate as the enum, so the compiler still requires every
+/// variant to be named here. That's the property we want: adding a
+/// future variant must force a deliberate classification decision rather
 /// than silently defaulting to one bucket.
-fn is_retryable(err: &DownloadError) -> bool {
+fn is_retryable(err: &CoreError) -> bool {
     match err {
         // Network/transport errors are retryable.
-        DownloadError::ReqwestError(_) => true,
-        DownloadError::IoError(_) => true,
+        CoreError::Reqwest(_) | CoreError::Io(_) => true,
         // 5xx server errors are retryable; 4xx (and any other non-5xx) are permanent.
         // `(500..600).contains(status)` operates on `&u16` because the match is over
-        // `&DownloadError`, so `status` binds as `&u16` — `Range<u16>::contains`
+        // `&CoreError`, so `status` binds as `&u16` — `Range<u16>::contains`
         // takes `&u16`, no extra borrow needed.
-        DownloadError::ServerError(status, _) => (500..600).contains(status),
+        CoreError::ServerError(status, _) => (500..600).contains(status),
         // Structured terminal errors produced after the per-chunk retry loop has
         // already done its work — retrying them here would compound the backoff
         // for failures the inner loop already declared unrecoverable.
-        DownloadError::ChunkFailed { .. } => false,
-        DownloadError::JoinFailed { .. } => false,
+        CoreError::ChunkFailed { .. } | CoreError::JoinFailed { .. } => false,
         // HEAD-response shape error, not a transient network condition.
-        DownloadError::MissingContentLength => false,
+        CoreError::MissingContentLength => false,
     }
 }
 
@@ -380,7 +346,7 @@ async fn download_chunk_with_retry(
     _chunk_index: usize,
     dest_path: std::path::PathBuf,
     pb: ProgressBar,
-) -> Result<(), DownloadError> {
+) -> Result<(), CoreError> {
     let mut retries = 0;
 
     loop {
@@ -415,18 +381,18 @@ fn require_partial_content(
     status: reqwest::StatusCode,
     start: u64,
     end: u64,
-) -> Result<(), DownloadError> {
+) -> Result<(), CoreError> {
     use reqwest::StatusCode;
     match status {
         StatusCode::PARTIAL_CONTENT => Ok(()),
-        StatusCode::OK => Err(DownloadError::ServerError(
+        StatusCode::OK => Err(CoreError::ServerError(
             status.as_u16(),
             format!(
                 "server ignored Range bytes={start}-{end} (returned 200 OK instead of 206); \
                  writing the full body at offset {start} would corrupt the file"
             ),
         )),
-        other => Err(DownloadError::ServerError(
+        other => Err(CoreError::ServerError(
             other.as_u16(),
             format!("Failed chunk bytes {start}-{end}"),
         )),
@@ -445,7 +411,7 @@ async fn try_download_chunk_to_offset(
     end: u64,
     dest_path: &Path,
     pb: &ProgressBar,
-) -> Result<(), DownloadError> {
+) -> Result<(), CoreError> {
     // Audit D6: per-request timeout on the chunk GET. The `Client` (line 97)
     // sets `connect_timeout(30s)` but no full-request timeout, so a slow-loris
     // server could hold a TCP open and dribble bytes indefinitely without ever
@@ -577,23 +543,23 @@ mod tests {
     // Regression for audit D1: previously `ChunkFailed(usize)` discarded the
     // underlying cause, so a user saw "chunk 5 failed" with no clue whether
     // it was 404, 500, connection reset, or disk-full. The reshaped variant
-    // carries the cause through `source: Box<DownloadError>`; this test pins
+    // carries the cause through `source: Box<CoreError>`; this test pins
     // the contract so a future refactor cannot silently re-flatten it.
     // `let ... else { unreachable!() }` is used instead of `panic!(...)`
     // because the project denies `panic` cluster-wide.
     #[test]
     fn chunk_failed_carries_cause() {
-        let inner = DownloadError::ServerError(404, "not found".into());
-        let outer = DownloadError::ChunkFailed {
+        let inner = CoreError::ServerError(404, "not found".into());
+        let outer = CoreError::ChunkFailed {
             index: 3,
             source: Box::new(inner),
         };
 
-        let DownloadError::ChunkFailed { index, source } = outer else {
+        let CoreError::ChunkFailed { index, source } = outer else {
             unreachable!("constructed a ChunkFailed above; any other variant is a bug")
         };
         assert_eq!(index, 3);
-        assert!(matches!(*source, DownloadError::ServerError(404, _)));
+        assert!(matches!(*source, CoreError::ServerError(404, _)));
     }
 
     // Regression for audit D6: pin the per-request timeout on the chunk GET.
@@ -615,14 +581,12 @@ mod tests {
     // Regression for audit D3: pin the variant shape so the missing-header
     // path cannot silently revert to `Ok(0)`. The assertion is intentionally
     // minimal — the contract here is "there is a distinct variant for this
-    // case", not "the variant carries field X". Phase 2.7 (D5 — retry
-    // classification) will decide whether this variant is retryable; Phase
-    // 3.8 will wire it through a thiserror-based hierarchy. Until then,
-    // `matches!` pins the shape.
+    // case", not "the variant carries field X". Phase 3.8 wired this variant
+    // through the thiserror-based `CoreError` hierarchy.
     #[test]
     fn missing_content_length_is_a_distinct_error() {
-        let err = DownloadError::MissingContentLength;
-        assert!(matches!(err, DownloadError::MissingContentLength));
+        let err = CoreError::MissingContentLength;
+        assert!(matches!(err, CoreError::MissingContentLength));
     }
 }
 
@@ -678,19 +642,19 @@ mod retry_classification_tests {
 
     #[test]
     fn five_hundred_is_retryable() {
-        assert!(is_retryable(&DownloadError::ServerError(500, "internal".into())));
+        assert!(is_retryable(&CoreError::ServerError(500, "internal".into())));
     }
 
     #[test]
     fn five_oh_three_is_retryable() {
         // Service Unavailable — the canonical transient 5xx.
-        assert!(is_retryable(&DownloadError::ServerError(503, "unavailable".into())));
+        assert!(is_retryable(&CoreError::ServerError(503, "unavailable".into())));
     }
 
     #[test]
     fn five_ninety_nine_is_retryable() {
         // Upper inclusive boundary of the 5xx range.
-        assert!(is_retryable(&DownloadError::ServerError(599, "edge".into())));
+        assert!(is_retryable(&CoreError::ServerError(599, "edge".into())));
     }
 
     #[test]
@@ -698,7 +662,7 @@ mod retry_classification_tests {
         // One below the 5xx floor: still a client error per the contract.
         // HTTP technically does not register 499, but the classifier's job is
         // "5xx only", so 499 must fall into the permanent bucket.
-        assert!(!is_retryable(&DownloadError::ServerError(499, "edge".into())));
+        assert!(!is_retryable(&CoreError::ServerError(499, "edge".into())));
     }
 
     #[test]
@@ -706,41 +670,41 @@ mod retry_classification_tests {
         // HTTP does not define 6xx; the contract is "5xx only" so this is
         // permanent. Pinning the upper exclusive boundary so a future bump
         // of `(500..600)` to `(500..=600)` is caught.
-        assert!(!is_retryable(&DownloadError::ServerError(600, "edge".into())));
+        assert!(!is_retryable(&CoreError::ServerError(600, "edge".into())));
     }
 
     #[test]
     fn four_oh_four_is_not_retryable() {
         // The headline audit case: 404 used to burn 3 s of backoff.
-        assert!(!is_retryable(&DownloadError::ServerError(404, "not found".into())));
+        assert!(!is_retryable(&CoreError::ServerError(404, "not found".into())));
     }
 
     #[test]
     fn four_oh_one_is_not_retryable() {
         // 401 is permanent for the same token — retrying just re-presents the
         // same credentials.
-        assert!(!is_retryable(&DownloadError::ServerError(401, "unauthorized".into())));
+        assert!(!is_retryable(&CoreError::ServerError(401, "unauthorized".into())));
     }
 
     #[test]
     fn four_oh_three_is_not_retryable() {
         // 403 — same reasoning as 401.
-        assert!(!is_retryable(&DownloadError::ServerError(403, "forbidden".into())));
+        assert!(!is_retryable(&CoreError::ServerError(403, "forbidden".into())));
     }
 
     #[test]
     fn missing_content_length_is_not_retryable() {
         // HEAD-response shape error — retrying the GET cannot heal a missing
         // header on a separate HEAD.
-        assert!(!is_retryable(&DownloadError::MissingContentLength));
+        assert!(!is_retryable(&CoreError::MissingContentLength));
     }
 
     #[test]
     fn io_error_is_retryable() {
         // Local IO blip (e.g. EAGAIN, transient EIO) — same transport-class
-        // bucket as `ReqwestError`. `std::io::Error::other` is the
-        // public constructor we use because the project denies `unwrap`.
-        let err = DownloadError::IoError(std::io::Error::other("transient io"));
+        // bucket as `Reqwest`. `std::io::Error::other` is the public
+        // constructor we use because the project denies `unwrap`.
+        let err = CoreError::Io(std::io::Error::other("transient io"));
         assert!(is_retryable(&err));
     }
 
@@ -749,8 +713,8 @@ mod retry_classification_tests {
         // `ChunkFailed` is constructed by the orchestrator AFTER the inner
         // retry loop has already exhausted its budget — retrying here would
         // compound the backoff for a failure already declared terminal.
-        let inner = DownloadError::ServerError(503, "x".into());
-        let err = DownloadError::ChunkFailed {
+        let inner = CoreError::ServerError(503, "x".into());
+        let err = CoreError::ChunkFailed {
             index: 1,
             source: Box::new(inner),
         };
@@ -763,6 +727,12 @@ mod retry_classification_tests {
     // extra dev-dep; we instead build a current-thread runtime by hand. The
     // project denies `unwrap_used` and `panic` cluster-wide, so we destructure
     // with `let ... else { unreachable!() }` on the runtime-build path.
+    //
+    // Phase 3.8 (audit D1 follow-up): the `index` field is now
+    // `Option<usize>`, replacing the prior `usize::MAX` sentinel. The
+    // orchestrator path uses `None` (chunk identity lost in the join
+    // layer); this test exercises the `Some(_)` shape so a future
+    // refactor that drops `Option` cannot regress without breaking here.
     #[test]
     fn join_failed_is_not_retryable() {
         let rt = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
@@ -780,8 +750,8 @@ mod retry_classification_tests {
                 Err(e) => e,
             }
         });
-        let err = DownloadError::JoinFailed {
-            index: 7,
+        let err = CoreError::JoinFailed {
+            index: Some(7),
             source: join_err,
         };
         assert!(!is_retryable(&err));

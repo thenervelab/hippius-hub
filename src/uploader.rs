@@ -7,24 +7,13 @@ use std::time::Duration;
 use tokio::fs::File;
 use tokio_util::codec::{BytesCodec, FramedRead};
 
-#[derive(Debug)]
-pub enum UploadError {
-    ReqwestError(reqwest::Error),
-    IoError(std::io::Error),
-    ServerError(u16, String),
-}
+use crate::error::CoreError;
 
-impl From<reqwest::Error> for UploadError {
-    fn from(err: reqwest::Error) -> Self {
-        UploadError::ReqwestError(err)
-    }
-}
-
-impl From<std::io::Error> for UploadError {
-    fn from(err: std::io::Error) -> Self {
-        UploadError::IoError(err)
-    }
-}
+// Phase 3.8 (audit U4): the local UploadError was folded into the
+// crate-wide `CoreError`. The single thiserror-derived enum carries
+// `reqwest::Error` and `std::io::Error` via `#[from]`, preserving the
+// `?` ergonomics and the `Error::source()` chain through the Python
+// boundary in `lib.rs::core_err_to_py`.
 
 /// Compute the SHA256 and total size of a local file.
 ///
@@ -38,15 +27,15 @@ impl From<std::io::Error> for UploadError {
 /// thread.
 ///
 /// The double `?` at the end is load-bearing: `spawn_blocking(...).await`
-/// produces `Result<Result<T, UploadError>, JoinError>`. We collapse the
-/// outer `JoinError` (panic in the closure / runtime shutdown) into our own
-/// IoError variant via `io::Error::other` so callers see one error surface,
-/// then `?` unwraps the inner Result.
-pub async fn hash_file_async(path: &Path) -> Result<(String, u64), UploadError> {
+/// produces `Result<Result<T, CoreError>, JoinError>`. We collapse the
+/// outer `JoinError` (panic in the closure / runtime shutdown) into our
+/// `CoreError::Io` variant via `io::Error::other` so callers see one
+/// error surface, then `?` unwraps the inner Result.
+pub async fn hash_file_async(path: &Path) -> Result<(String, u64), CoreError> {
     use std::io::Read;
 
     let path = path.to_path_buf();
-    tokio::task::spawn_blocking(move || -> Result<(String, u64), UploadError> {
+    tokio::task::spawn_blocking(move || -> Result<(String, u64), CoreError> {
         let mut file = std::fs::File::open(&path)?;
         let mut hasher = Sha256::new();
         let mut buffer = vec![0u8; 64 * 1024]; // 64 KB chunks
@@ -64,12 +53,12 @@ pub async fn hash_file_async(path: &Path) -> Result<(String, u64), UploadError> 
         Ok((hex::encode(hasher.finalize()), total_size))
     })
     .await
-    .map_err(|join_err| UploadError::IoError(std::io::Error::other(join_err)))?
+    .map_err(|join_err| CoreError::Io(std::io::Error::other(join_err)))?
 }
 
 /// Stream-upload a file to the OCI URL returned by /blobs/uploads/ (the PUT-with-digest finalises the blob).
 /// Shows a per-call progress bar — useful for large blobs (multi-GB).
-pub async fn upload_blob_async(url: &str, path: &Path, auth_token: Option<&str>) -> Result<(), UploadError> {
+pub async fn upload_blob_async(url: &str, path: &Path, auth_token: Option<&str>) -> Result<(), CoreError> {
     // Force HTTP/1.1 for the same reason as the downloader: avoids h2 single-TCP
     // multiplexing, lets uploads spread across multiple connections if the caller
     // parallelizes.
@@ -123,7 +112,7 @@ pub async fn upload_blob_async(url: &str, path: &Path, auth_token: Option<&str>)
 
     if !res.status().is_success() {
         pb.finish_with_message(format!("❌ {} failed", basename));
-        return Err(UploadError::ServerError(
+        return Err(CoreError::ServerError(
             res.status().as_u16(),
             format!("Upload failed: {:?}", res.status()),
         ));

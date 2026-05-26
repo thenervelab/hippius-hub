@@ -1,10 +1,43 @@
 use pyo3::prelude::*;
 use pyo3::exceptions::PyRuntimeError;
+use std::error::Error as StdError;
+use std::fmt::Write as _;
 use std::path::PathBuf;
 use std::sync::OnceLock;
 
+mod error;
+pub use error::{CoreError, Result};
+
 mod chunked_downloader;
+mod uploader;
+
 use chunked_downloader::ChunkedDownloader;
+
+/// Render a `CoreError` (plus its full `source()` chain) as a single
+/// `PyRuntimeError`. Each link in the chain is appended after a
+/// `caused by:` line so the Python `__str__` view shows wrapper +
+/// underlying cause (e.g. `chunk 7 failed\ncaused by: server returned
+/// 503 (transient)`). Previously the lib.rs callers used
+/// `format!("{:?}", e)` on the bare enum, which printed Debug shape
+/// without walking `source()` — losing the inner reqwest/io message
+/// the audit D8 / U4 findings called out.
+fn core_err_to_py(e: &CoreError) -> PyErr {
+    let mut msg = e.to_string();
+    let mut current: Option<&dyn StdError> = e.source();
+    while let Some(src) = current {
+        // `caused by:` mirrors `std::error::Report` and the
+        // `errors/source_chain_walk` exemplar; the linebreak between
+        // links keeps each layer scannable in a Python traceback.
+        // `write!` into the owned `String` avoids the intermediate
+        // `format!` allocation on every link in the chain.
+        // The `Result` is infallible — writing to a `String` cannot
+        // fail — so swallowing it is sound; we deliberately do not
+        // surface a synthetic error here.
+        let _ignored = write!(msg, "\ncaused by: {src}");
+        current = src.source();
+    }
+    PyRuntimeError::new_err(msg)
+}
 
 /// Process-global multi-threaded tokio runtime.
 ///
@@ -40,8 +73,7 @@ fn download_file_native(
     verify_hash: bool,
 ) -> PyResult<String> {
     let rt = shared_runtime();
-    let downloader = ChunkedDownloader::new(url, auth_token, chunk_size)
-        .map_err(|e| PyRuntimeError::new_err(format!("Downloader init error: {:?}", e)))?;
+    let downloader = ChunkedDownloader::new(url, auth_token, chunk_size).map_err(|e| core_err_to_py(&e))?;
     let dest = PathBuf::from(dest_path);
 
     // Release the GIL so other Python threads can run during the (long)
@@ -49,11 +81,9 @@ fn download_file_native(
     // entry; allow_threads explicitly releases it for the closure body.
     py.allow_threads(|| {
         rt.block_on(async { downloader.download(&dest, verify_hash).await })
-            .map_err(|e| PyRuntimeError::new_err(format!("Download failed: {:?}", e)))
+            .map_err(|e| core_err_to_py(&e))
     })
 }
-
-mod uploader;
 
 #[pyfunction]
 #[pyo3(signature = (path))]
@@ -64,7 +94,7 @@ fn hash_file_native(py: Python<'_>, path: String) -> PyResult<(String, u64)> {
     // Release the GIL across the blocking hash; see `download_file_native`.
     py.allow_threads(|| {
         rt.block_on(async { uploader::hash_file_async(&dest).await })
-            .map_err(|e| PyRuntimeError::new_err(format!("Hash failed: {:?}", e)))
+            .map_err(|e| core_err_to_py(&e))
     })
 }
 
@@ -82,7 +112,7 @@ fn upload_blob_native(
     // Release the GIL across the blocking upload; see `download_file_native`.
     py.allow_threads(|| {
         rt.block_on(async { uploader::upload_blob_async(&url, &dest, auth_token.as_deref()).await })
-            .map_err(|e| PyRuntimeError::new_err(format!("Upload failed: {:?}", e)))
+            .map_err(|e| core_err_to_py(&e))
     })
 }
 
