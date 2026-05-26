@@ -1,4 +1,4 @@
-use futures::stream::{self, StreamExt};
+use futures::stream::{FuturesUnordered, StreamExt};
 use reqwest::{header, Client};
 use sha2::{Digest, Sha256};
 use std::path::Path;
@@ -6,6 +6,7 @@ use std::time::Duration;
 use indicatif::{ProgressBar, ProgressStyle};
 use tokio::fs::OpenOptions;
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt, SeekFrom, BufWriter};
+use tokio::task::AbortHandle;
 
 const DEFAULT_CHUNK_SIZE: u64 = 100 * 1024 * 1024; // 100 MB default
 const MAX_CONCURRENT_DOWNLOADS: usize = 32;
@@ -152,7 +153,26 @@ impl ChunkedDownloader {
 
         // 3. Launch concurrent downloads — each streams directly to its
         //    correct offset in the final file.
-        let mut stream = stream::iter(0..num_chunks).map(|i| {
+        //
+        // Audit D4: previously this used `buffer_unordered(MAX_CONCURRENT_DOWNLOADS)`
+        // and early-returned on the first error, but dropping the `Buffered` stream
+        // does NOT cancel the `tokio::spawn`'d tasks behind it — `JoinHandle::drop`
+        // detaches a tokio task, leaving it running in the background where it
+        // continues writing to `dest_path` and holding sockets after we've already
+        // bubbled an error up. We now collect the spawn-side `AbortHandle`s eagerly
+        // and call `.abort()` on every survivor before propagating the error, so
+        // the survivors stop at their next await point instead of racing the next
+        // download. The chunk-level HTTP concurrency bound that
+        // `buffer_unordered(MAX_CONCURRENT_DOWNLOADS)` used to enforce is now
+        // carried by `pool_max_idle_per_host(MAX_CONCURRENT_DOWNLOADS)` on the
+        // reqwest client (line 98) — beyond pool capacity, reqwest queues HTTP
+        // requests on the existing connections, so eager spawn does not multiply
+        // network concurrency.
+        let mut joins: FuturesUnordered<tokio::task::JoinHandle<(usize, Result<(), DownloadError>)>> =
+            FuturesUnordered::new();
+        let mut abort_handles: Vec<AbortHandle> = Vec::with_capacity(num_chunks);
+
+        for i in 0..num_chunks {
             let (start, end) = chunk_bounds(content_length, self.chunk_size, i);
 
             let client = self.client.clone();
@@ -161,28 +181,46 @@ impl ChunkedDownloader {
             let chunk_pb = pb.clone();
             let path = dest_path_buf.clone();
 
-            tokio::spawn(async move {
+            let handle = tokio::spawn(async move {
                 let res = download_chunk_with_retry(client, url, token, start, end, i, path, chunk_pb).await;
                 (i, res)
-            })
-        }).buffer_unordered(MAX_CONCURRENT_DOWNLOADS);
+            });
+            // `abort_handle()` clones the cooperative-cancel signal; the original
+            // `JoinHandle` is what `FuturesUnordered` polls for completion.
+            abort_handles.push(handle.abort_handle());
+            joins.push(handle);
+        }
 
-        // Drain the bounded `buffer_unordered` stream. Exhaustive match preserves
+        // Drain the `FuturesUnordered` of `JoinHandle`s. Exhaustive match preserves
         // both the spawn-side (`JoinError`) and the download-layer cause: previously
         // both collapsed into a bare `ChunkFailed(usize)`, hiding which chunk failed
         // AND why. `usize::MAX` is the documented sentinel for "index unknown" —
         // the chunk index lives inside the future's return, which `JoinError` did
         // not preserve. Phase 3.8 will replace this enum with a thiserror-based
         // hierarchy; the sentinel survives until then.
-        while let Some(res) = stream.next().await {
+        //
+        // On any error we abort every collected handle before returning. Aborting
+        // an already-completed handle is a documented no-op (tokio), so iterating
+        // the full `abort_handles` vector is correct even though some tasks have
+        // finished. We do not drain the remaining `joins` after firing the aborts:
+        // tokio cancellation is cooperative — the spawned futures will return
+        // `JoinError::is_cancelled()` at their next await and shut down on their
+        // own; awaiting them here would only delay the user-visible failure.
+        while let Some(res) = joins.next().await {
             match res {
                 Err(join_err) => {
+                    for a in &abort_handles {
+                        a.abort();
+                    }
                     return Err(DownloadError::JoinFailed {
                         index: usize::MAX,
                         source: join_err,
                     });
                 }
                 Ok((i, Err(chunk_err))) => {
+                    for a in &abort_handles {
+                        a.abort();
+                    }
                     return Err(DownloadError::ChunkFailed {
                         index: i,
                         source: Box::new(chunk_err),
