@@ -450,6 +450,7 @@ def upload_folder(
     delete_patterns: Optional[Union[List[str], str]] = None,
     run_as_future: bool = False,
     endpoint: Optional[str] = None,
+    max_workers: int = 8,
 ) -> CommitInfo:
     """Upload every file under `folder_path` to a repository revision.
 
@@ -463,6 +464,10 @@ def upload_folder(
     `ConcurrentManifestUpdateError` — the partial-folder write does NOT
     silently land. Blob pushes that already completed are idempotent at the
     OCI level (content-addressed), so a retry of the whole folder is safe.
+
+    `max_workers` controls the per-file ThreadPoolExecutor — mirrors the
+    parameter on `snapshot_download` so callers with large folders and fast
+    pipes can push the upload pool past the default of 8.
     """
     _validate_repo_type(repo_type)
     _handle_unsupported_kwargs(create_pr, parent_commit, run_as_future)
@@ -496,7 +501,7 @@ def upload_folder(
     new_layers = []
     if filtered:
         print(f"📦 Preparing to upload {len(filtered)} file(s) to {repo_id}:{revision}...")
-        with ThreadPoolExecutor(max_workers=8) as executor:
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
             futures = [
                 executor.submit(
                     _upload_one_file,
