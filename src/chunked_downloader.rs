@@ -287,6 +287,38 @@ async fn download_chunk_with_retry(
     }
 }
 
+/// Verify that a chunk GET produced exactly HTTP 206 Partial Content.
+///
+/// Audit D2: previously `try_download_chunk_to_offset` accepted any 2xx
+/// status. A server that ignored the `Range` header would respond with
+/// 200 OK and the FULL body; we would then `seek(start)` and stream that
+/// full body starting at the chunk's offset, overwriting everything past
+/// `end + 1` and producing a silently corrupt file. The diagnostic on
+/// the 200 branch names the ignored range explicitly so the failure mode
+/// is unambiguous in logs — distinct from a "server returned the wrong
+/// bytes" error a caller might otherwise assume.
+fn require_partial_content(
+    status: reqwest::StatusCode,
+    start: u64,
+    end: u64,
+) -> Result<(), DownloadError> {
+    use reqwest::StatusCode;
+    match status {
+        StatusCode::PARTIAL_CONTENT => Ok(()),
+        StatusCode::OK => Err(DownloadError::ServerError(
+            status.as_u16(),
+            format!(
+                "server ignored Range bytes={start}-{end} (returned 200 OK instead of 206); \
+                 writing the full body at offset {start} would corrupt the file"
+            ),
+        )),
+        other => Err(DownloadError::ServerError(
+            other.as_u16(),
+            format!("Failed chunk bytes {start}-{end}"),
+        )),
+    }
+}
+
 /// Streaming download of a chunk directly to its offset in the final file
 /// (already pre-allocated). Each task opens its own file handle, seeks to its
 /// offset, and writes bytes as they arrive from the HTTP stream.
@@ -309,12 +341,7 @@ async fn try_download_chunk_to_offset(
 
     let mut res = req.send().await?;
 
-    if !res.status().is_success() {
-        return Err(DownloadError::ServerError(
-            res.status().as_u16(),
-            format!("Failed chunk bytes {}-{}", start, end),
-        ));
-    }
+    require_partial_content(res.status(), start, end)?;
 
     // Open this task's own handle on the pre-allocated final file, seek to start.
     let mut file = OpenOptions::new()
@@ -443,5 +470,43 @@ mod tests {
         };
         assert_eq!(index, 3);
         assert!(matches!(*source, DownloadError::ServerError(404, _)));
+    }
+}
+
+// Kept separate from the chunk-math `tests` module so the two test
+// categories don't bleed into each other: chunk math is pure-arithmetic,
+// this module is about HTTP status discipline. Audit D2.
+#[cfg(test)]
+mod partial_content_tests {
+    use super::*;
+    use reqwest::StatusCode;
+
+    #[test]
+    fn accepts_206() {
+        assert!(require_partial_content(StatusCode::PARTIAL_CONTENT, 0, 99).is_ok());
+    }
+
+    // The diagnostic on the 200 branch is load-bearing: it is the only signal
+    // distinguishing "server ignored Range" from "server returned wrong bytes".
+    // `let ... else { unreachable!() }` is used instead of `.unwrap_err()` /
+    // `panic!()` because the project denies `unwrap_used` and `panic`
+    // cluster-wide; the test still fails clearly if the helper accepts 200.
+    #[test]
+    fn rejects_200_with_diagnostic() {
+        let result = require_partial_content(StatusCode::OK, 0, 99);
+        let Err(err) = result else {
+            unreachable!("require_partial_content must reject 200 OK")
+        };
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("ignored Range"),
+            "diagnostic must name the ignored Range header, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn rejects_other_4xx_5xx() {
+        assert!(require_partial_content(StatusCode::NOT_FOUND, 0, 99).is_err());
+        assert!(require_partial_content(StatusCode::INTERNAL_SERVER_ERROR, 0, 99).is_err());
     }
 }
