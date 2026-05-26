@@ -4,7 +4,6 @@ HF semantics: 'If False, no token will be used.'
 Current code: falls through to get_docker_auth(), violating that contract.
 """
 from unittest.mock import patch
-import pytest
 from hippius_hub.auth import get_oci_bearer_token
 
 

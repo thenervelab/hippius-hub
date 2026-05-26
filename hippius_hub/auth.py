@@ -2,7 +2,7 @@ import os
 import json
 import threading
 import time
-from typing import Union
+from typing import Literal, Union
 import httpx
 from .constants import DEFAULT_CACHE_DIR, DEFAULT_HTTP_TIMEOUT, DEFAULT_REGISTRY_URL
 from .errors import LocalTokenNotFoundError
@@ -166,7 +166,7 @@ def get_docker_auth(registry_url: str) -> str:
 
 def get_oci_bearer_token(
     repo_id: str,
-    token: Union[str, bool, None] = None,
+    token: Union[str, Literal[False], None] = None,
     push: bool = False,
     use_cache: bool = True,
 ) -> str:
