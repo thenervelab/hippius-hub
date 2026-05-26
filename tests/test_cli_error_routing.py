@@ -42,14 +42,14 @@ def _synthetic_response(status_code: int = 404) -> httpx.Response:
     [
         # EntryNotFoundError / LocalEntryNotFoundError are plain Exception
         # subclasses in huggingface_hub — they take a bare string.
-        (EntryNotFoundError("missing.bin"), 2),
-        (LocalEntryNotFoundError("missing-from-cache"), 5),
+        (EntryNotFoundError("missing.bin"), 10),
+        (LocalEntryNotFoundError("missing-from-cache"), 13),
         # The rest subclass HfHubHTTPError and require a response kwarg.
-        (RepositoryNotFoundError("no-such-repo", response=_synthetic_response(404)), 3),
-        (RevisionNotFoundError("no-such-rev", response=_synthetic_response(404)), 4),
-        (GatedRepoError("gated", response=_synthetic_response(403)), 6),
-        (DisabledRepoError("disabled", response=_synthetic_response(403)), 6),
-        (HfHubHTTPError("generic-http", response=_synthetic_response(500)), 8),
+        (RepositoryNotFoundError("no-such-repo", response=_synthetic_response(404)), 11),
+        (RevisionNotFoundError("no-such-rev", response=_synthetic_response(404)), 12),
+        (GatedRepoError("gated", response=_synthetic_response(403)), 14),
+        (DisabledRepoError("disabled", response=_synthetic_response(403)), 14),
+        (HfHubHTTPError("generic-http", response=_synthetic_response(500)), 16),
         # Fallback: anything not in the typed hierarchy still gets a code.
         (Exception("opaque"), 1),
     ],
@@ -59,23 +59,23 @@ def test_format_download_error_distinguishes_typed_errors(exc, expected_code):
     assert code == expected_code, f"{type(exc).__name__} should map to {expected_code}, got {code}"
 
 
-def test_gated_repo_routes_to_6_not_3():
+def test_gated_repo_routes_to_14_not_11():
     """GatedRepoError IS-A RepositoryNotFoundError in huggingface_hub.
 
     A naive ordering that checks RepositoryNotFoundError first would route
-    every gated repo to code 3 (not-found) instead of 6 (access denied),
+    every gated repo to code 11 (not-found) instead of 14 (access denied),
     making auth failures indistinguishable from typos. This test pins the
     correct ordering: subclass checks must come before parent checks.
     """
     err = GatedRepoError("dataset-requires-license", response=_synthetic_response(403))
     msg, code = _format_download_error(err)
-    assert code == 6
+    assert code == 14
     assert "Access denied" in msg
 
 
-def test_concurrent_update_routes_to_7_before_generic_http():
+def test_concurrent_update_routes_to_15_before_generic_http():
     """ConcurrentManifestUpdateError subclasses HfHubHTTPError; the typed
-    routing must hit the specific code (7) not the generic one (8).
+    routing must hit the specific code (15) not the generic one (16).
 
     The 412-precondition-failed message is actionable (retry or serialize
     externally); a generic 'Registry HTTP error' would hide that the fix
@@ -83,7 +83,7 @@ def test_concurrent_update_routes_to_7_before_generic_http():
     """
     err = ConcurrentManifestUpdateError("manifest at o/r:main changed")
     msg, code = _format_download_error(err)
-    assert code == 7
+    assert code == 15
     assert "Concurrent write detected" in msg
     # Sanity: the error really is in the HfHubHTTPError hierarchy, so the
     # ordering matters — confirm it's not just a coincidence.

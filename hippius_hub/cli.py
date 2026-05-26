@@ -49,6 +49,23 @@ def _format_download_error(e: Exception) -> tuple[str, int]:
     generic exit 1. Imports are kept local so the CLI startup path doesn't
     pull in huggingface_hub.errors when no failure has occurred.
 
+    Exit codes:
+        1  generic failure (unknown exception)
+        2  reserved — argparse usage error (set elsewhere in cli.py)
+        10 file not found in repo (EntryNotFoundError)
+        11 repository not found (RepositoryNotFoundError)
+        12 revision not found (RevisionNotFoundError)
+        13 local cache miss (LocalEntryNotFoundError)
+        14 access denied (GatedRepoError, DisabledRepoError)
+        15 concurrent manifest write (ConcurrentManifestUpdateError)
+        16 registry HTTP error (HfHubHTTPError)
+
+    Codes start at 10 (not 2) to avoid colliding with bash's reserved
+    exit code 2 ("misuse of shell builtin") and argparse's default for
+    usage errors — both of which the CLI already produces at the parser
+    layer. A typed routing code that overlapped with those would be
+    indistinguishable from a bad-argument failure to a shell wrapper.
+
     Ordering invariant: HF's typed exception hierarchy has three subclass
     relationships that matter here — LocalEntryNotFoundError <: Entry-
     NotFoundError; GatedRepoError <: RepositoryNotFoundError <:
@@ -57,10 +74,10 @@ def _format_download_error(e: Exception) -> tuple[str, int]:
     test_disabled_repo_is_not_subclass_of_repository_not_found); and
     ConcurrentManifestUpdateError <: HfHubHTTPError. The isinstance
     checks MUST run subclass-before-parent or a cache miss would be
-    reported as a missing-in-repo file (2), a gated repo as 'not found'
-    (3) instead of 'access denied' (6), and a 412 manifest collision as
-    a generic HTTP error (8) instead of the actionable concurrent-write
-    code (7).
+    reported as a missing-in-repo file (10), a gated repo as 'not found'
+    (11) instead of 'access denied' (14), and a 412 manifest collision
+    as a generic HTTP error (16) instead of the actionable concurrent-
+    write code (15).
     """
     from .errors import (
         ConcurrentManifestUpdateError,
@@ -74,31 +91,34 @@ def _format_download_error(e: Exception) -> tuple[str, int]:
     )
     # Subclass-first: LocalEntryNotFoundError inherits from Entry-
     # NotFoundError. Checking the parent first would route every cache
-    # miss to code 2 (file-not-found-in-repo) — wrong actionable hint.
+    # miss to code 10 (file-not-found-in-repo) — wrong actionable hint.
     if isinstance(e, LocalEntryNotFoundError):
-        return (f"❌ Local cache miss: {e}", 5)
+        return (f"❌ Local cache miss: {e}", 13)
     if isinstance(e, EntryNotFoundError):
-        return (f"❌ File not found in repo: {e}", 2)
-    # Subclass-first: GatedRepoError and DisabledRepoError both inherit
-    # from RepositoryNotFoundError (auth-gated repos return 403, which HF
-    # models as a kind of "you can't see this repo"). Without this order,
-    # the RepositoryNotFoundError arm would swallow them.
+        return (f"❌ File not found in repo: {e}", 10)
+    # Subclass-first: GatedRepoError subclasses RepositoryNotFoundError
+    # (auth-gated repos return 403, which HF models as a kind of "you
+    # can't see this repo"). DisabledRepoError, despite being grouped
+    # with Gated here for the same user-facing message, does NOT inherit
+    # from RepositoryNotFoundError — but routing it first is still
+    # required so it doesn't fall through to the generic HfHubHTTPError
+    # arm below.
     if isinstance(e, (GatedRepoError, DisabledRepoError)):
-        return (f"❌ Access denied: {e}", 6)
+        return (f"❌ Access denied: {e}", 14)
     if isinstance(e, RepositoryNotFoundError):
-        return (f"❌ Repository not found: {e}", 3)
+        return (f"❌ Repository not found: {e}", 11)
     if isinstance(e, RevisionNotFoundError):
-        return (f"❌ Revision not found: {e}", 4)
+        return (f"❌ Revision not found: {e}", 12)
     # ConcurrentManifestUpdateError subclasses HfHubHTTPError; it must be
     # tested first so the actionable retry/serialize guidance survives.
     if isinstance(e, ConcurrentManifestUpdateError):
         return (
             f"❌ Concurrent write detected: {e}. Another writer pushed "
             f"to the same revision. Retry or serialize uploads externally.",
-            7,
+            15,
         )
     if isinstance(e, HfHubHTTPError):
-        return (f"❌ Registry HTTP error: {e}", 8)
+        return (f"❌ Registry HTTP error: {e}", 16)
     return (f"❌ Operation failed: {e}", 1)
 
 
