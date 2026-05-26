@@ -374,34 +374,30 @@ Closes: audit C3"
 **Files:**
 - Modify: `src/lib.rs`
 
-**Step 1: Write a Rust-side benchmark/test that demonstrates the cost**
+**Step 1: Write a Rust-side test that pins the cache invariant**
 
 Add to `src/lib.rs` under `#[cfg(test)]`:
 
 ```rust
 #[cfg(test)]
 mod runtime_tests {
-    use std::time::Instant;
-
     #[test]
-    fn shared_runtime_avoids_startup_cost() {
-        // Smoke test: ten consecutive Runtime::new() calls take meaningful
-        // time on macOS/Linux. After the fix, the global runtime is created
-        // once and reused, so the per-call overhead drops to ~zero.
-        let start = Instant::now();
-        for _ in 0..10 {
-            let _rt = tokio::runtime::Runtime::new().unwrap();
-        }
-        let elapsed = start.elapsed();
-        // This assertion is informational, not load-bearing — we expect
-        // 10 Runtime::new() to take more than a couple of milliseconds.
-        // After the global-runtime fix, the equivalent loop will be ~0ms.
-        eprintln!("10x Runtime::new(): {:?}", elapsed);
+    fn shared_runtime_returns_same_instance() {
+        // The whole point of Task 1.4 is that OnceLock caches a single Runtime
+        // for the process lifetime. Pointer equality is the direct expression
+        // of that invariant — independent of timing, allocator, or load.
+        let a: &'static _ = super::shared_runtime();
+        let b: &'static _ = super::shared_runtime();
+        assert!(std::ptr::eq(a, b));
     }
 }
 ```
 
-This is a benchmark stub — its job is to make the cost visible during review, not to enforce a threshold.
+This is the load-bearing smoke test — it would fail if `shared_runtime` were
+deleted or refactored to construct a new runtime per call. A timing loop over
+`Runtime::new()` (the OLD code path) would pass identically with `shared_runtime`
+removed, so it validates nothing; `eprintln!` would additionally violate the
+Phase 0 `print_stderr = "deny"` lint.
 
 **Step 2: Add a process-global runtime**
 
@@ -448,8 +444,8 @@ let rt = shared_runtime();
 
 **Step 4: Build + test**
 
-Run: `cargo build --release && cargo test runtime_tests::shared_runtime_avoids_startup_cost -- --nocapture`
-Expected: builds; prints elapsed time on stderr.
+Run: `cargo build --release && cargo test runtime_tests::shared_runtime_returns_same_instance`
+Expected: builds; the cache-invariant test passes (`test result: ok. 1 passed`).
 
 **Step 5: Commit**
 
