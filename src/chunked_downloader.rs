@@ -5,7 +5,11 @@ use std::path::Path;
 use std::time::Duration;
 use indicatif::{ProgressBar, ProgressStyle};
 use tokio::fs::OpenOptions;
-use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt, SeekFrom, BufWriter};
+// `AsyncReadExt` was used by the old in-tokio sha256 loop; Phase 2.8
+// moved that work onto `spawn_blocking` with the sync `std::io::Read`
+// trait inside `compute_sha256`, so the async-read trait is no longer
+// needed at module scope.
+use tokio::io::{AsyncSeekExt, AsyncWriteExt, SeekFrom, BufWriter};
 use tokio::task::AbortHandle;
 
 use crate::error::CoreError;
@@ -73,16 +77,27 @@ impl ChunkedDownloader {
     }
 
     /// Downloads the file concurrently by streaming each chunk directly to its
-    /// offset in the final file (sparse pre-allocated). If `verify_hash` is
-    /// true, reads the full file at the end to produce a SHA256. Otherwise
-    /// returns an empty string.
-    pub async fn download(&self, dest_path: &Path, verify_hash: bool) -> Result<String, CoreError> {
+    /// offset in the final file (sparse pre-allocated). When `verify_hash` is
+    /// true, reads the full file at the end and returns `Some(sha256_hex)`.
+    /// When false, skips the verify pass and returns `None`.
+    ///
+    /// Audit L6 (Phase 3.12): previously this signature was
+    /// `Result<String, CoreError>` and the no-verify path returned
+    /// `String::new()` as an in-band sentinel. `Option<String>` makes
+    /// "verification skipped" a value the type system carries — pyo3 maps
+    /// it to Python `Optional[str]`, and callers dispatch on `is None`
+    /// instead of comparing against the empty string. The empty-file
+    /// branch still returns `Some(sha256_of_empty_bytes)` because the
+    /// file exists and has a defined (non-skipped) digest.
+    pub async fn download(&self, dest_path: &Path, verify_hash: bool) -> Result<Option<String>, CoreError> {
         // 1. Fetch the total blob size
         let content_length = self.get_content_length().await?;
 
-        // Handle the empty-file case
+        // Handle the empty-file case. `create_empty_file` keeps its
+        // `Result<String, _>` shape because an empty file has a defined
+        // sha256; the `Option` wrap lives at this orchestration layer only.
         if content_length == 0 {
-            return self.create_empty_file(dest_path).await;
+            return Ok(Some(self.create_empty_file(dest_path).await?));
         }
 
         let pb = ProgressBar::new(content_length);
@@ -214,9 +229,11 @@ impl ChunkedDownloader {
 
             let hash = compute_sha256(dest_path, &pb_hash).await?;
             pb_hash.finish_with_message("✅ Verified");
-            Ok(hash)
+            Ok(Some(hash))
         } else {
-            Ok(String::new())
+            // Audit L6: typed "skipped" — was `Ok(String::new())` before
+            // Phase 3.12. `None` is the discriminant, not a magic value.
+            Ok(None)
         }
     }
 
@@ -559,6 +576,32 @@ mod tests {
     fn missing_content_length_is_a_distinct_error() {
         let err = CoreError::MissingContentLength;
         assert!(matches!(err, CoreError::MissingContentLength));
+    }
+
+    // Audit L6 (Phase 3.12): pin that `ChunkedDownloader::download` returns
+    // `Result<Option<String>, CoreError>`, not `Result<String, CoreError>`.
+    // The shape is the contract — a refactor that re-flattened it would
+    // silently re-introduce the empty-string sentinel and the Python
+    // caller's `is not None` dispatch would start routing every download
+    // through the manifest-digest fallback. Binding the method as a typed
+    // function pointer is the cheapest compile-time pin: a return-type
+    // change here surfaces as a coercion error at the binding, not as
+    // confused behaviour deep in the call stack. Same pattern as the
+    // `JoinFailed` constructor pin in `error::tests` — coerce a closure
+    // to a fully-typed `fn` pointer, then exercise it with `fn_addr_eq`
+    // so clippy's `no_effect_underscore_binding` lint stays satisfied.
+    #[test]
+    fn download_returns_option_string() {
+        type DownloadFut<'a> = std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<Option<String>, CoreError>> + Send + 'a>,
+        >;
+        // The coercion below is the assertion: if `download` ever stops
+        // returning `Result<Option<String>, _>` (e.g. reverts to `String`),
+        // the binding fails to typecheck and this test fails to build.
+        let typed: for<'a> fn(&'a ChunkedDownloader, &'a Path, bool) -> DownloadFut<'a> =
+            |d, p, v| Box::pin(d.download(p, v));
+        // Use `typed` as a value so the binding has an observed effect.
+        assert!(std::ptr::fn_addr_eq(typed, typed));
     }
 }
 

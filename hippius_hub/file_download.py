@@ -341,6 +341,15 @@ def _download_to_cache(
     print(f"Downloading {filename} (parallel)...")
     verify_hash = _resolve_verify_hash()
     try:
+        # Audit L6 (Phase 3.12): download_file_native now returns
+        # Optional[str] — `None` when verify_hash=False (skipped), `str`
+        # when verify_hash=True. Previously it returned `""` as an
+        # in-band sentinel for "skipped", which forced callers to know
+        # the convention and would collide with any legitimate empty
+        # string. The dispatch below is on `is not None`, not on
+        # `verify_hash`, so a future code path that returns `None` for
+        # other reasons (e.g. async cancellation) routes through the
+        # same fallback rather than masquerading as a valid digest.
         calculated_hash = download_file_native(
             url=blob_url,
             dest_path=temp_path,
@@ -359,9 +368,13 @@ def _download_to_cache(
                 pass
         raise
 
-    # If we skip hash verification, fall back to the digest from the OCI manifest
+    # If hash verification was skipped (calculated_hash is None), fall
+    # back to the digest from the OCI manifest. Otherwise use what the
+    # Rust side computed.
     final_hash = (
-        calculated_hash if verify_hash else target_digest.replace("sha256:", "")
+        calculated_hash
+        if calculated_hash is not None
+        else target_digest.replace("sha256:", "")
     )
 
     # 3. Atomic rename of the temp file into the SHA256 blob
@@ -382,6 +395,10 @@ def _download_to_local_dir(blob_url, dest_file, oci_token):
     if parent:
         os.makedirs(parent, exist_ok=True)
     print(f"Downloading {os.path.basename(dest_file)} (parallel)...")
+    # local_dir mode writes directly to the user-chosen path and does
+    # not assemble a content-addressed blob layout, so the calculated
+    # hash (Optional[str] post Phase 3.12) is intentionally unused — the
+    # file path is the identity here, not the digest.
     download_file_native(
         url=blob_url,
         dest_path=dest_file,

@@ -71,7 +71,17 @@ fn download_file_native(
     auth_token: Option<String>,
     chunk_size: Option<u64>,
     verify_hash: bool,
-) -> PyResult<String> {
+) -> PyResult<Option<String>> {
+    // Audit L6 (Phase 3.12): `Option<String>` instead of `String` for the
+    // hash result. pyo3 0.20's blanket `IntoPy` impl on `Option<T>` maps
+    // `None` to Python's `None` and `Some(s)` to `s`, so the Python
+    // signature becomes `Optional[str]` automatically. The previous
+    // contract returned `""` as an in-band "skipped" sentinel; callers
+    // now match on `is None` instead, which is also free of the
+    // theoretical collision with `sha256(b"")` = `e3b0c4...` (a
+    // non-empty 64-hex string — distinct from `""` but still a
+    // sentinel-shaped trap if a future SHA-0-like algorithm ever
+    // produced an empty digest).
     let rt = shared_runtime();
     let downloader = ChunkedDownloader::new(url, auth_token, chunk_size).map_err(|e| core_err_to_py(&e))?;
     let dest = PathBuf::from(dest_path);
