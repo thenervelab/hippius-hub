@@ -62,8 +62,15 @@ def login(
     else:
         raise ValueError("Either username/password or token must be provided")
 
+    # Write+chmod together so the file is never world-readable mid-flight.
+    # os.chmod on a path is a syscall, not enforced atomically with open();
+    # the best-effort try/except mirrors save_api_token in console.py.
     with open(TOKEN_PATH, "w") as f:
         f.write(auth_str)
+    try:
+        os.chmod(TOKEN_PATH, 0o600)
+    except OSError:
+        pass
     print(f"Token successfully saved to {TOKEN_PATH}")
 
 
