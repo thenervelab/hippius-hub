@@ -119,6 +119,62 @@ pub enum CoreError {
     MissingContentLength,
 }
 
+impl CoreError {
+    /// Returns `true` if retrying the operation that produced this error
+    /// stands a chance of succeeding.
+    ///
+    /// Audit U3 (Phase 3.11): both the downloader's per-chunk retry loop
+    /// and the uploader's whole-request retry loop need the same
+    /// transient-vs-permanent classifier. Keeping it as an inherent
+    /// method on `CoreError` is the single source of truth — the
+    /// alternative (a free fn in one module that the other imports, or a
+    /// duplicated copy) drifts as soon as either site adds a variant.
+    ///
+    /// Classification:
+    ///
+    /// * [`CoreError::Reqwest`] / [`CoreError::Io`] — transient
+    ///   transport-layer blips (TCP reset, transient EIO, mid-stream
+    ///   read), retryable.
+    /// * [`CoreError::ServerError`] with `status ∈ 500..600` — RFC 9110
+    ///   §15.6 retryable status codes.
+    /// * [`CoreError::ServerError`] with `status` outside `500..600` —
+    ///   permanent (4xx auth/format or any non-HTTP code), not
+    ///   retryable.
+    /// * [`CoreError::ChunkFailed`] / [`CoreError::JoinFailed`] —
+    ///   constructed by the orchestrator AFTER an inner retry loop has
+    ///   already given up; retrying compounds backoff for failures
+    ///   already declared terminal.
+    /// * [`CoreError::MissingContentLength`] — HEAD-response shape
+    ///   error, not transient.
+    ///
+    /// The match is intentionally exhaustive (no wildcard arm). The
+    /// `#[non_exhaustive]` attribute on `CoreError` is for *external*
+    /// callers; inside this crate the compiler still requires every
+    /// variant to be named, so adding a future variant forces a
+    /// deliberate classification decision instead of silently defaulting
+    /// to one bucket.
+    #[must_use]
+    pub fn is_retryable(&self) -> bool {
+        match self {
+            // Network/transport errors are retryable.
+            CoreError::Reqwest(_) | CoreError::Io(_) => true,
+            // 5xx server errors are retryable; 4xx (and any other
+            // non-5xx) are permanent. `(500..600).contains(status)`
+            // operates on `&u16` because the match is over `&CoreError`,
+            // so `status` binds as `&u16` — `Range<u16>::contains`
+            // takes `&u16`, no extra borrow needed.
+            CoreError::ServerError(status, _) => (500..600).contains(status),
+            // Structured terminal errors produced after the per-chunk
+            // retry loop has already done its work — retrying them here
+            // would compound the backoff for failures the inner loop
+            // already declared unrecoverable.
+            CoreError::ChunkFailed { .. } | CoreError::JoinFailed { .. } => false,
+            // HEAD-response shape error, not a transient network condition.
+            CoreError::MissingContentLength => false,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{CoreError, Result};

@@ -301,45 +301,11 @@ async fn compute_sha256(path: &Path, pb: &ProgressBar) -> Result<String, CoreErr
     .map_err(|join_err| CoreError::Io(std::io::Error::other(join_err)))?
 }
 
-/// Classify a `CoreError` for the retry loop.
-///
-/// Audit D5: previously `download_chunk_with_retry` retried EVERY error variant
-/// up to `MAX_RETRIES=3`, so a permanent 401/403/404 burned 200+400+800+1600 ms
-/// of exponential backoff before surfacing — and never succeeded. We now retry
-/// only transient causes:
-///
-/// * `Reqwest` / `Io` — network or local-IO blips; retry.
-/// * `ServerError(500..600, _)` — server-side faults documented as retryable by
-///   RFC 9110 §15.6; retry.
-///
-/// Everything else is terminal: 4xx (client error, no retry will fix it),
-/// `ChunkFailed`/`JoinFailed` (wrappers produced by the orchestrator AFTER the
-/// per-chunk retry loop has already exhausted, so retrying here would double-
-/// count), and `MissingContentLength` (HEAD response shape, not transient).
-///
-/// The match is intentionally exhaustive (no wildcard arm). `CoreError`
-/// is `#[non_exhaustive]` for *external* callers, but this function lives
-/// in the same crate as the enum, so the compiler still requires every
-/// variant to be named here. That's the property we want: adding a
-/// future variant must force a deliberate classification decision rather
-/// than silently defaulting to one bucket.
-fn is_retryable(err: &CoreError) -> bool {
-    match err {
-        // Network/transport errors are retryable.
-        CoreError::Reqwest(_) | CoreError::Io(_) => true,
-        // 5xx server errors are retryable; 4xx (and any other non-5xx) are permanent.
-        // `(500..600).contains(status)` operates on `&u16` because the match is over
-        // `&CoreError`, so `status` binds as `&u16` — `Range<u16>::contains`
-        // takes `&u16`, no extra borrow needed.
-        CoreError::ServerError(status, _) => (500..600).contains(status),
-        // Structured terminal errors produced after the per-chunk retry loop has
-        // already done its work — retrying them here would compound the backoff
-        // for failures the inner loop already declared unrecoverable.
-        CoreError::ChunkFailed { .. } | CoreError::JoinFailed { .. } => false,
-        // HEAD-response shape error, not a transient network condition.
-        CoreError::MissingContentLength => false,
-    }
-}
+// Audit D5 retry classification moved to `CoreError::is_retryable` in
+// `src/error.rs` (Phase 3.11). The uploader needs the same classifier,
+// and a method on the error type is the single source of truth — no
+// duplicate `fn` to drift, no `pub(crate)` import to maintain. See
+// `CoreError::is_retryable` for the variant-by-variant rationale.
 
 /// Wrapper with exponential-backoff retry for a single chunk download.
 async fn download_chunk_with_retry(
@@ -359,10 +325,11 @@ async fn download_chunk_with_retry(
             Ok(_) => return Ok(()),
             Err(e) => {
                 retries += 1;
-                // Audit D5: fail fast on permanent errors. Borrow `&e` so the
-                // owned error remains returnable below — `is_retryable` only
-                // reads the discriminant and (for `ServerError`) the status code.
-                if !is_retryable(&e) || retries > MAX_RETRIES {
+                // Audit D5: fail fast on permanent errors. The
+                // `is_retryable` method borrows `&self` so the owned `e`
+                // remains returnable below — it only inspects the
+                // discriminant and (for `ServerError`) the status code.
+                if !e.is_retryable() || retries > MAX_RETRIES {
                     return Err(e);
                 }
                 let wait_time = 2u64.pow(retries) * 100;
@@ -647,19 +614,19 @@ mod retry_classification_tests {
 
     #[test]
     fn five_hundred_is_retryable() {
-        assert!(is_retryable(&CoreError::ServerError(500, "internal".into())));
+        assert!(CoreError::ServerError(500, "internal".into()).is_retryable());
     }
 
     #[test]
     fn five_oh_three_is_retryable() {
         // Service Unavailable — the canonical transient 5xx.
-        assert!(is_retryable(&CoreError::ServerError(503, "unavailable".into())));
+        assert!(CoreError::ServerError(503, "unavailable".into()).is_retryable());
     }
 
     #[test]
     fn five_ninety_nine_is_retryable() {
         // Upper inclusive boundary of the 5xx range.
-        assert!(is_retryable(&CoreError::ServerError(599, "edge".into())));
+        assert!(CoreError::ServerError(599, "edge".into()).is_retryable());
     }
 
     #[test]
@@ -667,7 +634,7 @@ mod retry_classification_tests {
         // One below the 5xx floor: still a client error per the contract.
         // HTTP technically does not register 499, but the classifier's job is
         // "5xx only", so 499 must fall into the permanent bucket.
-        assert!(!is_retryable(&CoreError::ServerError(499, "edge".into())));
+        assert!(!CoreError::ServerError(499, "edge".into()).is_retryable());
     }
 
     #[test]
@@ -675,33 +642,33 @@ mod retry_classification_tests {
         // HTTP does not define 6xx; the contract is "5xx only" so this is
         // permanent. Pinning the upper exclusive boundary so a future bump
         // of `(500..600)` to `(500..=600)` is caught.
-        assert!(!is_retryable(&CoreError::ServerError(600, "edge".into())));
+        assert!(!CoreError::ServerError(600, "edge".into()).is_retryable());
     }
 
     #[test]
     fn four_oh_four_is_not_retryable() {
         // The headline audit case: 404 used to burn 3 s of backoff.
-        assert!(!is_retryable(&CoreError::ServerError(404, "not found".into())));
+        assert!(!CoreError::ServerError(404, "not found".into()).is_retryable());
     }
 
     #[test]
     fn four_oh_one_is_not_retryable() {
         // 401 is permanent for the same token — retrying just re-presents the
         // same credentials.
-        assert!(!is_retryable(&CoreError::ServerError(401, "unauthorized".into())));
+        assert!(!CoreError::ServerError(401, "unauthorized".into()).is_retryable());
     }
 
     #[test]
     fn four_oh_three_is_not_retryable() {
         // 403 — same reasoning as 401.
-        assert!(!is_retryable(&CoreError::ServerError(403, "forbidden".into())));
+        assert!(!CoreError::ServerError(403, "forbidden".into()).is_retryable());
     }
 
     #[test]
     fn missing_content_length_is_not_retryable() {
         // HEAD-response shape error — retrying the GET cannot heal a missing
         // header on a separate HEAD.
-        assert!(!is_retryable(&CoreError::MissingContentLength));
+        assert!(!CoreError::MissingContentLength.is_retryable());
     }
 
     #[test]
@@ -710,7 +677,7 @@ mod retry_classification_tests {
         // bucket as `Reqwest`. `std::io::Error::other` is the public
         // constructor we use because the project denies `unwrap`.
         let err = CoreError::Io(std::io::Error::other("transient io"));
-        assert!(is_retryable(&err));
+        assert!(err.is_retryable());
     }
 
     #[test]
@@ -723,7 +690,7 @@ mod retry_classification_tests {
             index: 1,
             source: Box::new(inner),
         };
-        assert!(!is_retryable(&err));
+        assert!(!err.is_retryable());
     }
 
     // `JoinError` has no public constructor — we produce one by aborting a
@@ -759,7 +726,7 @@ mod retry_classification_tests {
             index: Some(7),
             source: join_err,
         };
-        assert!(!is_retryable(&err));
+        assert!(!err.is_retryable());
     }
 
     // Audit D8 / code-review I2 follow-up: the `#[error(...)]` format on

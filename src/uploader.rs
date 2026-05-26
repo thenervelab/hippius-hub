@@ -56,9 +56,57 @@ pub async fn hash_file_async(path: &Path) -> Result<(String, u64), CoreError> {
     .map_err(|join_err| CoreError::Io(std::io::Error::other(join_err)))?
 }
 
+/// Mirror of [`crate::chunked_downloader::MAX_RETRIES`] for the upload
+/// path. Audit U3 (Phase 3.11): the downloader retried per-chunk up to
+/// 3 times; the uploader did not retry at all, so a single transient
+/// 503 lost the whole upload. The two paths now share the same budget
+/// and the same [`CoreError::is_retryable`] classifier — see
+/// `try_upload_blob_once` for the per-attempt body.
+const UPLOAD_MAX_RETRIES: u32 = 3;
+
 /// Stream-upload a file to the OCI URL returned by /blobs/uploads/ (the PUT-with-digest finalises the blob).
 /// Shows a per-call progress bar — useful for large blobs (multi-GB).
+///
+/// Audit U3 (Phase 3.11): wraps [`try_upload_blob_once`] in an
+/// exponential-backoff retry loop with the same shape as
+/// [`crate::chunked_downloader::download_chunk_with_retry`]. Each
+/// attempt re-opens the file inside `try_upload_blob_once` (the
+/// previous `FramedRead` stream has been consumed), so the retry sees a
+/// fresh handle. Backoff schedule: 200, 400, 800, 1600 ms — four
+/// attempts total, ~3 s of backoff before surfacing a transient 5xx as
+/// terminal. A 4xx never burns backoff.
 pub async fn upload_blob_async(url: &str, path: &Path, auth_token: Option<&str>) -> Result<(), CoreError> {
+    let mut retries: u32 = 0;
+    loop {
+        match try_upload_blob_once(url, path, auth_token).await {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                retries += 1;
+                // Same shape as `download_chunk_with_retry`: classify on
+                // the error itself (borrow only, so `e` remains
+                // returnable), give up on permanent errors immediately,
+                // give up on transient errors after the budget is spent.
+                if !e.is_retryable() || retries > UPLOAD_MAX_RETRIES {
+                    return Err(e);
+                }
+                // `2u64.pow(retries) * 100` reproduces the downloader's
+                // 200/400/800/1600 ms schedule. `retries` is `u32` to
+                // match `UPLOAD_MAX_RETRIES`; `pow` widens to `u64` so
+                // the multiplication cannot overflow at this budget.
+                let wait_time = 2u64.pow(retries) * 100;
+                tokio::time::sleep(Duration::from_millis(wait_time)).await;
+            }
+        }
+    }
+}
+
+/// Single upload attempt. Extracted from `upload_blob_async` in audit
+/// U3 (Phase 3.11) so the surrounding retry loop has a unit to call
+/// repeatedly. Each call opens its own `File` handle, builds its own
+/// `FramedRead` stream, and sends one PUT — so the retry loop above
+/// gets a fresh body on every attempt (the previous `Body::wrap_stream`
+/// is consumed once the request future completes or errors).
+async fn try_upload_blob_once(url: &str, path: &Path, auth_token: Option<&str>) -> Result<(), CoreError> {
     // Force HTTP/1.1 for the same reason as the downloader: avoids h2 single-TCP
     // multiplexing, lets uploads spread across multiple connections if the caller
     // parallelizes.
@@ -137,6 +185,8 @@ pub async fn upload_blob_async(url: &str, path: &Path, auth_token: Option<&str>)
 
 #[cfg(test)]
 mod tests {
+    use super::CoreError;
+
     /// Source-grep guard. Setting `Content-Length` on a streaming PUT
     /// re-introduces the TOCTOU race fixed in audit U2: between
     /// `metadata().len()` and the actual `FramedRead` consumption the file
@@ -162,5 +212,30 @@ mod tests {
             "uploader.rs must NOT set the Content-Length header on the streaming PUT \
              — that creates a TOCTOU race vs the file's actual size at stream time"
         );
+    }
+
+    // Audit U3 (Phase 3.11): pin the retry classification at the
+    // upload-loop entry point. The downloader has the exhaustive 4xx /
+    // 5xx / boundary suite in
+    // `chunked_downloader::retry_classification_tests`; these two tests
+    // pin the property the upload loop depends on without re-litigating
+    // the downloader's coverage — the classifier is a method on
+    // `CoreError`, so the two paths share one source of truth.
+
+    #[test]
+    fn upload_retry_skips_4xx() {
+        // Verify that an HTTP 401 returned from the server is NOT retried —
+        // a 4xx is permanent, retrying just wastes time.
+        let err = CoreError::ServerError(401, "Unauthorized".into());
+        assert!(
+            !err.is_retryable(),
+            "4xx must not be retryable; otherwise upload_blob_async wastes 1.4s before failing"
+        );
+    }
+
+    #[test]
+    fn upload_retry_handles_5xx() {
+        let err = CoreError::ServerError(503, "Service Unavailable".into());
+        assert!(err.is_retryable());
     }
 }
