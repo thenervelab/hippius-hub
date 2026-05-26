@@ -3,6 +3,7 @@ import hashlib
 import json
 import threading
 import time
+import warnings
 from typing import Literal, Optional, Union
 import httpx
 from .constants import DEFAULT_CACHE_DIR, DEFAULT_HTTP_TIMEOUT, DEFAULT_REGISTRY_URL
@@ -34,16 +35,31 @@ def _token_cache_key(repo_id: str, push: bool, token) -> tuple:
 
 
 def _jwt_expiration(jwt_str: str):
-    """Return the `exp` claim (Unix ts) of a JWT, or None if it can't be parsed."""
+    """Return the `exp` claim (Unix ts) of a JWT, or None if it can't be parsed.
+
+    Surfaces parse failures via UserWarning rather than returning None silently
+    — a malformed JWT means the token will never be cached, which manifests as
+    a silent perf regression (every call re-fetches from the token endpoint).
+    """
     parts = jwt_str.split(".")
     if len(parts) != 3:
+        warnings.warn(
+            "JWT does not have 3 segments; cannot extract exp claim (token will not be cached)",
+            UserWarning,
+            stacklevel=2,
+        )
         return None
     payload_b64 = parts[1]
     padding = "=" * (-len(payload_b64) % 4)
     try:
         decoded = base64.urlsafe_b64decode(payload_b64 + padding)
         payload = json.loads(decoded)
-    except (ValueError, json.JSONDecodeError):
+    except (ValueError, json.JSONDecodeError) as e:
+        warnings.warn(
+            f"JWT payload parse failed ({e}); token will not be cached",
+            UserWarning,
+            stacklevel=2,
+        )
         return None
     return payload.get("exp")
 
