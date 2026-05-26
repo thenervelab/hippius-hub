@@ -88,20 +88,13 @@ fn hippius_core(_py: Python, m: &PyModule) -> PyResult<()> {
 
 #[cfg(test)]
 mod runtime_tests {
-    use std::time::Instant;
-
-    // The audit fix replaces N runtime constructions with one shared runtime.
-    // This test documents (rather than enforces) the per-call cost so future
-    // readers see the motivation. The fix's gain is the absence of the loop
-    // body in production code paths, not a tighter bound here.
     #[test]
-    fn shared_runtime_avoids_startup_cost() {
-        let start = Instant::now();
-        for _ in 0..10 {
-            let _rt = tokio::runtime::Runtime::new()
-                .expect("test runtime construction must succeed");
-        }
-        let elapsed = start.elapsed();
-        eprintln!("10x Runtime::new(): {:?}", elapsed);
+    fn shared_runtime_returns_same_instance() {
+        // The whole point of Task 1.4 is that OnceLock caches a single Runtime
+        // for the process lifetime. Pointer equality is the direct expression
+        // of that invariant — independent of timing, allocator, or load.
+        let a: &'static _ = super::shared_runtime();
+        let b: &'static _ = super::shared_runtime();
+        assert!(std::ptr::eq(a, b));
     }
 }
