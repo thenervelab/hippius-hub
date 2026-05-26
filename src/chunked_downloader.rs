@@ -55,6 +55,15 @@ pub enum DownloadError {
         index: usize,
         source: tokio::task::JoinError,
     },
+    // Audit D3: HEAD response lacked a parseable `Content-Length` header.
+    // Previously the missing-header path collapsed into `Ok(0)` via
+    // `unwrap_or(0)`, indistinguishable from a legitimate empty blob — so
+    // `download()` would truncate the destination to 0 bytes and return
+    // sha256 of empty. This variant separates "server says the blob is
+    // empty" (Ok(0) -> create_empty_file) from "server did not tell us the
+    // size" (this error). Unit variant: the failure IS the absence; there
+    // is no inspectable field a caller could use beyond the variant tag.
+    MissingContentLength,
 }
 
 impl From<reqwest::Error> for DownloadError {
@@ -215,11 +224,16 @@ impl ChunkedDownloader {
             return Err(DownloadError::ServerError(res.status().as_u16(), format!("Failed HEAD request: {:?}", res.status())));
         }
 
+        // Audit D3: a missing/unparseable Content-Length previously fell through
+        // to `unwrap_or(0)`, which `download()` then routed into `create_empty_file`
+        // — silently truncating the destination and returning sha256 of empty.
+        // We now surface a typed error; the empty-file path in `download()` is
+        // reached only when the server explicitly sent `Content-Length: 0`.
         let content_length = res.headers()
             .get(header::CONTENT_LENGTH)
             .and_then(|val| val.to_str().ok())
             .and_then(|val| val.parse::<u64>().ok())
-            .unwrap_or(0);
+            .ok_or(DownloadError::MissingContentLength)?;
 
         Ok(content_length)
     }
@@ -470,6 +484,19 @@ mod tests {
         };
         assert_eq!(index, 3);
         assert!(matches!(*source, DownloadError::ServerError(404, _)));
+    }
+
+    // Regression for audit D3: pin the variant shape so the missing-header
+    // path cannot silently revert to `Ok(0)`. The assertion is intentionally
+    // minimal — the contract here is "there is a distinct variant for this
+    // case", not "the variant carries field X". Phase 2.7 (D5 — retry
+    // classification) will decide whether this variant is retryable; Phase
+    // 3.8 will wire it through a thiserror-based hierarchy. Until then,
+    // `matches!` pins the shape.
+    #[test]
+    fn missing_content_length_is_a_distinct_error() {
+        let err = DownloadError::MissingContentLength;
+        assert!(matches!(err, DownloadError::MissingContentLength));
     }
 }
 
