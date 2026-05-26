@@ -51,13 +51,16 @@ def _format_download_error(e: Exception) -> tuple[str, int]:
 
     Ordering invariant: HF's typed exception hierarchy has three subclass
     relationships that matter here — LocalEntryNotFoundError <: Entry-
-    NotFoundError, GatedRepoError/DisabledRepoError <: RepositoryNotFound
-    Error <: HfHubHTTPError, and ConcurrentManifestUpdateError <:
-    HfHubHTTPError. The isinstance checks MUST run subclass-before-parent
-    or a cache miss would be reported as a missing-in-repo file (2), a
-    gated repo as 'not found' (3) instead of 'access denied' (6), and a
-    412 manifest collision as a generic HTTP error (8) instead of the
-    actionable concurrent-write code (7).
+    NotFoundError; GatedRepoError <: RepositoryNotFoundError <:
+    HfHubHTTPError, while DisabledRepoError <: HfHubHTTPError directly
+    (NOT via RepositoryNotFoundError — that asymmetry is pinned by
+    test_disabled_repo_is_not_subclass_of_repository_not_found); and
+    ConcurrentManifestUpdateError <: HfHubHTTPError. The isinstance
+    checks MUST run subclass-before-parent or a cache miss would be
+    reported as a missing-in-repo file (2), a gated repo as 'not found'
+    (3) instead of 'access denied' (6), and a 412 manifest collision as
+    a generic HTTP error (8) instead of the actionable concurrent-write
+    code (7).
     """
     from .errors import (
         ConcurrentManifestUpdateError,

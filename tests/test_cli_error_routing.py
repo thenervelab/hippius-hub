@@ -88,3 +88,16 @@ def test_concurrent_update_routes_to_7_before_generic_http():
     # Sanity: the error really is in the HfHubHTTPError hierarchy, so the
     # ordering matters — confirm it's not just a coincidence.
     assert isinstance(err, HfHubHTTPError)
+
+
+def test_disabled_repo_is_not_subclass_of_repository_not_found():
+    """Pin the asymmetry in HF's hierarchy: GatedRepoError subclasses
+    RepositoryNotFoundError, but DisabledRepoError subclasses HfHubHTTPError
+    directly. If HF ever harmonizes these, _format_download_error's ordering
+    rationale (in the docstring) needs to be revisited.
+    """
+    from hippius_hub.errors import (
+        DisabledRepoError, GatedRepoError, RepositoryNotFoundError,
+    )
+    assert issubclass(GatedRepoError, RepositoryNotFoundError)
+    assert not issubclass(DisabledRepoError, RepositoryNotFoundError)
