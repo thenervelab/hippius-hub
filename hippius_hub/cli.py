@@ -40,6 +40,65 @@ def _print_json(obj: Any):
     print(json.dumps(obj, indent=2, sort_keys=True, default=str))
 
 
+def _format_download_error(e: Exception) -> tuple[str, int]:
+    """Map a download/upload exception to (message, exit_code) for the CLI.
+
+    Distinct exit codes let CI scripts and wrappers branch on the failure
+    mode (retry on concurrent-write, prompt for auth on gated/disabled,
+    abort on bad-revision typo) instead of swallowing every error as
+    generic exit 1. Imports are kept local so the CLI startup path doesn't
+    pull in huggingface_hub.errors when no failure has occurred.
+
+    Ordering invariant: HF's typed exception hierarchy has three subclass
+    relationships that matter here — LocalEntryNotFoundError <: Entry-
+    NotFoundError, GatedRepoError/DisabledRepoError <: RepositoryNotFound
+    Error <: HfHubHTTPError, and ConcurrentManifestUpdateError <:
+    HfHubHTTPError. The isinstance checks MUST run subclass-before-parent
+    or a cache miss would be reported as a missing-in-repo file (2), a
+    gated repo as 'not found' (3) instead of 'access denied' (6), and a
+    412 manifest collision as a generic HTTP error (8) instead of the
+    actionable concurrent-write code (7).
+    """
+    from .errors import (
+        ConcurrentManifestUpdateError,
+        DisabledRepoError,
+        EntryNotFoundError,
+        GatedRepoError,
+        HfHubHTTPError,
+        LocalEntryNotFoundError,
+        RepositoryNotFoundError,
+        RevisionNotFoundError,
+    )
+    # Subclass-first: LocalEntryNotFoundError inherits from Entry-
+    # NotFoundError. Checking the parent first would route every cache
+    # miss to code 2 (file-not-found-in-repo) — wrong actionable hint.
+    if isinstance(e, LocalEntryNotFoundError):
+        return (f"❌ Local cache miss: {e}", 5)
+    if isinstance(e, EntryNotFoundError):
+        return (f"❌ File not found in repo: {e}", 2)
+    # Subclass-first: GatedRepoError and DisabledRepoError both inherit
+    # from RepositoryNotFoundError (auth-gated repos return 403, which HF
+    # models as a kind of "you can't see this repo"). Without this order,
+    # the RepositoryNotFoundError arm would swallow them.
+    if isinstance(e, (GatedRepoError, DisabledRepoError)):
+        return (f"❌ Access denied: {e}", 6)
+    if isinstance(e, RepositoryNotFoundError):
+        return (f"❌ Repository not found: {e}", 3)
+    if isinstance(e, RevisionNotFoundError):
+        return (f"❌ Revision not found: {e}", 4)
+    # ConcurrentManifestUpdateError subclasses HfHubHTTPError; it must be
+    # tested first so the actionable retry/serialize guidance survives.
+    if isinstance(e, ConcurrentManifestUpdateError):
+        return (
+            f"❌ Concurrent write detected: {e}. Another writer pushed "
+            f"to the same revision. Retry or serialize uploads externally.",
+            7,
+        )
+    if isinstance(e, HfHubHTTPError):
+        return (f"❌ Registry HTTP error: {e}", 8)
+    return (f"❌ Operation failed: {e}", 1)
+
+
 # ----- registry sub-commands -----
 
 def cmd_registry_plans(_args):
@@ -552,8 +611,9 @@ def main():
             )
             print(f"✅ File downloaded to: {path}")
         except Exception as e:
-            print(f"❌ Download failed: {e}")
-            sys.exit(1)
+            msg, code = _format_download_error(e)
+            print(msg)
+            sys.exit(code)
         return
 
     if args.command == "upload":
@@ -561,8 +621,9 @@ def main():
         try:
             hippius_hub_upload(repo_id=args.repo_id, local_path=args.local_path, revision=args.revision)
         except Exception as e:
-            print(f"❌ Upload failed: {e}")
-            sys.exit(1)
+            msg, code = _format_download_error(e)
+            print(msg)
+            sys.exit(code)
         return
 
     if args.command == "login":
