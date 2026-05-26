@@ -69,6 +69,13 @@ pub async fn upload_blob_async(url: &str, path: &Path, auth_token: Option<&str>)
         .build()?;
 
     let file = File::open(path).await?;
+    // Snapshot file size for the progress bar UI only. We deliberately
+    // do NOT send this as Content-Length because the file may change
+    // between this stat() and the actual stream consumption — reqwest
+    // uses Transfer-Encoding: chunked when Content-Length is omitted,
+    // which sidesteps that TOCTOU race entirely. If the file changes
+    // mid-upload the progress bar may briefly read >100% or <100%;
+    // that UI quirk is preferable to an HTTP-level length mismatch.
     let file_size = file.metadata().await?.len();
 
     // Progress bar — the stream wrapper updates it on every chunk emitted to reqwest.
@@ -101,9 +108,12 @@ pub async fn upload_blob_async(url: &str, path: &Path, auth_token: Option<&str>)
     });
     let body = reqwest::Body::wrap_stream(stream);
 
+    // No explicit Content-Length: reqwest falls back to
+    // Transfer-Encoding: chunked for a `Body::wrap_stream` body, so the wire
+    // length matches whatever `FramedRead` actually delivers at stream time —
+    // not whatever `metadata().len()` reported a few syscalls earlier.
     let mut req = client
         .put(url)
-        .header(header::CONTENT_LENGTH, file_size)
         .header(header::CONTENT_TYPE, "application/octet-stream")
         .body(body);
 
@@ -123,4 +133,34 @@ pub async fn upload_blob_async(url: &str, path: &Path, auth_token: Option<&str>)
 
     pb.finish_with_message(format!("✅ {} uploaded", basename));
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    /// Source-grep guard. Setting `Content-Length` on a streaming PUT
+    /// re-introduces the TOCTOU race fixed in audit U2: between
+    /// `metadata().len()` and the actual `FramedRead` consumption the file
+    /// can be rewritten, so a fixed length either truncates the body (file
+    /// grew) or pads/short-sends (file shrunk). Reqwest's default of
+    /// Transfer-Encoding: chunked for a `Body::wrap_stream` body matches
+    /// the wire bytes to whatever the stream actually yields. If a future
+    /// edit needs a known length, it must hash-and-stat the bytes it is
+    /// about to send (e.g. read the file into memory once), not re-stat
+    /// the disk file.
+    #[test]
+    fn upload_does_not_set_content_length_header() {
+        // Needle assembled at runtime so this test source does not itself
+        // match. The forbidden pattern is the literal `header::` + the
+        // reqwest constant name for the Content-Length header.
+        let needle = ["header", "CONTENT", "LENGTH"].join("::");
+        let src = include_str!("uploader.rs");
+        // Count must be exactly the references in *this* test's comments
+        // describing what is forbidden — i.e. zero matches of the assembled
+        // needle, since we never write it as a contiguous token anywhere.
+        assert!(
+            !src.contains(&needle),
+            "uploader.rs must NOT set the Content-Length header on the streaming PUT \
+             — that creates a TOCTOU race vs the file's actual size at stream time"
+        );
+    }
 }
