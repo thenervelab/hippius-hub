@@ -103,9 +103,14 @@ def resolve_token_value(token):
 def resolve_auth_header(token):
     """Same three-state input, but always returns a full Authorization header
     (`Bearer ...` / `Basic ...`) or None. Use for direct Harbor admin-API calls
-    which need a complete header string."""
+    which need a complete header string.
+
+    `resolve_token_value` now forwards `False` as the HF anonymous sentinel
+    (rather than collapsing to `None`), so we treat both `False` and `None`
+    as "no header" here — the admin-API behavior is unchanged.
+    """
     value = resolve_token_value(token)
-    if value is None:
+    if value is None or value is False:
         return None
     if value.startswith(("Basic ", "Bearer ")):
         return value
