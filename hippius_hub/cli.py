@@ -179,7 +179,7 @@ def cmd_registry_provision(args):
         elif e.status_code == 409:
             print(f"❌ {e.body}")
         elif e.status_code == 202:
-            print(f"⏳ Project is still being created. Poll `hippius-hub registry status`.")
+            print("⏳ Project is still being created. Poll `hippius-hub registry status`.")
         else:
             print(f"❌ {e}")
         sys.exit(1)
@@ -239,7 +239,7 @@ def cmd_registry_me(_args):
 
 def cmd_registry_rotate(args):
     res = console.rotate_robot()
-    print(f"✅ New docker secret issued.")
+    print("✅ New docker secret issued.")
     print(f"  Login:  {res['robot_login']}")
     print(f"  Secret: {res['robot_secret']}")
     me = console.me()
@@ -262,8 +262,8 @@ def cmd_registry_repos(args):
 def cmd_registry_artifacts(args):
     if "/" not in args.repo:
         print(f"❌ Repo must be '<project>/<repo>', got '{args.repo}'.")
-        print(f"   Example: hippius-hub registry artifacts myorg/my-models")
-        print(f"   (run `hippius-hub registry me` to see your project name)")
+        print("   Example: hippius-hub registry artifacts myorg/my-models")
+        print("   (run `hippius-hub registry me` to see your project name)")
         sys.exit(2)
     res = console.list_artifacts(args.repo, page=args.page, page_size=args.page_size)
     if not res:
@@ -441,7 +441,7 @@ def cmd_models_show(args):
         print(f"  Quant:    {res.get('quantization') or '—'}")
         print(f"  Size:     {_fmt_bytes(res.get('total_size_bytes'))}")
         print(f"  Digest:   {res.get('digest')}")
-        print(f"  Files:")
+        print("  Files:")
         for f in res.get("files", []):
             print(f"    {f['filename']:40} {f['format']:12} {_fmt_bytes(f['size_bytes'])}")
         print(f"\n  pull: {res.get('pull_command')}")
@@ -662,7 +662,7 @@ def _cmd_upload(args):
 def _cmd_login(args):
     if args.hippius_token:
         console.save_api_token(args.hippius_token)
-        print(f"✅ Hippius API token saved.")
+        print("✅ Hippius API token saved.")
         return
     username = args.username
     password = args.password

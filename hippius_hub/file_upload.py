@@ -469,7 +469,7 @@ def upload_folder(
     if revision is None:
         revision = "main"
     if commit_message is None:
-        commit_message = f"Upload folder using hippius_hub"
+        commit_message = "Upload folder using hippius_hub"
     if commit_description is None:
         commit_description = ""
 
