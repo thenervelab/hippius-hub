@@ -3,7 +3,6 @@ use pyo3::exceptions::PyRuntimeError;
 use std::error::Error as StdError;
 use std::fmt::Write as _;
 use std::path::PathBuf;
-use std::sync::OnceLock;
 
 mod error;
 pub use error::{CoreError, Result};
@@ -39,27 +38,26 @@ fn core_err_to_py(e: &CoreError) -> PyErr {
     PyRuntimeError::new_err(msg)
 }
 
-/// Process-global multi-threaded tokio runtime.
+/// Process-global multi-threaded tokio runtime, managed by `pyo3-async-runtimes`.
 ///
-/// Why a single shared runtime: each `tokio::runtime::Runtime::new()` spawns
-/// worker threads and registers epoll/kqueue handles, then tears them down on
-/// drop. For workloads like `snapshot_download` (which calls `hf_hub_download`
-/// once per file), that per-call cost dominates the actual I/O. One runtime
-/// reused for the lifetime of the Python process amortises it to zero.
+/// `pyo3_async_runtimes::tokio::get_runtime()` returns the library's canonical
+/// singleton — an `OnceCell<Pyo3Runtime>` initialized on first call with a
+/// multi-thread builder. By routing through it instead of our own `OnceLock`
+/// we gain free interop if a future `#[pyfunction]` ever calls
+/// `pyo3_async_runtimes::tokio::future_into_py`: that helper spawns onto the
+/// same runtime, so sync `block_on` callers and async `future_into_py`
+/// callers would share threads instead of fighting over two unrelated pools.
 ///
-/// Why `OnceLock` over `LazyLock`: identical thread-safety guarantees here, but
-/// `OnceLock` lets us keep `shared_runtime` as a plain function — easier to
-/// move to a fallible builder later (e.g. configurable worker count) without
-/// changing call sites.
+/// The library's `get_runtime` signature is `pub fn get_runtime<'a>() -> &'a
+/// Runtime` (verified at docs.rs/pyo3-async-runtimes/0.22.0 source line 197);
+/// the `'a` is free elision over the underlying `OnceCell` static, so
+/// coercion to `&'static` is sound — the storage outlives the process.
+///
+/// The previous manual `OnceLock` build with a custom `"hippius-core"` thread
+/// name was replaced here in audit STRUCT-1 (Phase 5.1). The thread name was
+/// cosmetic; we accepted the library's default in exchange for the interop.
 fn shared_runtime() -> &'static tokio::runtime::Runtime {
-    static RT: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
-    RT.get_or_init(|| {
-        tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .thread_name("hippius-core")
-            .build()
-            .expect("failed to build the shared tokio runtime — fatal at module init")
-    })
+    pyo3_async_runtimes::tokio::get_runtime()
 }
 
 /// Download a file from `url` to `dest_path` using the shared tokio runtime.
@@ -217,9 +215,13 @@ fn hippius_core(m: &Bound<'_, PyModule>) -> PyResult<()> {
 mod runtime_tests {
     #[test]
     fn shared_runtime_returns_same_instance() {
-        // The whole point of Task 1.4 is that OnceLock caches a single Runtime
-        // for the process lifetime. Pointer equality is the direct expression
-        // of that invariant — independent of timing, allocator, or load.
+        // The singleton invariant survived the STRUCT-1 (Phase 5.1)
+        // migration: the underlying storage moved from our local
+        // `OnceLock<Runtime>` to `pyo3_async_runtimes`'s
+        // `OnceCell<Pyo3Runtime>`, but pointer equality across two calls is
+        // still the direct expression of "one runtime per process" — and a
+        // regression test that would fire if the library ever broke that
+        // contract or we accidentally swapped in a non-singleton wrapper.
         let a: &'static _ = super::shared_runtime();
         let b: &'static _ = super::shared_runtime();
         assert!(std::ptr::eq(a, b));

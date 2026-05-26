@@ -12,6 +12,11 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 pyo3 = { version = "0.22", features = ["extension-module", "abi3", "abi3-py38"] }
+# Provides the canonical process-global tokio runtime (see `shared_runtime`
+# in src/lib.rs). Version 0.22.x is the line aligned with pyo3 0.22 — each
+# pyo3-async-runtimes release pins to a single pyo3 minor; mismatches surface
+# as "expected pyo3 X, found Y" type errors at compile time. Audit STRUCT-1.
+pyo3-async-runtimes = { version = "0.22", features = ["tokio-runtime"] }
 tokio = { version = "1.35", features = ["rt", "rt-multi-thread", "macros", "fs", "time"] }
 tokio-util = { version = "0.7", features = ["codec"] }
 reqwest = { version = "0.11", default-features = false, features = ["json", "stream", "rustls-tls"] }
