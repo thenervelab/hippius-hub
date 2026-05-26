@@ -196,8 +196,17 @@ fn upload_blob_native(
 }
 
 /// A Python module implemented in Rust.
+///
+/// pyo3 0.22 migration: the `#[pymodule]` signature now takes
+/// `&Bound<'_, PyModule>` instead of the legacy `(Python, &PyModule)`
+/// pair. `Bound<'py, T>` is the post-0.21 GIL-bound smart pointer; the
+/// `'py` lifetime ties every Python object the closure produces to the
+/// GIL acquisition, so the borrow checker enforces what 0.20's GIL Refs
+/// proved manually. `wrap_pyfunction!(f, m)` keeps the same call shape
+/// because the macro accepts both `Python<'_>` and `&Bound<PyModule>`
+/// (see the `WrapPyFunctionArg` impls in `pyo3::impl_::pyfunction`).
 #[pymodule]
-fn hippius_core(_py: Python, m: &PyModule) -> PyResult<()> {
+fn hippius_core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(download_file_native, m)?)?;
     m.add_function(wrap_pyfunction!(hash_file_native, m)?)?;
     m.add_function(wrap_pyfunction!(upload_blob_native, m)?)?;
