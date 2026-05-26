@@ -414,24 +414,47 @@ def _download_to_local_dir(blob_url, dest_file, oci_token):
     return dest_file
 
 
-def _create_symlink(src: str, dst: str):
-    """Create a symlink with silent fallback for Windows or restricted filesystems."""
+def _create_symlink(src: str, dst: str) -> None:
+    """Materialize the snapshot entry at `dst` pointing at the blob at `src`.
+
+    Prefers a symlink (cheapest, allows cross-volume cache); falls back to
+    a hardlink (same-volume only); falls back to a full copy (doubles disk
+    use). Each fallback emits a UserWarning so operators see when the cache
+    is more expensive than expected — Windows without developer mode,
+    sandboxed CI without symlink capability, and removable FAT/exFAT drives
+    are the common offenders.
+    """
     if os.path.exists(dst):
         os.remove(dst)
 
     os.makedirs(os.path.dirname(dst), exist_ok=True)
 
     try:
-        # Relative path from the snapshot directory to the blob
+        # Relative path from the snapshot directory to the blob so the cache
+        # remains portable if the cache root is moved (the link target stays
+        # valid as long as the relative layout is preserved).
         rel_src = os.path.relpath(src, os.path.dirname(dst))
         os.symlink(rel_src, dst)
-    except OSError:
-        # Fallback 1: Hardlink
-        try:
-            os.link(src, dst)
-        except OSError:
-            # Fallback 2: Full plain copy (silent)
-            shutil.copy2(src, dst)
+        return
+    except OSError as e:
+        warnings.warn(
+            f"symlink {src!r} -> {dst!r} failed ({e}); falling back to hardlink",
+            UserWarning,
+            stacklevel=2,
+        )
+
+    try:
+        os.link(src, dst)
+        return
+    except OSError as e:
+        warnings.warn(
+            f"hardlink {src!r} -> {dst!r} failed ({e}); falling back to full copy "
+            f"-- this doubles disk usage for the snapshot",
+            UserWarning,
+            stacklevel=2,
+        )
+
+    shutil.copy2(src, dst)
 
 
 def try_to_load_from_cache(
