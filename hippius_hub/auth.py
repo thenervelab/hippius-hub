@@ -2,6 +2,7 @@ import os
 import json
 import threading
 import time
+from typing import Union
 import httpx
 from .constants import DEFAULT_CACHE_DIR, DEFAULT_HTTP_TIMEOUT, DEFAULT_REGISTRY_URL
 from .errors import LocalTokenNotFoundError
@@ -85,9 +86,15 @@ def resolve_token_value(token):
     """Translate HF's three-state token argument (None/True=saved, False=no auth,
     str=use literal) into the raw token / pre-wrapped header value used downstream
     by `get_oci_bearer_token` (which accepts either form).
+
+    `False` is forwarded verbatim as the HF "anonymous; do not auto-discover"
+    sentinel — downstream callers (notably `get_oci_bearer_token`) distinguish
+    "no preference (None)" from "explicit no-auth (False)" and only the former
+    consults the docker-config fallback. Collapsing False to None here would
+    silently push under the user's docker credentials.
     """
     if token is False:
-        return None
+        return False  # propagate the anonymous sentinel
     if isinstance(token, str):
         return token
     return get_token()
@@ -152,13 +159,25 @@ def get_docker_auth(registry_url: str) -> str:
         pass
     return None
 
-def get_oci_bearer_token(repo_id: str, token: str = None, push: bool = False, use_cache: bool = True) -> str:
+def get_oci_bearer_token(
+    repo_id: str,
+    token: Union[str, bool, None] = None,
+    push: bool = False,
+    use_cache: bool = True,
+) -> str:
     """Fetch an OCI bearer token from the Hippius registry token endpoint.
 
     Per-`(repo_id, push, auth_input)` cache, with TTL parsed from the JWT's
     own `exp` claim minus a 30s leeway. Pass `use_cache=False` to bypass.
     Reduces token-service round-trips when callers chain multiple ops on
     the same repo (e.g. `repo_exists()` then `revision_exists()`).
+
+    `token` accepts the HF three-state convention: a string (use it directly),
+    `None` (no caller preference — try docker-config fallback), or `False`
+    (HF's anonymous sentinel — caller explicitly opted out of auth, so do not
+    consult any ambient credential source). The `False` case is load-bearing
+    for security: a caller asking for anonymous I/O must not be silently
+    elevated to the user's docker-stored creds.
     """
     cache_key = (repo_id, push, token)
     now = time.time()
@@ -175,19 +194,26 @@ def get_oci_bearer_token(repo_id: str, token: str = None, push: bool = False, us
     auth_url = f"{DEFAULT_REGISTRY_URL}/service/token?service=harbor-registry&scope={scope}"
     headers = {}
 
-    # 1. Prefer ~/.docker/config.json if present (Basic Auth)
-    if not token:
+    # `token is False` is the HF sentinel for "anonymous; do not auto-discover".
+    # We must distinguish it from `None` ("no preference"), because only the
+    # latter is allowed to fall back to ambient docker credentials.
+    no_auth = token is False
+    effective_token = None if no_auth else token
+
+    # 1. Prefer ~/.docker/config.json if present (Basic Auth), but only when the
+    #    caller hasn't explicitly opted out via token=False.
+    if not effective_token and not no_auth:
         docker_auth = get_docker_auth(DEFAULT_REGISTRY_URL)
         if docker_auth:
             headers["Authorization"] = f"Basic {docker_auth}"
 
     # 2. Fall back to the provided token (Bearer or Basic depending on registry config)
-    if not headers.get("Authorization") and token:
-        if token.startswith("Basic ") or token.startswith("Bearer "):
-            headers["Authorization"] = token
+    if not headers.get("Authorization") and effective_token:
+        if effective_token.startswith(("Basic ", "Bearer ")):
+            headers["Authorization"] = effective_token
         else:
             # Backward compatibility
-            headers["Authorization"] = f"Bearer {token}"
+            headers["Authorization"] = f"Bearer {effective_token}"
 
     resp = httpx.get(auth_url, headers=headers, timeout=DEFAULT_HTTP_TIMEOUT)
     resp.raise_for_status()
