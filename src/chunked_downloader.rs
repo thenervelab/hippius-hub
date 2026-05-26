@@ -86,9 +86,12 @@ impl ChunkedDownloader {
         }
 
         let pb = ProgressBar::new(content_length);
+        // The template string is a compile-time string literal — `indicatif` only
+        // returns `Err` here for malformed format directives, which we control.
+        #[expect(clippy::expect_used, reason = "infallible static template")]
         pb.set_style(ProgressStyle::default_bar()
             .template("{msg} {spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({bytes_per_sec}, {eta})")
-            .unwrap()
+            .expect("indicatif template is static and infallible")
             .progress_chars("#>-"));
         pb.set_message("📥 Downloading");
 
@@ -201,9 +204,11 @@ impl ChunkedDownloader {
         //    Much faster than the old assembly phase (no rewrite).
         if verify_hash {
             let pb_hash = ProgressBar::new(content_length);
+            // Same rationale as the download-phase bar above: static literal template.
+            #[expect(clippy::expect_used, reason = "infallible static template")]
             pb_hash.set_style(ProgressStyle::default_bar()
                 .template("{msg} {spinner:.green} [{elapsed_precise}] [{bar:40.magenta/red}] {bytes}/{total_bytes} ({bytes_per_sec}, {eta})")
-                .unwrap()
+                .expect("indicatif template is static and infallible")
                 .progress_chars("=>-"));
             pb_hash.set_message("🔐 Verifying SHA256");
 

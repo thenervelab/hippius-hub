@@ -73,12 +73,15 @@ pub async fn upload_blob_async(url: &str, path: &Path, auth_token: Option<&str>)
 
     // Progress bar — the stream wrapper updates it on every chunk emitted to reqwest.
     let pb = ProgressBar::new(file_size);
+    // The template string is a compile-time literal; `indicatif` only errors on
+    // malformed format directives, which we control at the call site.
+    #[expect(clippy::expect_used, reason = "infallible static template")]
     pb.set_style(
         ProgressStyle::default_bar()
             .template(
                 "{msg} {spinner:.green} [{elapsed_precise}] [{bar:40.green/blue}] {bytes}/{total_bytes} ({bytes_per_sec}, {eta})",
             )
-            .unwrap()
+            .expect("indicatif template is static and infallible")
             .progress_chars("#>-"),
     );
     let basename = path
