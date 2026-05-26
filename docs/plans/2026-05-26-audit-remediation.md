@@ -883,29 +883,55 @@ Closes: audit H2"
 
 **Step 1: Extract a helper**
 
-In `cli.py`, add:
+In `cli.py`, add the helper below. **Order matters — subclasses must be
+checked BEFORE their parents.** See `_format_download_error` docstring
+for the three subclass relationships involved (LocalEntryNotFoundError
+<: EntryNotFoundError; GatedRepoError <: RepositoryNotFoundError <:
+HfHubHTTPError; ConcurrentManifestUpdateError <: HfHubHTTPError).
+DisabledRepoError subclasses HfHubHTTPError DIRECTLY (not via
+RepositoryNotFoundError) — it's grouped with GatedRepoError in the
+isinstance tuple for the same user-facing "Access denied" message, but
+the inheritance asymmetry is real (pinned by
+`test_disabled_repo_is_not_subclass_of_repository_not_found`).
+
+Exit codes start at 10 (not 2) to avoid colliding with bash's reserved
+code 2 ("misuse of shell builtin") and argparse's default for usage
+errors — both already produced by cli.py at the parser layer.
 
 ```python
 def _format_download_error(e: Exception) -> tuple[str, int]:
     """Map a download/upload exception to (message, exit_code) for the CLI."""
     from .errors import (
-        EntryNotFoundError, RepositoryNotFoundError, RevisionNotFoundError,
-        LocalEntryNotFoundError, GatedRepoError, DisabledRepoError,
-        HfHubHTTPError,
+        ConcurrentManifestUpdateError,
+        DisabledRepoError, EntryNotFoundError, GatedRepoError,
+        HfHubHTTPError, LocalEntryNotFoundError,
+        RepositoryNotFoundError, RevisionNotFoundError,
     )
-    if isinstance(e, EntryNotFoundError):
-        return (f"❌ File not found in repo: {e}", 2)
-    if isinstance(e, RepositoryNotFoundError):
-        return (f"❌ Repository not found: {e}", 3)
-    if isinstance(e, RevisionNotFoundError):
-        return (f"❌ Revision not found: {e}", 4)
+    # Subclass-first: LocalEntryNotFoundError <: EntryNotFoundError.
     if isinstance(e, LocalEntryNotFoundError):
-        return (f"❌ Local cache miss: {e}", 5)
+        return (f"❌ Local cache miss: {e}", 13)
+    if isinstance(e, EntryNotFoundError):
+        return (f"❌ File not found in repo: {e}", 10)
+    # Subclass-first: GatedRepoError <: RepositoryNotFoundError.
+    # (DisabledRepoError is grouped here for the same user-facing
+    # message but does NOT subclass RepositoryNotFoundError.)
     if isinstance(e, (GatedRepoError, DisabledRepoError)):
-        return (f"❌ Access denied: {e}", 6)
+        return (f"❌ Access denied: {e}", 14)
+    if isinstance(e, RepositoryNotFoundError):
+        return (f"❌ Repository not found: {e}", 11)
+    if isinstance(e, RevisionNotFoundError):
+        return (f"❌ Revision not found: {e}", 12)
+    # ConcurrentManifestUpdateError <: HfHubHTTPError; route first so
+    # the actionable retry/serialize guidance survives.
+    if isinstance(e, ConcurrentManifestUpdateError):
+        return (
+            f"❌ Concurrent write detected: {e}. Another writer pushed "
+            f"to the same revision. Retry or serialize uploads externally.",
+            15,
+        )
     if isinstance(e, HfHubHTTPError):
-        return (f"❌ Registry HTTP error: {e}", 7)
-    return (f"❌ Download failed: {e}", 1)
+        return (f"❌ Registry HTTP error: {e}", 16)
+    return (f"❌ Operation failed: {e}", 1)
 ```
 
 **Step 2: Use it in the download and upload branches**
@@ -923,8 +949,8 @@ except Exception as e:
 
 ```python
 @pytest.mark.parametrize("exc,expected_code", [
-    (EntryNotFoundError("x"), 2),
-    (RepositoryNotFoundError("y"), 3),
+    (EntryNotFoundError("x"), 10),
+    (RepositoryNotFoundError("y"), 11),
     (Exception("opaque"), 1),
 ])
 def test_format_download_error_distinguishes_typed_errors(exc, expected_code):
