@@ -161,11 +161,14 @@ def get_docker_auth(registry_url: str) -> str:
         with open(docker_config, "r") as f:
             config = json.load(f)
 
-        host = registry_url.replace("https://", "").replace("http://", "")
+        host = registry_url.replace("https://", "").replace("http://", "").rstrip("/")
         auths = config.get("auths", {})
 
+        # Match on host, not substring — otherwise "registry.hippius.com" would
+        # match "registry.hippius.com.evil.example", a classic confused-deputy.
         for key, val in auths.items():
-            if host in key:
+            key_host = key.replace("https://", "").replace("http://", "").rstrip("/")
+            if key_host == host:
                 return val.get("auth")
     except Exception:
         pass
