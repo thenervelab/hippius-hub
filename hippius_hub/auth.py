@@ -2,7 +2,7 @@ import os
 import json
 import threading
 import time
-from typing import Literal, Union
+from typing import Literal, Optional, Union
 import httpx
 from .constants import DEFAULT_CACHE_DIR, DEFAULT_HTTP_TIMEOUT, DEFAULT_REGISTRY_URL
 from .errors import LocalTokenNotFoundError
@@ -151,27 +151,37 @@ def whoami(token=None, *, endpoint: str = None) -> dict:
     return harbor_whoami(auth_header, endpoint=endpoint)
 
 
-def get_docker_auth(registry_url: str) -> str:
-    """Extract base64 auth string from ~/.docker/config.json for the given registry"""
+def get_docker_auth(registry_url: str) -> Optional[str]:
+    """Extract base64 auth string from ~/.docker/config.json for the given registry.
+
+    Returns None when the config doesn't exist or doesn't have a matching entry.
+    Emits a UserWarning (and still returns None) when the file exists but
+    can't be read/parsed — that case often means the user thinks they're
+    logged in but isn't, and silently falling through to a 401 wastes
+    debugging time.
+    """
     docker_config = os.path.expanduser("~/.docker/config.json")
     if not os.path.exists(docker_config):
         return None
-
     try:
         with open(docker_config, "r") as f:
             config = json.load(f)
-
-        host = registry_url.replace("https://", "").replace("http://", "").rstrip("/")
-        auths = config.get("auths", {})
-
-        # Match on host, not substring — otherwise "registry.hippius.com" would
-        # match "registry.hippius.com.evil.example", a classic confused-deputy.
-        for key, val in auths.items():
-            key_host = key.replace("https://", "").replace("http://", "").rstrip("/")
-            if key_host == host:
-                return val.get("auth")
-    except Exception:
-        pass
+    except (OSError, json.JSONDecodeError) as e:
+        import warnings
+        warnings.warn(
+            f"docker config at {docker_config} is unreadable ({e}); "
+            "treating as no creds.",
+            UserWarning,
+            stacklevel=2,
+        )
+        return None
+    host = registry_url.replace("https://", "").replace("http://", "").rstrip("/")
+    # Match on host, not substring — otherwise "registry.hippius.com" would
+    # match "registry.hippius.com.evil.example", a classic confused-deputy.
+    for key, val in config.get("auths", {}).items():
+        key_host = key.replace("https://", "").replace("http://", "").rstrip("/")
+        if key_host == host:
+            return val.get("auth")
     return None
 
 def get_oci_bearer_token(

@@ -61,3 +61,36 @@ def test_trailing_slash_in_input_is_normalized(tmp_path, monkeypatch):
     monkeypatch.setattr("os.path.expanduser",
                         lambda p: str(cfg) if p.endswith("config.json") else p)
     assert get_docker_auth("https://registry.hippius.com/") == "REAL"
+
+
+def test_corrupted_json_warns_and_returns_none(tmp_path, monkeypatch):
+    """A broken docker config emits a warning instead of silently failing."""
+    import pytest
+    cfg = tmp_path / "config.json"
+    cfg.write_text("{not valid json")  # intentionally malformed
+    monkeypatch.setattr("os.path.expanduser",
+                        lambda p: str(cfg) if p.endswith("config.json") else p)
+    with pytest.warns(UserWarning, match="unreadable"):
+        result = get_docker_auth("https://registry.hippius.com")
+    assert result is None
+
+
+import os
+import pytest
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root bypasses permissions")
+def test_unreadable_file_warns(tmp_path, monkeypatch):
+    """A permission-denied (or otherwise unreadable) config emits a warning."""
+    import stat
+    cfg = tmp_path / "config.json"
+    cfg.write_text("{}")
+    os.chmod(cfg, 0)  # no read permission
+    monkeypatch.setattr("os.path.expanduser",
+                        lambda p: str(cfg) if p.endswith("config.json") else p)
+    try:
+        with pytest.warns(UserWarning, match="unreadable"):
+            result = get_docker_auth("https://registry.hippius.com")
+        assert result is None
+    finally:
+        os.chmod(cfg, 0o644)  # restore so pytest cleanup can remove it
