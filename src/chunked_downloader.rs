@@ -39,7 +39,22 @@ pub enum DownloadError {
     ReqwestError(reqwest::Error),
     IoError(std::io::Error),
     ServerError(u16, String),
-    ChunkFailed(usize),
+    // `Box<DownloadError>` is the canonical recursive-enum boxing pattern: without
+    // indirection, `DownloadError` containing itself would be infinite-sized. The
+    // boxed `source` carries the real cause of a chunk failure (HTTP error, I/O
+    // error, server status) so callers can see WHY chunk N failed, not just that
+    // it did. Earlier shape `ChunkFailed(usize)` discarded the cause.
+    ChunkFailed {
+        index: usize,
+        source: Box<DownloadError>,
+    },
+    // Distinct from `ChunkFailed`: `JoinError` reports tokio-task-level failure
+    // (panic in the spawned future, cancellation) — qualitatively different from
+    // a download-layer error. `JoinError` is foreign and sized, so no boxing.
+    JoinFailed {
+        index: usize,
+        source: tokio::task::JoinError,
+    },
 }
 
 impl From<reqwest::Error> for DownloadError {
@@ -143,10 +158,28 @@ impl ChunkedDownloader {
             })
         }).buffer_unordered(MAX_CONCURRENT_DOWNLOADS);
 
+        // Drain the bounded `buffer_unordered` stream. Exhaustive match preserves
+        // both the spawn-side (`JoinError`) and the download-layer cause: previously
+        // both collapsed into a bare `ChunkFailed(usize)`, hiding which chunk failed
+        // AND why. `usize::MAX` is the documented sentinel for "index unknown" —
+        // the chunk index lives inside the future's return, which `JoinError` did
+        // not preserve. Phase 3.8 will replace this enum with a thiserror-based
+        // hierarchy; the sentinel survives until then.
         while let Some(res) = stream.next().await {
-            let (i, chunk_res) = res.map_err(|_| DownloadError::ChunkFailed(0))?;
-            if let Err(_e) = chunk_res {
-                return Err(DownloadError::ChunkFailed(i));
+            match res {
+                Err(join_err) => {
+                    return Err(DownloadError::JoinFailed {
+                        index: usize::MAX,
+                        source: join_err,
+                    });
+                }
+                Ok((i, Err(chunk_err))) => {
+                    return Err(DownloadError::ChunkFailed {
+                        index: i,
+                        source: Box::new(chunk_err),
+                    });
+                }
+                Ok((_, Ok(()))) => continue,
             }
         }
 
@@ -388,5 +421,27 @@ mod tests {
     fn chunk_bounds_one_byte_file_one_chunk() {
         assert_eq!(num_chunks(1, 100), 1);
         assert_eq!(chunk_bounds(1, 100, 0), (0, 0));
+    }
+
+    // Regression for audit D1: previously `ChunkFailed(usize)` discarded the
+    // underlying cause, so a user saw "chunk 5 failed" with no clue whether
+    // it was 404, 500, connection reset, or disk-full. The reshaped variant
+    // carries the cause through `source: Box<DownloadError>`; this test pins
+    // the contract so a future refactor cannot silently re-flatten it.
+    // `let ... else { unreachable!() }` is used instead of `panic!(...)`
+    // because the project denies `panic` cluster-wide.
+    #[test]
+    fn chunk_failed_carries_cause() {
+        let inner = DownloadError::ServerError(404, "not found".into());
+        let outer = DownloadError::ChunkFailed {
+            index: 3,
+            source: Box::new(inner),
+        };
+
+        let DownloadError::ChunkFailed { index, source } = outer else {
+            unreachable!("constructed a ChunkFailed above; any other variant is a bug")
+        };
+        assert_eq!(index, 3);
+        assert!(matches!(*source, DownloadError::ServerError(404, _)));
     }
 }
