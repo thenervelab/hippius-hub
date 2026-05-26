@@ -15,7 +15,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-test = ["pytest>=7", "respx>=0.21"]
+test = ["pytest>=7", "respx>=0.21", "hypothesis>=6"]
 
 [project.scripts]
 hippius-hub = "hippius_hub.cli:main"
