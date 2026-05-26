@@ -128,11 +128,20 @@ def resolve_token_value(token):
     "no preference (None)" from "explicit no-auth (False)" and only the former
     consults the docker-config fallback. Collapsing False to None here would
     silently push under the user's docker credentials.
+
+    Internally parses through `_token.TokenInput` so the three semantic cases
+    are dispatched on a typed tagged union rather than scattered isinstance /
+    `is False` checks — the public contract (input shape + return values) is
+    unchanged.
     """
-    if token is False:
+    from ._token import from_hf, Anonymous, Literal
+
+    parsed = from_hf(token)
+    if isinstance(parsed, Anonymous):
         return False  # propagate the anonymous sentinel
-    if isinstance(token, str):
-        return token
+    if isinstance(parsed, Literal):
+        return parsed.value
+    # UseStored
     return get_token()
 
 
@@ -159,24 +168,32 @@ def whoami(token=None, *, endpoint: str = None) -> dict:
     `token` follows HF semantics: None/True use the saved token, False raises,
     a string is used directly (auto-wrapped as `Bearer <str>` if it isn't already
     a full `Basic ...` / `Bearer ...` header).
+
+    Dispatch goes through `_token.TokenInput` so each branch corresponds to a
+    distinct dataclass variant — `from_hf` rejects unsupported types at the
+    boundary, removing the trailing `else: raise TypeError` that used to live
+    inline here.
     """
     from ._harbor import harbor_whoami
+    from ._token import from_hf, Anonymous, UseStored, Literal
 
-    if token is False:
+    parsed = from_hf(token)
+    if isinstance(parsed, Anonymous):
         raise LocalTokenNotFoundError("token=False but whoami requires authentication")
-    if token is None or token is True:
+    if isinstance(parsed, UseStored):
         auth_header = get_token()
         if not auth_header:
             raise LocalTokenNotFoundError(
                 "No saved token found; run `hippius-hub login` first."
             )
-    elif isinstance(token, str):
-        if token.startswith(("Basic ", "Bearer ")):
-            auth_header = token
-        else:
-            auth_header = f"Bearer {token}"
     else:
-        raise TypeError(f"Unsupported token type: {type(token).__name__}")
+        # Literal — narrowed by from_hf; mypy/ty can prove this is the only
+        # remaining variant given Anonymous and UseStored are handled above.
+        assert isinstance(parsed, Literal)
+        if parsed.value.startswith(("Basic ", "Bearer ")):
+            auth_header = parsed.value
+        else:
+            auth_header = f"Bearer {parsed.value}"
     return harbor_whoami(auth_header, endpoint=endpoint)
 
 
