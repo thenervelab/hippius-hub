@@ -218,6 +218,7 @@ def model_info(
     endpoint: Optional[str] = None,
     **kwargs,
 ) -> ModelInfo:
+    """Return a ModelInfo for `repo_id` (delegates to `repo_info` with `repo_type='model'`)."""
     return repo_info(
         repo_id,
         revision=revision,
@@ -238,6 +239,7 @@ def list_repo_files(
     token: Union[bool, str, None] = None,
     endpoint: Optional[str] = None,
 ) -> List[str]:
+    """Return the list of in-repo filenames at `revision` (defaults to 'main')."""
     _validate_repo_type(repo_type)
     if revision is None:
         revision = "main"
@@ -272,6 +274,7 @@ def revision_exists(
     token: Union[bool, str, None] = None,
     endpoint: Optional[str] = None,
 ) -> bool:
+    """True iff a manifest exists at `repo_id:revision` (HEADs the manifest)."""
     _validate_repo_type(repo_type)
     oci_repo = _oci_repo_path(repo_id, repo_type)
     oci_token = get_oci_bearer_token(oci_repo, resolve_token_value(token), push=False)
@@ -288,6 +291,7 @@ def file_exists(
     token: Union[bool, str, None] = None,
     endpoint: Optional[str] = None,
 ) -> bool:
+    """True iff `filename` is present in `repo_id`'s manifest at `revision`."""
     _validate_repo_type(repo_type)
     if revision is None:
         revision = "main"

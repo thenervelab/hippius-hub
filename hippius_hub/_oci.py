@@ -31,10 +31,12 @@ class ManifestResult:
 
 
 def oci_headers(oci_token: str) -> dict:
+    """Build the OCI v2 Authorization + manifest Accept headers."""
     return {"Authorization": f"Bearer {oci_token}", "Accept": OCI_MANIFEST_ACCEPT}
 
 
 def manifest_url(registry: str, repo_id: str, revision: str) -> str:
+    """Build the OCI v2 manifest URL for `repo_id` at `revision`."""
     return f"{registry}/v2/{repo_id}/manifests/{revision}"
 
 
@@ -80,6 +82,7 @@ def head_manifest(
     revision: str,
     oci_token: str,
 ) -> httpx.Response:
+    """HEAD the OCI manifest for `repo_id:revision` (used for cheap existence checks)."""
     return httpx.head(
         manifest_url(registry, repo_id, revision),
         headers=oci_headers(oci_token),

@@ -1,3 +1,10 @@
+"""Token and credential plumbing for the OCI registry.
+
+Resolves HF's three-state `token` argument (None/True/False/str) into either
+a saved-on-disk token or a literal, caches short-lived OCI bearer tokens per
+(repo, scope) so each download/upload doesn't re-auth, and exposes the
+saved-token persistence used by `login` / `logout` / `whoami`.
+"""
 import os
 import hashlib
 import json

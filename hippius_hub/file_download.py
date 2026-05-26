@@ -1,3 +1,10 @@
+"""Single-file download path: `hf_hub_download` against the OCI registry.
+
+Resolves a (repo_id, filename, revision) tuple to the matching layer digest
+via the OCI manifest, then delegates the blob fetch to the Rust extension
+(`hippius_core`). Mirrors huggingface_hub's local cache layout so the same
+on-disk state is interchangeable.
+"""
 import os
 import shutil
 import tempfile

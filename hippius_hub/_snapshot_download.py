@@ -1,3 +1,10 @@
+"""Whole-revision download path: `snapshot_download`.
+
+Resolves the manifest once, applies `allow_patterns` / `ignore_patterns`,
+and fans the matching layers out to `hf_hub_download` via a
+ThreadPoolExecutor so a snapshot of a large repo doesn't serialise on the
+network.
+"""
 import os
 import warnings
 from concurrent.futures import ThreadPoolExecutor, as_completed

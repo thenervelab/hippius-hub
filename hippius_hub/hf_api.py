@@ -69,12 +69,15 @@ class HippiusApi(HfApi):
     # ---- Phase A ----
 
     def hf_hub_download(self, repo_id, filename, **kwargs):
+        """Download a single file from the Hippius OCI registry (delegates to `file_download.hf_hub_download`)."""
         return _hf_hub_download(repo_id, filename, **self._inject(kwargs))
 
     def snapshot_download(self, repo_id, **kwargs):
+        """Download every file in `repo_id` at a revision (delegates to `_snapshot_download.snapshot_download`)."""
         return _snapshot_download(repo_id, **self._inject(kwargs))
 
     def whoami(self, token=None):
+        """Return the authenticated user/robot identity from Harbor."""
         return _whoami_module(
             token=token if token is not None else self._explicit_token,
             endpoint=self.endpoint,
@@ -83,6 +86,7 @@ class HippiusApi(HfApi):
     # ---- Phase B uploads ----
 
     def upload_file(self, *, path_or_fileobj, path_in_repo, repo_id, **kwargs):
+        """Upload a single file into `repo_id` (delegates to `file_upload.upload_file`)."""
         return _upload_file(
             path_or_fileobj=path_or_fileobj,
             path_in_repo=path_in_repo,
@@ -91,6 +95,7 @@ class HippiusApi(HfApi):
         )
 
     def upload_folder(self, *, repo_id, folder_path, **kwargs):
+        """Upload every file under `folder_path` into `repo_id` (delegates to `file_upload.upload_folder`)."""
         return _upload_folder(
             repo_id=repo_id,
             folder_path=folder_path,
@@ -100,35 +105,45 @@ class HippiusApi(HfApi):
     # ---- Phase B repo CRUD + inspection ----
 
     def create_repo(self, repo_id, **kwargs):
+        """Ensure the Harbor project for `repo_id` exists (delegates to `_repo_ops.create_repo`)."""
         return _create_repo(repo_id, **self._inject(kwargs))
 
     def delete_repo(self, repo_id, **kwargs):
+        """Delete the Harbor repository for `repo_id` (delegates to `_repo_ops.delete_repo`)."""
         return _delete_repo(repo_id, **self._inject(kwargs))
 
     def repo_info(self, repo_id, **kwargs):
+        """Return a ModelInfo describing `repo_id` (delegates to `_repo_ops.repo_info`)."""
         return _repo_info(repo_id, **self._inject(kwargs))
 
     def model_info(self, repo_id, **kwargs):
+        """Return a ModelInfo for a model repo (delegates to `_repo_ops.model_info`)."""
         return _model_info(repo_id, **self._inject(kwargs))
 
     def list_repo_files(self, repo_id, **kwargs):
+        """Return the file list for `repo_id` at a revision (delegates to `_repo_ops.list_repo_files`)."""
         return _list_repo_files(repo_id, **self._inject(kwargs))
 
     def repo_exists(self, repo_id, **kwargs):
+        """True iff `repo_id` has at least one pushed tag (delegates to `_repo_ops.repo_exists`)."""
         return _repo_exists(repo_id, **self._inject(kwargs))
 
     def revision_exists(self, repo_id, revision, **kwargs):
+        """True iff `repo_id:revision` has a manifest (delegates to `_repo_ops.revision_exists`)."""
         return _revision_exists(repo_id, revision, **self._inject(kwargs))
 
     def file_exists(self, repo_id, filename, **kwargs):
+        """True iff `filename` is in `repo_id`'s manifest at a revision (delegates to `_repo_ops.file_exists`)."""
         return _file_exists(repo_id, filename, **self._inject(kwargs))
 
     # ---- Auth pass-throughs ----
 
     def login(self, *args, **kwargs):
+        """Persist credentials for subsequent registry calls (delegates to `auth.login`)."""
         return _login_module(*args, **kwargs)
 
     def logout(self, *args, **kwargs):
+        """Forget any persisted credentials (delegates to `auth.logout`)."""
         return _logout_module(*args, **kwargs)
 
 
@@ -149,6 +164,12 @@ def _stub_method(method_name: str):
         )
     stub.__name__ = method_name
     stub.__qualname__ = f"HippiusApi.{method_name}"
+    # Mirror the HfApi method's identity in the docstring so callers see at a
+    # glance that this is an intentional no-op rather than a missing attribute.
+    stub.__doc__ = (
+        f"Not supported by hippius_hub: HfApi.{method_name}() has no equivalent "
+        f"on the OCI-backed Hippius registry; calling raises NotImplementedError."
+    )
     return stub
 
 

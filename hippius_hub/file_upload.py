@@ -1,3 +1,10 @@
+"""Upload path: `upload_file` / `upload_folder` against the OCI registry.
+
+Hashes each file, pushes its blob via the Rust extension, then merges the
+layer list into the existing manifest and PUTs it with `If-Match` so a
+concurrent writer's manifest can't be silently clobbered. Folder uploads
+parallelise per-file via a ThreadPoolExecutor.
+"""
 import datetime
 import hashlib
 import os

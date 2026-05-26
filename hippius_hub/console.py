@@ -22,6 +22,8 @@ from .constants import API_TOKEN_PATH, DEFAULT_API_URL, DEFAULT_CACHE_DIR, DEFAU
 
 
 class ConsoleError(Exception):
+    """Non-2xx response from the Hippius backend API; carries the status code and decoded body."""
+
     def __init__(self, status_code: int, body: Any):
         self.status_code = status_code
         self.body = body

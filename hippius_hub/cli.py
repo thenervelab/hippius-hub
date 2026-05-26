@@ -1,3 +1,10 @@
+"""`hippius-hub` command-line entry point.
+
+Dispatches `download` / `upload` / `login` / `registry` / `models` subcommands
+to the module-level functions in `hippius_hub.*`. Maps exceptions raised by
+those functions to typed exit codes so CI wrappers can branch on the failure
+mode (see `_format_download_error`).
+"""
 import argparse
 import getpass
 import json
@@ -728,6 +735,7 @@ def _handle_console_error(e: ConsoleError) -> None:
 
 
 def main():
+    """Parse argv and dispatch to the matching `_cmd_*` handler."""
     parser = _build_parser()
     args = parser.parse_args()
     handlers = {
