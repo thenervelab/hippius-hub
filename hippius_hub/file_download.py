@@ -5,7 +5,15 @@ from typing import Dict, Optional, Union
 
 from ._oci import fetch_manifest, layer_title
 from .auth import get_oci_bearer_token, get_token, resolve_token_value
-from .constants import DEFAULT_CACHE_DIR, resolve_registry
+from .constants import (
+    DEFAULT_CACHE_DIR,
+    resolve_chunk_size,
+    resolve_connect_timeout,
+    resolve_max_concurrent,
+    resolve_read_timeout,
+    resolve_registry,
+    resolve_verify_hash,
+)
 from .errors import (
     EntryNotFoundError,
     LocalEntryNotFoundError,
@@ -19,22 +27,6 @@ except ImportError:
 
 
 _VALID_REPO_TYPES = (None, "model", "dataset", "space")
-_DEFAULT_CHUNK_SIZE = 100 * 1024 * 1024
-
-
-def _resolve_chunk_size() -> int:
-    raw = os.environ.get("HIPPIUS_CHUNK_SIZE")
-    if not raw:
-        return _DEFAULT_CHUNK_SIZE
-    size = int(raw)
-    if size <= 0:
-        raise ValueError(f"HIPPIUS_CHUNK_SIZE must be a positive integer, got {size}")
-    return size
-
-
-def _resolve_verify_hash() -> bool:
-    raw = os.environ.get("HIPPIUS_VERIFY_HASH", "").lower()
-    return raw in ("1", "true", "yes")
 
 
 def _validate_repo_type(repo_type: Optional[str]):
@@ -190,13 +182,16 @@ def _download_to_cache(blob_url, repo_dir, snapshots_dir, filename, oci_token, t
 
     # 2. Concurrent download via the Rust engine
     print(f"Downloading {filename} (parallel)...")
-    verify_hash = _resolve_verify_hash()
+    verify_hash = resolve_verify_hash()
     calculated_hash = download_file_native(
         url=blob_url,
         dest_path=temp_path,
         auth_token=oci_token,
-        chunk_size=_resolve_chunk_size(),
+        chunk_size=resolve_chunk_size(),
         verify_hash=verify_hash,
+        max_concurrent=resolve_max_concurrent(),
+        connect_timeout_secs=resolve_connect_timeout(),
+        read_timeout_secs=resolve_read_timeout(),
     )
 
     # If we skip hash verification, fall back to the digest from the OCI manifest
@@ -224,8 +219,11 @@ def _download_to_local_dir(blob_url, dest_file, oci_token):
         url=blob_url,
         dest_path=dest_file,
         auth_token=oci_token,
-        chunk_size=_resolve_chunk_size(),
-        verify_hash=_resolve_verify_hash(),
+        chunk_size=resolve_chunk_size(),
+        verify_hash=resolve_verify_hash(),
+        max_concurrent=resolve_max_concurrent(),
+        connect_timeout_secs=resolve_connect_timeout(),
+        read_timeout_secs=resolve_read_timeout(),
     )
     return dest_file
 

@@ -3,7 +3,7 @@ import json
 import threading
 import time
 import httpx
-from .constants import DEFAULT_CACHE_DIR, DEFAULT_REGISTRY_URL
+from .constants import DEFAULT_CACHE_DIR, DEFAULT_HTTP_TIMEOUT, DEFAULT_REGISTRY_URL
 from .errors import LocalTokenNotFoundError
 
 TOKEN_PATH = os.path.join(DEFAULT_CACHE_DIR, "token")
@@ -189,7 +189,7 @@ def get_oci_bearer_token(repo_id: str, token: str = None, push: bool = False, us
             # Backward compatibility
             headers["Authorization"] = f"Bearer {token}"
 
-    resp = httpx.get(auth_url, headers=headers)
+    resp = httpx.get(auth_url, headers=headers, timeout=DEFAULT_HTTP_TIMEOUT)
     resp.raise_for_status()
     fresh_token = resp.json().get("token")
 

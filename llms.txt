@@ -112,6 +112,7 @@ hippius-hub models formats                                       # available fil
 # --- raw byte ops (uses docker credentials, parallel Rust path) ---
 hippius-hub upload <project>/<repo> <local-path> [--revision <tag>]
 hippius-hub download <project>/<repo> <filename> [--revision <tag>] [--verify-hash] [--chunk-size <bytes>] [--cache-dir <path>]
+hippius-hub diagnose <project>/<repo> <filename> [--revision <tag>] [--probe-mb <n>] [--verbose] [--json]
 ```
 
 ## Create a namespace and a repo
@@ -281,8 +282,15 @@ Multiple parallel `upload_file` calls to the same `repo_id:revision` race on the
 
 - `HIPPIUS_CHUNK_SIZE` (default `104857600` = 100 MiB) — per-chunk size for the parallel Rust downloader
 - `HIPPIUS_VERIFY_HASH` (default off) — set to `1`/`true` to SHA256-verify downloads locally
+- `HIPPIUS_MAX_CONCURRENT` (default `32`) — parallel connections per file download
+- `HIPPIUS_CONNECT_TIMEOUT` (default `30`) — TCP connect timeout in seconds
+- `HIPPIUS_READ_TIMEOUT` (default unset) — opt-in per-chunk total request timeout in seconds
+- `HIPPIUS_SNAPSHOT_WORKERS` / `HIPPIUS_UPLOAD_WORKERS` (default `8`) — concurrent files in snapshot download / folder upload
+- `HIPPIUS_DEBUG` / `RUST_LOG` (default off) — verbose transport logging (per-chunk timings, retries)
 - `HIPPIUS_API_URL` (default `https://api.hippius.com`) — console API base for the `registry` + `models` CLI subtrees
 - `HIPPIUS_TEST_REPO` (default `test/e2e-client`) — only used by the e2e test suite
+
+Slow transfers? `hippius-hub diagnose <project>/<repo> <filename> [--verbose] [--json]` runs a phased probe (DNS/TCP/TLS handshake, auth + metadata timing, single-vs-parallel throughput) and prints a shareable verdict. Full runbook in `docs/diagnosing-speed.md`.
 
 The `endpoint=` kwarg on every function lets you point at an alternative Hippius registry programmatically.
 

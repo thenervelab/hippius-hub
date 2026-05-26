@@ -22,6 +22,7 @@ from hippius_hub import (
     delete_repo,
     file_exists,
     list_repo_files,
+    list_repo_refs,
     model_info,
     repo_exists,
     repo_info,
@@ -44,6 +45,7 @@ from tests._helpers import write_test_file
     "repo_info",
     "model_info",
     "list_repo_files",
+    "list_repo_refs",
     "repo_exists",
     "revision_exists",
     "file_exists",
@@ -97,7 +99,7 @@ def test_hippius_api_implements_phase_a_b_methods():
         "hf_hub_download", "snapshot_download", "whoami",
         "upload_file", "upload_folder",
         "create_repo", "delete_repo",
-        "repo_info", "model_info", "list_repo_files",
+        "repo_info", "model_info", "list_repo_files", "list_repo_refs",
         "repo_exists", "revision_exists", "file_exists",
         "login", "logout",
     ]:
@@ -193,6 +195,40 @@ def test_repo_info_alias_works(tmp_path, logged_in, test_repo, revision):
     upload_file(path_or_fileobj=str(src), path_in_repo="ri.bin", repo_id=test_repo, revision=revision)
     info = repo_info(test_repo, revision=revision)
     assert isinstance(info, ModelInfo)
+
+
+@pytest.mark.e2e
+def test_repo_info_last_modified_from_manifest(tmp_path, logged_in, test_repo, revision):
+    """lastModified/createdAt fall back to the manifest's upload timestamp."""
+    src = tmp_path / "ts.bin"
+    write_test_file(src, 64, seed=b"ts")
+    upload_file(path_or_fileobj=str(src), path_in_repo="ts.bin", repo_id=test_repo, revision=revision)
+    info = repo_info(test_repo, revision=revision)
+    assert info.lastModified is not None
+
+
+# ---------- list_repo_refs ----------
+
+@pytest.mark.e2e
+def test_list_repo_refs_includes_uploaded_revision(tmp_path, logged_in, test_repo, revision):
+    from huggingface_hub import GitRefs
+    src = tmp_path / "ref.bin"
+    write_test_file(src, 64, seed=b"ref")
+    upload_file(path_or_fileobj=str(src), path_in_repo="ref.bin", repo_id=test_repo, revision=revision)
+
+    refs = list_repo_refs(test_repo)
+    assert isinstance(refs, GitRefs)
+    names = [r.name for r in refs.branches] + [r.name for r in refs.tags]
+    assert revision in names
+    # `main` is reported as a branch; any other revision as a tag.
+    if revision == "main":
+        assert "main" in [r.name for r in refs.branches]
+
+
+@pytest.mark.e2e
+def test_list_repo_refs_unknown_repo_raises(logged_in):
+    with pytest.raises(RepositoryNotFoundError):
+        list_repo_refs("test/definitely-not-here-zzz")
 
 
 # ---------- upload_file ----------

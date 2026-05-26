@@ -14,7 +14,7 @@ from tqdm import tqdm
 
 from ._oci import fetch_manifest, layer_title
 from .auth import get_oci_bearer_token, get_token, resolve_token_value
-from .constants import DEFAULT_HTTP_TIMEOUT, LAYER_TITLE_KEY, resolve_registry
+from .constants import DEFAULT_HTTP_TIMEOUT, LAYER_TITLE_KEY, resolve_registry, resolve_upload_workers
 from .file_download import _oci_repo_path, _validate_repo_type
 
 try:
@@ -379,7 +379,7 @@ def upload_folder(
     new_layers = []
     if filtered:
         print(f"📦 Preparing to upload {len(filtered)} file(s) to {repo_id}:{revision}...")
-        with ThreadPoolExecutor(max_workers=8) as executor:
+        with ThreadPoolExecutor(max_workers=resolve_upload_workers()) as executor:
             futures = [executor.submit(_process, rel) for rel in filtered]
             for fut in tqdm(as_completed(futures), total=len(filtered), desc="Uploading", unit="file"):
                 new_layers.append(fut.result())

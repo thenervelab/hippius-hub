@@ -2,13 +2,15 @@ use futures::stream::{self, StreamExt};
 use reqwest::{header, Client};
 use sha2::{Digest, Sha256};
 use std::path::Path;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use indicatif::{ProgressBar, ProgressStyle};
 use tokio::fs::OpenOptions;
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt, SeekFrom, BufWriter};
+use tracing::{debug, warn};
 
 const DEFAULT_CHUNK_SIZE: u64 = 100 * 1024 * 1024; // 100 MB default
-const MAX_CONCURRENT_DOWNLOADS: usize = 32;
+const MAX_CONCURRENT_DOWNLOADS: usize = 32; // default; overridable via HIPPIUS_MAX_CONCURRENT
+const DEFAULT_CONNECT_TIMEOUT_SECS: u64 = 30;
 const MAX_RETRIES: u32 = 3;
 const VERIFY_READ_BUFFER: usize = 8 * 1024 * 1024; // 8 MB read buffer for SHA256 verification
 
@@ -59,27 +61,51 @@ pub struct ChunkedDownloader {
     url: String,
     auth_token: Option<String>,
     chunk_size: u64,
+    max_concurrent: usize,
 }
 
 impl ChunkedDownloader {
     /// Construct a new concurrent downloader.
-    pub fn new(url: String, auth_token: Option<String>, chunk_size_bytes: Option<u64>) -> Result<Self, DownloadError> {
+    ///
+    /// `max_concurrent`, `connect_timeout_secs`, and `read_timeout_secs` are
+    /// optional tuning knobs (surfaced to users via HIPPIUS_MAX_CONCURRENT /
+    /// HIPPIUS_CONNECT_TIMEOUT / HIPPIUS_READ_TIMEOUT). `read_timeout_secs` maps
+    /// to reqwest 0.11's *total* per-request timeout — each chunk is its own
+    /// request, so this bounds a single stalled chunk, not the whole file. It
+    /// is left unset by default so a legitimately slow large chunk isn't aborted.
+    pub fn new(
+        url: String,
+        auth_token: Option<String>,
+        chunk_size_bytes: Option<u64>,
+        max_concurrent: Option<usize>,
+        connect_timeout_secs: Option<u64>,
+        read_timeout_secs: Option<u64>,
+    ) -> Result<Self, DownloadError> {
+        let max_concurrent = max_concurrent.unwrap_or(MAX_CONCURRENT_DOWNLOADS);
+        let connect_timeout = connect_timeout_secs.unwrap_or(DEFAULT_CONNECT_TIMEOUT_SECS);
+
         // Force HTTP/1.1: with h2 reqwest multiplexes all chunks on a single TCP,
         // which caps aggregate throughput at the per-connection BBR ceiling (~150 MB/s
         // even on a fast edge). Forcing h1 makes each parallel chunk get its own TCP,
         // letting the kernel/qdisc fan out across the available bandwidth.
-        let client = Client::builder()
-            .connect_timeout(Duration::from_secs(30))
+        let mut builder = Client::builder()
+            .connect_timeout(Duration::from_secs(connect_timeout))
             .http1_only()
-            .pool_max_idle_per_host(MAX_CONCURRENT_DOWNLOADS)
-            .tcp_keepalive(Duration::from_secs(30))
-            .build()?;
+            .pool_max_idle_per_host(max_concurrent)
+            .tcp_keepalive(Duration::from_secs(30));
+
+        if let Some(secs) = read_timeout_secs {
+            builder = builder.timeout(Duration::from_secs(secs));
+        }
+
+        let client = builder.build()?;
 
         Ok(Self {
             client,
             url,
             auth_token,
             chunk_size: chunk_size_bytes.unwrap_or(DEFAULT_CHUNK_SIZE),
+            max_concurrent,
         })
     }
 
@@ -141,7 +167,7 @@ impl ChunkedDownloader {
                 let res = download_chunk_with_retry(client, url, token, start, end, i, path, chunk_pb).await;
                 (i, res)
             })
-        }).buffer_unordered(MAX_CONCURRENT_DOWNLOADS);
+        }).buffer_unordered(self.max_concurrent);
 
         while let Some(res) = stream.next().await {
             let (i, chunk_res) = res.map_err(|_| DownloadError::ChunkFailed(0))?;
@@ -233,21 +259,37 @@ async fn download_chunk_with_retry(
     token: Option<String>,
     start: u64,
     end: u64,
-    _chunk_index: usize,
+    chunk_index: usize,
     dest_path: std::path::PathBuf,
     pb: ProgressBar,
 ) -> Result<(), DownloadError> {
     let mut retries = 0;
+    let started = Instant::now();
 
     loop {
         match try_download_chunk_to_offset(&client, &url, &token, start, end, &dest_path, &pb).await {
-            Ok(_) => return Ok(()),
+            Ok(_) => {
+                // Per-chunk timing is the signal we use to spot a slow CDN POP or
+                // an ISP token-bucket policer (fast early chunks, slow late ones).
+                debug!(
+                    chunk = chunk_index,
+                    start,
+                    end,
+                    bytes = end - start + 1,
+                    elapsed_ms = started.elapsed().as_millis() as u64,
+                    retries,
+                    "chunk complete"
+                );
+                return Ok(());
+            }
             Err(e) => {
                 retries += 1;
                 if retries > MAX_RETRIES {
+                    warn!(chunk = chunk_index, start, end, retries, error = ?e, "chunk failed after retries");
                     return Err(e);
                 }
                 let wait_time = 2u64.pow(retries) * 100;
+                warn!(chunk = chunk_index, retries, wait_ms = wait_time, error = ?e, "chunk retry");
                 tokio::time::sleep(Duration::from_millis(wait_time)).await;
             }
         }

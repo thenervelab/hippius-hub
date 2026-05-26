@@ -8,7 +8,7 @@ shape (None/True=saved, False=no auth, str=use literal).
 from typing import List, Optional, Union
 
 import httpx
-from huggingface_hub import ModelInfo, RepoUrl
+from huggingface_hub import GitRefInfo, GitRefs, ModelInfo, RepoUrl
 from huggingface_hub.hf_api import RepoSibling
 
 from ._harbor import (
@@ -52,6 +52,30 @@ def _list_tags(registry: str, repo_id: str, oci_token: str) -> Optional[list]:
         return None
     resp.raise_for_status()
     return resp.json().get("tags") or []
+
+
+def _manifest_digest(registry: str, repo_id: str, revision: str, oci_token: str) -> Optional[str]:
+    """Return the content digest of a revision's manifest, or None if unreachable.
+
+    Used as the commit-like identifier for a revision. A cheap HEAD suffices —
+    the digest comes back in the Docker-Content-Digest response header.
+    """
+    head = head_manifest(registry, repo_id, revision, oci_token)
+    if head.status_code != 200:
+        return None
+    return head.headers.get("Docker-Content-Digest")
+
+
+def _revision_created(registry: str, repo_id: str, revision: str, oci_token: str) -> Optional[str]:
+    """Return a revision's upload timestamp (ISO8601), or None if absent.
+
+    Read from the manifest's org.opencontainers.image.created annotation, which
+    uploads via this tool stamp. Revisions pushed by other tooling may lack it.
+    """
+    manifest = fetch_manifest(registry, repo_id, revision, oci_token, missing_ok=True)
+    if manifest is None:
+        return None
+    return manifest.get("annotations", {}).get("org.opencontainers.image.created")
 
 
 # ---- repo CRUD ----
@@ -183,6 +207,11 @@ def repo_info(
     if isinstance(harbor_repo, dict):
         last_modified = last_modified or harbor_repo.get("update_time")
         created_at = harbor_repo.get("creation_time")
+    # Fallback to the manifest's upload timestamp when Harbor admin data is
+    # unavailable (e.g. pull-only robot accounts get FORBIDDEN above).
+    manifest_created = manifest.get("annotations", {}).get("org.opencontainers.image.created")
+    last_modified = last_modified or manifest_created
+    created_at = created_at or manifest_created
     if isinstance(harbor_project, dict):
         private = not bool(harbor_project.get("metadata", {}).get("public", False))
     else:
@@ -244,6 +273,45 @@ def list_repo_files(
     oci_token = get_oci_bearer_token(oci_repo, resolve_token_value(token), push=False)
     manifest = fetch_manifest(resolve_registry(endpoint), oci_repo, revision, oci_token)
     return layer_titles(manifest)
+
+
+def list_repo_refs(
+    repo_id: str,
+    *,
+    repo_type: Optional[str] = None,
+    include_pull_requests: bool = False,
+    token: Union[bool, str, None] = None,
+    endpoint: Optional[str] = None,
+) -> GitRefs:
+    """List a repository's revisions as a HF-compatible GitRefs.
+
+    Each revision (an OCI manifest tag) maps to a GitRefInfo. The revision named
+    `main` — the mutable default that uploads re-point — is reported under
+    `branches`; every other revision behaves like a release and is reported under
+    `tags`. `target_commit` is the revision's manifest digest, resolved
+    best-effort (None if a single revision can't be reached).
+
+    `include_pull_requests` is accepted for HF signature parity but has no effect:
+    the Hippius registry has no pull-request refs.
+    """
+    _validate_repo_type(repo_type)
+    oci_repo = _oci_repo_path(repo_id, repo_type)
+    registry = resolve_registry(endpoint)
+    oci_token = get_oci_bearer_token(oci_repo, resolve_token_value(token), push=False)
+    tags = _list_tags(registry, oci_repo, oci_token)
+    if tags is None:
+        raise RepositoryNotFoundError(f"Repository {repo_id!r} not found")
+
+    branches = []
+    tag_refs = []
+    for tag in tags:
+        digest = _manifest_digest(registry, oci_repo, tag, oci_token)
+        if tag == "main":
+            branches.append(GitRefInfo(name=tag, ref="refs/heads/main", target_commit=digest))
+        else:
+            tag_refs.append(GitRefInfo(name=tag, ref=f"refs/tags/{tag}", target_commit=digest))
+
+    return GitRefs(branches=branches, converts=[], tags=tag_refs)
 
 
 def repo_exists(

@@ -183,9 +183,14 @@ hippius-hub download myorg/qwen-7b model-00001-of-00003.safetensors
 # Specific revision (= OCI tag)
 hippius-hub download myorg/qwen-7b config.json --revision v1
 
+# List a repo's revisions, newest first (the newest is marked "(latest)")
+hippius-hub revisions myorg/qwen-7b
+
 # Verify the SHA256 of the bytes after download
 hippius-hub download myorg/qwen-7b model.safetensors --verify-hash
 ```
+
+Omitting `--revision` downloads `main`, which always points to the most recently uploaded content (uploads default to `main` too) — so the default already gives you the latest, just like `huggingface_hub`. Use `hippius-hub revisions <repo>` to discover the available revisions and which one is newest.
 
 For pulling **every file in a revision**, prefer the Python `snapshot_download` API below — it parallelizes across files and matches the HF cache layout that `transformers` / `diffusers` expect.
 
@@ -258,7 +263,7 @@ upload_folder(
 ```python
 from hippius_hub import (
     create_repo, delete_repo,
-    repo_info, model_info, list_repo_files,
+    repo_info, model_info, list_repo_files, list_repo_refs,
     repo_exists, revision_exists, file_exists,
 )
 
@@ -266,6 +271,11 @@ create_repo("myorg/my-model", exist_ok=True)
 print(list_repo_files("myorg/my-model", revision="main"))
 info = model_info("myorg/my-model", revision="main")
 print(info.id, info.sha, [s.rfilename for s in info.siblings])
+
+# Discover available revisions (HF-compatible GitRefs).
+refs = list_repo_refs("myorg/my-model")
+print([b.name for b in refs.branches])  # ['main']
+print([t.name for t in refs.tags])      # ['v1', 'v1.2', ...]
 ```
 
 ## Object-oriented API: `HippiusApi`
@@ -303,10 +313,28 @@ Existing code that catches HF's exceptions keeps working.
 |---|---|---|
 | `HIPPIUS_CHUNK_SIZE` | `104857600` (100 MiB) | Per-chunk size for the parallel Rust downloader |
 | `HIPPIUS_VERIFY_HASH` | unset (off) | Set to `1`/`true` to SHA256-verify downloads locally |
+| `HIPPIUS_MAX_CONCURRENT` | `32` | Parallel connections per file download |
+| `HIPPIUS_CONNECT_TIMEOUT` | `30` | TCP connect timeout (seconds) |
+| `HIPPIUS_READ_TIMEOUT` | unset | Opt-in per-chunk total request timeout (seconds) |
+| `HIPPIUS_SNAPSHOT_WORKERS` | `8` | Concurrent files in `snapshot_download` |
+| `HIPPIUS_UPLOAD_WORKERS` | `8` | Concurrent files in a folder upload |
+| `HIPPIUS_DEBUG` / `RUST_LOG` | off | Verbose transport logging (per-chunk timings, retries) |
 | `HIPPIUS_API_URL` | `https://api.hippius.com` | Console API base used by the `registry` + `models` CLI subtrees |
 | `HIPPIUS_TEST_REPO` | `test/e2e-client` | Override the test repo used by the e2e suite |
 
 Programmatic overrides via the `endpoint=` kwarg on any function let you point at an alternative Hippius registry.
+
+### Diagnosing slow transfers
+
+If downloads/uploads are slow for some users but not others, run the built-in probe and share the report:
+
+```bash
+hippius-hub diagnose <repo_id> <filename>            # phased report + plain-English verdict
+hippius-hub diagnose <repo_id> <filename> --verbose  # add per-chunk transport logs
+hippius-hub diagnose <repo_id> <filename> --json     # machine-readable
+```
+
+It measures the endpoint handshake (DNS/TCP/TLS), the auth + metadata round-trips, and — the key signal — single-connection vs parallel-connection throughput, then tells you whether a slow link is being mitigated by parallelism or is bottlenecked elsewhere. See [`docs/diagnosing-speed.md`](docs/diagnosing-speed.md) for the full triage runbook.
 
 ## What's not supported
 
@@ -317,7 +345,7 @@ Programmatic overrides via the `endpoint=` kwarg on any function let you point a
 - Webhooks
 - Collections
 - Discussions / PRs
-- HF-typed git refs like `refs/pr/3` — only OCI tags are supported as revisions
+- HF-typed git refs like `refs/pr/3` — only OCI tags are supported as revisions. `list_repo_refs` reports the `main` revision under `branches` and every other revision under `tags`, with each `target_commit` set to the revision's manifest digest (resolved best-effort).
 
 Also known semantic divergences:
 
