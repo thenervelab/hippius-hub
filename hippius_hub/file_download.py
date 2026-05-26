@@ -1,6 +1,7 @@
 import os
 import shutil
 import warnings
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Optional, Union
 
@@ -130,6 +131,89 @@ def _cache_dirname(repo_id: str, repo_type: Optional[str]) -> str:
     return f"{prefix}--{repo_id.replace('/', '--')}"
 
 
+@dataclass(frozen=True)
+class _DownloadPaths:
+    """Cache-layout-resolved paths for a single file in hf_hub_download.
+
+    `dest_file` is the final on-disk path of the downloaded file. When
+    `local_dir` is set, only `dest_file` is meaningful (snapshots/repo_dir
+    are not used). Otherwise the snapshots layout is populated for the
+    cache.
+    """
+
+    dest_file: str
+    # The next two are None when local_dir is set (we don't use cache layout).
+    repo_dir: Optional[str]
+    snapshots_dir: Optional[str]
+
+
+def _resolve_dest_paths(
+    *,
+    repo_id: str,
+    filename: str,
+    repo_type: Optional[str],
+    revision: str,
+    cache_dir: str,
+    local_dir: Optional[Union[str, Path]],
+) -> _DownloadPaths:
+    """Compute where this file lands on disk given (local_dir vs cache_dir)."""
+    if local_dir is not None:
+        return _DownloadPaths(
+            dest_file=os.path.join(str(local_dir), filename),
+            repo_dir=None,
+            snapshots_dir=None,
+        )
+    repo_dir = os.path.join(cache_dir, _cache_dirname(repo_id, repo_type))
+    snapshots_dir = os.path.join(repo_dir, "snapshots", revision)
+    dest_file = os.path.join(snapshots_dir, filename)
+    return _DownloadPaths(
+        dest_file=dest_file, repo_dir=repo_dir, snapshots_dir=snapshots_dir
+    )
+
+
+def _resolve_target_digest(
+    manifest: Dict,
+    filename: str,
+    repo_id: str,
+    revision: str,
+) -> str:
+    """Find the layer whose title matches `filename` and return its digest.
+
+    Raises EntryNotFoundError if no layer matches OR if a matching layer has
+    no digest — preserves the exact behavior of the inline `if not target_digest`
+    fall-through that previously lived in hf_hub_download (both the "no match"
+    and "matched but digest is falsy" cases produced the same error message).
+    """
+    for layer in manifest.get("layers", []):
+        if layer_title(layer) == filename:
+            digest = layer.get("digest")
+            if digest:
+                return digest
+            break
+    raise EntryNotFoundError(
+        f"File '{filename}' not found in the OCI manifest of '{repo_id}:{revision}'"
+    )
+
+
+def _resolve_manifest(
+    *,
+    registry: str,
+    oci_repo: str,
+    revision: str,
+    oci_token: str,
+    cached: Optional[Dict],
+) -> Dict:
+    """Return the caller-provided manifest, or fetch it from the registry.
+
+    `cached` is the `_resolved_manifest` kwarg of hf_hub_download — populated
+    by snapshot_download to avoid N+1 manifest round-trips when downloading
+    many files from the same repo:revision. Read path only: no If-Match.
+    """
+    if cached is not None:
+        return cached
+    return fetch_manifest(registry, oci_repo, revision, oci_token).manifest
+
+
 def hf_hub_download(
     repo_id: str,
     filename: str,
@@ -189,18 +273,17 @@ def hf_hub_download(
         filename = f"{subfolder}/{filename}"
 
     oci_repo = _oci_repo_path(repo_id, repo_type)
-
-    if local_dir is not None:
-        dest_file = os.path.join(str(local_dir), filename)
-    else:
-        repo_dir = os.path.join(cache_dir, _cache_dirname(repo_id, repo_type))
-        snapshots_dir = os.path.join(repo_dir, "snapshots", revision)
-        dest_file = os.path.join(snapshots_dir, filename)
-
+    paths = _resolve_dest_paths(
+        repo_id=repo_id,
+        filename=filename,
+        repo_type=repo_type,
+        revision=revision,
+        cache_dir=cache_dir,
+        local_dir=local_dir,
+    )
     # 1. Cache check: never redownload an existing file
-    if not force_download and os.path.exists(dest_file):
-        return dest_file
-
+    if not force_download and os.path.exists(paths.dest_file):
+        return paths.dest_file
     if local_files_only:
         raise LocalEntryNotFoundError(
             f"{filename!r} not found in local cache (cache_dir={cache_dir!r}) "
@@ -209,46 +292,32 @@ def hf_hub_download(
 
     registry = resolve_registry(endpoint)
     auth_token = resolve_token_value(token)
-    # _oci_token + _resolved_manifest are internal kwargs used by
-    # snapshot_download to avoid N+1 token/manifest round-trips when
-    # downloading many files from the same repo:revision.
+    # _oci_token / _resolved_manifest let snapshot_download avoid N+1 round-trips.
     oci_token = _oci_token or get_oci_bearer_token(oci_repo, auth_token)
-
-    if _resolved_manifest is not None:
-        manifest = _resolved_manifest
-    else:
-        # Fetch the OCI manifest to find the file's exact digest. Read path:
-        # we only need the body, not the digest — there's no PUT to thread
-        # If-Match into here.
-        manifest = fetch_manifest(registry, oci_repo, revision, oci_token).manifest
-
-    target_digest = None
-    for layer in manifest.get("layers", []):
-        if layer_title(layer) == filename:
-            target_digest = layer.get("digest")
-            break
-
-    if not target_digest:
-        raise EntryNotFoundError(
-            f"File '{filename}' not found in the OCI manifest of '{repo_id}:{revision}'"
-        )
-
+    manifest = _resolve_manifest(
+        registry=registry,
+        oci_repo=oci_repo,
+        revision=revision,
+        oci_token=oci_token,
+        cached=_resolved_manifest,
+    )
+    target_digest = _resolve_target_digest(manifest, filename, repo_id, revision)
     blob_url = f"{registry}/v2/{oci_repo}/blobs/{target_digest}"
-
     if local_dir is not None:
-        return _download_to_local_dir(blob_url, dest_file, oci_token)
-
+        return _download_to_local_dir(blob_url, paths.dest_file, oci_token)
     return _download_to_cache(
         blob_url=blob_url,
-        repo_dir=repo_dir,
-        snapshots_dir=snapshots_dir,
+        repo_dir=paths.repo_dir,
+        snapshots_dir=paths.snapshots_dir,
         filename=filename,
         oci_token=oci_token,
         target_digest=target_digest,
     )
 
 
-def _download_to_cache(blob_url, repo_dir, snapshots_dir, filename, oci_token, target_digest):
+def _download_to_cache(
+    blob_url, repo_dir, snapshots_dir, filename, oci_token, target_digest
+):
     """Cache-structured download mirroring huggingface_hub's layout."""
     # Cache layout modeled on huggingface_hub
     blobs_dir = os.path.join(repo_dir, "blobs")
@@ -270,7 +339,9 @@ def _download_to_cache(blob_url, repo_dir, snapshots_dir, filename, oci_token, t
     )
 
     # If we skip hash verification, fall back to the digest from the OCI manifest
-    final_hash = calculated_hash if verify_hash else target_digest.replace("sha256:", "")
+    final_hash = (
+        calculated_hash if verify_hash else target_digest.replace("sha256:", "")
+    )
 
     # 3. Atomic rename of the temp file into the SHA256 blob
     blob_path = os.path.join(blobs_dir, f"sha256:{final_hash}")
