@@ -90,6 +90,34 @@ def _ensure_config_blob_uploaded(registry: str, repo_id: str, oci_token: str) ->
     return digest, size
 
 
+def _prev_digest_or_warn(existing, repo_id: str, revision: str) -> Optional[str]:
+    """Return the prior manifest's digest for If-Match, or None with a warning.
+
+    If `existing` is None (fresh repo / 404 fetch), return None silently —
+    there is no prior writer to race. If `existing.digest` is None (the
+    registry honored the fetch but omitted Docker-Content-Digest), warn
+    loudly: the next PUT will proceed without optimistic-concurrency
+    protection, regressing this revision to last-writer-wins. Per OCI
+    Distribution Spec §4.4.1, Docker-Content-Digest is RECOMMENDED but not
+    REQUIRED on manifest responses, so some registries / stripping proxies
+    legitimately omit it; we still want operators to see when they are
+    running unprotected — silent regression is the failure mode the audit
+    H1 fix was meant to close.
+    """
+    if existing is None:
+        return None
+    if existing.digest is None:
+        warnings.warn(
+            f"manifest fetch for {repo_id}:{revision} returned no "
+            f"Docker-Content-Digest header; PUT will proceed without If-Match "
+            f"and concurrent writers may silently overwrite each other",
+            UserWarning,
+            stacklevel=3,
+        )
+        return None
+    return existing.digest
+
+
 def _put_manifest(
     registry: str,
     repo_id: str,
@@ -305,7 +333,7 @@ def upload_file(
 
     existing = fetch_manifest(registry, oci_repo, revision, oci_token, missing_ok=True)
     existing_layers = existing.manifest.get("layers", []) if existing else []
-    prev_digest = existing.digest if existing else None
+    prev_digest = _prev_digest_or_warn(existing, repo_id, revision)
     merged_layers = _merge_layers(existing_layers, [new_layer])
 
     config_digest, config_size = _ensure_config_blob_uploaded(registry, oci_repo, oci_token)
@@ -415,7 +443,7 @@ def upload_folder(
     # between this GET and our PUT.
     existing = fetch_manifest(registry, oci_repo, revision, oci_token, missing_ok=True)
     existing_layers = existing.manifest.get("layers", []) if existing else []
-    prev_digest = existing.digest if existing else None
+    prev_digest = _prev_digest_or_warn(existing, repo_id, revision)
 
     delete_titles = set()
     if delete_patterns:

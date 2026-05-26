@@ -7,7 +7,7 @@ so the registry returns 412 Precondition Failed when a concurrent writer
 has already advanced the revision.
 
 These tests mock the OCI registry with respx — no real network is hit. They
-cover three cases:
+cover four cases:
 
   1. When the manifest existed (fetch returned a digest), the next PUT MUST
      carry `If-Match: <that-digest>`.
@@ -15,6 +15,11 @@ cover three cases:
      `ConcurrentManifestUpdateError` (not a generic HTTPStatusError).
   3. When there is no prior manifest (fresh repo, 404 fetch), the PUT MUST
      NOT carry an If-Match header — there's nothing to be optimistic about.
+  4. When the manifest fetch succeeded but the registry omitted the
+     `Docker-Content-Digest` response header (RECOMMENDED-but-not-REQUIRED
+     per OCI Distribution Spec §4.4.1), the PUT MUST proceed without
+     If-Match AND the call MUST emit a UserWarning so operators see that
+     this revision was written without optimistic-concurrency protection.
 """
 from __future__ import annotations
 
@@ -208,5 +213,58 @@ def test_no_if_match_when_no_prior_manifest(tmp_path):
     sent_headers = put_route.calls.last.request.headers
     assert "If-Match" not in sent_headers, (
         f"fresh-repo PUT must not carry If-Match, "
+        f"got If-Match={sent_headers.get('If-Match')!r}"
+    )
+
+
+@respx.mock
+def test_warns_when_prior_manifest_lacks_docker_content_digest(tmp_path):
+    """Registry honored the fetch but omitted Docker-Content-Digest.
+
+    OCI Distribution Spec §4.4.1 marks Docker-Content-Digest as RECOMMENDED
+    but not REQUIRED on manifest responses. Harbor sends it today, but a
+    proxy that strips the header (or a future registry change) would put
+    this code path into production silently. We can't synthesize the digest
+    — the body has been re-serialized into a dict — so the PUT MUST proceed
+    without If-Match, but the operator MUST see a warning naming the
+    repo:revision so the unprotected write is grep-able.
+    """
+    from hippius_hub.file_upload import upload_file
+
+    payload, sha_hex, _size = _write_payload(tmp_path)
+    _stub_auth_and_blob(respx.mock, sha_hex)
+
+    existing_manifest = {
+        "schemaVersion": 2,
+        "mediaType": "application/vnd.oci.image.manifest.v1+json",
+        "config": {"mediaType": "application/vnd.oci.empty.v1+json",
+                   "digest": "sha256:" + hashlib.sha256(b"{}").hexdigest(),
+                   "size": 2},
+        "layers": [],
+    }
+    # Deliberately omit Docker-Content-Digest: this is the regression target.
+    respx.mock.get(
+        f"{REGISTRY}/v2/{REPO_ID}/manifests/{REVISION}"
+    ).mock(return_value=httpx.Response(200, json=existing_manifest))
+    put_route = respx.mock.put(
+        f"{REGISTRY}/v2/{REPO_ID}/manifests/{REVISION}"
+    ).mock(return_value=httpx.Response(
+        201,
+        headers={"Docker-Content-Digest": "sha256:" + "d" * 64},
+    ))
+
+    with pytest.warns(UserWarning, match="Docker-Content-Digest"):
+        upload_file(
+            path_or_fileobj=str(payload),
+            path_in_repo="hello.txt",
+            repo_id=REPO_ID,
+            token="literal-token-value",
+            revision=REVISION,
+        )
+
+    assert put_route.called, "manifest PUT was never invoked"
+    sent_headers = put_route.calls.last.request.headers
+    assert "If-Match" not in sent_headers, (
+        f"PUT must not carry If-Match when prior digest is unknown, "
         f"got If-Match={sent_headers.get('If-Match')!r}"
     )
