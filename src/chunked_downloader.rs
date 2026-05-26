@@ -311,6 +311,45 @@ async fn compute_sha256(path: &Path, pb: &ProgressBar) -> Result<String, Downloa
     Ok(hex::encode(hasher.finalize()))
 }
 
+/// Classify a `DownloadError` for the retry loop.
+///
+/// Audit D5: previously `download_chunk_with_retry` retried EVERY error variant
+/// up to `MAX_RETRIES=3`, so a permanent 401/403/404 burned 200+400+800+1600 ms
+/// of exponential backoff before surfacing — and never succeeded. We now retry
+/// only transient causes:
+///
+/// * `ReqwestError` / `IoError` — network or local-IO blips; retry.
+/// * `ServerError(500..600, _)` — server-side faults documented as retryable by
+///   RFC 9110 §15.6; retry.
+///
+/// Everything else is terminal: 4xx (client error, no retry will fix it),
+/// `ChunkFailed`/`JoinFailed` (wrappers produced by the orchestrator AFTER the
+/// per-chunk retry loop has already exhausted, so retrying here would double-
+/// count), and `MissingContentLength` (HEAD response shape, not transient).
+///
+/// The match is intentionally exhaustive (no wildcard arm): any future variant
+/// added to `DownloadError` will force this classifier to be revisited rather
+/// than silently defaulting to one bucket.
+fn is_retryable(err: &DownloadError) -> bool {
+    match err {
+        // Network/transport errors are retryable.
+        DownloadError::ReqwestError(_) => true,
+        DownloadError::IoError(_) => true,
+        // 5xx server errors are retryable; 4xx (and any other non-5xx) are permanent.
+        // `(500..600).contains(status)` operates on `&u16` because the match is over
+        // `&DownloadError`, so `status` binds as `&u16` — `Range<u16>::contains`
+        // takes `&u16`, no extra borrow needed.
+        DownloadError::ServerError(status, _) => (500..600).contains(status),
+        // Structured terminal errors produced after the per-chunk retry loop has
+        // already done its work — retrying them here would compound the backoff
+        // for failures the inner loop already declared unrecoverable.
+        DownloadError::ChunkFailed { .. } => false,
+        DownloadError::JoinFailed { .. } => false,
+        // HEAD-response shape error, not a transient network condition.
+        DownloadError::MissingContentLength => false,
+    }
+}
+
 /// Wrapper with exponential-backoff retry for a single chunk download.
 async fn download_chunk_with_retry(
     client: Client,
@@ -329,7 +368,10 @@ async fn download_chunk_with_retry(
             Ok(_) => return Ok(()),
             Err(e) => {
                 retries += 1;
-                if retries > MAX_RETRIES {
+                // Audit D5: fail fast on permanent errors. Borrow `&e` so the
+                // owned error remains returnable below — `is_retryable` only
+                // reads the discriminant and (for `ServerError`) the status code.
+                if !is_retryable(&e) || retries > MAX_RETRIES {
                     return Err(e);
                 }
                 let wait_time = 2u64.pow(retries) * 100;
@@ -573,5 +615,129 @@ mod partial_content_tests {
     fn rejects_other_4xx_5xx() {
         assert!(require_partial_content(StatusCode::NOT_FOUND, 0, 99).is_err());
         assert!(require_partial_content(StatusCode::INTERNAL_SERVER_ERROR, 0, 99).is_err());
+    }
+}
+
+// Audit D5: pin the retry-classification contract. Tests cover the 4xx/5xx
+// boundary explicitly (499 / 500 / 599 / 600) plus the terminal variants
+// added by Phase 1.6 (ChunkFailed / JoinFailed) and Phase 1.8
+// (MissingContentLength). `ReqwestError` and `JoinError` cannot be
+// constructed without a live network/runtime — neither type exposes a
+// public constructor — so we cover `ReqwestError` indirectly through the
+// `IoError` arm (same `true` outcome, same single-match branch) and use a
+// real `tokio::spawn` + `abort` to produce a `JoinError` for `JoinFailed`.
+#[cfg(test)]
+mod retry_classification_tests {
+    use super::*;
+
+    #[test]
+    fn five_hundred_is_retryable() {
+        assert!(is_retryable(&DownloadError::ServerError(500, "internal".into())));
+    }
+
+    #[test]
+    fn five_oh_three_is_retryable() {
+        // Service Unavailable — the canonical transient 5xx.
+        assert!(is_retryable(&DownloadError::ServerError(503, "unavailable".into())));
+    }
+
+    #[test]
+    fn five_ninety_nine_is_retryable() {
+        // Upper inclusive boundary of the 5xx range.
+        assert!(is_retryable(&DownloadError::ServerError(599, "edge".into())));
+    }
+
+    #[test]
+    fn four_ninety_nine_is_not_retryable() {
+        // One below the 5xx floor: still a client error per the contract.
+        // HTTP technically does not register 499, but the classifier's job is
+        // "5xx only", so 499 must fall into the permanent bucket.
+        assert!(!is_retryable(&DownloadError::ServerError(499, "edge".into())));
+    }
+
+    #[test]
+    fn six_hundred_is_not_retryable() {
+        // HTTP does not define 6xx; the contract is "5xx only" so this is
+        // permanent. Pinning the upper exclusive boundary so a future bump
+        // of `(500..600)` to `(500..=600)` is caught.
+        assert!(!is_retryable(&DownloadError::ServerError(600, "edge".into())));
+    }
+
+    #[test]
+    fn four_oh_four_is_not_retryable() {
+        // The headline audit case: 404 used to burn 3 s of backoff.
+        assert!(!is_retryable(&DownloadError::ServerError(404, "not found".into())));
+    }
+
+    #[test]
+    fn four_oh_one_is_not_retryable() {
+        // 401 is permanent for the same token — retrying just re-presents the
+        // same credentials.
+        assert!(!is_retryable(&DownloadError::ServerError(401, "unauthorized".into())));
+    }
+
+    #[test]
+    fn four_oh_three_is_not_retryable() {
+        // 403 — same reasoning as 401.
+        assert!(!is_retryable(&DownloadError::ServerError(403, "forbidden".into())));
+    }
+
+    #[test]
+    fn missing_content_length_is_not_retryable() {
+        // HEAD-response shape error — retrying the GET cannot heal a missing
+        // header on a separate HEAD.
+        assert!(!is_retryable(&DownloadError::MissingContentLength));
+    }
+
+    #[test]
+    fn io_error_is_retryable() {
+        // Local IO blip (e.g. EAGAIN, transient EIO) — same transport-class
+        // bucket as `ReqwestError`. `std::io::Error::other` is the
+        // public constructor we use because the project denies `unwrap`.
+        let err = DownloadError::IoError(std::io::Error::other("transient io"));
+        assert!(is_retryable(&err));
+    }
+
+    #[test]
+    fn chunk_failed_is_not_retryable() {
+        // `ChunkFailed` is constructed by the orchestrator AFTER the inner
+        // retry loop has already exhausted its budget — retrying here would
+        // compound the backoff for a failure already declared terminal.
+        let inner = DownloadError::ServerError(503, "x".into());
+        let err = DownloadError::ChunkFailed {
+            index: 1,
+            source: Box::new(inner),
+        };
+        assert!(!is_retryable(&err));
+    }
+
+    // `JoinError` has no public constructor — we produce one by aborting a
+    // spawned task and awaiting its handle, which surfaces the documented
+    // `JoinError::is_cancelled()` shape. Using `#[tokio::test]` would need an
+    // extra dev-dep; we instead build a current-thread runtime by hand. The
+    // project denies `unwrap_used` and `panic` cluster-wide, so we destructure
+    // with `let ... else { unreachable!() }` on the runtime-build path.
+    #[test]
+    fn join_failed_is_not_retryable() {
+        let rt = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
+            Ok(rt) => rt,
+            Err(_) => unreachable!("current-thread runtime build is infallible in this environment"),
+        };
+        let join_err = rt.block_on(async {
+            let handle = tokio::spawn(async {
+                // Long-enough sleep that the abort lands before completion.
+                tokio::time::sleep(Duration::from_secs(60)).await;
+            });
+            handle.abort();
+            match handle.await {
+                Ok(()) => unreachable!("aborted task must surface a JoinError"),
+                Err(e) => e,
+            }
+        });
+        let err = DownloadError::JoinFailed {
+            index: 7,
+            source: join_err,
+        };
+        assert!(!is_retryable(&err));
     }
 }
