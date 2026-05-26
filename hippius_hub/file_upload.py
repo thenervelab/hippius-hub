@@ -259,6 +259,86 @@ def _build_commit_info(
     )
 
 
+def _upload_one_file(
+    *,
+    rel_path: str,
+    base_dir: str,
+    path_in_repo: Optional[str],
+    registry: str,
+    oci_repo: str,
+    oci_token: str,
+) -> dict:
+    """Upload one file from a folder and return its layer dict for the manifest.
+
+    Extracted from the per-file closure inside `upload_folder` so the thread-pool
+    body is testable in isolation and `upload_folder` stays under the project
+    line-length limit. Keeping this module-private (and not reused by
+    `upload_file`) because the two paths diverge in titling and progress output —
+    sharing them would re-introduce the very coupling this split removes.
+    """
+    abs_path = os.path.join(base_dir, rel_path)
+    sha256_hash, file_size = hash_file_native(abs_path)
+    repo_title = f"{path_in_repo}/{rel_path}" if path_in_repo else rel_path
+    tqdm.write(f"🚀 Uploading: {repo_title} ({file_size} bytes)...")
+    uploaded = _ensure_blob_uploaded(
+        registry, oci_repo, oci_token, abs_path, sha256_hash, file_size,
+    )
+    if uploaded:
+        tqdm.write(f"✅ Uploaded: {repo_title}")
+    else:
+        tqdm.write(f"✅ Already published (skipped): {repo_title}")
+    return _build_layer(sha256_hash, file_size, repo_title)
+
+
+def _finalize_upload_manifest(
+    *,
+    registry: str,
+    oci_repo: str,
+    oci_token: str,
+    repo_id: str,
+    revision: str,
+    new_layers: List[dict],
+    delete_patterns: Optional[Union[List[str], str]],
+    commit_message: str,
+    commit_description: str,
+) -> CommitInfo:
+    """Merge new layers into the existing manifest and PUT it (with If-Match).
+
+    Single read-modify-write on the manifest: one fetch reused for both the
+    delete-title computation and the merge, the captured digest threaded back
+    into the PUT as `If-Match` so a racing writer surfaces as 412 →
+    `ConcurrentManifestUpdateError` rather than silent last-writer-wins. The
+    deliberate non-reuse from `upload_file` is documented on `_upload_one_file`.
+    """
+    existing = fetch_manifest(registry, oci_repo, revision, oci_token, missing_ok=True)
+    existing_layers = existing.manifest.get("layers", []) if existing else []
+    prev_digest = _prev_digest_or_warn(existing, repo_id, revision)
+
+    delete_titles = set()
+    if delete_patterns:
+        existing_titles = [t for t in (layer_title(l) for l in existing_layers) if t]
+        delete_titles = set(filter_repo_objects(items=existing_titles, allow_patterns=delete_patterns))
+
+    merged_layers = _merge_layers(existing_layers, new_layers, delete_titles=delete_titles)
+
+    config_digest, config_size = _ensure_config_blob_uploaded(registry, oci_repo, oci_token)
+    manifest = {
+        "schemaVersion": 2,
+        "mediaType": "application/vnd.oci.image.manifest.v1+json",
+        "config": {
+            "mediaType": "application/vnd.oci.empty.v1+json",
+            "digest": config_digest,
+            "size": config_size,
+        },
+        "layers": merged_layers,
+        "annotations": _commit_annotations(commit_message, commit_description),
+    }
+
+    print(f"📝 Publishing OCI Manifest for {revision}...")
+    resp = _put_manifest(registry, oci_repo, revision, oci_token, manifest, if_match=prev_digest)
+    return _build_commit_info(registry, repo_id, revision, resp, commit_message, commit_description)
+
+
 def _handle_unsupported_kwargs(create_pr, parent_commit, run_as_future):
     """`create_pr` and `parent_commit` are accept-and-warn (closest HF analog is
     "no PR concept" and "no optimistic concurrency" — the upload still proceeds).
@@ -413,62 +493,41 @@ def upload_folder(
     registry = resolve_registry(endpoint)
     oci_token = _oci_bearer(oci_repo, token, push=True)
 
-    def _process(rel_path: str) -> dict:
-        abs_path = os.path.join(base_dir, rel_path)
-        sha256_hash, file_size = hash_file_native(abs_path)
-        repo_title = f"{path_in_repo}/{rel_path}" if path_in_repo else rel_path
-        tqdm.write(f"🚀 Uploading: {repo_title} ({file_size} bytes)...")
-        uploaded = _ensure_blob_uploaded(
-            registry, oci_repo, oci_token, abs_path, sha256_hash, file_size,
-        )
-        if uploaded:
-            tqdm.write(f"✅ Uploaded: {repo_title}")
-        else:
-            tqdm.write(f"✅ Already published (skipped): {repo_title}")
-        return _build_layer(sha256_hash, file_size, repo_title)
-
     new_layers = []
     if filtered:
         print(f"📦 Preparing to upload {len(filtered)} file(s) to {repo_id}:{revision}...")
         with ThreadPoolExecutor(max_workers=8) as executor:
-            futures = [executor.submit(_process, rel) for rel in filtered]
+            futures = [
+                executor.submit(
+                    _upload_one_file,
+                    rel_path=rel,
+                    base_dir=base_dir,
+                    path_in_repo=path_in_repo,
+                    registry=registry,
+                    oci_repo=oci_repo,
+                    oci_token=oci_token,
+                )
+                for rel in filtered
+            ]
             for fut in tqdm(as_completed(futures), total=len(filtered), desc="Uploading", unit="file"):
                 new_layers.append(fut.result())
 
-    # Fetch the existing manifest once and reuse it for both delete-title
-    # computation and the merge — the previous double-fetch widened the
-    # window in which a concurrent PUT could race this one. The digest
-    # captured here is what we send back as `If-Match` on the PUT so the
-    # registry rejects (412) any racing writer that advanced the revision
-    # between this GET and our PUT.
-    existing = fetch_manifest(registry, oci_repo, revision, oci_token, missing_ok=True)
-    existing_layers = existing.manifest.get("layers", []) if existing else []
-    prev_digest = _prev_digest_or_warn(existing, repo_id, revision)
-
-    delete_titles = set()
-    if delete_patterns:
-        existing_titles = [t for t in (layer_title(l) for l in existing_layers) if t]
-        delete_titles = set(filter_repo_objects(items=existing_titles, allow_patterns=delete_patterns))
-
-    merged_layers = _merge_layers(existing_layers, new_layers, delete_titles=delete_titles)
-
-    config_digest, config_size = _ensure_config_blob_uploaded(registry, oci_repo, oci_token)
-    manifest = {
-        "schemaVersion": 2,
-        "mediaType": "application/vnd.oci.image.manifest.v1+json",
-        "config": {
-            "mediaType": "application/vnd.oci.empty.v1+json",
-            "digest": config_digest,
-            "size": config_size,
-        },
-        "layers": merged_layers,
-        "annotations": _commit_annotations(commit_message, commit_description),
-    }
-
-    print(f"📝 Publishing OCI Manifest for {revision}...")
-    resp = _put_manifest(registry, oci_repo, revision, oci_token, manifest, if_match=prev_digest)
+    commit_info = _finalize_upload_manifest(
+        registry=registry,
+        oci_repo=oci_repo,
+        oci_token=oci_token,
+        repo_id=repo_id,
+        revision=revision,
+        new_layers=new_layers,
+        delete_patterns=delete_patterns,
+        commit_message=commit_message,
+        commit_description=commit_description,
+    )
+    # Kept in the caller (not the finalize helper) because the count refers to
+    # files just iterated here, not layers actually written to the manifest —
+    # the two differ when delete_patterns trims pre-existing titles.
     print(f"🎉 Successfully pushed {len(new_layers)} file(s) to {repo_id}:{revision}")
-    return _build_commit_info(registry, repo_id, revision, resp, commit_message, commit_description)
+    return commit_info
 
 
 def hippius_hub_upload(
