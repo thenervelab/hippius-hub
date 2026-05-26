@@ -1,4 +1,5 @@
 import os
+import hashlib
 import json
 import threading
 import time
@@ -18,6 +19,18 @@ import base64
 _OCI_TOKEN_CACHE = {}
 _OCI_TOKEN_CACHE_LOCK = threading.Lock()
 _OCI_TOKEN_LEEWAY_SECONDS = 30  # refresh tokens 30s before they actually expire
+
+
+def _token_cache_key(repo_id: str, push: bool, token) -> tuple:
+    """Cache key for OCI bearer tokens — hashes the token so plaintext
+    credentials never appear in the in-memory _OCI_TOKEN_CACHE dict.
+    Future debug dumps of the cache won't leak the secret.
+    """
+    if token is False:
+        return (repo_id, push, "<anon>")
+    if not token:
+        return (repo_id, push, None)
+    return (repo_id, push, hashlib.sha256(token.encode()).hexdigest())
 
 
 def _jwt_expiration(jwt_str: str):
@@ -204,7 +217,7 @@ def get_oci_bearer_token(
     for security: a caller asking for anonymous I/O must not be silently
     elevated to the user's docker-stored creds.
     """
-    cache_key = (repo_id, push, token)
+    cache_key = _token_cache_key(repo_id, push, token)
     now = time.time()
 
     if use_cache:
