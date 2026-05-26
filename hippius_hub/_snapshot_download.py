@@ -71,7 +71,10 @@ def snapshot_download(
     auth_token = resolve_token_value(token)
     oci_token = get_oci_bearer_token(oci_repo, auth_token)
 
-    manifest = fetch_manifest(registry, oci_repo, revision, oci_token)
+    # Read path: snapshot_download never PUTs, so we discard the digest and
+    # pass the bare manifest body through to each worker via _resolved_manifest
+    # (which is typed as a dict — see `hf_hub_download`).
+    manifest = fetch_manifest(registry, oci_repo, revision, oci_token).manifest
     filenames = layer_titles(manifest)
 
     filtered = list(

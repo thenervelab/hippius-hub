@@ -1,0 +1,212 @@
+"""Regression tests for OCI If-Match on manifest PUT (audit H1, M5).
+
+The TOCTOU window between fetch_manifest and the PUT that follows it lets
+two concurrent uploads to the same repo:revision silently overwrite each
+other. The fix is to send `If-Match: <previous-manifest-digest>` on the PUT
+so the registry returns 412 Precondition Failed when a concurrent writer
+has already advanced the revision.
+
+These tests mock the OCI registry with respx — no real network is hit. They
+cover three cases:
+
+  1. When the manifest existed (fetch returned a digest), the next PUT MUST
+     carry `If-Match: <that-digest>`.
+  2. When the registry returns 412 to the PUT, we MUST raise the typed
+     `ConcurrentManifestUpdateError` (not a generic HTTPStatusError).
+  3. When there is no prior manifest (fresh repo, 404 fetch), the PUT MUST
+     NOT carry an If-Match header — there's nothing to be optimistic about.
+"""
+from __future__ import annotations
+
+import hashlib
+from pathlib import Path
+
+import httpx
+import pytest
+import respx
+
+from hippius_hub.errors import ConcurrentManifestUpdateError, HfHubHTTPError
+
+
+REGISTRY = "https://registry.hippius.test"
+REPO_ID = "owner/repo"
+REVISION = "main"
+PREV_DIGEST = "sha256:" + "a" * 64
+
+
+def _write_payload(tmp_path: Path, name: str = "hello.txt") -> tuple[Path, str, int]:
+    """Drop a small file in tmp_path and return (path, sha256_hex, size).
+
+    Returning the precomputed digest lets the respx blob-HEAD route be
+    configured before the upload runs.
+    """
+    data = b"hello world\n"
+    target = tmp_path / name
+    target.write_bytes(data)
+    return target, hashlib.sha256(data).hexdigest(), len(data)
+
+
+def _stub_auth_and_blob(mock: respx.MockRouter, blob_digest: str) -> None:
+    """Wire the token-service + blob-HEAD routes that every upload path needs.
+
+    Blob HEAD returns 200 so the test does NOT exercise the native blob
+    uploader (which would require a real socket). The manifest path is what
+    matters for If-Match coverage.
+    """
+    mock.get(
+        url__startswith=f"{REGISTRY}/service/token",
+    ).mock(return_value=httpx.Response(200, json={"token": "fake-oci-jwt"}))
+    mock.head(
+        f"{REGISTRY}/v2/{REPO_ID}/blobs/sha256:{blob_digest}"
+    ).mock(return_value=httpx.Response(200))
+    # The empty-object config blob is always pushed; allow the HEAD to say
+    # "already there" so we don't need to mock the POST/PUT for it either.
+    empty_digest = "sha256:" + hashlib.sha256(b"{}").hexdigest()
+    mock.head(
+        f"{REGISTRY}/v2/{REPO_ID}/blobs/{empty_digest}"
+    ).mock(return_value=httpx.Response(200))
+
+
+@pytest.fixture(autouse=True)
+def _point_registry_at_mock(monkeypatch):
+    """Force every registry lookup to hit the respx mock URL.
+
+    Both bindings have to be patched: `constants.DEFAULT_REGISTRY_URL` is
+    what `resolve_registry()` reads, but `auth.py` did `from .constants
+    import DEFAULT_REGISTRY_URL` at import time and now holds its own
+    name binding — patching only the constants module leaves auth.py
+    pointed at the real registry and the token-service GET escapes the
+    mock. Patching both keeps the test offline.
+    """
+    monkeypatch.setattr("hippius_hub.constants.DEFAULT_REGISTRY_URL", REGISTRY)
+    monkeypatch.setattr("hippius_hub.auth.DEFAULT_REGISTRY_URL", REGISTRY)
+
+
+@respx.mock
+def test_put_manifest_sends_if_match_when_previous_digest_known(tmp_path):
+    """When fetch_manifest returned a digest, the next PUT must send If-Match.
+
+    Race-window closure: the second uploader's PUT now carries the digest
+    the first uploader saw. If a concurrent writer advanced the manifest in
+    between, the server rejects with 412 (covered by the next test).
+    """
+    from hippius_hub.file_upload import upload_file
+
+    payload, sha_hex, _size = _write_payload(tmp_path)
+    _stub_auth_and_blob(respx.mock, sha_hex)
+
+    existing_manifest = {
+        "schemaVersion": 2,
+        "mediaType": "application/vnd.oci.image.manifest.v1+json",
+        "config": {"mediaType": "application/vnd.oci.empty.v1+json",
+                   "digest": "sha256:" + hashlib.sha256(b"{}").hexdigest(),
+                   "size": 2},
+        "layers": [],
+    }
+    respx.mock.get(
+        f"{REGISTRY}/v2/{REPO_ID}/manifests/{REVISION}"
+    ).mock(return_value=httpx.Response(
+        200,
+        json=existing_manifest,
+        headers={"Docker-Content-Digest": PREV_DIGEST},
+    ))
+    put_route = respx.mock.put(
+        f"{REGISTRY}/v2/{REPO_ID}/manifests/{REVISION}"
+    ).mock(return_value=httpx.Response(
+        201,
+        headers={"Docker-Content-Digest": "sha256:" + "b" * 64},
+    ))
+
+    upload_file(
+        path_or_fileobj=str(payload),
+        path_in_repo="hello.txt",
+        repo_id=REPO_ID,
+        token="literal-token-value",
+        revision=REVISION,
+    )
+
+    assert put_route.called, "manifest PUT was never invoked"
+    sent_headers = put_route.calls.last.request.headers
+    assert sent_headers.get("If-Match") == PREV_DIGEST, (
+        f"PUT must carry If-Match={PREV_DIGEST!r}, "
+        f"got If-Match={sent_headers.get('If-Match')!r}"
+    )
+
+
+@respx.mock
+def test_412_raises_ConcurrentManifestUpdateError(tmp_path):
+    """A 412 from the registry must surface as the typed exception.
+
+    Catching `HfHubHTTPError` must also catch it, so callers that already
+    handle the HF-style hierarchy don't need a special case.
+    """
+    from hippius_hub.file_upload import upload_file
+
+    payload, sha_hex, _size = _write_payload(tmp_path)
+    _stub_auth_and_blob(respx.mock, sha_hex)
+
+    respx.mock.get(
+        f"{REGISTRY}/v2/{REPO_ID}/manifests/{REVISION}"
+    ).mock(return_value=httpx.Response(
+        200,
+        json={"schemaVersion": 2,
+              "config": {"digest": "sha256:" + hashlib.sha256(b"{}").hexdigest(),
+                         "size": 2},
+              "layers": []},
+        headers={"Docker-Content-Digest": PREV_DIGEST},
+    ))
+    respx.mock.put(
+        f"{REGISTRY}/v2/{REPO_ID}/manifests/{REVISION}"
+    ).mock(return_value=httpx.Response(412))
+
+    with pytest.raises(ConcurrentManifestUpdateError) as exc_info:
+        upload_file(
+            path_or_fileobj=str(payload),
+            path_in_repo="hello.txt",
+            repo_id=REPO_ID,
+            token="literal-token-value",
+            revision=REVISION,
+        )
+    # HF parity: callers writing `except HfHubHTTPError` should still catch us.
+    assert isinstance(exc_info.value, HfHubHTTPError)
+    assert REPO_ID in str(exc_info.value)
+    assert REVISION in str(exc_info.value)
+
+
+@respx.mock
+def test_no_if_match_when_no_prior_manifest(tmp_path):
+    """Fresh repo: manifest GET returns 404, so the PUT carries no If-Match.
+
+    Sending If-Match with `*` or an empty value here would either be wrong
+    semantics (no prior digest exists) or accidentally turn into a "create
+    only" precondition. The right behavior is to omit the header.
+    """
+    from hippius_hub.file_upload import upload_file
+
+    payload, sha_hex, _size = _write_payload(tmp_path)
+    _stub_auth_and_blob(respx.mock, sha_hex)
+
+    respx.mock.get(
+        f"{REGISTRY}/v2/{REPO_ID}/manifests/{REVISION}"
+    ).mock(return_value=httpx.Response(404))
+    put_route = respx.mock.put(
+        f"{REGISTRY}/v2/{REPO_ID}/manifests/{REVISION}"
+    ).mock(return_value=httpx.Response(
+        201,
+        headers={"Docker-Content-Digest": "sha256:" + "c" * 64},
+    ))
+
+    upload_file(
+        path_or_fileobj=str(payload),
+        path_in_repo="hello.txt",
+        repo_id=REPO_ID,
+        token="literal-token-value",
+        revision=REVISION,
+    )
+
+    assert put_route.called, "manifest PUT was never invoked"
+    sent_headers = put_route.calls.last.request.headers
+    assert "If-Match" not in sent_headers, (
+        f"fresh-repo PUT must not carry If-Match, "
+        f"got If-Match={sent_headers.get('If-Match')!r}"
+    )

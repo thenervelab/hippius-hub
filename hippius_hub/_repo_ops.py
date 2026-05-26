@@ -161,7 +161,9 @@ def repo_info(
     harbor_project = harbor_get_project(auth_header, project, endpoint=endpoint) if auth_header else None
 
     oci_token = get_oci_bearer_token(oci_repo, resolve_token_value(token), push=False)
-    manifest = fetch_manifest(resolve_registry(endpoint), oci_repo, revision, oci_token)
+    # Read path: we only need the manifest body, not the digest — `repo_info`
+    # never PUTs, so there's no If-Match to thread.
+    manifest = fetch_manifest(resolve_registry(endpoint), oci_repo, revision, oci_token).manifest
 
     # ModelInfo's __init__ treats each entry in `siblings` as a dict and
     # builds the RepoSibling internally — pass raw dicts here.
@@ -242,7 +244,8 @@ def list_repo_files(
 
     oci_repo = _oci_repo_path(repo_id, repo_type)
     oci_token = get_oci_bearer_token(oci_repo, resolve_token_value(token), push=False)
-    manifest = fetch_manifest(resolve_registry(endpoint), oci_repo, revision, oci_token)
+    # Read path: digest isn't needed because we don't PUT here.
+    manifest = fetch_manifest(resolve_registry(endpoint), oci_repo, revision, oci_token).manifest
     return layer_titles(manifest)
 
 
@@ -290,7 +293,9 @@ def file_exists(
         revision = "main"
     oci_repo = _oci_repo_path(repo_id, repo_type)
     oci_token = get_oci_bearer_token(oci_repo, resolve_token_value(token), push=False)
-    manifest = fetch_manifest(resolve_registry(endpoint), oci_repo, revision, oci_token, missing_ok=True)
-    if manifest is None:
+    # Read path: digest isn't needed because we don't PUT here. `missing_ok`
+    # lets us return False for a fresh repo without raising.
+    result = fetch_manifest(resolve_registry(endpoint), oci_repo, revision, oci_token, missing_ok=True)
+    if result is None:
         return False
-    return filename in layer_titles(manifest)
+    return filename in layer_titles(result.manifest)

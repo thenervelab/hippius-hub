@@ -149,8 +149,10 @@ def hf_hub_download(
     if _resolved_manifest is not None:
         manifest = _resolved_manifest
     else:
-        # Fetch the OCI manifest to find the file's exact digest
-        manifest = fetch_manifest(registry, oci_repo, revision, oci_token)
+        # Fetch the OCI manifest to find the file's exact digest. Read path:
+        # we only need the body, not the digest — there's no PUT to thread
+        # If-Match into here.
+        manifest = fetch_manifest(registry, oci_repo, revision, oci_token).manifest
 
     target_digest = None
     for layer in manifest.get("layers", []):

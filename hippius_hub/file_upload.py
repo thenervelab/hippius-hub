@@ -15,6 +15,7 @@ from tqdm import tqdm
 from ._oci import fetch_manifest, layer_title
 from .auth import get_oci_bearer_token, get_token, resolve_token_value
 from .constants import DEFAULT_HTTP_TIMEOUT, LAYER_TITLE_KEY, resolve_registry
+from .errors import ConcurrentManifestUpdateError
 from .file_download import _oci_repo_path, _validate_repo_type
 
 try:
@@ -95,14 +96,31 @@ def _put_manifest(
     revision: str,
     oci_token: str,
     manifest: dict,
-) -> dict:
-    """PUT the manifest to revision. Returns the response (with digest in headers)."""
+    *,
+    if_match: Optional[str] = None,
+) -> httpx.Response:
+    """PUT the manifest to revision. Returns the response (with digest in headers).
+
+    When `if_match` is provided (the digest from a prior fetch_manifest call),
+    sends `If-Match: <digest>` per OCI distribution spec 4.4. The server then
+    rejects with 412 Precondition Failed if a concurrent writer has advanced
+    the revision in between — we surface that as ConcurrentManifestUpdateError
+    so callers can choose to retry or serialize externally rather than silently
+    overwriting the other writer's layer.
+    """
     url = f"{registry}/v2/{repo_id}/manifests/{revision}"
     headers = {
         "Authorization": f"Bearer {oci_token}",
         "Content-Type": "application/vnd.oci.image.manifest.v1+json",
     }
+    if if_match:
+        headers["If-Match"] = if_match
     resp = httpx.put(url, headers=headers, json=manifest, timeout=DEFAULT_HTTP_TIMEOUT * 2)
+    if resp.status_code == 412:
+        raise ConcurrentManifestUpdateError(
+            f"manifest at {repo_id}:{revision} changed between read and write",
+            response=resp,
+        )
     resp.raise_for_status()
     return resp
 
@@ -257,11 +275,12 @@ def upload_file(
     Merges with the existing manifest: any layer with the same title is replaced.
     bytes / file-like objects are written to a temp file before hashing.
 
-    Race window: this is a read-modify-write on the manifest with no
-    optimistic-concurrency check. Two concurrent uploads to the same
-    `repo_id:revision` race; the second PUT wins, silently dropping the
-    first uploader's layer. Serialize uploads-to-same-revision externally
-    if you need atomicity.
+    Concurrency: this is a read-modify-write on the manifest. We send
+    `If-Match: <previous-digest>` on the PUT so the registry rejects (412 →
+    `ConcurrentManifestUpdateError`) when a racing writer has advanced the
+    revision between our fetch and our PUT — the alternative (silent
+    last-writer-wins) loses the racing writer's layer. Callers receive the
+    typed exception and can retry or serialize externally.
     """
     _validate_repo_type(repo_type)
     _handle_unsupported_kwargs(create_pr, parent_commit, run_as_future)
@@ -285,7 +304,8 @@ def upload_file(
         cleanup()
 
     existing = fetch_manifest(registry, oci_repo, revision, oci_token, missing_ok=True)
-    existing_layers = existing.get("layers", []) if existing else []
+    existing_layers = existing.manifest.get("layers", []) if existing else []
+    prev_digest = existing.digest if existing else None
     merged_layers = _merge_layers(existing_layers, [new_layer])
 
     config_digest, config_size = _ensure_config_blob_uploaded(registry, oci_repo, oci_token)
@@ -301,7 +321,7 @@ def upload_file(
         "annotations": _commit_annotations(commit_message, commit_description),
     }
 
-    resp = _put_manifest(registry, oci_repo, revision, oci_token, manifest)
+    resp = _put_manifest(registry, oci_repo, revision, oci_token, manifest, if_match=prev_digest)
     return _build_commit_info(registry, repo_id, revision, resp, commit_message, commit_description)
 
 
@@ -329,9 +349,12 @@ def upload_folder(
     existing manifest — any layer with a matching title is replaced; titles
     matching delete_patterns are removed from the new manifest entirely.
 
-    Race window: same TOCTOU caveat as `upload_file` applies — manifest is
-    fetched once before the PUT with no If-Match check, so concurrent writers
-    to the same revision will lose each other's changes.
+    Concurrency: like `upload_file`, the PUT carries `If-Match` from the
+    manifest fetch. A concurrent writer that advanced the revision in the
+    meantime causes the registry to return 412, which surfaces here as
+    `ConcurrentManifestUpdateError` — the partial-folder write does NOT
+    silently land. Blob pushes that already completed are idempotent at the
+    OCI level (content-addressed), so a retry of the whole folder is safe.
     """
     _validate_repo_type(repo_type)
     _handle_unsupported_kwargs(create_pr, parent_commit, run_as_future)
@@ -386,9 +409,13 @@ def upload_folder(
 
     # Fetch the existing manifest once and reuse it for both delete-title
     # computation and the merge — the previous double-fetch widened the
-    # window in which a concurrent PUT could race this one.
+    # window in which a concurrent PUT could race this one. The digest
+    # captured here is what we send back as `If-Match` on the PUT so the
+    # registry rejects (412) any racing writer that advanced the revision
+    # between this GET and our PUT.
     existing = fetch_manifest(registry, oci_repo, revision, oci_token, missing_ok=True)
-    existing_layers = existing.get("layers", []) if existing else []
+    existing_layers = existing.manifest.get("layers", []) if existing else []
+    prev_digest = existing.digest if existing else None
 
     delete_titles = set()
     if delete_patterns:
@@ -411,7 +438,7 @@ def upload_folder(
     }
 
     print(f"📝 Publishing OCI Manifest for {revision}...")
-    resp = _put_manifest(registry, oci_repo, revision, oci_token, manifest)
+    resp = _put_manifest(registry, oci_repo, revision, oci_token, manifest, if_match=prev_digest)
     print(f"🎉 Successfully pushed {len(new_layers)} file(s) to {repo_id}:{revision}")
     return _build_commit_info(registry, repo_id, revision, resp, commit_message, commit_description)
 
