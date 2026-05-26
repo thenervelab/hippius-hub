@@ -603,6 +603,88 @@ mod tests {
         // Use `typed` as a value so the binding has an observed effect.
         assert!(std::ptr::fn_addr_eq(typed, typed));
     }
+
+    // Phase 7.1 backfill: hand-picked fixtures above cover the boundary cases
+    // a human would think of (off-by-one, exact multiples, one-byte file). The
+    // proptest block below pins the STRUCTURAL invariants over the full u64
+    // input space — the shrinker surfaces edges the author didn't enumerate.
+    // Five properties together specify what `num_chunks` + `chunk_bounds`
+    // MUST produce for any valid input, independent of implementation:
+    //   - coverage: chunk sizes sum to content_length
+    //   - contiguity: no gaps, no overlaps between consecutive chunks
+    //   - full span: first chunk starts at 0, last ends at content_length - 1
+    //   - chunk_size == 0 → 0 chunks (defense-in-depth no-panic guarantee)
+    //   - content_length == 0 → 0 chunks (empty-file guarantee)
+    // Input bounds are deliberately small enough (≤ 1 GB / 200 MB) to keep
+    // the default 256-case run under a second while still spanning realistic
+    // file sizes. `proptest::prop_assert!` / `prop_assert_eq!` are used in
+    // place of `assert!` so the shrinker reports the minimal failing case
+    // instead of aborting the test runner on the first failure.
+    proptest::proptest! {
+        /// Sum of `(end - start + 1)` across all chunks equals `content_length`.
+        #[test]
+        fn proptest_chunks_cover_exactly_content_length(
+            content_length in 1u64..1_000_000_000,
+            chunk_size in 1u64..200_000_000,
+        ) {
+            let n = num_chunks(content_length, chunk_size);
+            proptest::prop_assert!(n > 0, "non-empty file must have ≥1 chunk");
+            let mut total = 0u64;
+            for i in 0..n {
+                let (s, e) = chunk_bounds(content_length, chunk_size, i);
+                proptest::prop_assert!(s <= e, "chunk {} has start > end: {} > {}", i, s, e);
+                total += e - s + 1;
+            }
+            proptest::prop_assert_eq!(total, content_length);
+        }
+
+        /// Consecutive chunks are disjoint and contiguous: chunk i ends one
+        /// byte before chunk i+1 begins.
+        #[test]
+        fn proptest_chunks_are_contiguous(
+            content_length in 1u64..1_000_000_000,
+            chunk_size in 1u64..200_000_000,
+        ) {
+            let n = num_chunks(content_length, chunk_size);
+            for i in 1..n {
+                let (_, prev_end) = chunk_bounds(content_length, chunk_size, i - 1);
+                let (cur_start, _) = chunk_bounds(content_length, chunk_size, i);
+                proptest::prop_assert_eq!(
+                    cur_start, prev_end + 1,
+                    "gap or overlap between chunk {} and {}", i - 1, i
+                );
+            }
+        }
+
+        /// First chunk starts at byte 0; last chunk ends at `content_length - 1`.
+        #[test]
+        fn proptest_chunks_span_full_file(
+            content_length in 1u64..1_000_000_000,
+            chunk_size in 1u64..200_000_000,
+        ) {
+            let n = num_chunks(content_length, chunk_size);
+            let (first_start, _) = chunk_bounds(content_length, chunk_size, 0);
+            let (_, last_end) = chunk_bounds(content_length, chunk_size, n - 1);
+            proptest::prop_assert_eq!(first_start, 0);
+            proptest::prop_assert_eq!(last_end, content_length - 1);
+        }
+
+        /// `chunk_size == 0` returns 0 chunks (no panic via div-by-zero).
+        #[test]
+        fn proptest_num_chunks_handles_zero_chunk_size(
+            content_length in 0u64..1_000_000_000,
+        ) {
+            proptest::prop_assert_eq!(num_chunks(content_length, 0), 0);
+        }
+
+        /// `content_length == 0` returns 0 chunks (empty file → no Range GETs).
+        #[test]
+        fn proptest_num_chunks_handles_zero_content(
+            chunk_size in 0u64..200_000_000,
+        ) {
+            proptest::prop_assert_eq!(num_chunks(0, chunk_size), 0);
+        }
+    }
 }
 
 // Kept separate from the chunk-math `tests` module so the two test
