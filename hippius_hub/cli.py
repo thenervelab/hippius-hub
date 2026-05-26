@@ -468,7 +468,14 @@ def cmd_models_formats(_args):
 
 # ----- top-level -----
 
-def main():
+def _build_parser() -> argparse.ArgumentParser:
+    """Construct the full argparse tree.
+
+    Kept separate from main() so the wiring (~150 lines of add_parser /
+    add_argument / set_defaults) doesn't drown the dispatch logic. The
+    parser is pure data: building it has no side effects, so tests can
+    instantiate it in isolation.
+    """
     parser = argparse.ArgumentParser(
         prog="hippius-hub",
         description=f"Hippius Hub CLI v{__version__} — registry namespaces, AI model index, "
@@ -619,81 +626,106 @@ def main():
     modsub.add_parser("formats", help="Show available filter values"
                      ).set_defaults(func=cmd_models_formats)
 
+    return parser
+
+
+def _cmd_download(args):
+    print(f"Downloading {args.filename} from {args.repo_id} (revision: {args.revision})...")
+    if args.chunk_size is not None:
+        os.environ["HIPPIUS_CHUNK_SIZE"] = str(args.chunk_size)
+    if args.verify_hash:
+        os.environ["HIPPIUS_VERIFY_HASH"] = "1"
+    try:
+        path = hippius_hub_download(
+            repo_id=args.repo_id, filename=args.filename, revision=args.revision,
+            cache_dir=args.cache_dir,
+        )
+        print(f"✅ File downloaded to: {path}")
+    except Exception as e:
+        msg, code = _format_download_error(e)
+        print(msg)
+        sys.exit(code)
+
+
+def _cmd_upload(args):
+    # Imported lazily so `hippius-hub --help` / `download` don't pay the
+    # cost of pulling in the upload path (huggingface_hub.HfApi etc.).
+    from .file_upload import hippius_hub_upload
+    try:
+        hippius_hub_upload(repo_id=args.repo_id, local_path=args.local_path, revision=args.revision)
+    except Exception as e:
+        msg, code = _format_download_error(e)
+        print(msg)
+        sys.exit(code)
+
+
+def _cmd_login(args):
+    if args.hippius_token:
+        console.save_api_token(args.hippius_token)
+        print(f"✅ Hippius API token saved.")
+        return
+    username = args.username
+    password = args.password
+    token = args.token
+    if not token and not (username and password):
+        print("Get your API token from https://console.hippius.com, then run:")
+        print("  hippius-hub login --hippius-token <token>")
+        print()
+        print("Alternatively, log in with docker registry credentials:")
+        username = input("Username: ").strip()
+        if username:
+            # Do NOT strip(): a password that legitimately ends in
+            # whitespace would silently lose those bytes and produce
+            # a misleading 401 with no diagnostic clue.
+            password = getpass.getpass("Password or CLI secret: ")
+        else:
+            token = getpass.getpass("Token: ")
+    try:
+        login(username=username, password=password, token=token)
+    except ValueError as e:
+        print(f"❌ Login failed: {e}")
+        sys.exit(1)
+
+
+def _handle_console_error(e: ConsoleError) -> None:
+    """Map a ConsoleError to a user-facing message and exit.
+
+    The 401 branch is what the user hits when their token expired or was
+    never set — the message points them at the exact command and URL,
+    rather than a stack-traced 'HTTP 401'. 404 surfaces the server's own
+    body so 'project not found' vs 'plan not found' stay distinguishable
+    without parsing JSON in the CLI layer.
+    """
+    if e.status_code == 401:
+        print("❌ Not logged in. Run `hippius-hub login --hippius-token <token>` "
+              "(get one from https://console.hippius.com).")
+    elif e.status_code == 404:
+        print(f"❌ Not found: {e.body}")
+    else:
+        print(f"❌ {e}")
+    sys.exit(1)
+
+
+def main():
+    parser = _build_parser()
     args = parser.parse_args()
-
-    if args.command == "download":
-        print(f"Downloading {args.filename} from {args.repo_id} (revision: {args.revision})...")
-        if args.chunk_size is not None:
-            os.environ["HIPPIUS_CHUNK_SIZE"] = str(args.chunk_size)
-        if args.verify_hash:
-            os.environ["HIPPIUS_VERIFY_HASH"] = "1"
-        try:
-            path = hippius_hub_download(
-                repo_id=args.repo_id, filename=args.filename, revision=args.revision,
-                cache_dir=args.cache_dir,
-            )
-            print(f"✅ File downloaded to: {path}")
-        except Exception as e:
-            msg, code = _format_download_error(e)
-            print(msg)
-            sys.exit(code)
+    handlers = {
+        "download": _cmd_download,
+        "upload": _cmd_upload,
+        "login": _cmd_login,
+    }
+    if args.command in handlers:
+        handlers[args.command](args)
         return
-
-    if args.command == "upload":
-        from .file_upload import hippius_hub_upload
-        try:
-            hippius_hub_upload(repo_id=args.repo_id, local_path=args.local_path, revision=args.revision)
-        except Exception as e:
-            msg, code = _format_download_error(e)
-            print(msg)
-            sys.exit(code)
-        return
-
-    if args.command == "login":
-        if args.hippius_token:
-            console.save_api_token(args.hippius_token)
-            print(f"✅ Hippius API token saved.")
-            return
-        username = args.username
-        password = args.password
-        token = args.token
-        if not token and not (username and password):
-            print("Get your API token from https://console.hippius.com, then run:")
-            print("  hippius-hub login --hippius-token <token>")
-            print()
-            print("Alternatively, log in with docker registry credentials:")
-            username = input("Username: ").strip()
-            if username:
-                # Do NOT strip(): a password that legitimately ends in
-                # whitespace would silently lose those bytes and produce
-                # a misleading 401 with no diagnostic clue.
-                password = getpass.getpass("Password or CLI secret: ")
-            else:
-                token = getpass.getpass("Token: ")
-        try:
-            login(username=username, password=password, token=token)
-        except ValueError as e:
-            print(f"❌ Login failed: {e}")
-            sys.exit(1)
-        return
-
     if args.command in ("registry", "models"):
         if not hasattr(args, "func"):
             parser.print_help()
             sys.exit(1)
         try:
             args.func(args)
-            return
         except ConsoleError as e:
-            if e.status_code == 401:
-                print("❌ Not logged in. Run `hippius-hub login --hippius-token <token>` "
-                      "(get one from https://console.hippius.com).")
-            elif e.status_code == 404:
-                print(f"❌ Not found: {e.body}")
-            else:
-                print(f"❌ {e}")
-            sys.exit(1)
-
+            _handle_console_error(e)
+        return
     parser.print_help()
     sys.exit(1)
 
