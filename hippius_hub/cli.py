@@ -580,9 +580,12 @@ def main():
             print("Alternatively, log in with docker registry credentials:")
             username = input("Username: ").strip()
             if username:
-                password = getpass.getpass("Password or CLI secret: ").strip()
+                # Do NOT strip(): a password that legitimately ends in
+                # whitespace would silently lose those bytes and produce
+                # a misleading 401 with no diagnostic clue.
+                password = getpass.getpass("Password or CLI secret: ")
             else:
-                token = getpass.getpass("Token: ").strip()
+                token = getpass.getpass("Token: ")
         try:
             login(username=username, password=password, token=token)
         except ValueError as e:
