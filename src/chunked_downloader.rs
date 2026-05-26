@@ -294,21 +294,41 @@ impl ChunkedDownloader {
 }
 
 /// Compute the SHA256 of the final file in a single sequential read-pass.
+///
+/// Audit U1: same justification as `uploader::hash_file_async` — sha2's
+/// digest loop is CPU-bound and would block a tokio worker for seconds on a
+/// multi-GB verify, starving the parallel download tasks the runtime is
+/// trying to drain. `spawn_blocking` parks the work on the dedicated
+/// blocking pool instead. The `ProgressBar` is `Send + Sync` (Arc-internal
+/// per indicatif docs), so cloning it into the closure for tick updates is
+/// safe — `pb.inc` is thread-safe and now runs from the blocking thread.
+///
+/// The double `?` mirrors `hash_file_async`: outer `?` flattens
+/// `JoinError → DownloadError::IoError`, inner `?` propagates `io::Error`
+/// from the closure body.
 async fn compute_sha256(path: &Path, pb: &ProgressBar) -> Result<String, DownloadError> {
-    let mut file = OpenOptions::new().read(true).open(path).await?;
-    let mut hasher = Sha256::new();
-    let mut buf = vec![0u8; VERIFY_READ_BUFFER];
+    use std::io::Read;
 
-    loop {
-        let n = file.read(&mut buf).await?;
-        if n == 0 {
-            break;
+    let path = path.to_path_buf();
+    let pb = pb.clone(); // indicatif::ProgressBar clones cheaply via internal Arc.
+    tokio::task::spawn_blocking(move || -> Result<String, DownloadError> {
+        let mut file = std::fs::File::open(&path)?;
+        let mut hasher = Sha256::new();
+        let mut buf = vec![0u8; VERIFY_READ_BUFFER];
+
+        loop {
+            let n = file.read(&mut buf)?;
+            if n == 0 {
+                break;
+            }
+            hasher.update(&buf[..n]);
+            pb.inc(n as u64);
         }
-        hasher.update(&buf[..n]);
-        pb.inc(n as u64);
-    }
 
-    Ok(hex::encode(hasher.finalize()))
+        Ok(hex::encode(hasher.finalize()))
+    })
+    .await
+    .map_err(|join_err| DownloadError::IoError(std::io::Error::other(join_err)))?
 }
 
 /// Classify a `DownloadError` for the retry loop.

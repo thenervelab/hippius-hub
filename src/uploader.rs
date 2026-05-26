@@ -5,7 +5,6 @@ use sha2::{Digest, Sha256};
 use std::path::Path;
 use std::time::Duration;
 use tokio::fs::File;
-use tokio::io::AsyncReadExt;
 use tokio_util::codec::{BytesCodec, FramedRead};
 
 #[derive(Debug)]
@@ -27,23 +26,45 @@ impl From<std::io::Error> for UploadError {
     }
 }
 
-/// Compute the SHA256 and total size of a local file
+/// Compute the SHA256 and total size of a local file.
+///
+/// Audit U1: the digest loop is CPU-bound and the I/O is unbuffered file
+/// reads — neither benefits from running on a tokio worker thread, and the
+/// combination starves other futures on the same runtime for seconds on
+/// multi-GB blobs. We route the whole pass through `spawn_blocking` so the
+/// runtime keeps its worker threads free for actual async work (HTTP, other
+/// downloads). `std::fs::File` + `std::io::Read` are the right primitives
+/// inside the blocking pool; the async wrappers would only re-block the same
+/// thread.
+///
+/// The double `?` at the end is load-bearing: `spawn_blocking(...).await`
+/// produces `Result<Result<T, UploadError>, JoinError>`. We collapse the
+/// outer `JoinError` (panic in the closure / runtime shutdown) into our own
+/// IoError variant via `io::Error::other` so callers see one error surface,
+/// then `?` unwraps the inner Result.
 pub async fn hash_file_async(path: &Path) -> Result<(String, u64), UploadError> {
-    let mut file = File::open(path).await?;
-    let mut hasher = Sha256::new();
-    let mut buffer = vec![0u8; 64 * 1024]; // 64 KB chunks
-    let mut total_size = 0u64;
+    use std::io::Read;
 
-    loop {
-        let bytes_read = file.read(&mut buffer).await?;
-        if bytes_read == 0 {
-            break;
+    let path = path.to_path_buf();
+    tokio::task::spawn_blocking(move || -> Result<(String, u64), UploadError> {
+        let mut file = std::fs::File::open(&path)?;
+        let mut hasher = Sha256::new();
+        let mut buffer = vec![0u8; 64 * 1024]; // 64 KB chunks
+        let mut total_size = 0u64;
+
+        loop {
+            let bytes_read = file.read(&mut buffer)?;
+            if bytes_read == 0 {
+                break;
+            }
+            hasher.update(&buffer[..bytes_read]);
+            total_size += bytes_read as u64;
         }
-        hasher.update(&buffer[..bytes_read]);
-        total_size += bytes_read as u64;
-    }
 
-    Ok((hex::encode(hasher.finalize()), total_size))
+        Ok((hex::encode(hasher.finalize()), total_size))
+    })
+    .await
+    .map_err(|join_err| UploadError::IoError(std::io::Error::other(join_err)))?
 }
 
 /// Stream-upload a file to the OCI URL returned by /blobs/uploads/ (the PUT-with-digest finalises the blob).
