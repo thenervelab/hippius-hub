@@ -122,8 +122,13 @@ def _oci_repo_path(repo_id: str, repo_type: Optional[str]) -> str:
                 f"pass repo_id without the prefix when using repo_type={repo_type!r}"
             )
         return f"{prefix}/{repo_id}"
-    # Already validated by _validate_repo_type; unreachable.
-    raise NotImplementedError(f"repo_type={repo_type!r}")
+    # _validate_repo_type guards the only inputs that could reach here.
+    # AssertionError (not NotImplementedError) is the canonical "unreachable
+    # by design" signal — NotImplementedError reads as "TODO: implement",
+    # which would be misleading: there is nothing left to implement here.
+    raise AssertionError(
+        f"unreachable: _validate_repo_type should have rejected {repo_type!r} before this point"
+    )
 
 
 def _cache_dirname(repo_id: str, repo_type: Optional[str]) -> str:
