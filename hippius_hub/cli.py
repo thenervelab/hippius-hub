@@ -125,6 +125,7 @@ def _format_download_error(e: Exception) -> tuple[str, int]:
 # ----- registry sub-commands -----
 
 def cmd_registry_plans(_args):
+    """List available pricing plans (`hippius-hub registry plans`)."""
     plans = console.list_plans()
     for p in plans:
         print(f"\n{p['name']} — {p['price_credits']:g} credits/mo")
@@ -136,6 +137,7 @@ def cmd_registry_plans(_args):
 
 
 def cmd_registry_check(args):
+    """Check whether a namespace is available (`hippius-hub registry check`)."""
     res = console.check_namespace(args.name)
     if res.get("available"):
         print(f"✅ {args.name} is available")
@@ -171,6 +173,7 @@ def _maybe_docker_login(host: str, user: str, secret: str, *, auto: bool):
 
 
 def cmd_registry_provision(args):
+    """Provision the user's registry namespace (`hippius-hub registry provision`)."""
     try:
         res = console.provision(args.namespace)
     except ConsoleError as e:
@@ -217,6 +220,7 @@ def cmd_registry_provision(args):
 
 
 def cmd_registry_status(_args):
+    """Show provisioning status for the user's projects (`hippius-hub registry status`)."""
     res = console.provision_status()
     projects = res.get("projects") or []
     if not projects:
@@ -227,6 +231,7 @@ def cmd_registry_status(_args):
 
 
 def cmd_registry_me(_args):
+    """Show the active registry project (`hippius-hub registry me`)."""
     res = console.me()
     print(f"Project:   {res['project_name']}")
     print(f"Plan:      {res.get('plan_name')}")
@@ -238,6 +243,7 @@ def cmd_registry_me(_args):
 
 
 def cmd_registry_rotate(args):
+    """Issue a fresh docker robot secret (`hippius-hub registry rotate-token`)."""
     res = console.rotate_robot()
     print("✅ New docker secret issued.")
     print(f"  Login:  {res['robot_login']}")
@@ -248,6 +254,7 @@ def cmd_registry_rotate(args):
 
 
 def cmd_registry_repos(args):
+    """List the user's repositories (`hippius-hub registry repos`)."""
     res = console.list_repositories(page=args.page, page_size=args.page_size)
     if not res:
         print("No repositories.")
@@ -260,6 +267,7 @@ def cmd_registry_repos(args):
 
 
 def cmd_registry_artifacts(args):
+    """List artifacts inside one repository (`hippius-hub registry artifacts`)."""
     if "/" not in args.repo:
         print(f"❌ Repo must be '<project>/<repo>', got '{args.repo}'.")
         print("   Example: hippius-hub registry artifacts myorg/my-models")
@@ -279,6 +287,7 @@ def cmd_registry_artifacts(args):
 
 
 def cmd_registry_usage(_args):
+    """Show storage usage and 7-day history (`hippius-hub registry usage`)."""
     res = console.usage()
     live = res.get("live", {}) or {}
     print(f"Storage used:  {_fmt_bytes(live.get('storage_used_bytes'))}")
@@ -293,6 +302,7 @@ def cmd_registry_usage(_args):
 
 
 def cmd_registry_publicity(args):
+    """Toggle project public/private (`hippius-hub registry publicity`)."""
     new = args.value.lower() == "public"
     res = console.toggle_publicity(public=new)
     print(f"✅ Project is now {'public' if res['public'] else 'private'}")
@@ -312,6 +322,7 @@ def _resolve_plan_id(plan_arg: str) -> int:
 
 
 def cmd_registry_subscribe(args):
+    """Subscribe to a plan on-chain (`hippius-hub registry subscribe`)."""
     plan_id = _resolve_plan_id(args.plan)
     res = console.subscribe(plan_id, pay_upfront=args.pay_upfront)
     print(f"✅ Subscription submitted for plan '{res.get('plan_name', plan_id)}'")
@@ -324,6 +335,7 @@ def cmd_registry_subscribe(args):
 
 
 def cmd_registry_subscriptions(_args):
+    """List the user's active subscriptions (`hippius-hub registry subscriptions`)."""
     rows = console.list_subscriptions() or []
     if not rows:
         print("No subscriptions yet. Run `hippius-hub registry subscribe <plan>`.")
@@ -339,6 +351,7 @@ def cmd_registry_subscriptions(_args):
 
 
 def cmd_registry_unsubscribe(args):
+    """Cancel a subscription by on-chain ID (`hippius-hub registry unsubscribe`)."""
     res = console.cancel_subscription(args.subscription_id)
     print(f"✅ Cancel submitted for subscription #{res.get('subscription_id', args.subscription_id)}")
     print(f"   extrinsic_hash: {res.get('extrinsic_hash')}")
@@ -363,6 +376,7 @@ def _print_key_row(k: dict) -> None:
 
 
 def cmd_registry_keys_list(_args):
+    """List per-project API keys (`hippius-hub registry keys list`)."""
     rows = console.list_keys() or []
     if not rows:
         print("No keys yet. Create one with: hippius-hub registry keys create <name> --role read")
@@ -373,6 +387,7 @@ def cmd_registry_keys_list(_args):
 
 
 def cmd_registry_keys_create(args):
+    """Create a new role-scoped API key (`hippius-hub registry keys create`)."""
     res = console.create_key(args.name, args.role, expires_days=args.expires_days)
     print(f"✅ Key '{res['name']}' created — role={res['role']}")
     print(f"  Login:  {res['login']}")
@@ -386,11 +401,13 @@ def cmd_registry_keys_create(args):
 
 
 def cmd_registry_keys_show(args):
+    """Show one API key without its secret (`hippius-hub registry keys show`)."""
     res = console.show_key(args.key_id)
     _print_key_row(res)
 
 
 def cmd_registry_keys_rotate(args):
+    """Rotate the secret for one API key (`hippius-hub registry keys rotate`)."""
     res = console.rotate_key(args.key_id)
     print(f"✅ Key '{res['name']}' rotated")
     print(f"  Login:  {res['login']}")
@@ -399,6 +416,7 @@ def cmd_registry_keys_rotate(args):
 
 
 def cmd_registry_keys_revoke(args):
+    """Delete an API key irreversibly (`hippius-hub registry keys revoke`)."""
     console.revoke_key(args.key_id)
     print(f"✅ Key #{args.key_id} revoked. Its docker login will stop working immediately.")
 
@@ -406,6 +424,7 @@ def cmd_registry_keys_revoke(args):
 # ----- models sub-commands -----
 
 def cmd_models_list(args):
+    """Search the AI model index (`hippius-hub models list`)."""
     res = console.models_list(
         fmt=args.format, architecture=args.arch, quantization=args.quant,
         min_params=args.min_params or None, max_params=args.max_params or None,
@@ -424,6 +443,7 @@ def cmd_models_list(args):
 
 
 def cmd_models_show(args):
+    """Show one model's versions or a specific reference (`hippius-hub models show`)."""
     parts = args.repo_id.split("/", 1)
     if len(parts) != 2:
         print("❌ repo_id must be <project>/<repo>")
@@ -459,6 +479,7 @@ def cmd_models_show(args):
 
 
 def cmd_models_formats(_args):
+    """Show available model filter values (`hippius-hub models formats`)."""
     res = console.models_formats()
     print("Available filters:")
     print(f"  formats:        {', '.join(res.get('formats') or [])}")
