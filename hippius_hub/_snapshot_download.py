@@ -1,4 +1,5 @@
 import os
+import warnings
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Dict, List, Optional, Union
@@ -10,6 +11,48 @@ from .auth import get_oci_bearer_token, resolve_token_value
 from .constants import DEFAULT_CACHE_DIR, resolve_registry
 from .errors import LocalEntryNotFoundError
 from .file_download import _cache_dirname, _oci_repo_path, _validate_repo_type, hf_hub_download
+
+
+def _handle_ignored_snapshot_kwargs(
+    *,
+    etag_timeout: float,
+    tqdm_class,
+    headers,
+    user_agent,
+    library_name,
+    library_version,
+):
+    """Emit UserWarning for HF kwargs snapshot_download accepts but ignores.
+
+    Excludes dry_run — snapshot_download honors it. stacklevel=3 points at
+    the user's call site, not this helper.
+    """
+    if etag_timeout != 10.0:
+        warnings.warn(
+            "etag_timeout is ignored: hippius_hub does not perform ETag negotiation.",
+            UserWarning,
+            stacklevel=3,
+        )
+    if tqdm_class is not None:
+        warnings.warn(
+            "tqdm_class is ignored: hippius_hub uses its own progress bar.",
+            UserWarning,
+            stacklevel=3,
+        )
+    if headers:
+        warnings.warn(
+            "headers= is ignored: hippius_hub doesn't pass custom HTTP headers yet.",
+            UserWarning,
+            stacklevel=3,
+        )
+    if user_agent:
+        warnings.warn("user_agent is ignored.", UserWarning, stacklevel=3)
+    if library_name or library_version:
+        warnings.warn(
+            "library_name/library_version are ignored.",
+            UserWarning,
+            stacklevel=3,
+        )
 
 
 def snapshot_download(
@@ -37,11 +80,21 @@ def snapshot_download(
     """Download every file in an OCI manifest for `repo_id` at `revision`.
 
     Returns the path to the snapshot directory (or `local_dir` if provided).
-    Honors allow_patterns/ignore_patterns via huggingface_hub.utils.filter_repo_objects.
-    library_name/library_version/user_agent/etag_timeout/tqdm_class/headers are
-    accepted for HF signature parity and currently have no effect.
+    Honors allow_patterns/ignore_patterns via huggingface_hub.utils.filter_repo_objects,
+    plus dry_run (early-returns without downloading).
+    Accepted but currently ignored (UserWarning at call site):
+        etag_timeout (when != 10.0), tqdm_class, headers, user_agent,
+        library_name, library_version.
     """
     _validate_repo_type(repo_type)
+    _handle_ignored_snapshot_kwargs(
+        etag_timeout=etag_timeout,
+        tqdm_class=tqdm_class,
+        headers=headers,
+        user_agent=user_agent,
+        library_name=library_name,
+        library_version=library_version,
+    )
     if cache_dir is None:
         cache_dir = DEFAULT_CACHE_DIR
     cache_dir = str(cache_dir)

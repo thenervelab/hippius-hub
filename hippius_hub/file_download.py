@@ -1,5 +1,6 @@
 import os
 import shutil
+import warnings
 from pathlib import Path
 from typing import Dict, Optional, Union
 
@@ -42,6 +43,60 @@ def _validate_repo_type(repo_type: Optional[str]):
         raise NotImplementedError(
             f"repo_type={repo_type!r} is not supported by hippius_hub. "
             f"Valid values: {', '.join(repr(t) for t in _VALID_REPO_TYPES)}."
+        )
+
+
+def _handle_ignored_download_kwargs(
+    *,
+    etag_timeout: float,
+    tqdm_class,
+    dry_run: bool,
+    headers,
+    user_agent,
+    library_name,
+    library_version,
+):
+    """Emit UserWarning for HF kwargs we accept but don't yet honor.
+
+    Use only from hf_hub_download. snapshot_download has its own variant
+    (it implements dry_run, so doesn't raise for it). stacklevel=3 points
+    the warning at the user's call site, not this helper.
+    """
+    # Compare against the documented HF default rather than truthiness:
+    # etag_timeout=0 is a valid (if odd) user choice that should still warn.
+    if etag_timeout != 10.0:
+        warnings.warn(
+            "etag_timeout is ignored: hippius_hub does not perform ETag negotiation.",
+            UserWarning,
+            stacklevel=3,
+        )
+    if tqdm_class is not None:
+        warnings.warn(
+            "tqdm_class is ignored: hippius_hub uses its own progress bar.",
+            UserWarning,
+            stacklevel=3,
+        )
+    if dry_run:
+        # dry_run is supported in snapshot_download but NOT here — fail fast
+        # so users don't silently get a full download when they asked for a
+        # no-op enumeration.
+        raise NotImplementedError(
+            "dry_run is not supported by hf_hub_download; use snapshot_download(dry_run=True) "
+            "to enumerate files without downloading."
+        )
+    if headers:
+        warnings.warn(
+            "headers= is ignored: hippius_hub doesn't pass custom HTTP headers yet.",
+            UserWarning,
+            stacklevel=3,
+        )
+    if user_agent:
+        warnings.warn("user_agent is ignored.", UserWarning, stacklevel=3)
+    if library_name or library_version:
+        warnings.warn(
+            "library_name/library_version are ignored.",
+            UserWarning,
+            stacklevel=3,
         )
 
 
@@ -103,11 +158,24 @@ def hf_hub_download(
 
     Honored kwargs: subfolder, revision, cache_dir, local_dir, force_download,
     token, local_files_only, endpoint, repo_type (model-only).
-    Accepted but currently ignored: etag_timeout, tqdm_class, dry_run, headers.
+    Accepted but currently ignored (UserWarning at call site):
+        etag_timeout (when != 10.0), tqdm_class, headers, user_agent,
+        library_name, library_version.
+    Rejected (raises NotImplementedError): dry_run — supported in
+        snapshot_download but not here, raise rather than silently download.
 
     hippius_hub-specific overrides via env: HIPPIUS_CHUNK_SIZE, HIPPIUS_VERIFY_HASH.
     """
     _validate_repo_type(repo_type)
+    _handle_ignored_download_kwargs(
+        etag_timeout=etag_timeout,
+        tqdm_class=tqdm_class,
+        dry_run=dry_run,
+        headers=headers,
+        user_agent=user_agent,
+        library_name=library_name,
+        library_version=library_version,
+    )
     if force_download and local_files_only:
         raise ValueError(
             "Cannot pass 'force_download=True' and 'local_files_only=True' at the same time."
