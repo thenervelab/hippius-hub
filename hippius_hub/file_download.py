@@ -1,5 +1,6 @@
 import os
 import shutil
+import tempfile
 import warnings
 from dataclasses import dataclass
 from pathlib import Path
@@ -325,18 +326,38 @@ def _download_to_cache(
     os.makedirs(snapshots_dir, exist_ok=True)
 
     file_path = os.path.join(snapshots_dir, filename)
-    temp_path = os.path.join(blobs_dir, f"tmp_{filename.replace('/', '_')}")
+    # Unique per call: two concurrent downloaders writing the same logical
+    # file no longer race on a shared temp path. mkstemp returns (fd, path);
+    # we close the fd immediately because the Rust download_file_native
+    # opens the file by path, not by inherited handle.
+    safe_name = filename.replace("/", "_")
+    fd, temp_path = tempfile.mkstemp(
+        dir=blobs_dir,
+        prefix=f"tmp_{safe_name}_",
+    )
+    os.close(fd)
 
     # 2. Concurrent download via the Rust engine
     print(f"Downloading {filename} (parallel)...")
     verify_hash = _resolve_verify_hash()
-    calculated_hash = download_file_native(
-        url=blob_url,
-        dest_path=temp_path,
-        auth_token=oci_token,
-        chunk_size=_resolve_chunk_size(),
-        verify_hash=verify_hash,
-    )
+    try:
+        calculated_hash = download_file_native(
+            url=blob_url,
+            dest_path=temp_path,
+            auth_token=oci_token,
+            chunk_size=_resolve_chunk_size(),
+            verify_hash=verify_hash,
+        )
+    except Exception:
+        # Clean up the mkstemp file before bubbling up. The inner OSError
+        # swallow is intentional: a cleanup failure (file already gone,
+        # permissions) must not shadow the original download exception.
+        if os.path.exists(temp_path):
+            try:
+                os.remove(temp_path)
+            except OSError:
+                pass
+        raise
 
     # If we skip hash verification, fall back to the digest from the OCI manifest
     final_hash = (
