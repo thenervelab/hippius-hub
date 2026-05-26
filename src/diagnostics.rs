@@ -301,6 +301,10 @@ pub async fn probe_blob(
     let mut parallel_mbps = None;
     let mut parallel_ms = None;
     let mut parallel_chunks: Vec<ChunkTiming> = Vec::new();
+    // How many bytes we actually probed. Starts at the (possibly content-length
+    // clamped) request target and is corrected down to what the single stream
+    // really transferred — see below.
+    let mut effective_bytes = probe;
 
     if probe == 0 {
         errors.push("blob is empty; skipping throughput probes".to_string());
@@ -312,8 +316,14 @@ pub async fn probe_blob(
         single_stream_ms = Some(elapsed.as_millis() as u64);
         single_stream_mbps = Some(mbps(bytes, elapsed));
 
-        // Parallel: split the same byte window across `n` connections.
-        let ranges = split_ranges(probe, n);
+        // Parallel: split across `n` connections. Use the bytes the single
+        // stream actually transferred as ground truth, NOT the unclamped
+        // `probe`: when the blob HEAD was a redirect (no Content-Length) and the
+        // file is smaller than `probe`, splitting `probe` would issue ranges
+        // past EOF → HTTP 416 and fail the whole probe. The single stream
+        // already stopped at EOF, so `bytes` is the real downloadable size.
+        effective_bytes = bytes;
+        let ranges = split_ranges(effective_bytes, n);
         let par_start = Instant::now();
         let results: Vec<Result<(usize, u64, Duration), DiagError>> = stream::iter(
             ranges.into_iter().enumerate(),
@@ -368,7 +378,7 @@ pub async fn probe_blob(
         content_length,
         server_request_ids: request_ids,
         ttfb_ms,
-        probe_bytes: probe,
+        probe_bytes: effective_bytes,
         single_stream_mbps,
         single_stream_ms,
         parallel_mbps,

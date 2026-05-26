@@ -209,6 +209,36 @@ def test_repo_info_last_modified_from_manifest(tmp_path, logged_in, test_repo, r
 
 # ---------- list_repo_refs ----------
 
+def test_list_repo_refs_maps_branches_and_tags(monkeypatch):
+    """Unit-level: `main` goes under branches, everything else under tags, with
+    target_commit set to each revision's manifest digest. Mocks the network so
+    the GitRefs/GitRefInfo mapping is covered without creds (the other refs
+    tests are e2e-only)."""
+    from huggingface_hub import GitRefs
+    from hippius_hub import _repo_ops
+
+    monkeypatch.setattr(_repo_ops, "get_oci_bearer_token", lambda *a, **k: "tok")
+    monkeypatch.setattr(_repo_ops, "_list_tags", lambda *a, **k: ["main", "v1", "v2"])
+    monkeypatch.setattr(_repo_ops, "_manifest_digest", lambda *a, **k: "sha256:abc")
+
+    refs = _repo_ops.list_repo_refs("org/model")
+    assert isinstance(refs, GitRefs)
+    assert [b.name for b in refs.branches] == ["main"]
+    assert refs.branches[0].ref == "refs/heads/main"
+    assert sorted(t.name for t in refs.tags) == ["v1", "v2"]
+    assert all(t.ref.startswith("refs/tags/") for t in refs.tags)
+    assert all(t.target_commit == "sha256:abc" for t in refs.tags)
+
+
+def test_list_repo_refs_unknown_repo_raises_unit(monkeypatch):
+    from hippius_hub import _repo_ops
+
+    monkeypatch.setattr(_repo_ops, "get_oci_bearer_token", lambda *a, **k: "tok")
+    monkeypatch.setattr(_repo_ops, "_list_tags", lambda *a, **k: None)
+    with pytest.raises(RepositoryNotFoundError):
+        _repo_ops.list_repo_refs("org/missing")
+
+
 @pytest.mark.e2e
 def test_list_repo_refs_includes_uploaded_revision(tmp_path, logged_in, test_repo, revision):
     from huggingface_hub import GitRefs

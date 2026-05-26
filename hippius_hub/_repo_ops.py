@@ -146,7 +146,11 @@ def delete_repo(
     project, repo = split_repo_id(_oci_repo_path(repo_id, repo_type))
     auth_header = resolve_auth_header(token)
     if auth_header is None:
-        raise RepositoryNotFoundError("delete_repo requires authentication")
+        # Same HfHubHTTPError-needs-a-response requirement as above; without
+        # this the raise itself throws TypeError instead of the intended error.
+        from httpx import Request, Response
+        fake_resp = Response(401, request=Request("GET", resolve_registry(endpoint)))
+        raise RepositoryNotFoundError("delete_repo requires authentication", response=fake_resp)
     harbor_delete_repository(
         auth_header, project, repo, endpoint=endpoint, missing_ok=missing_ok,
     )
@@ -300,7 +304,11 @@ def list_repo_refs(
     oci_token = get_oci_bearer_token(oci_repo, resolve_token_value(token), push=False)
     tags = _list_tags(registry, oci_repo, oci_token)
     if tags is None:
-        raise RepositoryNotFoundError(f"Repository {repo_id!r} not found")
+        # RepositoryNotFoundError (an HfHubHTTPError) requires a response object;
+        # synthesize a 404 like create_repo does above.
+        from httpx import Request, Response
+        fake_resp = Response(404, request=Request("GET", registry))
+        raise RepositoryNotFoundError(f"Repository {repo_id!r} not found", response=fake_resp)
 
     branches = []
     tag_refs = []
