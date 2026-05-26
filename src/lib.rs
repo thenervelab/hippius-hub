@@ -32,6 +32,7 @@ fn shared_runtime() -> &'static tokio::runtime::Runtime {
 #[pyfunction]
 #[pyo3(signature = (url, dest_path, auth_token=None, chunk_size=None, verify_hash=true))]
 fn download_file_native(
+    py: Python<'_>,
     url: String,
     dest_path: String,
     auth_token: Option<String>,
@@ -39,42 +40,50 @@ fn download_file_native(
     verify_hash: bool,
 ) -> PyResult<String> {
     let rt = shared_runtime();
-
     let downloader = ChunkedDownloader::new(url, auth_token, chunk_size)
         .map_err(|e| PyRuntimeError::new_err(format!("Downloader init error: {:?}", e)))?;
-
     let dest = PathBuf::from(dest_path);
 
-    // Block the Python thread while Rust runs concurrent async I/O.
-    let sha256_hash = rt.block_on(async {
-        downloader.download(&dest, verify_hash).await
-    }).map_err(|e| PyRuntimeError::new_err(format!("Download failed: {:?}", e)))?;
-
-    Ok(sha256_hash)
+    // Release the GIL so other Python threads can run during the (long)
+    // network/disk I/O. pyo3 acquires the GIL automatically on function
+    // entry; allow_threads explicitly releases it for the closure body.
+    py.allow_threads(|| {
+        rt.block_on(async { downloader.download(&dest, verify_hash).await })
+            .map_err(|e| PyRuntimeError::new_err(format!("Download failed: {:?}", e)))
+    })
 }
 
 mod uploader;
 
 #[pyfunction]
 #[pyo3(signature = (path))]
-fn hash_file_native(path: String) -> PyResult<(String, u64)> {
+fn hash_file_native(py: Python<'_>, path: String) -> PyResult<(String, u64)> {
     let rt = shared_runtime();
-
     let dest = PathBuf::from(path);
-    rt.block_on(async {
-        uploader::hash_file_async(&dest).await
-    }).map_err(|e| PyRuntimeError::new_err(format!("Hash failed: {:?}", e)))
+
+    // Release the GIL across the blocking hash; see `download_file_native`.
+    py.allow_threads(|| {
+        rt.block_on(async { uploader::hash_file_async(&dest).await })
+            .map_err(|e| PyRuntimeError::new_err(format!("Hash failed: {:?}", e)))
+    })
 }
 
 #[pyfunction]
 #[pyo3(signature = (url, path, auth_token=None))]
-fn upload_blob_native(url: String, path: String, auth_token: Option<String>) -> PyResult<()> {
+fn upload_blob_native(
+    py: Python<'_>,
+    url: String,
+    path: String,
+    auth_token: Option<String>,
+) -> PyResult<()> {
     let rt = shared_runtime();
-
     let dest = PathBuf::from(path);
-    rt.block_on(async {
-        uploader::upload_blob_async(&url, &dest, auth_token.as_deref()).await
-    }).map_err(|e| PyRuntimeError::new_err(format!("Upload failed: {:?}", e)))
+
+    // Release the GIL across the blocking upload; see `download_file_native`.
+    py.allow_threads(|| {
+        rt.block_on(async { uploader::upload_blob_async(&url, &dest, auth_token.as_deref()).await })
+            .map_err(|e| PyRuntimeError::new_err(format!("Upload failed: {:?}", e)))
+    })
 }
 
 /// A Python module implemented in Rust.
