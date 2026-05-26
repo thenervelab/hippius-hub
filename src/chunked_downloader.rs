@@ -756,4 +756,50 @@ mod retry_classification_tests {
         };
         assert!(!is_retryable(&err));
     }
+
+    // Audit D8 / code-review I2 follow-up: the `#[error(...)]` format on
+    // `CoreError::JoinFailed` uses a `match` to render `index: None` as
+    // `<unknown>` and `index: Some(N)` as the number. The shape compiles
+    // either way the arms are ordered, so a refactor that flipped them
+    // would ship a wrong message without any test failing. Pin both arms
+    // here. `JoinError` is non-`Clone` and has no public constructor, so
+    // we spawn-and-abort twice in the same runtime to obtain two distinct
+    // values. Same `Err => e` / `Ok(()) => unreachable!` shape on the
+    // join arm as the sibling `join_failed_is_not_retryable` to honor
+    // `panic = "deny"` (`expect_used` is also warned, see Cargo.toml).
+    #[test]
+    fn join_failed_display_renders_index_correctly() {
+        let Ok(rt) = tokio::runtime::Builder::new_current_thread().enable_all().build() else {
+            unreachable!("current-thread runtime build is infallible in this environment")
+        };
+        let (join_err_none, join_err_some) = rt.block_on(async {
+            let aborted = || async {
+                let handle = tokio::spawn(async {
+                    tokio::time::sleep(Duration::from_mins(1)).await;
+                });
+                handle.abort();
+                match handle.await {
+                    Ok(()) => unreachable!("aborted task must surface a JoinError"),
+                    Err(e) => e,
+                }
+            };
+            (aborted().await, aborted().await)
+        });
+        let err_none = CoreError::JoinFailed {
+            index: None,
+            source: join_err_none,
+        };
+        let err_some = CoreError::JoinFailed {
+            index: Some(7),
+            source: join_err_some,
+        };
+        assert!(
+            err_none.to_string().contains("<unknown>"),
+            "Display for None must contain '<unknown>', got: {err_none}",
+        );
+        assert!(
+            err_some.to_string().contains("chunk task 7 failed"),
+            "Display for Some(7) must contain 'chunk task 7 failed', got: {err_some}",
+        );
+    }
 }
