@@ -15,7 +15,10 @@
 db-path = "~/.cargo/advisory-db"
 db-urls = ["https://github.com/rustsec/advisory-db"]
 yanked = "deny"
-unmaintained = "all"
+# cargo-deny ≥ 0.16 removed the `unmaintained` key (EmbarkStudios/cargo-deny#611).
+# Unmaintained advisories are now part of the standard RUSTSEC stream and
+# always checked; suppress individual ones via the `ignore` list below
+# rather than a category-level toggle.
 
 # Documented exceptions only. Every entry MUST name the advisory ID,
 # the version range it applies to, the rationale for not patching,
