@@ -177,6 +177,10 @@ fn hash_file_native(py: Python<'_>, path: String) -> PyResult<(String, u64)> {
 /// the file is being streamed.
 #[pyfunction]
 #[pyo3(signature = (url, path, auth_token=None))]
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "pyo3 #[pyfunction] requires owned values to extract from Python args"
+)]
 fn upload_blob_native(
     py: Python<'_>,
     url: String,

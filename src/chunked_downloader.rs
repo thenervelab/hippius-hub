@@ -28,8 +28,16 @@ fn num_chunks(content_length: u64, chunk_size: u64) -> usize {
     if content_length == 0 || chunk_size == 0 {
         return 0;
     }
-    // Integer ceiling division — avoids the f64 round-trip the older code used.
-    ((content_length + chunk_size - 1) / chunk_size) as usize
+    // Integer ceiling division — `div_ceil` (stable since Rust 1.73) avoids
+    // both the f64 round-trip the original code used AND the `+ chunk_size
+    // - 1` overflow that the manual form would hit at `u64::MAX`.
+    //
+    // `try_into().unwrap_or(usize::MAX)` saturates the u64→usize conversion
+    // on 32-bit targets. The downloader cannot realistically address more
+    // than `usize::MAX` chunks (each chunk has its own `tokio::spawn`,
+    // backing JoinHandle, and reqwest pool slot — saturating means "as
+    // many chunks as the platform can spawn", not silent truncation).
+    content_length.div_ceil(chunk_size).try_into().unwrap_or(usize::MAX)
 }
 
 /// Inclusive `(start, end)` byte range for chunk index `i` in a Range header.
@@ -209,7 +217,7 @@ impl ChunkedDownloader {
                         source: Box::new(chunk_err),
                     });
                 }
-                Ok((_, Ok(()))) => continue,
+                Ok((_, Ok(()))) => {}
             }
         }
 
@@ -275,7 +283,9 @@ impl ChunkedDownloader {
         drop(f);
 
         let mut hasher = Sha256::new();
-        hasher.update(&[]);
+        // `update` accepts `impl AsRef<[u8]>`; passing the empty slice
+        // directly is clearer than `&[]`.
+        hasher.update([]);
         Ok(hex::encode(hasher.finalize()))
     }
 }
@@ -325,6 +335,18 @@ async fn compute_sha256(path: &Path, pb: &ProgressBar) -> Result<String, CoreErr
 // `CoreError::is_retryable` for the variant-by-variant rationale.
 
 /// Wrapper with exponential-backoff retry for a single chunk download.
+///
+/// The eight parameters are the data captured by `tokio::spawn` for one
+/// chunk task: the reqwest client + URL + bearer token (cloned per chunk
+/// so the spawn body is `'static`), the inclusive byte range, the
+/// destination path (each chunk writes its own slice), the progress bar
+/// handle, and a chunk index reserved for future error reporting.
+/// Bundling into a struct would require an extra clone per chunk for no
+/// readability gain.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "spawn-captured chunk state; bundling into a struct adds a clone per chunk"
+)]
 async fn download_chunk_with_retry(
     client: Client,
     url: String,
@@ -338,8 +360,8 @@ async fn download_chunk_with_retry(
     let mut retries = 0;
 
     loop {
-        match try_download_chunk_to_offset(&client, &url, &token, start, end, &dest_path, &pb).await {
-            Ok(_) => return Ok(()),
+        match try_download_chunk_to_offset(&client, &url, token.as_deref(), start, end, &dest_path, &pb).await {
+            Ok(()) => return Ok(()),
             Err(e) => {
                 retries += 1;
                 // Audit D5: fail fast on permanent errors. The
@@ -395,7 +417,7 @@ fn require_partial_content(
 async fn try_download_chunk_to_offset(
     client: &Client,
     url: &str,
-    token: &Option<String>,
+    token: Option<&str>,
     start: u64,
     end: u64,
     dest_path: &Path,
@@ -411,10 +433,10 @@ async fn try_download_chunk_to_offset(
     // value per the reqwest 0.12 docs; we keep it per-request so other client
     // uses (e.g. the HEAD in `get_content_length`) pick their own budget.
     let mut req = client.get(url)
-        .header(header::RANGE, format!("bytes={}-{}", start, end))
-        .timeout(Duration::from_secs(300));
+        .header(header::RANGE, format!("bytes={start}-{end}"))
+        .timeout(Duration::from_mins(5));  // 5 minutes per chunk
 
-    if let Some(ref t) = token {
+    if let Some(t) = token {
         req = req.bearer_auth(t);
     }
 
@@ -832,14 +854,13 @@ mod retry_classification_tests {
     // refactor that drops `Option` cannot regress without breaking here.
     #[test]
     fn join_failed_is_not_retryable() {
-        let rt = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
-            Ok(rt) => rt,
-            Err(_) => unreachable!("current-thread runtime build is infallible in this environment"),
+        let Ok(rt) = tokio::runtime::Builder::new_current_thread().enable_all().build() else {
+            unreachable!("current-thread runtime build is infallible in this environment")
         };
         let join_err = rt.block_on(async {
             let handle = tokio::spawn(async {
                 // Long-enough sleep that the abort lands before completion.
-                tokio::time::sleep(Duration::from_secs(60)).await;
+                tokio::time::sleep(Duration::from_mins(1)).await;
             });
             handle.abort();
             match handle.await {

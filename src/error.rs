@@ -164,13 +164,16 @@ impl CoreError {
             // so `status` binds as `&u16` — `Range<u16>::contains`
             // takes `&u16`, no extra borrow needed.
             CoreError::ServerError(status, _) => (500..600).contains(status),
-            // Structured terminal errors produced after the per-chunk
-            // retry loop has already done its work — retrying them here
-            // would compound the backoff for failures the inner loop
-            // already declared unrecoverable.
-            CoreError::ChunkFailed { .. } | CoreError::JoinFailed { .. } => false,
-            // HEAD-response shape error, not a transient network condition.
-            CoreError::MissingContentLength => false,
+            // Three permanent variants:
+            //   - ChunkFailed / JoinFailed are structured terminal errors
+            //     produced after the per-chunk retry loop already did its
+            //     work — retrying compounds backoff for failures the inner
+            //     loop already declared unrecoverable.
+            //   - MissingContentLength is a HEAD-response shape error,
+            //     not a transient network condition.
+            CoreError::ChunkFailed { .. }
+            | CoreError::JoinFailed { .. }
+            | CoreError::MissingContentLength => false,
         }
     }
 }

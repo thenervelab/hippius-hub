@@ -65,6 +65,14 @@ jobs:
           command: check
           arguments: --all-features
 
+      # Clippy gate. The Cargo.toml [lints.clippy] block sets pedantic
+      # to warn and the panic-prevention set (unwrap_used, panic,
+      # print_stdout, etc.) to deny. Without invoking clippy in CI, that
+      # block is documentation; with this step it's enforcement. New
+      # .unwrap() or print! in hot paths fails the merge.
+      - name: Clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
       - name: Rust unit tests (chunk math + uploader helpers)
         run: cargo test --lib
 

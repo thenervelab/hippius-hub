@@ -111,7 +111,7 @@ async fn try_upload_blob_once(url: &str, path: &Path, auth_token: Option<&str>) 
     // multiplexing, lets uploads spread across multiple connections if the caller
     // parallelizes.
     let client = Client::builder()
-        .timeout(Duration::from_secs(3600)) // 1h timeout for very large uploads
+        .timeout(Duration::from_hours(1)) // 1h timeout for very large uploads
         .http1_only()
         .tcp_keepalive(Duration::from_secs(30))
         .build()?;
@@ -141,9 +141,8 @@ async fn try_upload_blob_once(url: &str, path: &Path, auth_token: Option<&str>) 
     );
     let basename = path
         .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "blob".to_string());
-    pb.set_message(format!("📤 {}", basename));
+        .map_or_else(|| "blob".to_string(), |n| n.to_string_lossy().into_owned());
+    pb.set_message(format!("📤 {basename}"));
 
     // Wrap the stream so we tick the progress bar on every body chunk emitted
     // to reqwest. ProgressBar is Arc-internally → cloning is cheap.
@@ -172,14 +171,14 @@ async fn try_upload_blob_once(url: &str, path: &Path, auth_token: Option<&str>) 
     let res = req.send().await?;
 
     if !res.status().is_success() {
-        pb.finish_with_message(format!("❌ {} failed", basename));
+        pb.finish_with_message(format!("❌ {basename} failed"));
         return Err(CoreError::ServerError(
             res.status().as_u16(),
             format!("Upload failed: {:?}", res.status()),
         ));
     }
 
-    pb.finish_with_message(format!("✅ {} uploaded", basename));
+    pb.finish_with_message(format!("✅ {basename} uploaded"));
     Ok(())
 }
 
