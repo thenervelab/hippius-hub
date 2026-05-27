@@ -20,10 +20,10 @@ pyo3-async-runtimes = { version = "0.22", features = ["tokio-runtime"] }
 tokio = { version = "1.35", features = ["rt", "rt-multi-thread", "macros", "fs", "time"] }
 tokio-util = { version = "0.7", features = ["codec"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
-indicatif = "0.17.8"
+indicatif = "0.18.4"
 futures = "0.3"
 hex = "0.4"
-thiserror = "1.0"
+thiserror = "2.0"
 
 [target.'cfg(all(target_arch = "x86_64", target_os = "linux"))'.dependencies]
 sha2 = { version = "0.10", features = ["asm"] }
