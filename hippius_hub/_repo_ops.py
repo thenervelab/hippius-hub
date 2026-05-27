@@ -43,15 +43,42 @@ def _list_tags(registry: str, repo_id: str, oci_token: str) -> Optional[list]:
     Robots with `pull` perm can call this. Returns None on 404 (repo doesn't exist),
     a (possibly empty) list otherwise.
     """
-    resp = httpx.get(
-        f"{registry}/v2/{repo_id}/tags/list",
-        headers={"Authorization": f"Bearer {oci_token}"},
-        timeout=DEFAULT_HTTP_TIMEOUT,
-    )
-    if resp.status_code == 404:
+    # Follow RFC 5988 `Link: rel="next"` pagination so repos with many tags
+    # return the complete list, not just the registry's first page — callers
+    # like list_repo_refs / `revisions` need every tag, not a prefix.
+    headers = {"Authorization": f"Bearer {oci_token}"}
+    url = f"{registry}/v2/{repo_id}/tags/list"
+    tags: list = []
+    seen = set()
+    while url and url not in seen:
+        seen.add(url)
+        resp = httpx.get(url, headers=headers, timeout=DEFAULT_HTTP_TIMEOUT)
+        if resp.status_code == 404:
+            return None
+        resp.raise_for_status()
+        tags.extend(resp.json().get("tags") or [])
+        url = _next_link(resp.headers.get("Link"), registry)
+    return tags
+
+
+def _next_link(link_header: Optional[str], registry: str) -> Optional[str]:
+    """Extract the absolute `rel="next"` URL from an RFC 5988 Link header, or
+    None when there's no next page. Distribution registries return the next
+    page as a root-relative path (e.g. `</v2/repo/tags/list?last=x&n=y>`)."""
+    if not link_header:
         return None
-    resp.raise_for_status()
-    return resp.json().get("tags") or []
+    for part in link_header.split(","):
+        segments = part.split(";")
+        if len(segments) < 2:
+            continue
+        rel = "".join(segments[1:]).replace(" ", "").replace('"', "").lower()
+        if "rel=next" not in rel:
+            continue
+        target = segments[0].strip().lstrip("<").rstrip(">").strip()
+        if target.startswith("http://") or target.startswith("https://"):
+            return target
+        return f"{registry}{target}"
+    return None
 
 
 def _manifest_digest(registry: str, repo_id: str, revision: str, oci_token: str) -> Optional[str]:
@@ -76,6 +103,25 @@ def _revision_created(registry: str, repo_id: str, revision: str, oci_token: str
     if manifest is None:
         return None
     return manifest.get("annotations", {}).get("org.opencontainers.image.created")
+
+
+def _normalize_oci_timestamp(ts: Optional[str]) -> Optional[str]:
+    """Convert an OCI `created` annotation to the shape huggingface_hub accepts.
+
+    Uploads stamp it with `datetime.isoformat()`, which yields an offset form
+    like `2026-05-26T18:05:32.733878+00:00`. ModelInfo runs HF's parse_datetime,
+    which only accepts the `...Z` form and raises ValueError on the offset — so
+    we reshape it here. Returns None when absent or unparseable: a bad timestamp
+    should drop the field, not crash repo_info.
+    """
+    if not ts:
+        return None
+    from datetime import datetime, timezone
+    try:
+        dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
 
 
 # ---- repo CRUD ----
@@ -213,7 +259,11 @@ def repo_info(
         created_at = harbor_repo.get("creation_time")
     # Fallback to the manifest's upload timestamp when Harbor admin data is
     # unavailable (e.g. pull-only robot accounts get FORBIDDEN above).
-    manifest_created = manifest.get("annotations", {}).get("org.opencontainers.image.created")
+    # Normalized to HF's expected `...Z` form — the raw annotation is an offset
+    # ISO string that ModelInfo's parse_datetime would reject.
+    manifest_created = _normalize_oci_timestamp(
+        manifest.get("annotations", {}).get("org.opencontainers.image.created")
+    )
     last_modified = last_modified or manifest_created
     created_at = created_at or manifest_created
     if isinstance(harbor_project, dict):

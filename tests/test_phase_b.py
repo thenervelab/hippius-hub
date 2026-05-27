@@ -239,6 +239,64 @@ def test_list_repo_refs_unknown_repo_raises_unit(monkeypatch):
         _repo_ops.list_repo_refs("org/missing")
 
 
+def test_next_link_parsing():
+    from hippius_hub._repo_ops import _next_link
+    reg = "https://reg.example.com"
+    assert _next_link(None, reg) is None
+    # root-relative next → made absolute against the registry
+    assert (
+        _next_link('</v2/r/tags/list?last=x&n=2>; rel="next"', reg)
+        == "https://reg.example.com/v2/r/tags/list?last=x&n=2"
+    )
+    # already-absolute next → returned as-is
+    assert (
+        _next_link('<https://cdn.example/v2/r/tags/list?last=x>; rel="next"', reg)
+        == "https://cdn.example/v2/r/tags/list?last=x"
+    )
+    # only a prev link → no next page
+    assert _next_link('</v2/r/tags/list?last=x>; rel="prev"', reg) is None
+
+
+def test_list_tags_follows_pagination(monkeypatch):
+    """_list_tags walks Link: rel=next so the full tag set comes back, not just
+    the first page (the bug behind list_repo_refs missing fresh revisions)."""
+    from hippius_hub import _repo_ops
+
+    class _FakeResp:
+        def __init__(self, tags, link=None):
+            self.status_code = 200
+            self._tags = tags
+            self.headers = {"Link": link} if link else {}
+
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return {"tags": self._tags}
+
+    pages = {
+        "https://reg/v2/r/tags/list": _FakeResp(["a", "b"], '</v2/r/tags/list?last=b>; rel="next"'),
+        "https://reg/v2/r/tags/list?last=b": _FakeResp(["c"]),
+    }
+    monkeypatch.setattr(_repo_ops.httpx, "get", lambda url, **kwargs: pages[url])
+    assert _repo_ops._list_tags("https://reg", "r", "tok") == ["a", "b", "c"]
+
+
+def test_normalize_oci_timestamp_to_hf_form():
+    from huggingface_hub.utils import parse_datetime
+    from hippius_hub._repo_ops import _normalize_oci_timestamp
+
+    assert _normalize_oci_timestamp(None) is None
+    assert _normalize_oci_timestamp("") is None
+    # The offset form datetime.isoformat() produces (what crashed ModelInfo).
+    out = _normalize_oci_timestamp("2026-05-26T18:05:32.733878+00:00")
+    assert out == "2026-05-26T18:05:32.733878Z"
+    # And the result is something huggingface_hub can actually parse.
+    parse_datetime(out)
+    # Garbage degrades to None rather than raising.
+    assert _normalize_oci_timestamp("not-a-date") is None
+
+
 @pytest.mark.e2e
 def test_list_repo_refs_includes_uploaded_revision(tmp_path, logged_in, test_repo, revision):
     from huggingface_hub import GitRefs
