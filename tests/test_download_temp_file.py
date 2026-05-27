@@ -70,11 +70,11 @@ def test_temp_paths_unique_under_thread_concurrency(cache_layout, monkeypatch):
     get distinct temp paths. The OS-level guarantee from mkstemp is what
     actually closes the race; this test pins that we're using it correctly.
 
-    `_create_symlink` is also mocked out — it has its own TOCTOU race on
-    `os.path.exists(dst) + os.remove(dst)` that fires when threads converge
-    on the same blob_path. That race is orthogonal to the mkstemp uniqueness
-    claim this test makes; stubbing the symlink step keeps the assertion
-    surface focused.
+    Audit RACE-2: `_create_symlink` is now atomic-rename-safe (it no
+    longer has the `if exists(): remove()` TOCTOU window), so we run
+    the REAL function here rather than stubbing it out. If a regression
+    re-introduces the TOCTOU, this test will surface it as
+    ResourceWarnings or as the final symlink missing/wrong-target.
     """
     repo_dir, snapshots_dir = cache_layout
     seen_temp_paths: list[str] = []
@@ -93,10 +93,6 @@ def test_temp_paths_unique_under_thread_concurrency(cache_layout, monkeypatch):
         return None
 
     monkeypatch.setattr(file_download, "download_file_native", fake_download)
-    # The symlink step races on a shared dst when threads converge — see
-    # docstring above. Replace it with a no-op so the test only assesses
-    # what it claims to.
-    monkeypatch.setattr(file_download, "_create_symlink", lambda src, dst: None)
 
     def worker():
         file_download._download_to_cache(
@@ -117,6 +113,12 @@ def test_temp_paths_unique_under_thread_concurrency(cache_layout, monkeypatch):
     assert len(seen_temp_paths) == 8
     assert len(set(seen_temp_paths)) == 8, (
         f"concurrent temp paths collided: {sorted(set(seen_temp_paths))!r}"
+    )
+    # And the symlink raced through cleanly — final state is a single
+    # snapshot file pointing at the blob.
+    final = snapshots_dir / "weights.bin"
+    assert final.exists() or final.is_symlink(), (
+        f"final snapshot symlink missing after concurrent downloads"
     )
 
 

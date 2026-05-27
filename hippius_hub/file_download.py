@@ -8,6 +8,7 @@ on-disk state is interchangeable.
 import os
 import shutil
 import tempfile
+import uuid
 import warnings
 from dataclasses import dataclass
 from pathlib import Path
@@ -430,20 +431,38 @@ def _create_symlink(src: str, dst: str) -> None:
     is more expensive than expected — Windows without developer mode,
     sandboxed CI without symlink capability, and removable FAT/exFAT drives
     are the common offenders.
-    """
-    if os.path.exists(dst):
-        os.remove(dst)
 
+    The previous implementation had a TOCTOU race between
+    `if os.path.exists(dst): os.remove(dst)` and the subsequent
+    `os.symlink(dst)`: two concurrent downloaders converging on the same
+    snapshot path could observe `exists()` then race on the `remove`
+    (one wins, the other gets FileNotFoundError) or both race on the
+    `symlink` (one wins, the other gets FileExistsError). The fix is
+    the same atomic-rename pattern used in `auth._atomic_write_secret`:
+    create the new link at a sibling temp name (per-process unique),
+    then `os.replace` into `dst`. Replace is atomic on POSIX same-
+    filesystem renames — readers see either the old link/file or the
+    new one, never an absent-during-transition state.
+    """
     os.makedirs(os.path.dirname(dst), exist_ok=True)
+    tmp_dst = f"{dst}.{os.getpid()}.{uuid.uuid4().hex[:8]}.tmp"
+
+    # Relative path from the snapshot directory to the blob so the cache
+    # remains portable if the cache root is moved (the link target stays
+    # valid as long as the relative layout is preserved).
+    rel_src = os.path.relpath(src, os.path.dirname(dst))
 
     try:
-        # Relative path from the snapshot directory to the blob so the cache
-        # remains portable if the cache root is moved (the link target stays
-        # valid as long as the relative layout is preserved).
-        rel_src = os.path.relpath(src, os.path.dirname(dst))
-        os.symlink(rel_src, dst)
+        os.symlink(rel_src, tmp_dst)
+        os.replace(tmp_dst, dst)
         return
     except OSError as e:
+        # Best-effort cleanup of the tmp name if the symlink+replace
+        # sequence failed before the rename landed.
+        try:
+            os.unlink(tmp_dst)
+        except FileNotFoundError:
+            pass
         warnings.warn(
             f"symlink {src!r} -> {dst!r} failed ({e}); falling back to hardlink",
             UserWarning,
@@ -451,9 +470,14 @@ def _create_symlink(src: str, dst: str) -> None:
         )
 
     try:
-        os.link(src, dst)
+        os.link(src, tmp_dst)
+        os.replace(tmp_dst, dst)
         return
     except OSError as e:
+        try:
+            os.unlink(tmp_dst)
+        except FileNotFoundError:
+            pass
         warnings.warn(
             f"hardlink {src!r} -> {dst!r} failed ({e}); falling back to full copy "
             f"-- this doubles disk usage for the snapshot",
@@ -461,7 +485,13 @@ def _create_symlink(src: str, dst: str) -> None:
             stacklevel=2,
         )
 
-    shutil.copy2(src, dst)
+    # shutil.copy2 writes directly to dst (overwrites if present) and
+    # is not concurrency-safe across writers — but at this point we've
+    # already exhausted the link fallbacks, so we accept the residual
+    # race window for the rare-path copy case. Copy to temp + replace
+    # to keep behavior consistent with the link paths above.
+    shutil.copy2(src, tmp_dst)
+    os.replace(tmp_dst, dst)
 
 
 def try_to_load_from_cache(
