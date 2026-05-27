@@ -83,21 +83,26 @@ jobs:
           .venv/bin/maturin develop --release
           .venv/bin/pip install -e ".[test]"
 
-      # Supply-chain gate (Python side). `--strict` upgrades any warning
-      # (e.g. a yanked release) to a hard fail. Before auditing we
-      # bump the known-vulnerable transitive dev-tool deps (pip itself,
-      # pygments via pytest's traceback rendering, idna/urllib3/requests
-      # via huggingface_hub's transitive surface) to current-stable so
-      # CVEs that affect only our test environment — not shipped users —
+      # Supply-chain gate (Python side). Before auditing we bump the
+      # known-vulnerable transitive dev-tool deps (pip itself, pygments
+      # via pytest's traceback rendering, idna/urllib3/requests via
+      # huggingface_hub's transitive surface) to current-stable so CVEs
+      # that affect only our test environment — not shipped users —
       # don't gate merges. New CVEs that survive the upgrade ARE
-      # surfaced and DO fail CI, which is the intent.
+      # surfaced and DO fail CI: pip-audit returns non-zero on any
+      # vulnerability finding regardless of `--strict`.
       #
       # `--skip-editable` excludes the in-tree hippius_hub install
       # (`pip install -e ".[test]"` above) from the audit. Without it,
-      # pip-audit tries to look up the current local version on PyPI
-      # and `--strict` upgrades the "not found" warning to a fatal
-      # error — which happens on every version bump until the release
-      # actually lands on PyPI.
+      # pip-audit can't resolve the current local version on PyPI
+      # because each release-bump commit predates the PyPI upload.
+      #
+      # We deliberately do NOT pass `--strict`: it upgrades the
+      # "skipped editable" log line into a fatal error, defeating
+      # `--skip-editable` entirely. `--strict` only affects warning
+      # severity (e.g. "couldn't fetch metadata for package X");
+      # actual CVE detection is non-zero regardless, which is the
+      # signal we care about.
       - name: Python supply-chain audit
         run: |
           .venv/bin/pip install --upgrade \
@@ -106,7 +111,7 @@ jobs:
             'requests>=2.33.0' \
             'urllib3>=2.7.0'
           .venv/bin/pip install pip-audit==2.10.0
-          .venv/bin/pip-audit --strict --skip-editable
+          .venv/bin/pip-audit --skip-editable
 
       - name: Run full test suite (Hippius + HF parity, every PR / release)
         # Secrets are NOT exposed to PRs from forks (GitHub's default for
