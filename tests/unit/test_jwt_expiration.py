@@ -71,3 +71,29 @@ def test_valid_jwt_does_not_warn():
         assert _jwt_expiration(jwt) == 9999999999
         jwt_warnings = [w for w in caught if "JWT" in str(w.message)]
         assert jwt_warnings == []
+
+
+@pytest.mark.parametrize("payload_raw,kind", [
+    (b"42", "int"),
+    (b"null", "NoneType"),
+    (b"[]", "list"),
+    (b'"string"', "str"),
+])
+def test_payload_not_object_returns_none(payload_raw, kind):
+    """RFC 7519 §4 requires the payload to be a JSON object. A token whose
+    middle segment decodes to a non-object would previously crash with an
+    uncaught AttributeError at `.get("exp")` — fix surfaces a typed warning.
+    """
+    b64 = base64.urlsafe_b64encode(payload_raw).decode().rstrip("=")
+    with pytest.warns(UserWarning, match=f"not a JSON object \\({kind}\\)"):
+        assert _jwt_expiration(f"h.{b64}.s") is None
+
+
+def test_payload_invalid_utf8_returns_none():
+    """`json.loads` on non-UTF-8 bytes raises UnicodeDecodeError, which IS a
+    ValueError subclass — so the existing except tuple catches it. This test
+    pins that we surface a warning rather than crashing.
+    """
+    b64 = base64.urlsafe_b64encode(b"\xff\xfe\xfd").decode().rstrip("=")
+    with pytest.warns(UserWarning, match="parse failed"):
+        assert _jwt_expiration(f"h.{b64}.s") is None

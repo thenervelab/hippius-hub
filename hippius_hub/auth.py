@@ -62,8 +62,23 @@ def _jwt_expiration(jwt_str: str):
         decoded = base64.urlsafe_b64decode(payload_b64 + padding)
         payload = json.loads(decoded)
     except (ValueError, json.JSONDecodeError) as e:
+        # ValueError covers: binascii.Error (bad b64), UnicodeDecodeError
+        # (json.loads on non-UTF-8 bytes), and JSONDecodeError. All three
+        # share that ancestor in modern CPython.
         warnings.warn(
             f"JWT payload parse failed ({e}); token will not be cached",
+            UserWarning,
+            stacklevel=2,
+        )
+        return None
+    # A JWT payload MUST be a JSON object per RFC 7519 §4. A pathological
+    # token containing `null`, `42`, or `[]` as its middle segment decodes
+    # to a non-dict — calling `.get("exp")` on that would raise an
+    # AttributeError that the caller doesn't expect from a parse helper.
+    if not isinstance(payload, dict):
+        warnings.warn(
+            f"JWT payload is not a JSON object ({type(payload).__name__}); "
+            "token will not be cached",
             UserWarning,
             stacklevel=2,
         )
