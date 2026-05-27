@@ -23,7 +23,10 @@ cover four cases:
 """
 from __future__ import annotations
 
+import base64
 import hashlib
+import json
+import time
 from pathlib import Path
 
 import httpx
@@ -31,6 +34,21 @@ import pytest
 import respx
 
 from hippius_hub.errors import ConcurrentManifestUpdateError, HfHubHTTPError
+
+
+def _valid_jwt() -> str:
+    """Build a 3-segment JWT with a far-future exp.
+
+    The token-service stub used to return `"fake-oci-jwt"`, which has no
+    dots — every call into `_jwt_expiration` emitted the
+    `"JWT does not have 3 segments"` UserWarning. Tests should not leak
+    warnings they don't assert on, so we synthesize a structurally-valid
+    token here. The signature segment is a placeholder: `_jwt_expiration`
+    inspects only the payload (middle segment).
+    """
+    def b64(x):
+        return base64.urlsafe_b64encode(json.dumps(x).encode()).decode().rstrip("=")
+    return f"{b64({'alg': 'none'})}.{b64({'exp': int(time.time()) + 3600})}.signature"
 
 
 REGISTRY = "https://registry.hippius.test"
@@ -60,7 +78,7 @@ def _stub_auth_and_blob(mock: respx.MockRouter, blob_digest: str) -> None:
     """
     mock.get(
         url__startswith=f"{REGISTRY}/service/token",
-    ).mock(return_value=httpx.Response(200, json={"token": "fake-oci-jwt"}))
+    ).mock(return_value=httpx.Response(200, json={"token": _valid_jwt()}))
     mock.head(
         f"{REGISTRY}/v2/{REPO_ID}/blobs/sha256:{blob_digest}"
     ).mock(return_value=httpx.Response(200))
