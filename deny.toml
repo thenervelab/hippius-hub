@@ -1,0 +1,92 @@
+# cargo-deny policy for hippius_hub.
+#
+# Three concerns: advisories, licenses, and dependency bans. The CI
+# step `cargo deny check` enforces all three on every PR; offline
+# devs can run it locally with `cargo install cargo-deny && cargo deny check`.
+
+[advisories]
+# Deny ANY known advisory. Pairs with Dependabot's weekly cadence:
+# new advisories trip CI within a few days of publication, Dependabot
+# opens the upgrade PR, the merge fixes CI.
+#
+# `unmaintained = "all"` denies BOTH the workspace-direct dependency
+# and transitive deps flagged as unmaintained. The looser default
+# `"workspace"` would let a transitively-unmaintained crate ship.
+db-path = "~/.cargo/advisory-db"
+db-urls = ["https://github.com/rustsec/advisory-db"]
+yanked = "deny"
+unmaintained = "all"
+
+# Documented exceptions only. Every entry MUST name the advisory ID,
+# the version range it applies to, the rationale for not patching,
+# and a follow-up plan. Review at every Dependabot merge to confirm
+# the exception is still legitimate.
+ignore = [
+    { id = "RUSTSEC-2025-0020", reason = """
+pyo3 0.22.x PyString::from_object reads past nul bytes in &str. Fixed in
+pyo3 0.24.1+, but we don't call PyString::from_object anywhere in
+src/ (verified via `rg PyString src/` — no matches as of 2026-05-27).
+The audit just migrated 0.20 → 0.22 (STRUCT-1 / CT3); forcing
+another major upgrade is out of scope for this PR. Remove this
+ignore when upgrading pyo3 to ≥0.24.1.
+""" },
+    { id = "RUSTSEC-2025-0119", reason = """
+number_prefix 0.4.0 (transitive via indicatif 0.17) is unmaintained
+but not insecure — RUSTSEC-2025-0119 is an "unmaintained" advisory,
+not a CVE. The crate provides trivial integer→human-prefix arithmetic
+that's effectively "done" rather than "abandoned". The fix path is
+upstream: indicatif must migrate to unit-prefix. Track via
+https://github.com/console-rs/indicatif issues; remove this ignore
+when indicatif drops number_prefix.
+""" },
+]
+
+[licenses]
+# Allowlist set derived from `cargo tree -e no-build,no-dev --format '{l}'`
+# on this branch. New licenses entering the tree fail CI explicitly —
+# better than silently absorbing a copyleft dep.
+#
+# `confidence-threshold = 0.93` is cargo-deny's recommended default;
+# tighter values false-flag uncommon license headers.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "BSL-1.0",
+    "MPL-2.0",
+    "Unlicense",
+    "Zlib",
+    "CC0-1.0",
+    # CDLA-Permissive-2.0: introduced by webpki-roots 1.0.7 via reqwest 0.12.
+    # Community Data License Agreement Permissive — explicitly designed for
+    # data redistribution (here: the Mozilla root CA bundle). No copyleft
+    # provisions, compatible with proprietary use. Approved on 2026-05-27.
+    "CDLA-Permissive-2.0",
+]
+confidence-threshold = 0.93
+exceptions = []
+
+[bans]
+# `multiple-versions = "warn"` (not deny) — duplicate-crate explosions
+# happen routinely during transitive dep churn (e.g. two `syn` majors
+# coexisting briefly). Deny would block legitimate upgrades; warn lets
+# `cargo deny check` flag the bloat without blocking the merge.
+multiple-versions = "warn"
+wildcards = "deny"
+highlight = "all"
+deny = []
+skip = []
+skip-tree = []
+
+[sources]
+# Only crates.io is trusted. Pulling from arbitrary git URLs is a
+# supply-chain vector — every Cargo.toml `[dependencies]` block on
+# this repo uses crates.io, and any drift will surface here.
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

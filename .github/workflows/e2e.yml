@@ -54,6 +54,17 @@ jobs:
         with:
           toolchain: stable
 
+      # Supply-chain gate (Rust side). deny.toml defines the policy:
+      # advisories deny + documented ignores, license allowlist,
+      # crates.io-only sources, wildcard ban. Paired with the cargo
+      # ecosystem entry in .github/dependabot.yml so the merge of a
+      # new advisory triggers a Dependabot PR within a week.
+      - name: Cargo supply-chain audit
+        uses: EmbarkStudios/cargo-deny-action@d6d27f1b02f0c07f9db6ffc34e7871bba5ab5816  # v2.0.9
+        with:
+          command: check
+          arguments: --all-features
+
       - name: Rust unit tests (chunk math + uploader helpers)
         run: cargo test --lib
 
@@ -63,6 +74,24 @@ jobs:
           .venv/bin/pip install --upgrade pip maturin
           .venv/bin/maturin develop --release
           .venv/bin/pip install -e ".[test]"
+
+      # Supply-chain gate (Python side). `--strict` upgrades any warning
+      # (e.g. a yanked release) to a hard fail. Before auditing we
+      # bump the known-vulnerable transitive dev-tool deps (pip itself,
+      # pygments via pytest's traceback rendering, idna/urllib3/requests
+      # via huggingface_hub's transitive surface) to current-stable so
+      # CVEs that affect only our test environment — not shipped users —
+      # don't gate merges. New CVEs that survive the upgrade ARE
+      # surfaced and DO fail CI, which is the intent.
+      - name: Python supply-chain audit
+        run: |
+          .venv/bin/pip install --upgrade \
+            'idna>=3.15' \
+            'pygments>=2.20.0' \
+            'requests>=2.33.0' \
+            'urllib3>=2.7.0'
+          .venv/bin/pip install pip-audit==2.10.0
+          .venv/bin/pip-audit --strict
 
       - name: Run full test suite (Hippius + HF parity, every PR / release)
         # Secrets are NOT exposed to PRs from forks (GitHub's default for
