@@ -299,30 +299,34 @@ def test_normalize_oci_timestamp_to_hf_form():
 
 
 @pytest.mark.e2e
-def test_list_repo_refs_includes_uploaded_revision(tmp_path, logged_in, test_repo, revision):
-    import time
+def test_list_repo_refs_includes_uploaded_revision(tmp_path, logged_in, test_repo):
+    import uuid
     from huggingface_hub import GitRefs
 
+    # Use a dedicated, freshly-created repo rather than the shared test repo. The
+    # shared repo accumulates thousands of tags across CI runs, and the registry's
+    # tag listing lags a push on a repo that large/busy — so a just-uploaded tag
+    # isn't reliably listable right away. On a fresh repo it's immediate; we clean
+    # it up afterwards. (A project-scoped robot creates the repo on first push.)
+    project = test_repo.split("/")[0]
+    repo = f"{project}/refs-{uuid.uuid4().hex[:8]}"
     src = tmp_path / "ref.bin"
     write_test_file(src, 64, seed=b"ref")
-    upload_file(path_or_fileobj=str(src), path_in_repo="ref.bin", repo_id=test_repo, revision=revision)
+    upload_file(path_or_fileobj=str(src), path_in_repo="ref.bin", repo_id=repo, revision="v1")
 
-    # The registry's tag listing is eventually consistent — a just-pushed tag can
-    # take a moment to surface — so poll until the fresh revision appears under
-    # tags. (Don't assume `main` exists: the shared test repo is populated almost
-    # entirely from unique per-test revisions.)
-    refs = None
-    for _ in range(10):
-        refs = list_repo_refs(test_repo)
+    try:
+        refs = list_repo_refs(repo)
         assert isinstance(refs, GitRefs)
-        if revision in [t.name for t in refs.tags]:
-            break
-        time.sleep(3)
-    else:
-        pytest.fail(f"{revision!r} did not appear under tags within the timeout")
-
-    # A non-main revision is classified as a tag, never a branch.
-    assert revision not in [b.name for b in refs.branches]
+        # A non-main revision is classified as a tag, never a branch.
+        assert "v1" in [t.name for t in refs.tags]
+        assert "v1" not in [b.name for b in refs.branches]
+    finally:
+        # Best-effort cleanup — a push-only robot may lack delete perms, and a
+        # leaked tiny repo shouldn't fail the assertion above.
+        try:
+            delete_repo(repo)
+        except Exception:
+            pass
 
 
 @pytest.mark.e2e
