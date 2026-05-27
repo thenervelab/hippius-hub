@@ -114,14 +114,24 @@ jobs:
           .venv/bin/pip-audit --skip-editable
 
       - name: Run full test suite (Hippius + HF parity, every PR / release)
-        # Secrets are NOT exposed to PRs from forks (GitHub's default for
-        # `pull_request` triggers). The conftest `_have_creds()` check
-        # detects the empty-env case and skips e2e-marked tests so a fork
-        # PR sees offline tests pass and live tests skip — no false fail.
+        # Secrets are NOT exposed to PRs from forks or Dependabot (GitHub's
+        # default for `pull_request` triggers). When the registry creds are
+        # absent we deselect the e2e-marked tests entirely (`-m "not e2e"`)
+        # rather than relying on every e2e fixture to self-skip — a fixture
+        # that mishandles the no-creds path would otherwise ERROR and turn a
+        # fork/Dependabot PR red on a check it can't satisfy. Pushes to main
+        # and tags (where secrets ARE present) still run the full live suite.
         # See README §"CI secrets" for the full list and how they map to
         # the conftest fixtures (`creds`, `logged_in`).
         env:
           HIPPIUS_TEST_USER: ${{ secrets.HIPPIUS_TEST_USER }}
           HIPPIUS_TEST_PASS: ${{ secrets.HIPPIUS_TEST_PASS }}
           HIPPIUS_TEST_TOKEN: ${{ secrets.HIPPIUS_TEST_TOKEN }}
-        run: .venv/bin/pytest -v
+        run: |
+          if [ -n "$HIPPIUS_TEST_TOKEN" ] || { [ -n "$HIPPIUS_TEST_USER" ] && [ -n "$HIPPIUS_TEST_PASS" ]; }; then
+            echo "Registry creds present — running full suite (offline + e2e)."
+            .venv/bin/pytest -v
+          else
+            echo "No registry creds (fork/Dependabot PR) — running offline suite only."
+            .venv/bin/pytest -v -m "not e2e"
+          fi
