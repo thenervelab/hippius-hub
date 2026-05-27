@@ -19,6 +19,25 @@ const MAX_CONCURRENT_DOWNLOADS: usize = 32;
 const MAX_RETRIES: u32 = 3;
 const VERIFY_READ_BUFFER: usize = 8 * 1024 * 1024; // 8 MB read buffer for SHA256 verification
 
+/// Per-chunk request timeout (audit D6).
+///
+/// The `Client::builder().connect_timeout(30s)` on line 64 covers the
+/// TCP handshake; this constant is the FULL-REQUEST budget applied
+/// per chunk GET via `.timeout(...)`. A slow-loris server that
+/// completes the handshake then dribbles bytes can hold a connection
+/// open indefinitely without ever tripping `connect_timeout` — this
+/// per-request limit forecloses that.
+///
+/// Held in a const (not inline) so the regression test below can
+/// assert the VALUE — a self-referential `include_str!` match on
+/// `.timeout(Duration::from_mins(5))` would trivially pass when the
+/// assertion text itself is the only occurrence. With a const, the
+/// test asserts the value; removing the const's only call site at
+/// `try_download_chunk_to_offset` makes it `dead_code`, which
+/// `cargo clippy -- -D warnings` already promotes to a CI failure.
+/// Three-layer defense without self-reference.
+const CHUNK_REQUEST_TIMEOUT: Duration = Duration::from_mins(5);
+
 /// Number of HTTP Range requests needed to cover `content_length` bytes when
 /// each chunk is `chunk_size` bytes. Returns 0 for empty files (caller is
 /// expected to handle that as a special case). Returns 0 for `chunk_size == 0`
@@ -434,7 +453,7 @@ async fn try_download_chunk_to_offset(
     // uses (e.g. the HEAD in `get_content_length`) pick their own budget.
     let mut req = client.get(url)
         .header(header::RANGE, format!("bytes={start}-{end}"))
-        .timeout(Duration::from_mins(5));  // 5 minutes per chunk
+        .timeout(CHUNK_REQUEST_TIMEOUT);  // audit D6 — see const docs
 
     if let Some(t) = token {
         req = req.bearer_auth(t);
@@ -573,19 +592,28 @@ mod tests {
         assert!(matches!(*source, CoreError::ServerError(404, _)));
     }
 
-    // Regression for audit D6: pin the per-request timeout on the chunk GET.
-    // A behavioral test would need a mock HTTP server with controlled latency
-    // (Phase 4.3 territory); this structural source-grep is the minimal guard
-    // that ensures a future refactor cannot silently drop the `.timeout(...)`
-    // call and re-expose the slow-loris hang. `include_str!` is evaluated at
-    // compile time on the same file the test lives in, so the assertion runs
-    // against exactly the source the binary was built from.
+    // Regression for audit D6: pin the per-chunk request timeout on the
+    // chunk GET. Asserts the VALUE of the named const (300 seconds = 5
+    // minutes). The const itself is enforced by `cargo clippy -D warnings`:
+    // if a future refactor removes its only call site at
+    // `try_download_chunk_to_offset`, the const becomes `dead_code` and CI
+    // fails before this test even runs. Two complementary guards:
+    //   1. clippy: const must be used → production code must reference it
+    //   2. this test: const must equal 300s → value can't drift accidentally
+    //
+    // An earlier shape of this test used `include_str!` to grep the file
+    // for the literal timeout call. That was vacuous: the assertion text
+    // itself contained the substring it was searching for, so any source
+    // file containing the test passed regardless of what production did.
+    // The named-const approach removes the self-reference.
     #[test]
     fn try_download_chunk_to_offset_sets_request_timeout() {
-        let src = include_str!("chunked_downloader.rs");
-        assert!(
-            src.contains(".timeout(Duration::from_secs(300))"),
-            "chunked_downloader.rs must call .timeout(...) on the chunk GET request",
+        assert_eq!(
+            CHUNK_REQUEST_TIMEOUT,
+            Duration::from_mins(5),
+            "CHUNK_REQUEST_TIMEOUT must be 5 minutes; a slow-loris server \
+             could otherwise hold a TCP connection open indefinitely after \
+             a fast handshake (connect_timeout covers only the handshake).",
         );
     }
 
