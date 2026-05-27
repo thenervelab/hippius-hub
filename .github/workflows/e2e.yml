@@ -60,7 +60,7 @@ jobs:
       # ecosystem entry in .github/dependabot.yml so the merge of a
       # new advisory triggers a Dependabot PR within a week.
       - name: Cargo supply-chain audit
-        uses: EmbarkStudios/cargo-deny-action@d6d27f1b02f0c07f9db6ffc34e7871bba5ab5816  # v2.0.9
+        uses: EmbarkStudios/cargo-deny-action@7343aaf3a9563e7c5e0e8bac3896a292217cb163  # v2.0.19
         with:
           command: check
           arguments: --all-features
