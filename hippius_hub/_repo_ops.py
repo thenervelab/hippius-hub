@@ -342,8 +342,12 @@ def list_repo_refs(
     Each revision (an OCI manifest tag) maps to a GitRefInfo. The revision named
     `main` — the mutable default that uploads re-point — is reported under
     `branches`; every other revision behaves like a release and is reported under
-    `tags`. `target_commit` is the revision's manifest digest, resolved
-    best-effort (None if a single revision can't be reached).
+    `tags`.
+
+    `target_commit` is left None: the registry's tag list doesn't carry the
+    manifest digest, and resolving it would be one HEAD per revision (O(N)
+    round-trips — minutes on repos with many revisions). Callers that need a
+    specific revision's digest can read `repo_info(repo_id, revision=...).sha`.
 
     `include_pull_requests` is accepted for HF signature parity but has no effect:
     the Hippius registry has no pull-request refs.
@@ -363,11 +367,10 @@ def list_repo_refs(
     branches = []
     tag_refs = []
     for tag in tags:
-        digest = _manifest_digest(registry, oci_repo, tag, oci_token)
         if tag == "main":
-            branches.append(GitRefInfo(name=tag, ref="refs/heads/main", target_commit=digest))
+            branches.append(GitRefInfo(name=tag, ref="refs/heads/main", target_commit=None))
         else:
-            tag_refs.append(GitRefInfo(name=tag, ref=f"refs/tags/{tag}", target_commit=digest))
+            tag_refs.append(GitRefInfo(name=tag, ref=f"refs/tags/{tag}", target_commit=None))
 
     return GitRefs(branches=branches, converts=[], tags=tag_refs)
 

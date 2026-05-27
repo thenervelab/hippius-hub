@@ -210,16 +210,15 @@ def test_repo_info_last_modified_from_manifest(tmp_path, logged_in, test_repo, r
 # ---------- list_repo_refs ----------
 
 def test_list_repo_refs_maps_branches_and_tags(monkeypatch):
-    """Unit-level: `main` goes under branches, everything else under tags, with
-    target_commit set to each revision's manifest digest. Mocks the network so
-    the GitRefs/GitRefInfo mapping is covered without creds (the other refs
-    tests are e2e-only)."""
+    """Unit-level: `main` goes under branches, everything else under tags. Mocks
+    the network so the GitRefs/GitRefInfo mapping is covered without creds (the
+    other refs tests are e2e-only). target_commit is intentionally None — the
+    tag list doesn't carry digests and resolving them is O(N) round-trips."""
     from huggingface_hub import GitRefs
     from hippius_hub import _repo_ops
 
     monkeypatch.setattr(_repo_ops, "get_oci_bearer_token", lambda *a, **k: "tok")
     monkeypatch.setattr(_repo_ops, "_list_tags", lambda *a, **k: ["main", "v1", "v2"])
-    monkeypatch.setattr(_repo_ops, "_manifest_digest", lambda *a, **k: "sha256:abc")
 
     refs = _repo_ops.list_repo_refs("org/model")
     assert isinstance(refs, GitRefs)
@@ -227,7 +226,7 @@ def test_list_repo_refs_maps_branches_and_tags(monkeypatch):
     assert refs.branches[0].ref == "refs/heads/main"
     assert sorted(t.name for t in refs.tags) == ["v1", "v2"]
     assert all(t.ref.startswith("refs/tags/") for t in refs.tags)
-    assert all(t.target_commit == "sha256:abc" for t in refs.tags)
+    assert all(t.target_commit is None for t in refs.tags)
 
 
 def test_list_repo_refs_unknown_repo_raises_unit(monkeypatch):
@@ -299,18 +298,29 @@ def test_normalize_oci_timestamp_to_hf_form():
 
 @pytest.mark.e2e
 def test_list_repo_refs_includes_uploaded_revision(tmp_path, logged_in, test_repo, revision):
+    import time
     from huggingface_hub import GitRefs
+
     src = tmp_path / "ref.bin"
     write_test_file(src, 64, seed=b"ref")
     upload_file(path_or_fileobj=str(src), path_in_repo="ref.bin", repo_id=test_repo, revision=revision)
 
-    refs = list_repo_refs(test_repo)
-    assert isinstance(refs, GitRefs)
-    names = [r.name for r in refs.branches] + [r.name for r in refs.tags]
-    assert revision in names
-    # `main` is reported as a branch; any other revision as a tag.
-    if revision == "main":
-        assert "main" in [r.name for r in refs.branches]
+    # The registry's tag listing is eventually consistent — a just-pushed tag can
+    # take a moment to surface — so poll until the fresh revision appears under
+    # tags. (Don't assume `main` exists: the shared test repo is populated almost
+    # entirely from unique per-test revisions.)
+    refs = None
+    for _ in range(10):
+        refs = list_repo_refs(test_repo)
+        assert isinstance(refs, GitRefs)
+        if revision in [t.name for t in refs.tags]:
+            break
+        time.sleep(3)
+    else:
+        pytest.fail(f"{revision!r} did not appear under tags within the timeout")
+
+    # A non-main revision is classified as a tag, never a branch.
+    assert revision not in [b.name for b in refs.branches]
 
 
 @pytest.mark.e2e
