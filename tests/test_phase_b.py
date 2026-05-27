@@ -257,8 +257,9 @@ def test_next_link_parsing():
 
 
 def test_list_tags_follows_pagination(monkeypatch):
-    """_list_tags walks Link: rel=next so the full tag set comes back, not just
-    the first page (the bug behind list_repo_refs missing fresh revisions)."""
+    """_list_tags requests an explicit page size (the registry's default page
+    omits the Link header and returns a single tag) and then walks Link: rel=next
+    so the full tag set comes back — the bug behind list_repo_refs missing tags."""
     from hippius_hub import _repo_ops
 
     class _FakeResp:
@@ -273,9 +274,10 @@ def test_list_tags_follows_pagination(monkeypatch):
         def json(self):
             return {"tags": self._tags}
 
+    first = f"https://reg/v2/r/tags/list?n={_repo_ops._TAGS_PAGE_SIZE}"
     pages = {
-        "https://reg/v2/r/tags/list": _FakeResp(["a", "b"], '</v2/r/tags/list?last=b>; rel="next"'),
-        "https://reg/v2/r/tags/list?last=b": _FakeResp(["c"]),
+        first: _FakeResp(["a", "b"], '</v2/r/tags/list?last=b&n=2>; rel="next"'),
+        "https://reg/v2/r/tags/list?last=b&n=2": _FakeResp(["c"]),
     }
     monkeypatch.setattr(_repo_ops.httpx, "get", lambda url, **kwargs: pages[url])
     assert _repo_ops._list_tags("https://reg", "r", "tok") == ["a", "b", "c"]

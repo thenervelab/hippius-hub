@@ -37,17 +37,22 @@ def _build_repo_url(repo_id: str, endpoint: Optional[str]) -> RepoUrl:
     return RepoUrl(f"{base}/v2/{repo_id}", endpoint=base)
 
 
+_TAGS_PAGE_SIZE = 1000
+
+
 def _list_tags(registry: str, repo_id: str, oci_token: str) -> Optional[list]:
-    """Return list of tags for a repo via the OCI v2 distribution API.
+    """Return the complete list of tags for a repo via the OCI v2 distribution API.
 
     Robots with `pull` perm can call this. Returns None on 404 (repo doesn't exist),
     a (possibly empty) list otherwise.
     """
-    # Follow RFC 5988 `Link: rel="next"` pagination so repos with many tags
-    # return the complete list, not just the registry's first page — callers
-    # like list_repo_refs / `revisions` need every tag, not a prefix.
+    # The registry's default (no `?n`) page returns only the first tag and omits
+    # the Link header, so we MUST request an explicit page size — otherwise
+    # callers like list_repo_refs / `revisions` would silently see one tag.
+    # Harbor echoes `n` into the `Link: rel="next"` header, so the loop below
+    # then walks the remaining pages (RFC 5988) to assemble the full list.
     headers = {"Authorization": f"Bearer {oci_token}"}
-    url = f"{registry}/v2/{repo_id}/tags/list"
+    url = f"{registry}/v2/{repo_id}/tags/list?n={_TAGS_PAGE_SIZE}"
     tags: list = []
     seen = set()
     while url and url not in seen:
