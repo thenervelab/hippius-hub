@@ -20,7 +20,7 @@ from huggingface_hub.utils import filter_repo_objects
 from tqdm import tqdm
 
 from ._oci import fetch_manifest, layer_title
-from .auth import get_oci_bearer_token, get_token, resolve_token_value
+from .auth import get_oci_bearer_token, resolve_token_value
 from .constants import DEFAULT_HTTP_TIMEOUT, LAYER_TITLE_KEY, resolve_registry
 from .errors import ConcurrentManifestUpdateError
 from .file_download import _oci_repo_path, _validate_repo_type

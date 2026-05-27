@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Dict, Optional, Union
 
 from ._oci import fetch_manifest, layer_title
-from .auth import get_oci_bearer_token, get_token, resolve_token_value
+from .auth import get_oci_bearer_token, resolve_token_value
 from .constants import DEFAULT_CACHE_DIR, resolve_registry
 from .errors import (
     EntryNotFoundError,
