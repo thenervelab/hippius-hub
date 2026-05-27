@@ -6,7 +6,7 @@ build-backend = "maturin"
 name = "hippius_hub"
 version = "0.5.0"
 description = "Hippius Hub CLI + Python client: manage your registry namespace, search the AI model index, and pull/push models with a Rust-accelerated transport"
-requires-python = ">=3.10"
+requires-python = ">=3.9"
 dependencies = [
     "httpx",
     "typing_extensions",
