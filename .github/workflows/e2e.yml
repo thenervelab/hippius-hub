@@ -91,6 +91,13 @@ jobs:
       # CVEs that affect only our test environment — not shipped users —
       # don't gate merges. New CVEs that survive the upgrade ARE
       # surfaced and DO fail CI, which is the intent.
+      #
+      # `--skip-editable` excludes the in-tree hippius_hub install
+      # (`pip install -e ".[test]"` above) from the audit. Without it,
+      # pip-audit tries to look up the current local version on PyPI
+      # and `--strict` upgrades the "not found" warning to a fatal
+      # error — which happens on every version bump until the release
+      # actually lands on PyPI.
       - name: Python supply-chain audit
         run: |
           .venv/bin/pip install --upgrade \
@@ -99,7 +106,7 @@ jobs:
             'requests>=2.33.0' \
             'urllib3>=2.7.0'
           .venv/bin/pip install pip-audit==2.10.0
-          .venv/bin/pip-audit --strict
+          .venv/bin/pip-audit --strict --skip-editable
 
       - name: Run full test suite (Hippius + HF parity, every PR / release)
         # Secrets are NOT exposed to PRs from forks (GitHub's default for
