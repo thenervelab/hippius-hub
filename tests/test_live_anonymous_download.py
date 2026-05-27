@@ -16,12 +16,22 @@ from __future__ import annotations
 
 import os
 
+import httpx
 import pytest
 
 from hippius_hub import hippius_hub_upload, hf_hub_download
 from hippius_hub.errors import GatedRepoError, HfHubHTTPError, RepositoryNotFoundError
 
 from tests._helpers import sha256_of_file, write_test_file
+
+
+# Status codes the live registry returns when the test repo is private
+# and the request was anonymous. The skip path below treats these as
+# "not-a-bug-in-hippius_hub" — the repo is private, anonymous can't
+# read it. Mark the repo public via
+# `hippius-hub registry publicity public` to flip the test from skip
+# to assert.
+_PRIVATE_REPO_STATUS_CODES = {401, 403, 404}
 
 
 pytestmark = pytest.mark.e2e
@@ -61,22 +71,28 @@ def test_token_false_can_pull_public_file(
             token=False,  # HF anonymous sentinel
         )
     except (RepositoryNotFoundError, GatedRepoError) as e:
-        pytest.skip(
-            f"`{test_repo}` does not appear to be public on the live "
-            f"registry (got {type(e).__name__}: {e}); the C2 invariant "
-            f"is still pinned at the localhost level via "
-            f"tests/test_anonymous_download.py. Mark the repo public "
-            f"via `hippius-hub registry publicity public` to enable "
-            f"this live test."
-        )
-    except HfHubHTTPError as e:
-        # 401 from the token service when anonymous isn't accepted — same
-        # outcome (test repo isn't open to anonymous pulls).
-        if "401" in str(e) or "403" in str(e):
-            pytest.skip(
-                f"registry rejected anonymous pull from `{test_repo}` "
-                f"({e}); see above for fix."
-            )
+        # HF-typed exceptions get the clearest skip reason.
+        pytest.skip(_skip_reason(test_repo, e))
+    except (HfHubHTTPError, httpx.HTTPStatusError) as e:
+        # Raw httpx.HTTPStatusError can leak through _oci.fetch_manifest
+        # (line 75: `resp.raise_for_status()`) when the registry returns
+        # 401 to the manifest GET — no HF-type wrapper applies because
+        # the failure happens before the file-not-found path. Inspect
+        # the response status code instead of string-matching.
+        status = getattr(getattr(e, "response", None), "status_code", None)
+        if status in _PRIVATE_REPO_STATUS_CODES:
+            pytest.skip(_skip_reason(test_repo, e, status=status))
         raise
 
     assert sha256_of_file(out) == expected_sha
+
+
+def _skip_reason(test_repo: str, exc: BaseException, *, status: int | None = None) -> str:
+    code = f" [HTTP {status}]" if status is not None else ""
+    return (
+        f"`{test_repo}` does not appear to be public on the live registry "
+        f"(got {type(exc).__name__}{code}: {exc}). The C2 invariant is "
+        f"still pinned at the localhost level via "
+        f"tests/test_anonymous_download.py. Mark the repo public via "
+        f"`hippius-hub registry publicity public` to enable this live test."
+    )
