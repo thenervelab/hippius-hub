@@ -19,6 +19,20 @@ def test_cli_login_writes_token(tmp_path, monkeypatch):
 
     assert token_file.read_text() == "Bearer fake"
 
+    # Audit C3 pin: the token file must be 0o600 (owner-read/write only).
+    # The chmod happens inside auth.login (auth.py:106-109) after the write.
+    # On Windows os.chmod is a no-op and the test would always fail; skip
+    # rather than yield a false negative — Windows users are off-policy
+    # for the CLI anyway (see auth.py comment).
+    if sys.platform.startswith("win"):
+        pytest.skip("chmod 0o600 is a POSIX-only invariant; Windows has no equivalent.")
+    mode = os.stat(token_file).st_mode & 0o777
+    assert mode == 0o600, (
+        f"token file permissions must be 0o600, got 0o{mode:o}. "
+        f"World-readable token = anyone on the same box (CI runner, shared "
+        f"laptop) can pull your bearer JWT out of ~/.cache/hippius/hub/token."
+    )
+
 
 @pytest.mark.e2e
 def test_cli_download_smoke(tmp_path, test_repo, creds, revision):

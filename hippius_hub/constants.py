@@ -1,3 +1,8 @@
+"""Shared defaults: cache dirs, registry/API URLs, HTTP timeouts, OCI media types.
+
+Single source of truth so the env-var override knobs (HIPPIUS_API_URL etc.)
+don't need to be re-implemented in each module.
+"""
 import os
 from typing import Optional
 

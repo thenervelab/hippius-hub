@@ -135,6 +135,7 @@ def harbor_delete_project(
     endpoint: Optional[str] = None,
     missing_ok: bool = False,
 ) -> None:
+    """Delete a Harbor project; with `missing_ok=True`, 404 is swallowed."""
     resp = httpx.delete(
         f"{_base(endpoint)}/api/v2.0/projects/{project_name}",
         headers=_headers(auth_header),
@@ -178,6 +179,7 @@ def harbor_delete_repository(
     endpoint: Optional[str] = None,
     missing_ok: bool = False,
 ) -> None:
+    """Delete a Harbor repository under `project_name`; with `missing_ok=True`, 404 is swallowed."""
     encoded = repo_name.replace("/", "%2F")
     resp = httpx.delete(
         f"{_base(endpoint)}/api/v2.0/projects/{project_name}/repositories/{encoded}",

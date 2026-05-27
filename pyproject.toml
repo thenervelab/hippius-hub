@@ -4,9 +4,9 @@ build-backend = "maturin"
 
 [project]
 name = "hippius_hub"
-version = "0.4.7"
+version = "0.5.0"
 description = "Hippius Hub CLI + Python client: manage your registry namespace, search the AI model index, and pull/push models with a Rust-accelerated transport"
-requires-python = ">=3.8"
+requires-python = ">=3.9"
 dependencies = [
     "httpx",
     "typing_extensions",
@@ -15,7 +15,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-test = ["pytest>=7"]
+test = ["pytest>=7", "respx>=0.21", "hypothesis>=6"]
 
 [project.scripts]
 hippius-hub = "hippius_hub.cli:main"

@@ -1,7 +1,8 @@
 [package]
 name = "hippius_core"
-version = "0.4.7"
+version = "0.5.0"
 edition = "2021"
+license = "MIT OR Apache-2.0"
 
 [lib]
 name = "hippius_core"
@@ -10,16 +11,57 @@ name = "hippius_core"
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-pyo3 = { version = "0.20", features = ["extension-module", "abi3", "abi3-py38"] }
+pyo3 = { version = "0.22", features = ["extension-module", "abi3", "abi3-py38"] }
+# Provides the canonical process-global tokio runtime (see `shared_runtime`
+# in src/lib.rs). Version 0.22.x is the line aligned with pyo3 0.22 — each
+# pyo3-async-runtimes release pins to a single pyo3 minor; mismatches surface
+# as "expected pyo3 X, found Y" type errors at compile time. Audit STRUCT-1.
+pyo3-async-runtimes = { version = "0.22", features = ["tokio-runtime"] }
 tokio = { version = "1.35", features = ["rt", "rt-multi-thread", "macros", "fs", "time"] }
 tokio-util = { version = "0.7", features = ["codec"] }
-reqwest = { version = "0.11", default-features = false, features = ["json", "stream", "rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
 indicatif = "0.17.8"
 futures = "0.3"
 hex = "0.4"
+thiserror = "1.0"
 
 [target.'cfg(all(target_arch = "x86_64", target_os = "linux"))'.dependencies]
 sha2 = { version = "0.10", features = ["asm"] }
 
 [target.'cfg(not(all(target_arch = "x86_64", target_os = "linux")))'.dependencies]
 sha2 = "0.10"
+
+[dev-dependencies]
+proptest = "1.5"
+
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+# Panic prevention
+unwrap_used = "deny"
+expect_used = "warn"
+panic = "deny"
+panic_in_result_fn = "deny"
+unimplemented = "deny"
+# No cheating
+allow_attributes = "deny"
+# Code hygiene
+dbg_macro = "deny"
+todo = "deny"
+print_stdout = "deny"
+print_stderr = "deny"
+# Safety
+await_holding_lock = "deny"
+large_futures = "deny"
+exit = "deny"
+mem_forget = "deny"
+# Pedantic relaxations (too noisy)
+module_name_repetitions = "allow"
+similar_names = "allow"
+# pyo3 0.22 `#[pyfunction]` macro expansion emits a `PyErr::from(PyErr)`
+# round-trip on the return type, which clippy reports as a useless
+# conversion. The conversion lives inside the proc-macro output and is
+# unreachable from our source — no `#[expect]` on the function attribute
+# fulfills it because the lint emits at a position the attribute span
+# does not cover. Allowing it crate-wide is the upstream-suggested
+# workaround until pyo3 emits `#[allow]` itself in the generated code.
+useless_conversion = "allow"

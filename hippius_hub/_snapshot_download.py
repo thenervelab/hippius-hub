@@ -1,4 +1,12 @@
+"""Whole-revision download path: `snapshot_download`.
+
+Resolves the manifest once, applies `allow_patterns` / `ignore_patterns`,
+and fans the matching layers out to `hf_hub_download` via a
+ThreadPoolExecutor so a snapshot of a large repo doesn't serialise on the
+network.
+"""
 import os
+import warnings
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Dict, List, Optional, Union
@@ -10,6 +18,48 @@ from .auth import get_oci_bearer_token, resolve_token_value
 from .constants import DEFAULT_CACHE_DIR, resolve_registry
 from .errors import LocalEntryNotFoundError
 from .file_download import _cache_dirname, _oci_repo_path, _validate_repo_type, hf_hub_download
+
+
+def _handle_ignored_snapshot_kwargs(
+    *,
+    etag_timeout: float,
+    tqdm_class,
+    headers,
+    user_agent,
+    library_name,
+    library_version,
+):
+    """Emit UserWarning for HF kwargs snapshot_download accepts but ignores.
+
+    Excludes dry_run — snapshot_download honors it. stacklevel=3 points at
+    the user's call site, not this helper.
+    """
+    if etag_timeout != 10.0:
+        warnings.warn(
+            "etag_timeout is ignored: hippius_hub does not perform ETag negotiation.",
+            UserWarning,
+            stacklevel=3,
+        )
+    if tqdm_class is not None:
+        warnings.warn(
+            "tqdm_class is ignored: hippius_hub uses its own progress bar.",
+            UserWarning,
+            stacklevel=3,
+        )
+    if headers:
+        warnings.warn(
+            "headers= is ignored: hippius_hub doesn't pass custom HTTP headers yet.",
+            UserWarning,
+            stacklevel=3,
+        )
+    if user_agent:
+        warnings.warn("user_agent is ignored.", UserWarning, stacklevel=3)
+    if library_name or library_version:
+        warnings.warn(
+            "library_name/library_version are ignored.",
+            UserWarning,
+            stacklevel=3,
+        )
 
 
 def snapshot_download(
@@ -37,11 +87,32 @@ def snapshot_download(
     """Download every file in an OCI manifest for `repo_id` at `revision`.
 
     Returns the path to the snapshot directory (or `local_dir` if provided).
-    Honors allow_patterns/ignore_patterns via huggingface_hub.utils.filter_repo_objects.
-    library_name/library_version/user_agent/etag_timeout/tqdm_class/headers are
-    accepted for HF signature parity and currently have no effect.
+    Honors allow_patterns/ignore_patterns via huggingface_hub.utils.filter_repo_objects,
+    plus dry_run.
+
+    ``dry_run=True`` is a true I/O short-circuit: it returns the snapshot
+    directory path without making any HTTP requests (no token-service call,
+    no manifest GET, no blob fetches). The previous implementation deferred
+    the early return until after the manifest GET, which silently surfaced
+    network errors and auth failures to a path the caller said should be a
+    no-op. allow_patterns / ignore_patterns are *not* applied in dry_run
+    mode — there are no filenames to filter when the manifest is never
+    fetched. If a caller needs "what would be downloaded" semantics, run
+    snapshot_download a second time without dry_run.
+
+    Accepted but currently ignored (UserWarning at call site):
+        etag_timeout (when != 10.0), tqdm_class, headers, user_agent,
+        library_name, library_version.
     """
     _validate_repo_type(repo_type)
+    _handle_ignored_snapshot_kwargs(
+        etag_timeout=etag_timeout,
+        tqdm_class=tqdm_class,
+        headers=headers,
+        user_agent=user_agent,
+        library_name=library_name,
+        library_version=library_version,
+    )
     if cache_dir is None:
         cache_dir = DEFAULT_CACHE_DIR
     cache_dir = str(cache_dir)
@@ -66,12 +137,23 @@ def snapshot_download(
             )
         return snapshot_dir
 
+    # dry_run short-circuits BEFORE the token-service call and manifest GET.
+    # The earlier placement (after manifest fetch) leaked network I/O and
+    # auth failures into a path the caller asked to be a no-op — a 401 on
+    # the token endpoint would surface as a confusing exception when the
+    # user passed dry_run=True expecting "just tell me the path."
+    if dry_run:
+        return snapshot_dir
+
     oci_repo = _oci_repo_path(repo_id, repo_type)
     registry = resolve_registry(endpoint)
     auth_token = resolve_token_value(token)
     oci_token = get_oci_bearer_token(oci_repo, auth_token)
 
-    manifest = fetch_manifest(registry, oci_repo, revision, oci_token)
+    # Read path: snapshot_download never PUTs, so we discard the digest and
+    # pass the bare manifest body through to each worker via _resolved_manifest
+    # (which is typed as a dict — see `hf_hub_download`).
+    manifest = fetch_manifest(registry, oci_repo, revision, oci_token).manifest
     filenames = layer_titles(manifest)
 
     filtered = list(
@@ -81,9 +163,6 @@ def snapshot_download(
             ignore_patterns=ignore_patterns,
         )
     )
-
-    if dry_run:
-        return snapshot_dir
 
     def _download_one(filename: str) -> str:
         # Pass through the already-fetched manifest + OCI token so each worker

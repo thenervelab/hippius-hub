@@ -4,6 +4,17 @@ import uuid
 import pytest
 
 
+# Load the Phase 2.4 respx fixture module as a pytest plugin so fixtures it
+# defines (notably `monkeypatched_registry`) are discoverable by tests that
+# request them by name. Helper functions (`token_route`, `manifest_get_route`,
+# etc.) remain plain imports — the `pytest_plugins` mechanism is specifically
+# about exposing `@pytest.fixture`-decorated callables to test collection.
+# respx itself is auto-registered via its `pytest11` entry point (verified
+# via `importlib.metadata.entry_points(group='pytest11')`), so it is NOT
+# listed here.
+pytest_plugins = ["tests.respx_fixtures"]
+
+
 @pytest.fixture(autouse=True)
 def _clear_oci_token_cache():
     """Prevent cross-test contamination of the global OCI bearer-token cache.

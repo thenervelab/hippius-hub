@@ -323,7 +323,7 @@ Also known semantic divergences:
 
 - `model_info` fills `id`, `sha`, `lastModified`, `siblings`, `private`. Fields with no OCI-registry analog (`pipeline_tag`, `library_name`, `tags`, `downloads`, `likes`) are `None`.
 - `hf_hub_url` returns the OCI manifest URL — usable for inspection but not a direct CDN download URL like HF's.
-- Concurrent `upload_file` calls to the same `repo_id:revision` race on the manifest with no If-Match check (last writer wins). Serialize same-revision uploads externally.
+- Concurrent `upload_file` calls to the same `repo_id:revision` are protected by an `If-Match` header on the manifest PUT: the first writer wins, the second sees `ConcurrentManifestUpdateError` (subclass of `HfHubHTTPError`) and can retry on a fresh baseline. If the registry omits `Docker-Content-Digest` on the manifest GET (RECOMMENDED-but-not-REQUIRED per OCI Distribution Spec §4.4.1), the PUT proceeds without `If-Match` and a `UserWarning` is emitted so the unprotected write is grep-able in logs.
 
 ## Development
 
@@ -345,3 +345,33 @@ HIPPIUS_TEST_USER='...' HIPPIUS_TEST_PASS='...' pytest -m hf_parity -v
 ```
 
 The CI workflow (`.github/workflows/e2e.yml`) runs fast tests on every PR, the Hippius e2e suite on every PR with credentials, and the full HF-parity nightly.
+
+## CI secrets
+
+The e2e workflow consumes three repository secrets. The `creds` fixture in `tests/conftest.py:34-45` accepts either the USER+PASS pair (Basic Auth) OR the TOKEN (Bearer) path; if both env vars are empty the `_have_creds()` check returns False and every `@pytest.mark.e2e` test skips cleanly. This is deliberate so PRs from **forks** — which never receive secrets under the `pull_request` trigger by GitHub's default — see the offline suite pass and the live suite skip, rather than a confusing fail.
+
+| Secret name           | Status      | Purpose |
+|-----------------------|-------------|---------|
+| `HIPPIUS_TEST_USER`   | recommended | Username for Basic Auth against registry.hippius.com. Paired with HIPPIUS_TEST_PASS. |
+| `HIPPIUS_TEST_PASS`   | recommended | Password / docker robot secret paired with HIPPIUS_TEST_USER. |
+| `HIPPIUS_TEST_TOKEN`  | optional    | Bearer token alternative. Useful when rotating to a role-scoped robot via `hippius-hub registry keys create --role push`. |
+
+Set them in repo settings under **Settings → Secrets and variables → Actions → Repository secrets**, or via the CLI:
+
+```bash
+gh secret set HIPPIUS_TEST_USER -b 'robot$your-project+ci'
+gh secret set HIPPIUS_TEST_PASS    # interactive prompt; value won't appear in shell history
+gh secret set HIPPIUS_TEST_TOKEN   # only if using the Bearer path
+```
+
+**Scope the test credentials to `test/e2e-client` only — never to a production namespace.** That keeps the blast radius of any leak limited to test data. For finer-grained scope, create a role-scoped robot:
+
+```bash
+# On the workstation where you're already logged in:
+hippius-hub registry keys create ci-e2e --role push --expires-days 90
+# Use the printed login/secret as HIPPIUS_TEST_USER / HIPPIUS_TEST_PASS.
+```
+
+The test namespace defaults to `test/e2e-client` (overridable via `HIPPIUS_TEST_REPO`).
+
+GitHub Actions auto-masks secret values in job logs (they appear as `***`), but a malicious test that explicitly `print()`s a credential could still leak it via the streamed log. Review test changes accordingly.
