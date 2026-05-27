@@ -31,14 +31,17 @@ class ConsoleError(Exception):
 
 
 def save_api_token(token: str) -> None:
-    """Persist the user's console.hippius.com API token to disk."""
+    """Persist the user's console.hippius.com API token to disk.
+
+    Uses the same atomic-rename pattern as `auth.login` so the API
+    token file is never observable at any mode other than 0o600 —
+    the previous write-then-chmod sequence left a transient
+    world-readable window. See `auth._atomic_write_secret` for the
+    pattern and rationale.
+    """
+    from .auth import _atomic_write_secret  # avoid import cycle at module load
     os.makedirs(DEFAULT_CACHE_DIR, exist_ok=True)
-    with open(API_TOKEN_PATH, "w") as f:
-        f.write(token.strip())
-    try:
-        os.chmod(API_TOKEN_PATH, 0o600)
-    except OSError:
-        pass
+    _atomic_write_secret(API_TOKEN_PATH, token.strip())
 
 
 def load_api_token() -> Optional[str]:

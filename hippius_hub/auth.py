@@ -5,20 +5,22 @@ a saved-on-disk token or a literal, caches short-lived OCI bearer tokens per
 (repo, scope) so each download/upload doesn't re-auth, and exposes the
 saved-token persistence used by `login` / `logout` / `whoami`.
 """
-import os
+import base64
 import hashlib
 import json
+import os
+import tempfile
 import threading
 import time
 import warnings
 from typing import Literal, Optional, Union
+
 import httpx
+
 from .constants import DEFAULT_CACHE_DIR, DEFAULT_HTTP_TIMEOUT, DEFAULT_REGISTRY_URL
 from .errors import LocalTokenNotFoundError
 
 TOKEN_PATH = os.path.join(DEFAULT_CACHE_DIR, "token")
-
-import base64
 
 
 # Per-(repo_id, push, auth_input) cache of OCI bearer JWTs.
@@ -86,6 +88,56 @@ def _jwt_expiration(jwt_str: str):
     return payload.get("exp")
 
 
+def _atomic_write_secret(path: str, content: str) -> None:
+    """Write `content` to `path` such that the file is NEVER world-readable.
+
+    The previous implementation (write-then-chmod) opened the file with
+    the process umask — typically 0o022 on Linux, leaving the file at
+    0o644 until the subsequent ``os.chmod`` call landed. A reader racing
+    that window saw the bearer token. Even on a sub-millisecond window
+    that's a real exfiltration vector on shared hosts (CI runners,
+    multi-tenant laptops).
+
+    Pattern: write to a sibling tempfile (mkstemp creates with 0o600 on
+    POSIX), then ``os.rename`` over the destination. Rename is atomic on
+    POSIX same-filesystem moves — readers either see the old file or
+    the new file, never a transient half-written or wrong-mode state.
+
+    On Windows, ``os.chmod`` is a near-no-op and mkstemp's mode is best-
+    effort; the pattern still works because Windows ACLs default to
+    owner-only on tempfile creation.
+    """
+    parent = os.path.dirname(path) or "."
+    fd, tmp_path = tempfile.mkstemp(dir=parent, prefix=".token-", suffix=".tmp")
+    try:
+        # mkstemp returns 0o600 on POSIX but enforce explicitly so a
+        # future stdlib change (or a non-standard tempfile impl) cannot
+        # downgrade us silently.
+        try:
+            os.fchmod(fd, 0o600)
+        except (AttributeError, OSError):
+            # os.fchmod doesn't exist on Windows; mkstemp's default is
+            # already owner-only on that platform.
+            pass
+        with os.fdopen(fd, "w") as f:
+            f.write(content)
+        # os.replace == os.rename with overwrite semantics on POSIX,
+        # better Windows behavior. Atomic same-filesystem rename:
+        # readers always see EITHER the old path or the new — never an
+        # in-flight wrong-mode file.
+        os.replace(tmp_path, path)
+    except BaseException:
+        # mkstemp left a tempfile on disk; remove it if we didn't
+        # successfully rename. The bare except is deliberate — any
+        # path that didn't reach os.replace must clean up, including
+        # KeyboardInterrupt/SystemExit.
+        try:
+            os.unlink(tmp_path)
+        except FileNotFoundError:
+            pass
+        raise
+
+
 def login(
     token: str = None,
     *,
@@ -101,6 +153,11 @@ def login(
     `add_to_git_credential` and `skip_if_logged_in` are accepted for HF
     signature compatibility and currently have no effect (Hippius doesn't
     use git credential storage).
+
+    The token file is written via an atomic-rename pattern (see
+    `_atomic_write_secret`) so it is never observable at any mode other
+    than 0o600 — the previous write-then-chmod pattern left a transient
+    world-readable window between open() and chmod().
     """
     os.makedirs(DEFAULT_CACHE_DIR, exist_ok=True)
 
@@ -113,15 +170,7 @@ def login(
     else:
         raise ValueError("Either username/password or token must be provided")
 
-    # Write+chmod together so the file is never world-readable mid-flight.
-    # os.chmod on a path is a syscall, not enforced atomically with open();
-    # the best-effort try/except mirrors save_api_token in console.py.
-    with open(TOKEN_PATH, "w") as f:
-        f.write(auth_str)
-    try:
-        os.chmod(TOKEN_PATH, 0o600)
-    except OSError:
-        pass
+    _atomic_write_secret(TOKEN_PATH, auth_str)
     print(f"Token successfully saved to {TOKEN_PATH}")
 
 
