@@ -21,6 +21,16 @@ from . import console
 from .console import ConsoleError
 
 
+# Typed exit codes for non-exception failure modes — i.e. user-input
+# validation errors and informational "not available" results that the
+# typed-error dispatch in `_format_download_error` doesn't cover. Same
+# 10+ codespace rationale as the download/upload exit codes: stay out of
+# bash's reserved 1-2 range (1 = generic, 2 = misuse of shell builtin /
+# argparse usage error) so shell wrappers can branch deterministically.
+EXIT_NAMESPACE_TAKEN = 17       # `registry check <name>` -> name is taken
+EXIT_INVALID_REPO_FORMAT = 18   # CLI arg `<project>/<repo>` is malformed
+
+
 def _fmt_bytes(n) -> str:
     if n is None:
         return "—"
@@ -66,12 +76,17 @@ def _format_download_error(e: Exception) -> tuple[str, int]:
         14 access denied (GatedRepoError, DisabledRepoError)
         15 concurrent manifest write (ConcurrentManifestUpdateError)
         16 registry HTTP error (HfHubHTTPError)
+        17 registry namespace not available (set by cmd_registry_check)
+        18 malformed `<project>/<repo>` CLI argument (set by registry/models)
 
     Codes start at 10 (not 2) to avoid colliding with bash's reserved
     exit code 2 ("misuse of shell builtin") and argparse's default for
     usage errors — both of which the CLI already produces at the parser
     layer. A typed routing code that overlapped with those would be
     indistinguishable from a bad-argument failure to a shell wrapper.
+    Codes 17 and 18 are non-exception paths (validated by the CLI itself
+    before any HTTP call) so they don't appear in this function's
+    dispatch — they're set inline by the registry/models handlers.
 
     Ordering invariant: HF's typed exception hierarchy has three subclass
     relationships that matter here — LocalEntryNotFoundError <: Entry-
@@ -150,7 +165,7 @@ def cmd_registry_check(args):
         print(f"✅ {args.name} is available")
     else:
         print(f"❌ {res.get('message') or 'taken'}")
-        sys.exit(2)
+        sys.exit(EXIT_NAMESPACE_TAKEN)
 
 
 def _maybe_docker_login(host: str, user: str, secret: str, *, auto: bool):
@@ -279,7 +294,7 @@ def cmd_registry_artifacts(args):
         print(f"❌ Repo must be '<project>/<repo>', got '{args.repo}'.")
         print("   Example: hippius-hub registry artifacts myorg/my-models")
         print("   (run `hippius-hub registry me` to see your project name)")
-        sys.exit(2)
+        sys.exit(EXIT_INVALID_REPO_FORMAT)
     res = console.list_artifacts(args.repo, page=args.page, page_size=args.page_size)
     if not res:
         print("No artifacts.")
@@ -454,7 +469,7 @@ def cmd_models_show(args):
     parts = args.repo_id.split("/", 1)
     if len(parts) != 2:
         print("❌ repo_id must be <project>/<repo>")
-        sys.exit(1)
+        sys.exit(EXIT_INVALID_REPO_FORMAT)
     project, repo = parts
     if args.reference:
         res = console.model_detail(project, repo, args.reference)
