@@ -88,7 +88,18 @@ def snapshot_download(
 
     Returns the path to the snapshot directory (or `local_dir` if provided).
     Honors allow_patterns/ignore_patterns via huggingface_hub.utils.filter_repo_objects,
-    plus dry_run (early-returns without downloading).
+    plus dry_run.
+
+    ``dry_run=True`` is a true I/O short-circuit: it returns the snapshot
+    directory path without making any HTTP requests (no token-service call,
+    no manifest GET, no blob fetches). The previous implementation deferred
+    the early return until after the manifest GET, which silently surfaced
+    network errors and auth failures to a path the caller said should be a
+    no-op. allow_patterns / ignore_patterns are *not* applied in dry_run
+    mode — there are no filenames to filter when the manifest is never
+    fetched. If a caller needs "what would be downloaded" semantics, run
+    snapshot_download a second time without dry_run.
+
     Accepted but currently ignored (UserWarning at call site):
         etag_timeout (when != 10.0), tqdm_class, headers, user_agent,
         library_name, library_version.
@@ -126,6 +137,14 @@ def snapshot_download(
             )
         return snapshot_dir
 
+    # dry_run short-circuits BEFORE the token-service call and manifest GET.
+    # The earlier placement (after manifest fetch) leaked network I/O and
+    # auth failures into a path the caller asked to be a no-op — a 401 on
+    # the token endpoint would surface as a confusing exception when the
+    # user passed dry_run=True expecting "just tell me the path."
+    if dry_run:
+        return snapshot_dir
+
     oci_repo = _oci_repo_path(repo_id, repo_type)
     registry = resolve_registry(endpoint)
     auth_token = resolve_token_value(token)
@@ -144,9 +163,6 @@ def snapshot_download(
             ignore_patterns=ignore_patterns,
         )
     )
-
-    if dry_run:
-        return snapshot_dir
 
     def _download_one(filename: str) -> str:
         # Pass through the already-fetched manifest + OCI token so each worker
