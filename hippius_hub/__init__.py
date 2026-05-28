@@ -42,7 +42,12 @@ from ._repo_ops import (
     revision_exists,
 )
 from .auth import get_token, login, logout, whoami
-from .hf_api import HippiusApi
+# Card classes are subclasses defined in `.hf_api` (NOT bare re-exports from
+# huggingface_hub) — the HF originals have `push_to_hub`/`load` methods that
+# hit huggingface.co. Importing them from this package gives users the data
+# shape but raises if they call the network methods, instead of silently
+# routing README I/O at HF.
+from .hf_api import DatasetCard, HippiusApi, ModelCard, RepoCard
 
 # Re-export huggingface_hub typed exceptions
 from .errors import (
@@ -60,21 +65,21 @@ from .errors import (
     RevisionNotFoundError,
 )
 
-# Re-export huggingface_hub dataclasses so consumers receive HF-compatible types
+# Re-export huggingface_hub dataclasses so consumers receive HF-compatible types.
+# RepoCard / ModelCard / DatasetCard are NOT in this list — they're imported
+# above from `.hf_api` instead, as Hippius-safe subclasses that block the HF
+# network methods.
 from huggingface_hub import (
     CardData,
     CommitInfo,
     CommitOperationAdd,
     CommitOperationDelete,
-    DatasetCard,
     DatasetInfo,
     GitRefInfo,
     GitRefs,
     HfFileMetadata,
-    ModelCard,
     ModelCardData,
     ModelInfo,
-    RepoCard,
     RepoFile,
     RepoFolder,
     RepoUrl,

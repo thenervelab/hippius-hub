@@ -1,4 +1,21 @@
 import hashlib
+import subprocess
+import sys
+
+
+HIPPIUS_CLI = [sys.executable, "-m", "hippius_hub.cli"]
+
+
+def run_cli(args, env, check=True):
+    """Invoke `hippius-hub <args...>` as a subprocess and return CompletedProcess.
+
+    Uses `-m hippius_hub.cli` so we don't depend on the console script being
+    on PATH. CLI tests pass the `cli_env` fixture as `env` to keep credentials
+    isolated to a tmp HOME.
+    """
+    return subprocess.run(
+        HIPPIUS_CLI + list(args), env=env, check=check, capture_output=True, text=True,
+    )
 
 
 def write_test_file(path, size, seed=b"hippius"):
