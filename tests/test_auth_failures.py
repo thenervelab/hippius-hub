@@ -68,20 +68,34 @@ def test_console_check_namespace_works_without_auth(tmp_path, monkeypatch):
 # ---------- OCI auth failures ----------
 
 def test_oci_call_with_garbage_token_fails(tmp_path, monkeypatch, test_repo):
-    """A bogus docker-registry token must produce an httpx error from the
-    OCI token-service step. Confirms auth is actually evaluated server-side."""
-    from hippius_hub import auth
+    """A bogus docker-registry token must produce an httpx error when used
+    for a PUSH operation.
+
+    Why push and not pull: `test/e2e-client` is a public repo (so anonymous
+    pull tokens are issued even with garbage credentials — the registry just
+    drops the bogus Authorization header and treats the request as anonymous).
+    The push scope, however, requires authenticated identity, so the token
+    endpoint refuses it for an invalid Basic header. This is the genuine
+    "auth is actually evaluated" signal."""
+    from hippius_hub import auth, upload_file
 
     monkeypatch.setattr(auth, "TOKEN_PATH", str(tmp_path / "tok"))
     with open(auth.TOKEN_PATH, "w") as f:
         # Looks like a Basic header but the credentials are nonsense.
         f.write("Basic " + "Z2FyYmFnZTpnYXJiYWdl")  # garbage:garbage
 
+    src = tmp_path / "garbage-auth.bin"
+    src.write_bytes(b"x")
+
     with pytest.raises(httpx.HTTPStatusError) as excinfo:
-        # Any authenticated OCI op works — repo_exists hits the token endpoint first.
-        from hippius_hub import repo_exists
-        repo_exists(test_repo)
-    # 401 from the token endpoint or 403 if it lets us through.
+        upload_file(
+            path_or_fileobj=str(src),
+            path_in_repo="garbage-auth.bin",
+            repo_id=test_repo,
+            revision=f"garbage-{uuid.uuid4().hex[:8]}",
+        )
+    # 401 from the token endpoint (refused push scope) or 403 if the token
+    # service issues a no-perm token and the registry rejects the PUT.
     assert excinfo.value.response.status_code in (401, 403)
 
 
