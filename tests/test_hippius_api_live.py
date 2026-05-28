@@ -14,7 +14,6 @@ import pytest
 from huggingface_hub import CommitInfo, ModelInfo
 
 from hippius_hub import HippiusApi
-from hippius_hub.constants import DEFAULT_REGISTRY_URL
 
 from tests._helpers import sha256_of_file, write_test_file
 
@@ -22,23 +21,17 @@ from tests._helpers import sha256_of_file, write_test_file
 pytestmark = pytest.mark.e2e
 
 
-# `HippiusApi()` with no args delegates `endpoint=None` to `HfApi.__init__`,
-# which falls back to HF's `constants.ENDPOINT = 'https://huggingface.co'`.
-# `_inject` then forwards that endpoint to every hippius_hub call, routing
-# uploads/downloads at huggingface.co instead of registry.hippius.com.
-# All tests below pass `endpoint=DEFAULT_REGISTRY_URL` explicitly. The
-# `HippiusApi()` constructor defaulting to HF's endpoint is a real bug —
-# tracked as a follow-up; fixing it would let us drop this kwarg here.
-def _api():
-    return HippiusApi(endpoint=DEFAULT_REGISTRY_URL)
-
-
 def test_hippius_api_upload_then_download_via_instance(
     tmp_path, cache_dir, logged_in, test_repo, revision,
 ):
     """upload_file → hf_hub_download via a HippiusApi() instance. Same round
-    trip as test_phase_b but routed through the OO entry point."""
-    api = _api()
+    trip as test_phase_b but routed through the OO entry point.
+
+    No explicit endpoint kwarg — `HippiusApi()` defaults to DEFAULT_REGISTRY_URL
+    (fixed in the same PR as this test). A regression that re-introduces the
+    HF endpoint default would cause this test to 404 at huggingface.co.
+    """
+    api = HippiusApi()
     src = tmp_path / "api.bin"
     expected = write_test_file(src, 256, seed=b"hippius-api")
 
@@ -61,7 +54,7 @@ def test_hippius_api_inspection_methods(tmp_path, logged_in, test_repo, revision
     """list_repo_files / file_exists / model_info via the instance.
     Catches any binding bug where these resolve to the HF base implementation
     (which would fail by hitting huggingface.co)."""
-    api = _api()
+    api = HippiusApi()
     src = tmp_path / "insp.bin"
     write_test_file(src, 64, seed=b"insp")
     api.upload_file(
@@ -83,7 +76,7 @@ def test_hippius_api_inspection_methods(tmp_path, logged_in, test_repo, revision
 def test_hippius_api_whoami_via_instance(logged_in):
     """The HF base class has its own whoami; we must override it so the
     call routes to harbor, not huggingface.co."""
-    api = _api()
+    api = HippiusApi()
     result = api.whoami()
     assert result["name"].startswith("robot$")
     assert result["type"] == "robot"
@@ -94,7 +87,7 @@ def test_hippius_api_upload_file_accepts_binary_io(
 ):
     """The bytes/BinaryIO path is tested at the module level — re-test through
     the instance to prove `_normalize_path_or_fileobj` is reached the same way."""
-    api = _api()
+    api = HippiusApi()
     payload = b"hippius-api-binaryio\n" * 32
     api.upload_file(
         path_or_fileobj=io.BytesIO(payload),
