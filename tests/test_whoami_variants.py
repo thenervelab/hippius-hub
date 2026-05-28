@@ -35,16 +35,21 @@ def test_whoami_token_true_uses_saved_token(logged_in):
 
 
 def test_whoami_with_raw_token_string(logged_in):
-    """A raw token string (no `Bearer `/`Basic ` prefix) must be wrapped
-    internally and produce the same result as the saved-token path."""
+    """A raw token string (no `Bearer ` prefix) must be wrapped as `Bearer`
+    internally and reach harbor successfully.
+
+    Only runs when the saved token is already Bearer-shaped: re-wrapping a
+    base64 Basic-auth payload as `Bearer <b64>` would produce a malformed
+    header. The CI robot's creds are Basic (`<robot$user>:<secret>` b64),
+    so this test typically skips in CI and only fires locally against an
+    HF-style bearer token. The Basic-input path is exercised by
+    test_whoami_with_prewrapped_header below.
+    """
     saved = get_token()
     assert saved, "logged_in fixture should have written a token"
-    # Strip the prefix so we hand in a bare token string, exercising the
-    # auto-wrap branch in whoami's token handling.
-    if saved.startswith(("Bearer ", "Basic ")):
-        bare = saved.split(" ", 1)[1]
-    else:
-        bare = saved
+    if saved.startswith("Basic "):
+        pytest.skip("Saved creds are Basic auth; bare-token rewrap only applies to Bearer")
+    bare = saved.split(" ", 1)[1] if saved.startswith("Bearer ") else saved
     result = whoami(token=bare)
     assert result["name"].startswith("robot$")
 
