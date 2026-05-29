@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Dict, Optional, Union
 
 from ._oci import fetch_manifest, layer_title
-from .auth import get_oci_bearer_token, resolve_token_value
+from .auth import get_oci_bearer_token
 from .constants import DEFAULT_CACHE_DIR, resolve_registry
 from .errors import (
     EntryNotFoundError,
@@ -348,9 +348,10 @@ def hf_hub_download(
         )
 
     registry = resolve_registry(endpoint)
-    auth_token = resolve_token_value(token)
     # _oci_token / _resolved_manifest let snapshot_download avoid N+1 round-trips.
-    oci_token = _oci_token or get_oci_bearer_token(oci_repo, auth_token)
+    # Token resolution + the off-origin credential guard happen inside
+    # get_oci_bearer_token, which mints from `registry` (= resolve_registry(endpoint)).
+    oci_token = _oci_token or get_oci_bearer_token(oci_repo, token, endpoint=endpoint)
     manifest = _resolve_manifest(
         registry=registry,
         oci_repo=oci_repo,

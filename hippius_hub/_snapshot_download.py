@@ -14,7 +14,7 @@ from typing import Dict, List, Optional, Union
 from huggingface_hub.utils import filter_repo_objects
 
 from ._oci import fetch_manifest, layer_titles
-from .auth import get_oci_bearer_token, resolve_token_value
+from .auth import get_oci_bearer_token
 from .constants import DEFAULT_CACHE_DIR, resolve_registry
 from .errors import LocalEntryNotFoundError
 from .file_download import _cache_dirname, _oci_repo_path, _validate_repo_type, hf_hub_download
@@ -147,8 +147,9 @@ def snapshot_download(
 
     oci_repo = _oci_repo_path(repo_id, repo_type)
     registry = resolve_registry(endpoint)
-    auth_token = resolve_token_value(token)
-    oci_token = get_oci_bearer_token(oci_repo, auth_token)
+    # Token resolution + the off-origin credential guard live inside
+    # get_oci_bearer_token, which mints from `registry` (= resolve_registry(endpoint)).
+    oci_token = get_oci_bearer_token(oci_repo, token, endpoint=endpoint)
 
     # Read path: snapshot_download never PUTs, so we discard the digest and
     # pass the bare manifest body through to each worker via _resolved_manifest
