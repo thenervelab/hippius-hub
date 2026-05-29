@@ -70,6 +70,18 @@ def test_card_load_classmethod_raises_not_implemented(Card):
 
 
 @pytest.mark.parametrize("Card", [RepoCard, ModelCard, DatasetCard])
+def test_card_validate_raises_not_implemented(Card):
+    """`Card.validate()` in huggingface_hub POSTs the card YAML to
+    huggingface.co/api/validate-yaml (repocard.py). Like `push_to_hub`/`load`
+    it routes at HF, so a drop-in user calling `card.validate()` would silently
+    ship metadata to huggingface.co. It must raise NotImplementedError — same
+    HF-routing leak class as the other two action methods."""
+    card = Card("---\nlicense: mit\n---\n# README\n")
+    with pytest.raises(NotImplementedError, match="huggingface.co"):
+        card.validate()
+
+
+@pytest.mark.parametrize("Card", [RepoCard, ModelCard, DatasetCard])
 def test_card_local_methods_still_work(Card, tmp_path):
     """The block is specifically on the two network methods. Local
     operations (constructor, `save`, dict access) must keep working —

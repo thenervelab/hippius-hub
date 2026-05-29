@@ -218,9 +218,12 @@ del _install_stubs
 # default that surfaced in 26559541574.
 #
 # Subclass each card type so the data shape (and `isinstance` checks against
-# the HF class) is preserved, but the two network methods raise. Local-only
-# operations (`save`, `__init__`, `from_template`, dict access, `__repr__`)
-# are inherited unchanged. To push a README to Hippius, use
+# the HF class) is preserved, but the network methods raise. `validate` is
+# blocked alongside `push_to_hub`/`load` because huggingface_hub's
+# `RepoCard.validate()` POSTs the card YAML to huggingface.co/api/validate-yaml
+# (repocard.py) — a drop-in caller would otherwise leak metadata to HF.
+# Local-only operations (`save`, `__init__`, `from_template`, dict access,
+# `__repr__`) are inherited unchanged. To push a README to Hippius, use
 # `hippius_hub.upload_file` with `path_in_repo="README.md"`.
 
 
@@ -247,24 +250,27 @@ class RepoCard(_HfRepoCard):
     """Hippius wrapper around huggingface_hub.RepoCard.
 
     Data-shape unchanged (so `isinstance(card, huggingface_hub.RepoCard)`
-    still holds). `push_to_hub` and `load` are blocked because they hit
-    huggingface.co in the parent implementation — use `upload_file` /
+    still holds). `push_to_hub`, `load`, and `validate` are blocked because
+    they hit huggingface.co in the parent implementation — use `upload_file` /
     `hf_hub_download` from this package instead.
     """
     push_to_hub = _block_card_action("push_to_hub", "RepoCard")
     load = classmethod(_block_card_action("load", "RepoCard"))
+    validate = _block_card_action("validate", "RepoCard")
 
 
 class ModelCard(_HfModelCard):
     """Hippius wrapper around huggingface_hub.ModelCard. See `RepoCard` for rationale."""
     push_to_hub = _block_card_action("push_to_hub", "ModelCard")
     load = classmethod(_block_card_action("load", "ModelCard"))
+    validate = _block_card_action("validate", "ModelCard")
 
 
 class DatasetCard(_HfDatasetCard):
     """Hippius wrapper around huggingface_hub.DatasetCard. See `RepoCard` for rationale."""
     push_to_hub = _block_card_action("push_to_hub", "DatasetCard")
     load = classmethod(_block_card_action("load", "DatasetCard"))
+    validate = _block_card_action("validate", "DatasetCard")
 
 
 __all__ = ["HippiusApi", "ModelCard", "DatasetCard", "RepoCard"]
