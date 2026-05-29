@@ -3,6 +3,7 @@ use indicatif::{ProgressBar, ProgressStyle};
 use reqwest::{header, Client};
 use sha2::{Digest, Sha256};
 use std::path::Path;
+use std::sync::OnceLock;
 use std::time::Duration;
 use tokio::fs::File;
 use tokio_util::codec::{BytesCodec, FramedRead};
@@ -106,15 +107,44 @@ pub async fn upload_blob_async(url: &str, path: &Path, auth_token: Option<&str>)
 /// `FramedRead` stream, and sends one PUT — so the retry loop above
 /// gets a fresh body on every attempt (the previous `Body::wrap_stream`
 /// is consumed once the request future completes or errors).
-async fn try_upload_blob_once(url: &str, path: &Path, auth_token: Option<&str>) -> Result<(), CoreError> {
+/// Process-global HTTP client for blob uploads.
+///
+/// Mirrors the downloader, which builds its `reqwest::Client` once in
+/// `ChunkedDownloader::new` and reuses it across all chunks. Previously
+/// `try_upload_blob_once` rebuilt a client on every call — once per blob and
+/// once per retry — discarding the keep-alive connection pool and forcing a
+/// fresh DNS+TCP+TLS handshake against the registry host the previous blob just
+/// finished using (audit N-4 / RUST-3). The `OnceLock` hoists construction out
+/// of the per-attempt path so warm connections survive between blobs.
+///
+/// Construction is fallible (`build()` errors if the TLS backend won't
+/// initialize), so this returns `Result` rather than `expect`-ing inside a
+/// `get_or_init` closure — the crate denies `panic`/`unwrap` and warns on
+/// `expect`. On the rare init race the losing thread's freshly built client is
+/// dropped unused (RAII); after first init `get()` returns the shared client
+/// immediately. `OnceLock` is valid in statics and never poisoned on panic
+/// (doc.rust-lang.org/std/sync/struct.OnceLock.html).
+fn upload_client() -> Result<&'static Client, CoreError> {
+    static CLIENT: OnceLock<Client> = OnceLock::new();
+    if let Some(client) = CLIENT.get() {
+        return Ok(client);
+    }
     // Force HTTP/1.1 for the same reason as the downloader: avoids h2 single-TCP
     // multiplexing, lets uploads spread across multiple connections if the caller
     // parallelizes.
-    let client = Client::builder()
+    let built = Client::builder()
         .timeout(Duration::from_hours(1)) // 1h timeout for very large uploads
         .http1_only()
         .tcp_keepalive(Duration::from_secs(30))
+        .pool_max_idle_per_host(8)
         .build()?;
+    Ok(CLIENT.get_or_init(|| built))
+}
+
+async fn try_upload_blob_once(url: &str, path: &Path, auth_token: Option<&str>) -> Result<(), CoreError> {
+    // Reuse the process-global client so the keep-alive connection pool
+    // survives across blobs and retries (audit N-4 / RUST-3).
+    let client = upload_client()?;
 
     let file = File::open(path).await?;
     // Snapshot file size for the progress bar UI only. We deliberately
@@ -236,5 +266,24 @@ mod tests {
     fn upload_retry_handles_5xx() {
         let err = CoreError::ServerError(503, "Service Unavailable".into());
         assert!(err.is_retryable());
+    }
+
+    // RUST-3 (audit N-4): the upload client is a process-global singleton,
+    // built once and reused across blobs/retries rather than rebuilt per
+    // attempt. Two calls must hand back the SAME `&'static Client` (pointer
+    // equality) — the same invariant `lib.rs::runtime_tests` pins for the
+    // shared runtime. `unwrap`/`expect`/`panic!` are denied crate-wide, so we
+    // assert via `is_ok` + `if let` instead of unwrapping the Result.
+    #[test]
+    fn upload_client_returns_same_instance() {
+        let a = super::upload_client();
+        let b = super::upload_client();
+        assert!(a.is_ok() && b.is_ok(), "upload client must build");
+        if let (Ok(a), Ok(b)) = (a, b) {
+            assert!(
+                std::ptr::eq(a, b),
+                "upload_client must return one shared instance, not a fresh client per call"
+            );
+        }
     }
 }
