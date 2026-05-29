@@ -41,13 +41,6 @@ def test_delete_artifact_removes_tag(
     except console.ConsoleError as e:
         if e.status_code == 404:
             pytest.skip(f"Indexer hasn't seen {revision!r} yet; can't validate delete")
-        # A 5xx means the console origin (api.hippius.com behind Cloudflare) is
-        # unavailable — an environment outage, not a client regression and not
-        # the ACL/permission change this test exists to catch (that surfaces as
-        # 401/403). Skip so an upstream 502/503/504 doesn't red CI; the fix for
-        # a persistent 5xx is server-side (owner_action_required).
-        if e.status_code >= 500:
-            pytest.skip(f"Console backend unavailable (HTTP {e.status_code}); not a client-side failure")
         raise
 
     rows = console.list_artifacts(qualified, page=1, page_size=50) or []
