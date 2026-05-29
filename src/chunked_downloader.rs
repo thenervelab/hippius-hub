@@ -840,6 +840,22 @@ mod retry_classification_tests {
     }
 
     #[test]
+    fn four_oh_eight_is_retryable() {
+        // 408 Request Timeout (RFC 9110 §15.5.9): the request didn't complete
+        // in time; resending stands a chance, so it's retryable despite being
+        // a 4xx.
+        assert!(CoreError::ServerError(408, "request timeout".into()).is_retryable());
+    }
+
+    #[test]
+    fn four_two_nine_is_retryable() {
+        // 429 Too Many Requests (RFC 6585 §4): the canonical backpressure
+        // signal Harbor emits under per-token rate limits. Backing off and
+        // retrying is the correct response, not terminal failure.
+        assert!(CoreError::ServerError(429, "too many requests".into()).is_retryable());
+    }
+
+    #[test]
     fn missing_content_length_is_not_retryable() {
         // HEAD-response shape error — retrying the GET cannot heal a missing
         // header on a separate HEAD.

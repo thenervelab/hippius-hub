@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Dict, Optional, Union
 
 from ._oci import fetch_manifest, layer_title
-from .auth import get_oci_bearer_token, resolve_token_value
+from .auth import get_oci_bearer_token
 from .constants import DEFAULT_CACHE_DIR, resolve_registry
 from .errors import (
     EntryNotFoundError,
@@ -161,6 +161,44 @@ class _DownloadPaths:
     snapshots_dir: Optional[str]
 
 
+def _safe_join(base: str, filename: str) -> str:
+    """Join `filename` under `base`, rejecting paths that escape `base`.
+
+    `filename` comes from the OCI manifest's `org.opencontainers.image.title`
+    layer annotation, which is server-controlled. Without this guard an
+    absolute path (`/etc/cron.d/x`) or a `..` segment would let a malicious or
+    compromised manifest place files outside the cache / `local_dir` under the
+    invoking user's permissions — the path-traversal vector huggingface_hub
+    rejects in `_get_pointer_path`. Nested subdirectories (`weights/x.bin`,
+    used for `subfolder=`) stay allowed; only escapes are refused.
+    """
+    # Split on both separators so a Windows-style `..\x` is caught on POSIX too
+    # (os.path.join would otherwise treat the whole thing as one component).
+    parts = filename.replace("\\", "/").split("/")
+    if os.path.isabs(filename) or ".." in parts:
+        raise ValueError(
+            f"Unsafe path in repository file name {filename!r}: absolute paths "
+            f"and '..' segments are not allowed (would escape {base!r})."
+        )
+    dest = os.path.join(base, *parts)
+    # Backstop independent of the textual checks above: confirm the resolved
+    # path still lives under `base`. Mirrors huggingface_hub's containment
+    # assertion; `commonpath` is filesystem/drive-aware on every platform.
+    base_abs = os.path.abspath(base)
+    dest_abs = os.path.abspath(dest)
+    try:
+        contained = os.path.commonpath([base_abs, dest_abs]) == base_abs
+    except ValueError:
+        # Different drives (Windows) — commonpath raises; treat as not contained.
+        contained = False
+    if not contained:
+        raise ValueError(
+            f"Unsafe path in repository file name {filename!r}: resolves outside "
+            f"the target directory {base!r}."
+        )
+    return dest
+
+
 def _resolve_dest_paths(
     *,
     repo_id: str,
@@ -170,16 +208,21 @@ def _resolve_dest_paths(
     cache_dir: str,
     local_dir: Optional[Union[str, Path]],
 ) -> _DownloadPaths:
-    """Compute where this file lands on disk given (local_dir vs cache_dir)."""
+    """Compute where this file lands on disk given (local_dir vs cache_dir).
+
+    `filename` is server-controlled (manifest layer title), so both the
+    local_dir and cache destinations are routed through `_safe_join`, which
+    refuses any path that escapes the target directory.
+    """
     if local_dir is not None:
         return _DownloadPaths(
-            dest_file=os.path.join(str(local_dir), filename),
+            dest_file=_safe_join(str(local_dir), filename),
             repo_dir=None,
             snapshots_dir=None,
         )
     repo_dir = os.path.join(cache_dir, _cache_dirname(repo_id, repo_type))
     snapshots_dir = os.path.join(repo_dir, "snapshots", revision)
-    dest_file = os.path.join(snapshots_dir, filename)
+    dest_file = _safe_join(snapshots_dir, filename)
     return _DownloadPaths(
         dest_file=dest_file, repo_dir=repo_dir, snapshots_dir=snapshots_dir
     )
@@ -305,9 +348,10 @@ def hf_hub_download(
         )
 
     registry = resolve_registry(endpoint)
-    auth_token = resolve_token_value(token)
     # _oci_token / _resolved_manifest let snapshot_download avoid N+1 round-trips.
-    oci_token = _oci_token or get_oci_bearer_token(oci_repo, auth_token)
+    # Token resolution + the off-origin credential guard happen inside
+    # get_oci_bearer_token, which mints from `registry` (= resolve_registry(endpoint)).
+    oci_token = _oci_token or get_oci_bearer_token(oci_repo, token, endpoint=endpoint)
     manifest = _resolve_manifest(
         registry=registry,
         oci_repo=oci_repo,
@@ -403,22 +447,53 @@ def _download_to_cache(
 
 
 def _download_to_local_dir(blob_url, dest_file, oci_token):
-    """Direct download to a user-chosen directory — bypasses the cache layout."""
+    """Direct download to a user-chosen directory — bypasses the cache layout.
+
+    Downloads to a per-call temp sibling and atomically `os.replace`s it into
+    `dest_file` only on success. The Rust downloader pre-allocates its target
+    at full size (`f.set_len`) and streams chunks into it in place, so writing
+    straight to `dest_file` would leave a full-size, hole-ridden file at the
+    user's path on any chunk failure or Ctrl-C — and `hf_hub_download`'s
+    `os.path.exists(dest_file)` cache check would then serve that corrupt file
+    as a hit on the next call. Temp-then-replace makes the user-visible path
+    appear only after a fully successful download. Cleanup is on `BaseException`
+    (not `Exception`) so a `KeyboardInterrupt` mid-stream also removes the
+    partial temp file.
+    """
     parent = os.path.dirname(dest_file)
     if parent:
         os.makedirs(parent, exist_ok=True)
     print(f"Downloading {os.path.basename(dest_file)} (parallel)...")
-    # local_dir mode writes directly to the user-chosen path and does
-    # not assemble a content-addressed blob layout, so the calculated
-    # hash (Optional[str] post Phase 3.12) is intentionally unused — the
-    # file path is the identity here, not the digest.
-    download_file_native(
-        url=blob_url,
-        dest_path=dest_file,
-        auth_token=oci_token,
-        chunk_size=_resolve_chunk_size(),
-        verify_hash=_resolve_verify_hash(),
+    # Per-call unique temp sibling in the destination directory so the final
+    # `os.replace` is an atomic same-filesystem rename. mkstemp returns
+    # (fd, path); close the fd because the Rust download opens the file by path.
+    fd, temp_path = tempfile.mkstemp(
+        dir=parent or ".",
+        prefix=f".tmp_{os.path.basename(dest_file)}_",
     )
+    os.close(fd)
+    try:
+        # local_dir mode writes to the user-chosen path and does not assemble a
+        # content-addressed blob layout, so the calculated hash (Optional[str]
+        # post Phase 3.12) is intentionally unused — the path is the identity.
+        download_file_native(
+            url=blob_url,
+            dest_path=temp_path,
+            auth_token=oci_token,
+            chunk_size=_resolve_chunk_size(),
+            verify_hash=_resolve_verify_hash(),
+        )
+    except BaseException:
+        # Remove the partial temp file before propagating. The inner OSError
+        # swallow mirrors `_download_to_cache`: a cleanup failure must not
+        # shadow the original download exception (or KeyboardInterrupt).
+        if os.path.exists(temp_path):
+            try:
+                os.remove(temp_path)
+            except OSError:
+                pass
+        raise
+    os.replace(temp_path, dest_file)
     return dest_file
 
 

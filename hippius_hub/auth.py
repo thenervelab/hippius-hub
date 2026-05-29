@@ -17,7 +17,12 @@ from typing import Literal, Optional, Union
 
 import httpx
 
-from .constants import DEFAULT_CACHE_DIR, DEFAULT_HTTP_TIMEOUT, DEFAULT_REGISTRY_URL
+from .constants import (
+    DEFAULT_CACHE_DIR,
+    DEFAULT_HTTP_TIMEOUT,
+    DEFAULT_REGISTRY_URL,
+    resolve_registry,
+)
 from .errors import LocalTokenNotFoundError
 
 TOKEN_PATH = os.path.join(DEFAULT_CACHE_DIR, "token")
@@ -31,16 +36,46 @@ _OCI_TOKEN_CACHE_LOCK = threading.Lock()
 _OCI_TOKEN_LEEWAY_SECONDS = 30  # refresh tokens 30s before they actually expire
 
 
-def _token_cache_key(repo_id: str, push: bool, token) -> tuple:
+def _token_cache_key(repo_id: str, push: bool, token, registry: str) -> tuple:
     """Cache key for OCI bearer tokens — hashes the token so plaintext
     credentials never appear in the in-memory _OCI_TOKEN_CACHE dict.
     Future debug dumps of the cache won't leak the secret.
+
+    `registry` is part of the key (INPUT-1): tokens are minted per-origin, so a
+    token issued by the default registry must never be served from cache for a
+    request aimed at a different `endpoint` — that would forward a
+    default-origin credential off-origin.
     """
     if token is False:
-        return (repo_id, push, "<anon>")
+        return (repo_id, push, "<anon>", registry)
     if not token:
-        return (repo_id, push, None)
-    return (repo_id, push, hashlib.sha256(token.encode()).hexdigest())
+        return (repo_id, push, None, registry)
+    return (repo_id, push, hashlib.sha256(token.encode()).hexdigest(), registry)
+
+
+def _forbid_offorigin_ambient_credentials(token, endpoint) -> None:
+    """Refuse to forward a stored/ambient credential to a non-default registry.
+
+    INPUT-1 confused-deputy guard. A credential read from the saved login file
+    (`token` is `None`/`True`) was entered for the default Hippius registry;
+    forwarding it to a caller-supplied `endpoint` would leak it to that origin.
+    Only the saved-login credential is gated — an explicit literal `token` is
+    the caller's own credential (they chose to send it), and the docker-config
+    fallback is already host-scoped by `get_docker_auth`. Anonymous use of a
+    custom endpoint (no saved credential present) is left untouched.
+    """
+    if token is not None and token is not True:
+        return  # explicit literal, or False (anonymous) — caller's own choice
+    if resolve_registry(endpoint) == DEFAULT_REGISTRY_URL:
+        return  # same origin the saved credential was entered for
+    if get_token() is None:
+        return  # nothing stored to leak — allow anonymous access to the endpoint
+    raise ValueError(
+        "Refusing to send your stored login credentials to a non-default "
+        f"registry endpoint ({resolve_registry(endpoint)!r}). Pass an explicit "
+        "token=... for custom endpoints so ambient credentials are not "
+        "forwarded off-origin."
+    )
 
 
 def _jwt_expiration(jwt_str: str):
@@ -216,7 +251,7 @@ def resolve_token_value(token):
     return get_token()
 
 
-def resolve_auth_header(token):
+def resolve_auth_header(token, *, endpoint: Optional[str] = None):
     """Same three-state input, but always returns a full Authorization header
     (`Bearer ...` / `Basic ...`) or None. Use for direct Harbor admin-API calls
     which need a complete header string.
@@ -224,10 +259,16 @@ def resolve_auth_header(token):
     `resolve_token_value` now forwards `False` as the HF anonymous sentinel
     (rather than collapsing to `None`), so we treat both `False` and `None`
     as "no header" here — the admin-API behavior is unchanged.
+
+    `endpoint` is the credential trust boundary (INPUT-1): a stored login
+    credential is never returned for a non-default endpoint, so a Harbor admin
+    call against a caller-supplied registry can't leak the saved Basic
+    `user:password` off-origin.
     """
     value = resolve_token_value(token)
     if value is None or value is False:
         return None
+    _forbid_offorigin_ambient_credentials(token, endpoint)
     if value.startswith(("Basic ", "Bearer ")):
         return value
     return f"Bearer {value}"
@@ -252,6 +293,8 @@ def whoami(token=None, *, endpoint: str = None) -> dict:
     if isinstance(parsed, Anonymous):
         raise LocalTokenNotFoundError("token=False but whoami requires authentication")
     if isinstance(parsed, UseStored):
+        # Don't forward the saved credential to a caller-supplied endpoint.
+        _forbid_offorigin_ambient_credentials(token, endpoint)
         auth_header = get_token()
         if not auth_header:
             raise LocalTokenNotFoundError(
@@ -305,13 +348,14 @@ def get_oci_bearer_token(
     token: Union[str, Literal[False], None] = None,
     push: bool = False,
     use_cache: bool = True,
+    endpoint: Optional[str] = None,
 ) -> str:
-    """Fetch an OCI bearer token from the Hippius registry token endpoint.
+    """Fetch an OCI bearer token from the registry's token endpoint.
 
-    Per-`(repo_id, push, auth_input)` cache, with TTL parsed from the JWT's
-    own `exp` claim minus a 30s leeway. Pass `use_cache=False` to bypass.
-    Reduces token-service round-trips when callers chain multiple ops on
-    the same repo (e.g. `repo_exists()` then `revision_exists()`).
+    Per-`(repo_id, push, auth_input, registry)` cache, with TTL parsed from the
+    JWT's own `exp` claim minus a 30s leeway. Pass `use_cache=False` to bypass.
+    Reduces token-service round-trips when callers chain multiple ops on the
+    same repo (e.g. `repo_exists()` then `revision_exists()`).
 
     `token` accepts the HF three-state convention: a string (use it directly),
     `None` (no caller preference — try docker-config fallback), or `False`
@@ -319,8 +363,21 @@ def get_oci_bearer_token(
     consult any ambient credential source). The `False` case is load-bearing
     for security: a caller asking for anonymous I/O must not be silently
     elevated to the user's docker-stored creds.
+
+    `endpoint` is a credential trust boundary (INPUT-1). The token is minted
+    from `resolve_registry(endpoint)` — the same origin it is sent to — never
+    from a hard-coded default, so a Hippius-issued token can't be harvested by
+    pointing the client at an attacker endpoint. The docker-config fallback is
+    looked up for that same origin (host-scoped), and a stored login credential
+    is refused for any non-default endpoint via the off-origin guard.
     """
-    cache_key = _token_cache_key(repo_id, push, token)
+    registry = resolve_registry(endpoint)
+    # Refuse to forward a saved login credential to a non-default origin before
+    # resolving it into a header (confused-deputy guard).
+    _forbid_offorigin_ambient_credentials(token, endpoint)
+    auth_input = resolve_token_value(token)
+
+    cache_key = _token_cache_key(repo_id, push, auth_input, registry)
     now = time.time()
 
     if use_cache:
@@ -332,19 +389,21 @@ def get_oci_bearer_token(
                 return cached_token
 
     scope = f"repository:{repo_id}:pull,push" if push else f"repository:{repo_id}:pull"
-    auth_url = f"{DEFAULT_REGISTRY_URL}/service/token?service=harbor-registry&scope={scope}"
+    auth_url = f"{registry}/service/token?service=harbor-registry&scope={scope}"
     headers = {}
 
-    # `token is False` is the HF sentinel for "anonymous; do not auto-discover".
-    # We must distinguish it from `None` ("no preference"), because only the
-    # latter is allowed to fall back to ambient docker credentials.
-    no_auth = token is False
-    effective_token = None if no_auth else token
+    # `auth_input is False` is the HF sentinel for "anonymous; do not
+    # auto-discover". We must distinguish it from `None` ("no preference"),
+    # because only the latter is allowed to fall back to ambient docker creds.
+    no_auth = auth_input is False
+    effective_token = None if no_auth else auth_input
 
-    # 1. Prefer ~/.docker/config.json if present (Basic Auth), but only when the
-    #    caller hasn't explicitly opted out via token=False.
+    # 1. Prefer ~/.docker/config.json for THIS registry (Basic Auth), but only
+    #    when the caller hasn't explicitly opted out via token=False. The lookup
+    #    is host-scoped, so a custom endpoint only matches creds the user
+    #    actually stored for that endpoint's host.
     if not effective_token and not no_auth:
-        docker_auth = get_docker_auth(DEFAULT_REGISTRY_URL)
+        docker_auth = get_docker_auth(registry)
         if docker_auth:
             headers["Authorization"] = f"Basic {docker_auth}"
 
