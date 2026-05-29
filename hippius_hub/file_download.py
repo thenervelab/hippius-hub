@@ -403,22 +403,53 @@ def _download_to_cache(
 
 
 def _download_to_local_dir(blob_url, dest_file, oci_token):
-    """Direct download to a user-chosen directory — bypasses the cache layout."""
+    """Direct download to a user-chosen directory — bypasses the cache layout.
+
+    Downloads to a per-call temp sibling and atomically `os.replace`s it into
+    `dest_file` only on success. The Rust downloader pre-allocates its target
+    at full size (`f.set_len`) and streams chunks into it in place, so writing
+    straight to `dest_file` would leave a full-size, hole-ridden file at the
+    user's path on any chunk failure or Ctrl-C — and `hf_hub_download`'s
+    `os.path.exists(dest_file)` cache check would then serve that corrupt file
+    as a hit on the next call. Temp-then-replace makes the user-visible path
+    appear only after a fully successful download. Cleanup is on `BaseException`
+    (not `Exception`) so a `KeyboardInterrupt` mid-stream also removes the
+    partial temp file.
+    """
     parent = os.path.dirname(dest_file)
     if parent:
         os.makedirs(parent, exist_ok=True)
     print(f"Downloading {os.path.basename(dest_file)} (parallel)...")
-    # local_dir mode writes directly to the user-chosen path and does
-    # not assemble a content-addressed blob layout, so the calculated
-    # hash (Optional[str] post Phase 3.12) is intentionally unused — the
-    # file path is the identity here, not the digest.
-    download_file_native(
-        url=blob_url,
-        dest_path=dest_file,
-        auth_token=oci_token,
-        chunk_size=_resolve_chunk_size(),
-        verify_hash=_resolve_verify_hash(),
+    # Per-call unique temp sibling in the destination directory so the final
+    # `os.replace` is an atomic same-filesystem rename. mkstemp returns
+    # (fd, path); close the fd because the Rust download opens the file by path.
+    fd, temp_path = tempfile.mkstemp(
+        dir=parent or ".",
+        prefix=f".tmp_{os.path.basename(dest_file)}_",
     )
+    os.close(fd)
+    try:
+        # local_dir mode writes to the user-chosen path and does not assemble a
+        # content-addressed blob layout, so the calculated hash (Optional[str]
+        # post Phase 3.12) is intentionally unused — the path is the identity.
+        download_file_native(
+            url=blob_url,
+            dest_path=temp_path,
+            auth_token=oci_token,
+            chunk_size=_resolve_chunk_size(),
+            verify_hash=_resolve_verify_hash(),
+        )
+    except BaseException:
+        # Remove the partial temp file before propagating. The inner OSError
+        # swallow mirrors `_download_to_cache`: a cleanup failure must not
+        # shadow the original download exception (or KeyboardInterrupt).
+        if os.path.exists(temp_path):
+            try:
+                os.remove(temp_path)
+            except OSError:
+                pass
+        raise
+    os.replace(temp_path, dest_file)
     return dest_file
 
 
