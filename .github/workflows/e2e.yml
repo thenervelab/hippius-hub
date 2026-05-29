@@ -113,25 +113,42 @@ jobs:
           .venv/bin/pip install pip-audit==2.10.0
           .venv/bin/pip-audit --skip-editable
 
+      # Runs on every trigger (PR, push to main, tag push, release,
+      # dispatch). The `addopts = "-m 'not expensive'"` default in
+      # pyproject.toml automatically excludes the expensive marker
+      # without needing a CLI flag here.
+      #
+      # Secrets are NOT exposed to PRs from forks (GitHub's default for
+      # `pull_request` triggers). The conftest `_have_creds()` and
+      # `_have_console_token()` checks detect the empty-env case and
+      # skip e2e-marked tests so a fork PR sees offline tests pass and
+      # live tests skip — no false fail. See README §"CI secrets" for
+      # the full list and how they map to the conftest fixtures
+      # (`creds`, `logged_in`, `console_logged_in`).
       - name: Run full test suite (Hippius + HF parity, every PR / release)
-        # Secrets are NOT exposed to PRs from forks or Dependabot (GitHub's
-        # default for `pull_request` triggers). When the registry creds are
-        # absent we deselect the e2e-marked tests entirely (`-m "not e2e"`)
-        # rather than relying on every e2e fixture to self-skip — a fixture
-        # that mishandles the no-creds path would otherwise ERROR and turn a
-        # fork/Dependabot PR red on a check it can't satisfy. Pushes to main
-        # and tags (where secrets ARE present) still run the full live suite.
-        # See README §"CI secrets" for the full list and how they map to
-        # the conftest fixtures (`creds`, `logged_in`).
         env:
           HIPPIUS_TEST_USER: ${{ secrets.HIPPIUS_TEST_USER }}
           HIPPIUS_TEST_PASS: ${{ secrets.HIPPIUS_TEST_PASS }}
           HIPPIUS_TEST_TOKEN: ${{ secrets.HIPPIUS_TEST_TOKEN }}
-        run: |
-          if [ -n "$HIPPIUS_TEST_TOKEN" ] || { [ -n "$HIPPIUS_TEST_USER" ] && [ -n "$HIPPIUS_TEST_PASS" ]; }; then
-            echo "Registry creds present — running full suite (offline + e2e)."
-            .venv/bin/pytest -v
-          else
-            echo "No registry creds (fork/Dependabot PR) — running offline suite only."
-            .venv/bin/pytest -v -m "not e2e"
-          fi
+          HIPPIUS_TEST_CONSOLE_TOKEN: ${{ secrets.HIPPIUS_TEST_CONSOLE_TOKEN }}
+        run: .venv/bin/pytest -v
+
+      # Expensive suite: on-chain subscribe/cancel, robot rotation,
+      # publicity toggle (quota resize). Only runs on release events,
+      # manual dispatch, or tag pushes. `-m expensive` overrides the
+      # default `not expensive` from addopts (pytest's last -m wins).
+      # Each test additionally gates on its own HIPPIUS_TEST_ALLOW_*
+      # env var, so even this step is a no-op if the secret is unset —
+      # a release intentionally not meant to mutate prod state still
+      # skips them.
+      - name: Run expensive suite (release / manual / tag only)
+        if: github.event_name == 'release' || github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/v')
+        env:
+          HIPPIUS_TEST_USER: ${{ secrets.HIPPIUS_TEST_USER }}
+          HIPPIUS_TEST_PASS: ${{ secrets.HIPPIUS_TEST_PASS }}
+          HIPPIUS_TEST_TOKEN: ${{ secrets.HIPPIUS_TEST_TOKEN }}
+          HIPPIUS_TEST_CONSOLE_TOKEN: ${{ secrets.HIPPIUS_TEST_CONSOLE_TOKEN }}
+          HIPPIUS_TEST_ALLOW_CHAIN: ${{ secrets.HIPPIUS_TEST_ALLOW_CHAIN }}
+          HIPPIUS_TEST_ALLOW_PROD_MUTATION: ${{ secrets.HIPPIUS_TEST_ALLOW_PROD_MUTATION }}
+          HIPPIUS_TEST_ALLOW_TOKEN_ROTATE: ${{ secrets.HIPPIUS_TEST_ALLOW_TOKEN_ROTATE }}
+        run: .venv/bin/pytest -v -m expensive

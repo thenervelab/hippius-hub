@@ -21,7 +21,7 @@ from ._harbor import (
     split_repo_id,
 )
 from ._oci import fetch_manifest, head_manifest, iter_titled_layers, layer_titles
-from .auth import get_oci_bearer_token, get_token, resolve_auth_header, resolve_token_value
+from .auth import get_oci_bearer_token, resolve_auth_header
 from .constants import DEFAULT_HTTP_TIMEOUT, resolve_registry
 from .errors import (
     EntryNotFoundError,
@@ -77,7 +77,7 @@ def create_repo(
     _validate_repo_type(repo_type)
     oci_repo = _oci_repo_path(repo_id, repo_type)
     project, _ = split_repo_id(oci_repo)
-    auth_header = resolve_auth_header(token)
+    auth_header = resolve_auth_header(token, endpoint=endpoint)
     if auth_header is None:
         raise LocalTokenNotFoundError(
             "Authentication required; run `hippius-hub login` first."
@@ -85,7 +85,7 @@ def create_repo(
 
     # Use the OCI tags/list endpoint to detect existing repos — accessible to
     # any account with pull perms, unlike Harbor's admin project API.
-    oci_token = get_oci_bearer_token(oci_repo, resolve_token_value(token), push=False)
+    oci_token = get_oci_bearer_token(oci_repo, token, push=False, endpoint=endpoint)
     tags = _list_tags(resolve_registry(endpoint), oci_repo, oci_token)
 
     if tags is not None:
@@ -120,7 +120,7 @@ def delete_repo(
     """Delete the Harbor repository (project/repo)."""
     _validate_repo_type(repo_type)
     project, repo = split_repo_id(_oci_repo_path(repo_id, repo_type))
-    auth_header = resolve_auth_header(token)
+    auth_header = resolve_auth_header(token, endpoint=endpoint)
     if auth_header is None:
         raise RepositoryNotFoundError("delete_repo requires authentication")
     harbor_delete_repository(
@@ -154,13 +154,13 @@ def repo_info(
     oci_repo = _oci_repo_path(repo_id, repo_type)
     project, repo = split_repo_id(oci_repo)
 
-    auth_header = resolve_auth_header(token)
+    auth_header = resolve_auth_header(token, endpoint=endpoint)
     # Harbor lookups are best-effort: robot accounts often lack admin-API
     # perms (returns None). The OCI manifest fetch below is the source of truth.
     harbor_repo = harbor_get_repository(auth_header, project, repo, endpoint=endpoint) if auth_header else None
     harbor_project = harbor_get_project(auth_header, project, endpoint=endpoint) if auth_header else None
 
-    oci_token = get_oci_bearer_token(oci_repo, resolve_token_value(token), push=False)
+    oci_token = get_oci_bearer_token(oci_repo, token, push=False, endpoint=endpoint)
     # Read path: we only need the manifest body, not the digest — `repo_info`
     # never PUTs, so there's no If-Match to thread.
     manifest = fetch_manifest(resolve_registry(endpoint), oci_repo, revision, oci_token).manifest
@@ -245,7 +245,7 @@ def list_repo_files(
         revision = "main"
 
     oci_repo = _oci_repo_path(repo_id, repo_type)
-    oci_token = get_oci_bearer_token(oci_repo, resolve_token_value(token), push=False)
+    oci_token = get_oci_bearer_token(oci_repo, token, push=False, endpoint=endpoint)
     # Read path: digest isn't needed because we don't PUT here.
     manifest = fetch_manifest(resolve_registry(endpoint), oci_repo, revision, oci_token).manifest
     return layer_titles(manifest)
@@ -261,7 +261,7 @@ def repo_exists(
     """True iff the OCI repository has ever been pushed to (any tag exists)."""
     _validate_repo_type(repo_type)
     oci_repo = _oci_repo_path(repo_id, repo_type)
-    oci_token = get_oci_bearer_token(oci_repo, resolve_token_value(token), push=False)
+    oci_token = get_oci_bearer_token(oci_repo, token, push=False, endpoint=endpoint)
     tags = _list_tags(resolve_registry(endpoint), oci_repo, oci_token)
     return tags is not None and len(tags) > 0
 
@@ -277,7 +277,7 @@ def revision_exists(
     """True iff a manifest exists at `repo_id:revision` (HEADs the manifest)."""
     _validate_repo_type(repo_type)
     oci_repo = _oci_repo_path(repo_id, repo_type)
-    oci_token = get_oci_bearer_token(oci_repo, resolve_token_value(token), push=False)
+    oci_token = get_oci_bearer_token(oci_repo, token, push=False, endpoint=endpoint)
     head = head_manifest(resolve_registry(endpoint), oci_repo, revision, oci_token)
     return head.status_code == 200
 
@@ -296,7 +296,7 @@ def file_exists(
     if revision is None:
         revision = "main"
     oci_repo = _oci_repo_path(repo_id, repo_type)
-    oci_token = get_oci_bearer_token(oci_repo, resolve_token_value(token), push=False)
+    oci_token = get_oci_bearer_token(oci_repo, token, push=False, endpoint=endpoint)
     # Read path: digest isn't needed because we don't PUT here. `missing_ok`
     # lets us return False for a fresh repo without raising.
     result = fetch_manifest(resolve_registry(endpoint), oci_repo, revision, oci_token, missing_ok=True)

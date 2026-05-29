@@ -136,10 +136,14 @@ impl CoreError {
     ///   transport-layer blips (TCP reset, transient EIO, mid-stream
     ///   read), retryable.
     /// * [`CoreError::ServerError`] with `status ∈ 500..600` — RFC 9110
-    ///   §15.6 retryable status codes.
-    /// * [`CoreError::ServerError`] with `status` outside `500..600` —
-    ///   permanent (4xx auth/format or any non-HTTP code), not
-    ///   retryable.
+    ///   §15.6 server-error status codes, retryable.
+    /// * [`CoreError::ServerError`] of 408 or 429 — the two retryable 4xx:
+    ///   408 Request Timeout (RFC 9110 §15.5.9) and 429 Too Many Requests
+    ///   (RFC 6585 §4). Harbor emits 429 under per-token rate limits, so
+    ///   treating it as permanent would surface routine backpressure as a
+    ///   terminal failure.
+    /// * [`CoreError::ServerError`] with any other status — permanent (4xx
+    ///   auth/format or any non-HTTP code), not retryable.
     /// * [`CoreError::ChunkFailed`] / [`CoreError::JoinFailed`] —
     ///   constructed by the orchestrator AFTER an inner retry loop has
     ///   already given up; retrying compounds backoff for failures
@@ -158,12 +162,14 @@ impl CoreError {
         match self {
             // Network/transport errors are retryable.
             CoreError::Reqwest(_) | CoreError::Io(_) => true,
-            // 5xx server errors are retryable; 4xx (and any other
-            // non-5xx) are permanent. `(500..600).contains(status)`
-            // operates on `&u16` because the match is over `&CoreError`,
-            // so `status` binds as `&u16` — `Range<u16>::contains`
-            // takes `&u16`, no extra borrow needed.
-            CoreError::ServerError(status, _) => (500..600).contains(status),
+            // 5xx server errors are retryable, plus the two retryable 4xx
+            // (408 Request Timeout, 429 Too Many Requests). Everything else
+            // 4xx is permanent. `(500..600).contains(status)` operates on
+            // `&u16` because the match is over `&CoreError`, so `status` binds
+            // as `&u16`; `matches!(*status, ...)` derefs for the value pattern.
+            CoreError::ServerError(status, _) => {
+                matches!(*status, 408 | 429) || (500..600).contains(status)
+            }
             // Three permanent variants:
             //   - ChunkFailed / JoinFailed are structured terminal errors
             //     produced after the per-chunk retry loop already did its
