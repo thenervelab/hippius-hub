@@ -50,7 +50,14 @@ def parity_seed():
     per-test `logged_in` fixture or pollute the user's saved token.
     """
     if not _hippius_creds_available():
-        return None
+        # This is a generator fixture (it `yield`s below), so it must yield
+        # its "no seed" sentinel rather than `return None` — a bare return
+        # finishes the generator without yielding, which pytest reports as
+        # "parity_seed did not yield a value" (an ERROR, not a clean skip).
+        # The `client` fixture turns this None into a `pytest.skip` for the
+        # hippius parametrization while the hf parametrization still runs.
+        yield None
+        return
 
     from hippius_hub import auth, upload_folder
 
