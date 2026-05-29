@@ -161,6 +161,44 @@ class _DownloadPaths:
     snapshots_dir: Optional[str]
 
 
+def _safe_join(base: str, filename: str) -> str:
+    """Join `filename` under `base`, rejecting paths that escape `base`.
+
+    `filename` comes from the OCI manifest's `org.opencontainers.image.title`
+    layer annotation, which is server-controlled. Without this guard an
+    absolute path (`/etc/cron.d/x`) or a `..` segment would let a malicious or
+    compromised manifest place files outside the cache / `local_dir` under the
+    invoking user's permissions — the path-traversal vector huggingface_hub
+    rejects in `_get_pointer_path`. Nested subdirectories (`weights/x.bin`,
+    used for `subfolder=`) stay allowed; only escapes are refused.
+    """
+    # Split on both separators so a Windows-style `..\x` is caught on POSIX too
+    # (os.path.join would otherwise treat the whole thing as one component).
+    parts = filename.replace("\\", "/").split("/")
+    if os.path.isabs(filename) or ".." in parts:
+        raise ValueError(
+            f"Unsafe path in repository file name {filename!r}: absolute paths "
+            f"and '..' segments are not allowed (would escape {base!r})."
+        )
+    dest = os.path.join(base, *parts)
+    # Backstop independent of the textual checks above: confirm the resolved
+    # path still lives under `base`. Mirrors huggingface_hub's containment
+    # assertion; `commonpath` is filesystem/drive-aware on every platform.
+    base_abs = os.path.abspath(base)
+    dest_abs = os.path.abspath(dest)
+    try:
+        contained = os.path.commonpath([base_abs, dest_abs]) == base_abs
+    except ValueError:
+        # Different drives (Windows) — commonpath raises; treat as not contained.
+        contained = False
+    if not contained:
+        raise ValueError(
+            f"Unsafe path in repository file name {filename!r}: resolves outside "
+            f"the target directory {base!r}."
+        )
+    return dest
+
+
 def _resolve_dest_paths(
     *,
     repo_id: str,
@@ -170,16 +208,21 @@ def _resolve_dest_paths(
     cache_dir: str,
     local_dir: Optional[Union[str, Path]],
 ) -> _DownloadPaths:
-    """Compute where this file lands on disk given (local_dir vs cache_dir)."""
+    """Compute where this file lands on disk given (local_dir vs cache_dir).
+
+    `filename` is server-controlled (manifest layer title), so both the
+    local_dir and cache destinations are routed through `_safe_join`, which
+    refuses any path that escapes the target directory.
+    """
     if local_dir is not None:
         return _DownloadPaths(
-            dest_file=os.path.join(str(local_dir), filename),
+            dest_file=_safe_join(str(local_dir), filename),
             repo_dir=None,
             snapshots_dir=None,
         )
     repo_dir = os.path.join(cache_dir, _cache_dirname(repo_id, repo_type))
     snapshots_dir = os.path.join(repo_dir, "snapshots", revision)
-    dest_file = os.path.join(snapshots_dir, filename)
+    dest_file = _safe_join(snapshots_dir, filename)
     return _DownloadPaths(
         dest_file=dest_file, repo_dir=repo_dir, snapshots_dir=snapshots_dir
     )
