@@ -92,10 +92,10 @@ def _revision_created(registry: str, repo_id: str, revision: str, oci_token: str
     Read from the manifest's org.opencontainers.image.created annotation, which
     uploads via this tool stamp. Revisions pushed by other tooling may lack it.
     """
-    manifest = fetch_manifest(registry, repo_id, revision, oci_token, missing_ok=True)
-    if manifest is None:
+    result = fetch_manifest(registry, repo_id, revision, oci_token, missing_ok=True)
+    if result is None:
         return None
-    return manifest.get("annotations", {}).get("org.opencontainers.image.created")
+    return result.manifest.get("annotations", {}).get("org.opencontainers.image.created")
 
 
 def _normalize_oci_timestamp(ts: Optional[str]) -> Optional[str]:

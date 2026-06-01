@@ -101,8 +101,8 @@ def run_diagnose(
     report["token"] = {"ms": round(token_ms, 1)}
 
     logger.debug("fetching metadata for %s:%s", oci_repo, revision)
-    manifest, manifest_ms = _timed(fetch_manifest, registry, oci_repo, revision, oci_token)
-    layers = manifest.get("layers", [])
+    manifest_result, manifest_ms = _timed(fetch_manifest, registry, oci_repo, revision, oci_token)
+    layers = manifest_result.manifest.get("layers", [])
     report["manifest"] = {"ms": round(manifest_ms, 1), "files": len(layers)}
 
     target_digest = None

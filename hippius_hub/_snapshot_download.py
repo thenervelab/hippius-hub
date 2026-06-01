@@ -15,7 +15,7 @@ from huggingface_hub.utils import filter_repo_objects
 
 from ._oci import fetch_manifest, layer_titles
 from .auth import get_oci_bearer_token
-from .constants import DEFAULT_CACHE_DIR, resolve_registry
+from .constants import DEFAULT_CACHE_DIR, resolve_registry, resolve_snapshot_workers
 from .errors import LocalEntryNotFoundError
 from .file_download import _cache_dirname, _oci_repo_path, _validate_repo_type, hf_hub_download
 
