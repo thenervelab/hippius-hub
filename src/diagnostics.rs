@@ -24,7 +24,6 @@
 )]
 
 use std::collections::BTreeMap;
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use futures::stream::{self, StreamExt};
@@ -53,7 +52,6 @@ pub enum DiagError {
     Url(String),
     Io(std::io::Error),
     Reqwest(reqwest::Error),
-    Tls(String),
 }
 
 impl From<std::io::Error> for DiagError {
@@ -172,35 +170,6 @@ async fn timed_get_range(
     Ok((total, t0.elapsed(), ttfb))
 }
 
-/// Best-effort raw TLS handshake on an already-connected TCP socket. Reuses the
-/// socket whose connect we just timed so `tls_handshake_ms` is pure handshake.
-async fn handshake_tls(host: &str, tcp: TcpStream) -> Result<(Option<String>, Option<String>), DiagError> {
-    use tokio_rustls::rustls::{ClientConfig, OwnedTrustAnchor, RootCertStore, ServerName};
-    use tokio_rustls::TlsConnector;
-
-    let mut roots = RootCertStore::empty();
-    roots.add_trust_anchors(webpki_roots::TLS_SERVER_ROOTS.iter().map(|ta| {
-        OwnedTrustAnchor::from_subject_spki_name_constraints(ta.subject, ta.spki, ta.name_constraints)
-    }));
-    let mut config = ClientConfig::builder()
-        .with_safe_defaults()
-        .with_root_certificates(roots)
-        .with_no_client_auth();
-    config.alpn_protocols = vec![b"http/1.1".to_vec()];
-
-    let connector = TlsConnector::from(Arc::new(config));
-    let server_name =
-        ServerName::try_from(host).map_err(|e| DiagError::Tls(format!("invalid server name {host:?}: {e}")))?;
-    let tls = connector.connect(server_name, tcp).await?;
-
-    let (_, conn) = tls.get_ref();
-    let version = conn.protocol_version().map(|v| format!("{v:?}"));
-    let alpn = conn
-        .alpn_protocol()
-        .map(|p| String::from_utf8_lossy(p).into_owned());
-    Ok((version, alpn))
-}
-
 /// Collect known request-id headers from a response into `out` (later wins, so
 /// the final download host's ids override the registry's when we merge).
 fn collect_request_ids(headers: &reqwest::header::HeaderMap, out: &mut BTreeMap<String, String>) {
@@ -251,21 +220,17 @@ pub async fn probe_blob(
     let tcp = TcpStream::connect(addr).await?;
     let tcp_connect_ms = tcp_start.elapsed().as_millis() as u64;
 
-    // --- TLS handshake (best-effort; reuses the connected socket) ---
-    let mut tls_handshake_ms = None;
-    let mut tls_version = None;
-    let mut alpn = None;
-    if scheme == "https" {
-        let tls_start = Instant::now();
-        match handshake_tls(&host, tcp).await {
-            Ok((ver, al)) => {
-                tls_handshake_ms = Some(tls_start.elapsed().as_millis() as u64);
-                tls_version = ver;
-                alpn = al;
-            }
-            Err(e) => errors.push(format!("TLS handshake probe failed: {e:?}")),
-        }
-    }
+    // TLS handshake sub-probe was removed because the only ecosystem option
+    // for a raw timed handshake on an already-open socket (tokio-rustls 0.24 +
+    // webpki-roots 0.25) carried RUSTSEC-2026-0098/0099/0104. The newer
+    // rustls 0.23 line is API-incompatible and adds a CryptoProvider install
+    // dance; the timing it would buy us isn't worth the migration here.
+    // `tls_handshake_ms / tls_version / alpn` stay in the report shape but
+    // are always None — `format_report` already renders that gracefully.
+    drop(tcp);
+    let tls_handshake_ms: Option<u64> = None;
+    let tls_version: Option<String> = None;
+    let alpn: Option<String> = None;
 
     // --- HEAD with redirects disabled, to reveal a redirect to a download host ---
     let probe_client = Client::builder()
