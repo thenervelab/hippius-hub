@@ -2,7 +2,7 @@ use futures::stream::{FuturesUnordered, StreamExt};
 use reqwest::{header, Client};
 use sha2::{Digest, Sha256};
 use std::path::Path;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use indicatif::{ProgressBar, ProgressStyle};
 use tokio::fs::OpenOptions;
 // `AsyncReadExt` was used by the old in-tokio sha256 loop; Phase 2.8
@@ -80,7 +80,6 @@ pub struct ChunkedDownloader {
     url: String,
     auth_token: Option<String>,
     chunk_size: u64,
-    max_concurrent: usize,
 }
 
 impl ChunkedDownloader {
@@ -90,24 +89,18 @@ impl ChunkedDownloader {
         // which caps aggregate throughput at the per-connection BBR ceiling (~150 MB/s
         // even on a fast edge). Forcing h1 makes each parallel chunk get its own TCP,
         // letting the kernel/qdisc fan out across the available bandwidth.
-        let mut builder = Client::builder()
-            .connect_timeout(Duration::from_secs(connect_timeout))
+        let client = Client::builder()
+            .connect_timeout(Duration::from_secs(DEFAULT_CONNECT_TIMEOUT_SECS))
             .http1_only()
-            .pool_max_idle_per_host(max_concurrent)
-            .tcp_keepalive(Duration::from_secs(30));
-
-        if let Some(secs) = read_timeout_secs {
-            builder = builder.timeout(Duration::from_secs(secs));
-        }
-
-        let client = builder.build()?;
+            .pool_max_idle_per_host(MAX_CONCURRENT_DOWNLOADS)
+            .tcp_keepalive(Duration::from_secs(30))
+            .build()?;
 
         Ok(Self {
             client,
             url,
             auth_token,
             chunk_size: chunk_size_bytes.unwrap_or(DEFAULT_CHUNK_SIZE),
-            max_concurrent,
         })
     }
 
@@ -207,8 +200,6 @@ impl ChunkedDownloader {
             abort_handles.push(handle.abort_handle());
             joins.push(handle);
         }
-            })
-        }).buffer_unordered(self.max_concurrent);
 
         // Drain the `FuturesUnordered` of `JoinHandle`s. Exhaustive match preserves
         // both the spawn-side (`JoinError`) and the download-layer cause: previously
@@ -382,12 +373,11 @@ async fn download_chunk_with_retry(
     token: Option<String>,
     start: u64,
     end: u64,
-    chunk_index: usize,
+    _chunk_index: usize,
     dest_path: std::path::PathBuf,
     pb: ProgressBar,
 ) -> Result<(), CoreError> {
     let mut retries = 0;
-    let started = Instant::now();
 
     loop {
         match try_download_chunk_to_offset(&client, &url, token.as_deref(), start, end, &dest_path, &pb).await {
@@ -402,7 +392,6 @@ async fn download_chunk_with_retry(
                     return Err(e);
                 }
                 let wait_time = 2u64.pow(retries) * 100;
-                warn!(chunk = chunk_index, retries, wait_ms = wait_time, error = ?e, "chunk retry");
                 tokio::time::sleep(Duration::from_millis(wait_time)).await;
             }
         }

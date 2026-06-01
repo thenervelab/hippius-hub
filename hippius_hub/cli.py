@@ -760,40 +760,24 @@ def _cmd_upload(args):
         msg, code = _format_download_error(e)
         print(msg)
         sys.exit(code)
-    if args.command == "revisions":
-        try:
-            cmd_revisions(args)
-        except Exception as e:
-            print(f"❌ Could not list revisions: {e}")
-            sys.exit(1)
-        return
 
-    if args.command == "upload":
-        from .file_upload import hippius_hub_upload
-        try:
-            hippius_hub_upload(repo_id=args.repo_id, local_path=args.local_path, revision=args.revision)
-        except Exception as e:
-            print(f"❌ Upload failed: {e}")
-            sys.exit(1)
-        return
 
-    if args.command == "diagnose":
-        # --verbose surfaces per-chunk transport logs (Rust tracing + Python logging).
-        # Set before the import so the native layer picks it up on first call.
-        if args.verbose:
-            os.environ["HIPPIUS_DEBUG"] = "1"
-        from .diagnose import format_report, run_diagnose
-        # Errors are allowed to bubble here: a failed/hung phase is itself the
-        # diagnostic signal we want the user to see and report.
-        report = run_diagnose(
-            repo_id=args.repo_id, filename=args.filename, revision=args.revision,
-            probe_bytes=args.probe_mb * 1024 * 1024,
-        )
-        if args.json:
-            _print_json(report)
-        else:
-            print(format_report(report))
-        return
+def _cmd_diagnose(args):
+    # --verbose surfaces per-chunk transport logs (Rust tracing + Python logging).
+    # Set before the import so the native layer picks it up on first call.
+    if args.verbose:
+        os.environ["HIPPIUS_DEBUG"] = "1"
+    from .diagnose import format_report, run_diagnose
+    # Errors are allowed to bubble here: a failed/hung phase is itself the
+    # diagnostic signal we want the user to see and report.
+    report = run_diagnose(
+        repo_id=args.repo_id, filename=args.filename, revision=args.revision,
+        probe_bytes=args.probe_mb * 1024 * 1024,
+    )
+    if args.json:
+        _print_json(report)
+    else:
+        print(format_report(report))
 
 
 def _cmd_login(args):
@@ -851,6 +835,8 @@ def main():
         "download": _cmd_download,
         "upload": _cmd_upload,
         "login": _cmd_login,
+        "revisions": cmd_revisions,
+        "diagnose": _cmd_diagnose,
     }
     if args.command in handlers:
         handlers[args.command](args)

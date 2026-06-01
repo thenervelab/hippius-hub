@@ -390,7 +390,7 @@ def _download_to_cache(
 
     # 2. Concurrent download via the Rust engine
     print(f"Downloading {filename} (parallel)...")
-    verify_hash = _resolve_verify_hash()
+    verify_hash = resolve_verify_hash()
     try:
         # Audit L6 (Phase 3.12): download_file_native now returns
         # Optional[str] — `None` when verify_hash=False (skipped), `str`
@@ -405,7 +405,7 @@ def _download_to_cache(
             url=blob_url,
             dest_path=temp_path,
             auth_token=oci_token,
-            chunk_size=_resolve_chunk_size(),
+            chunk_size=resolve_chunk_size(),
             verify_hash=verify_hash,
         )
     except Exception:
@@ -474,8 +474,8 @@ def _download_to_local_dir(blob_url, dest_file, oci_token):
             url=blob_url,
             dest_path=temp_path,
             auth_token=oci_token,
-            chunk_size=_resolve_chunk_size(),
-            verify_hash=_resolve_verify_hash(),
+            chunk_size=resolve_chunk_size(),
+            verify_hash=resolve_verify_hash(),
         )
     except BaseException:
         # Remove the partial temp file before propagating. The inner OSError

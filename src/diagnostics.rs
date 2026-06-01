@@ -14,6 +14,15 @@
 //! the TLS sub-probe is best-effort — a raw-handshake failure is recorded but
 //! does not abort the throughput tests, which are what users care about most.
 
+#![expect(
+    clippy::cast_possible_truncation,
+    reason = "Duration::as_millis() returns u128; for any real network probe the value fits in u64 with vast margin (584M years)"
+)]
+#![expect(
+    clippy::cast_precision_loss,
+    reason = "bytes/seconds folded into f64 MB/s for display; the precision loss is below the resolution we'd ever print"
+)]
+
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -35,6 +44,10 @@ const REQUEST_ID_HEADERS: &[&str] = &[
     "docker-content-digest",
 ];
 
+#[expect(
+    dead_code,
+    reason = "payloads are surfaced via the Debug formatter in lib.rs (PyRuntimeError formats `{e:?}`), not read directly here"
+)]
 #[derive(Debug)]
 pub enum DiagError {
     Url(String),
@@ -110,7 +123,7 @@ fn split_ranges(total: u64, n: usize) -> Vec<(u64, u64)> {
     if total == 0 || n == 0 {
         return Vec::new();
     }
-    let chunk = (total + n as u64 - 1) / n as u64; // ceil
+    let chunk = total.div_ceil(n as u64);
     let mut ranges = Vec::new();
     let mut start = 0u64;
     while start < total {
@@ -134,17 +147,15 @@ async fn timed_get_range(
     let want = end - start + 1;
     let mut req = client
         .get(url)
-        .header(RANGE, format!("bytes={}-{}", start, end));
+        .header(RANGE, format!("bytes={start}-{end}"));
     if let Some(t) = auth_token {
         req = req.bearer_auth(t);
     }
 
     let t0 = Instant::now();
     let mut resp = req.send().await?;
-    if !resp.status().is_success() {
-        return Err(DiagError::Reqwest(
-            resp.error_for_status_ref().unwrap_err(),
-        ));
+    if let Err(e) = resp.error_for_status_ref() {
+        return Err(DiagError::Reqwest(e));
     }
 
     let mut total = 0u64;
@@ -183,7 +194,7 @@ async fn handshake_tls(host: &str, tcp: TcpStream) -> Result<(Option<String>, Op
     let tls = connector.connect(server_name, tcp).await?;
 
     let (_, conn) = tls.get_ref();
-    let version = conn.protocol_version().map(|v| format!("{:?}", v));
+    let version = conn.protocol_version().map(|v| format!("{v:?}"));
     let alpn = conn
         .alpn_protocol()
         .map(|p| String::from_utf8_lossy(p).into_owned());
@@ -202,6 +213,10 @@ fn collect_request_ids(headers: &reqwest::header::HeaderMap, out: &mut BTreeMap<
     }
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "linear DNS → TCP → TLS → HEAD → single-stream → parallel pipeline; splitting hides the phase ordering that makes this readable"
+)]
 pub async fn probe_blob(
     blob_url: &str,
     auth_token: Option<&str>,
@@ -248,7 +263,7 @@ pub async fn probe_blob(
                 tls_version = ver;
                 alpn = al;
             }
-            Err(e) => errors.push(format!("TLS handshake probe failed: {:?}", e)),
+            Err(e) => errors.push(format!("TLS handshake probe failed: {e:?}")),
         }
     }
 
@@ -263,17 +278,18 @@ pub async fn probe_blob(
     }
     let head_resp = head_req.send().await?;
     let head_status = head_resp.status().as_u16();
-    let http_version = Some(format!("{:?}", head_resp.version()));
+    let version = head_resp.version();
+    let http_version = Some(format!("{version:?}"));
     let redirected = head_resp.status().is_redirection();
     let location = head_resp
         .headers()
         .get(LOCATION)
         .and_then(|v| v.to_str().ok())
-        .map(|s| s.to_string());
+        .map(ToString::to_string);
     let final_host = location
         .as_deref()
         .and_then(|loc| Url::parse(loc).ok())
-        .and_then(|u| u.host_str().map(|h| h.to_string()));
+        .and_then(|u| u.host_str().map(ToString::to_string));
     let content_length = head_resp
         .headers()
         .get(CONTENT_LENGTH)
@@ -331,7 +347,7 @@ pub async fn probe_blob(
         .map(|(i, (start, end))| {
             let client = transfer_client.clone();
             let url = blob_url.to_string();
-            let token = auth_token.map(|t| t.to_string());
+            let token = auth_token.map(ToString::to_string);
             async move {
                 let (bytes, elapsed, _) =
                     timed_get_range(&client, &url, token.as_deref(), start, end).await?;
@@ -425,6 +441,7 @@ mod tests {
     }
 
     #[test]
+    #[expect(clippy::float_cmp, reason = "mbps short-circuits to literal 0.0 for zero-duration; testing exact equality is the contract")]
     fn mbps_zero_duration_is_zero() {
         assert_eq!(mbps(1000, Duration::from_secs(0)), 0.0);
     }

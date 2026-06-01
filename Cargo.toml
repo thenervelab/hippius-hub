@@ -17,13 +17,21 @@ pyo3 = { version = "0.22", features = ["extension-module", "abi3", "abi3-py38"] 
 # pyo3-async-runtimes release pins to a single pyo3 minor; mismatches surface
 # as "expected pyo3 X, found Y" type errors at compile time. Audit STRUCT-1.
 pyo3-async-runtimes = { version = "0.22", features = ["tokio-runtime"] }
-tokio = { version = "1.35", features = ["rt", "rt-multi-thread", "macros", "fs", "time"] }
+tokio = { version = "1.35", features = ["rt", "rt-multi-thread", "macros", "fs", "time", "net"] }
 tokio-util = { version = "0.7", features = ["codec"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
 indicatif = "0.17.8"
 futures = "0.3"
 hex = "0.4"
 thiserror = "1.0"
+# Diagnostics probe (src/diagnostics.rs). Raw TLS handshake timing is done
+# separately from reqwest's TLS so `tls_handshake_ms` is pure handshake; that
+# needs tokio-rustls + webpki-roots directly. serde/serde_json serialize the
+# DiagnosticReport into the JSON string handed back to Python.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio-rustls = "0.24"
+webpki-roots = "0.25"
 
 [target.'cfg(all(target_arch = "x86_64", target_os = "linux"))'.dependencies]
 sha2 = { version = "0.10", features = ["asm"] }

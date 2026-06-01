@@ -8,6 +8,7 @@ mod error;
 pub use error::{CoreError, Result};
 
 mod chunked_downloader;
+mod diagnostics;
 mod uploader;
 
 use chunked_downloader::ChunkedDownloader;
@@ -197,6 +198,44 @@ fn upload_blob_native(
     })
 }
 
+/// Probe the network path to a single blob URL and return a JSON-encoded
+/// `DiagnosticReport` (see `src/diagnostics.rs`). Python decodes it on the
+/// other side (see `hippius_hub/diagnose.py: report["blob"] = json.loads(raw)`)
+/// so the wire contract is intentionally a string — every new field added to
+/// `DiagnosticReport` flows through without changing the pyo3 signature.
+#[pyfunction]
+#[pyo3(signature = (blob_url, auth_token=None, probe_bytes=33_554_432, max_concurrent=None, connect_timeout_secs=None))]
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "pyo3 #[pyfunction] requires owned values to extract from Python args"
+)]
+fn diagnose_blob_native(
+    py: Python<'_>,
+    blob_url: String,
+    auth_token: Option<String>,
+    probe_bytes: u64,
+    max_concurrent: Option<usize>,
+    connect_timeout_secs: Option<u64>,
+) -> PyResult<String> {
+    let rt = shared_runtime();
+    py.allow_threads(|| {
+        let report = rt
+            .block_on(async {
+                diagnostics::probe_blob(
+                    &blob_url,
+                    auth_token.as_deref(),
+                    probe_bytes,
+                    max_concurrent,
+                    connect_timeout_secs,
+                )
+                .await
+            })
+            .map_err(|e| PyRuntimeError::new_err(format!("{e:?}")))?;
+        serde_json::to_string(&report)
+            .map_err(|e| PyRuntimeError::new_err(format!("serialize DiagnosticReport: {e}")))
+    })
+}
+
 /// A Python module implemented in Rust.
 ///
 /// pyo3 0.22 migration: the `#[pymodule]` signature now takes
@@ -212,6 +251,7 @@ fn hippius_core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(download_file_native, m)?)?;
     m.add_function(wrap_pyfunction!(hash_file_native, m)?)?;
     m.add_function(wrap_pyfunction!(upload_blob_native, m)?)?;
+    m.add_function(wrap_pyfunction!(diagnose_blob_native, m)?)?;
     Ok(())
 }
 
