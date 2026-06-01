@@ -1,3 +1,10 @@
+"""`hippius-hub` command-line entry point.
+
+Dispatches `download` / `upload` / `login` / `registry` / `models` subcommands
+to the module-level functions in `hippius_hub.*`. Maps exceptions raised by
+those functions to typed exit codes so CI wrappers can branch on the failure
+mode (see `_format_download_error`).
+"""
 import argparse
 import getpass
 import json
@@ -14,6 +21,16 @@ from .file_download import _oci_repo_path, hippius_hub_download
 from ._repo_ops import _list_tags, _manifest_digest, _revision_created
 from . import console
 from .console import ConsoleError
+
+
+# Typed exit codes for non-exception failure modes — i.e. user-input
+# validation errors and informational "not available" results that the
+# typed-error dispatch in `_format_download_error` doesn't cover. Same
+# 10+ codespace rationale as the download/upload exit codes: stay out of
+# bash's reserved 1-2 range (1 = generic, 2 = misuse of shell builtin /
+# argparse usage error) so shell wrappers can branch deterministically.
+EXIT_NAMESPACE_TAKEN = 17       # `registry check <name>` -> name is taken
+EXIT_INVALID_REPO_FORMAT = 18   # CLI arg `<project>/<repo>` is malformed
 
 
 def _fmt_bytes(n) -> str:
@@ -42,9 +59,97 @@ def _print_json(obj: Any):
     print(json.dumps(obj, indent=2, sort_keys=True, default=str))
 
 
+def _format_download_error(e: Exception) -> tuple[str, int]:
+    """Map a download/upload exception to (message, exit_code) for the CLI.
+
+    Distinct exit codes let CI scripts and wrappers branch on the failure
+    mode (retry on concurrent-write, prompt for auth on gated/disabled,
+    abort on bad-revision typo) instead of swallowing every error as
+    generic exit 1. Imports are kept local so the CLI startup path doesn't
+    pull in huggingface_hub.errors when no failure has occurred.
+
+    Exit codes:
+        1  generic failure (unknown exception)
+        2  reserved — argparse usage error (set elsewhere in cli.py)
+        10 file not found in repo (EntryNotFoundError)
+        11 repository not found (RepositoryNotFoundError)
+        12 revision not found (RevisionNotFoundError)
+        13 local cache miss (LocalEntryNotFoundError)
+        14 access denied (GatedRepoError, DisabledRepoError)
+        15 concurrent manifest write (ConcurrentManifestUpdateError)
+        16 registry HTTP error (HfHubHTTPError)
+        17 registry namespace not available (set by cmd_registry_check)
+        18 malformed `<project>/<repo>` CLI argument (set by registry/models)
+
+    Codes start at 10 (not 2) to avoid colliding with bash's reserved
+    exit code 2 ("misuse of shell builtin") and argparse's default for
+    usage errors — both of which the CLI already produces at the parser
+    layer. A typed routing code that overlapped with those would be
+    indistinguishable from a bad-argument failure to a shell wrapper.
+    Codes 17 and 18 are non-exception paths (validated by the CLI itself
+    before any HTTP call) so they don't appear in this function's
+    dispatch — they're set inline by the registry/models handlers.
+
+    Ordering invariant: HF's typed exception hierarchy has three subclass
+    relationships that matter here — LocalEntryNotFoundError <: Entry-
+    NotFoundError; GatedRepoError <: RepositoryNotFoundError <:
+    HfHubHTTPError, while DisabledRepoError <: HfHubHTTPError directly
+    (NOT via RepositoryNotFoundError — that asymmetry is pinned by
+    test_disabled_repo_is_not_subclass_of_repository_not_found); and
+    ConcurrentManifestUpdateError <: HfHubHTTPError. The isinstance
+    checks MUST run subclass-before-parent or a cache miss would be
+    reported as a missing-in-repo file (10), a gated repo as 'not found'
+    (11) instead of 'access denied' (14), and a 412 manifest collision
+    as a generic HTTP error (16) instead of the actionable concurrent-
+    write code (15).
+    """
+    from .errors import (
+        ConcurrentManifestUpdateError,
+        DisabledRepoError,
+        EntryNotFoundError,
+        GatedRepoError,
+        HfHubHTTPError,
+        LocalEntryNotFoundError,
+        RepositoryNotFoundError,
+        RevisionNotFoundError,
+    )
+    # Subclass-first: LocalEntryNotFoundError inherits from Entry-
+    # NotFoundError. Checking the parent first would route every cache
+    # miss to code 10 (file-not-found-in-repo) — wrong actionable hint.
+    if isinstance(e, LocalEntryNotFoundError):
+        return (f"❌ Local cache miss: {e}", 13)
+    if isinstance(e, EntryNotFoundError):
+        return (f"❌ File not found in repo: {e}", 10)
+    # Subclass-first: GatedRepoError subclasses RepositoryNotFoundError
+    # (auth-gated repos return 403, which HF models as a kind of "you
+    # can't see this repo"). DisabledRepoError, despite being grouped
+    # with Gated here for the same user-facing message, does NOT inherit
+    # from RepositoryNotFoundError — but routing it first is still
+    # required so it doesn't fall through to the generic HfHubHTTPError
+    # arm below.
+    if isinstance(e, (GatedRepoError, DisabledRepoError)):
+        return (f"❌ Access denied: {e}", 14)
+    if isinstance(e, RepositoryNotFoundError):
+        return (f"❌ Repository not found: {e}", 11)
+    if isinstance(e, RevisionNotFoundError):
+        return (f"❌ Revision not found: {e}", 12)
+    # ConcurrentManifestUpdateError subclasses HfHubHTTPError; it must be
+    # tested first so the actionable retry/serialize guidance survives.
+    if isinstance(e, ConcurrentManifestUpdateError):
+        return (
+            f"❌ Concurrent write detected: {e}. Another writer pushed "
+            f"to the same revision. Retry or serialize uploads externally.",
+            15,
+        )
+    if isinstance(e, HfHubHTTPError):
+        return (f"❌ Registry HTTP error: {e}", 16)
+    return (f"❌ Operation failed: {e}", 1)
+
+
 # ----- registry sub-commands -----
 
 def cmd_registry_plans(_args):
+    """List available pricing plans (`hippius-hub registry plans`)."""
     plans = console.list_plans()
     for p in plans:
         print(f"\n{p['name']} — {p['price_credits']:g} credits/mo")
@@ -56,12 +161,13 @@ def cmd_registry_plans(_args):
 
 
 def cmd_registry_check(args):
+    """Check whether a namespace is available (`hippius-hub registry check`)."""
     res = console.check_namespace(args.name)
     if res.get("available"):
         print(f"✅ {args.name} is available")
     else:
         print(f"❌ {res.get('message') or 'taken'}")
-        sys.exit(2)
+        sys.exit(EXIT_NAMESPACE_TAKEN)
 
 
 def _maybe_docker_login(host: str, user: str, secret: str, *, auto: bool):
@@ -91,6 +197,7 @@ def _maybe_docker_login(host: str, user: str, secret: str, *, auto: bool):
 
 
 def cmd_registry_provision(args):
+    """Provision the user's registry namespace (`hippius-hub registry provision`)."""
     try:
         res = console.provision(args.namespace)
     except ConsoleError as e:
@@ -99,7 +206,7 @@ def cmd_registry_provision(args):
         elif e.status_code == 409:
             print(f"❌ {e.body}")
         elif e.status_code == 202:
-            print(f"⏳ Project is still being created. Poll `hippius-hub registry status`.")
+            print("⏳ Project is still being created. Poll `hippius-hub registry status`.")
         else:
             print(f"❌ {e}")
         sys.exit(1)
@@ -137,6 +244,7 @@ def cmd_registry_provision(args):
 
 
 def cmd_registry_status(_args):
+    """Show provisioning status for the user's projects (`hippius-hub registry status`)."""
     res = console.provision_status()
     projects = res.get("projects") or []
     if not projects:
@@ -147,6 +255,7 @@ def cmd_registry_status(_args):
 
 
 def cmd_registry_me(_args):
+    """Show the active registry project (`hippius-hub registry me`)."""
     res = console.me()
     print(f"Project:   {res['project_name']}")
     print(f"Plan:      {res.get('plan_name')}")
@@ -158,8 +267,9 @@ def cmd_registry_me(_args):
 
 
 def cmd_registry_rotate(args):
+    """Issue a fresh docker robot secret (`hippius-hub registry rotate-token`)."""
     res = console.rotate_robot()
-    print(f"✅ New docker secret issued.")
+    print("✅ New docker secret issued.")
     print(f"  Login:  {res['robot_login']}")
     print(f"  Secret: {res['robot_secret']}")
     me = console.me()
@@ -168,6 +278,7 @@ def cmd_registry_rotate(args):
 
 
 def cmd_registry_repos(args):
+    """List the user's repositories (`hippius-hub registry repos`)."""
     res = console.list_repositories(page=args.page, page_size=args.page_size)
     if not res:
         print("No repositories.")
@@ -180,11 +291,12 @@ def cmd_registry_repos(args):
 
 
 def cmd_registry_artifacts(args):
+    """List artifacts inside one repository (`hippius-hub registry artifacts`)."""
     if "/" not in args.repo:
         print(f"❌ Repo must be '<project>/<repo>', got '{args.repo}'.")
-        print(f"   Example: hippius-hub registry artifacts myorg/my-models")
-        print(f"   (run `hippius-hub registry me` to see your project name)")
-        sys.exit(2)
+        print("   Example: hippius-hub registry artifacts myorg/my-models")
+        print("   (run `hippius-hub registry me` to see your project name)")
+        sys.exit(EXIT_INVALID_REPO_FORMAT)
     res = console.list_artifacts(args.repo, page=args.page, page_size=args.page_size)
     if not res:
         print("No artifacts.")
@@ -199,6 +311,7 @@ def cmd_registry_artifacts(args):
 
 
 def cmd_registry_usage(_args):
+    """Show storage usage and 7-day history (`hippius-hub registry usage`)."""
     res = console.usage()
     live = res.get("live", {}) or {}
     print(f"Storage used:  {_fmt_bytes(live.get('storage_used_bytes'))}")
@@ -213,6 +326,7 @@ def cmd_registry_usage(_args):
 
 
 def cmd_registry_publicity(args):
+    """Toggle project public/private (`hippius-hub registry publicity`)."""
     new = args.value.lower() == "public"
     res = console.toggle_publicity(public=new)
     print(f"✅ Project is now {'public' if res['public'] else 'private'}")
@@ -232,6 +346,7 @@ def _resolve_plan_id(plan_arg: str) -> int:
 
 
 def cmd_registry_subscribe(args):
+    """Subscribe to a plan on-chain (`hippius-hub registry subscribe`)."""
     plan_id = _resolve_plan_id(args.plan)
     res = console.subscribe(plan_id, pay_upfront=args.pay_upfront)
     print(f"✅ Subscription submitted for plan '{res.get('plan_name', plan_id)}'")
@@ -244,6 +359,7 @@ def cmd_registry_subscribe(args):
 
 
 def cmd_registry_subscriptions(_args):
+    """List the user's active subscriptions (`hippius-hub registry subscriptions`)."""
     rows = console.list_subscriptions() or []
     if not rows:
         print("No subscriptions yet. Run `hippius-hub registry subscribe <plan>`.")
@@ -259,6 +375,7 @@ def cmd_registry_subscriptions(_args):
 
 
 def cmd_registry_unsubscribe(args):
+    """Cancel a subscription by on-chain ID (`hippius-hub registry unsubscribe`)."""
     res = console.cancel_subscription(args.subscription_id)
     print(f"✅ Cancel submitted for subscription #{res.get('subscription_id', args.subscription_id)}")
     print(f"   extrinsic_hash: {res.get('extrinsic_hash')}")
@@ -283,6 +400,7 @@ def _print_key_row(k: dict) -> None:
 
 
 def cmd_registry_keys_list(_args):
+    """List per-project API keys (`hippius-hub registry keys list`)."""
     rows = console.list_keys() or []
     if not rows:
         print("No keys yet. Create one with: hippius-hub registry keys create <name> --role read")
@@ -293,6 +411,7 @@ def cmd_registry_keys_list(_args):
 
 
 def cmd_registry_keys_create(args):
+    """Create a new role-scoped API key (`hippius-hub registry keys create`)."""
     res = console.create_key(args.name, args.role, expires_days=args.expires_days)
     print(f"✅ Key '{res['name']}' created — role={res['role']}")
     print(f"  Login:  {res['login']}")
@@ -306,11 +425,13 @@ def cmd_registry_keys_create(args):
 
 
 def cmd_registry_keys_show(args):
+    """Show one API key without its secret (`hippius-hub registry keys show`)."""
     res = console.show_key(args.key_id)
     _print_key_row(res)
 
 
 def cmd_registry_keys_rotate(args):
+    """Rotate the secret for one API key (`hippius-hub registry keys rotate`)."""
     res = console.rotate_key(args.key_id)
     print(f"✅ Key '{res['name']}' rotated")
     print(f"  Login:  {res['login']}")
@@ -319,6 +440,7 @@ def cmd_registry_keys_rotate(args):
 
 
 def cmd_registry_keys_revoke(args):
+    """Delete an API key irreversibly (`hippius-hub registry keys revoke`)."""
     console.revoke_key(args.key_id)
     print(f"✅ Key #{args.key_id} revoked. Its docker login will stop working immediately.")
 
@@ -326,6 +448,7 @@ def cmd_registry_keys_revoke(args):
 # ----- models sub-commands -----
 
 def cmd_models_list(args):
+    """Search the AI model index (`hippius-hub models list`)."""
     res = console.models_list(
         fmt=args.format, architecture=args.arch, quantization=args.quant,
         min_params=args.min_params or None, max_params=args.max_params or None,
@@ -344,10 +467,11 @@ def cmd_models_list(args):
 
 
 def cmd_models_show(args):
+    """Show one model's versions or a specific reference (`hippius-hub models show`)."""
     parts = args.repo_id.split("/", 1)
     if len(parts) != 2:
         print("❌ repo_id must be <project>/<repo>")
-        sys.exit(1)
+        sys.exit(EXIT_INVALID_REPO_FORMAT)
     project, repo = parts
     if args.reference:
         res = console.model_detail(project, repo, args.reference)
@@ -361,7 +485,7 @@ def cmd_models_show(args):
         print(f"  Quant:    {res.get('quantization') or '—'}")
         print(f"  Size:     {_fmt_bytes(res.get('total_size_bytes'))}")
         print(f"  Digest:   {res.get('digest')}")
-        print(f"  Files:")
+        print("  Files:")
         for f in res.get("files", []):
             print(f"    {f['filename']:40} {f['format']:12} {_fmt_bytes(f['size_bytes'])}")
         print(f"\n  pull: {res.get('pull_command')}")
@@ -379,6 +503,7 @@ def cmd_models_show(args):
 
 
 def cmd_models_formats(_args):
+    """Show available model filter values (`hippius-hub models formats`)."""
     res = console.models_formats()
     print("Available filters:")
     print(f"  formats:        {', '.join(res.get('formats') or [])}")
@@ -429,7 +554,14 @@ def cmd_revisions(args):
 
 # ----- top-level -----
 
-def main():
+def _build_parser() -> argparse.ArgumentParser:
+    """Construct the full argparse tree.
+
+    Kept separate from main() so the wiring (~150 lines of add_parser /
+    add_argument / set_defaults) doesn't drown the dispatch logic. The
+    parser is pure data: building it has no side effects, so tests can
+    instantiate it in isolation.
+    """
     parser = argparse.ArgumentParser(
         prog="hippius-hub",
         description=f"Hippius Hub CLI v{__version__} — registry namespaces, AI model index, "
@@ -597,25 +729,37 @@ def main():
     modsub.add_parser("formats", help="Show available filter values"
                      ).set_defaults(func=cmd_models_formats)
 
-    args = parser.parse_args()
+    return parser
 
-    if args.command == "download":
-        print(f"Downloading {args.filename} from {args.repo_id} (revision: {args.revision})...")
-        if args.chunk_size is not None:
-            os.environ["HIPPIUS_CHUNK_SIZE"] = str(args.chunk_size)
-        if args.verify_hash:
-            os.environ["HIPPIUS_VERIFY_HASH"] = "1"
-        try:
-            path = hippius_hub_download(
-                repo_id=args.repo_id, filename=args.filename, revision=args.revision,
-                cache_dir=args.cache_dir,
-            )
-            print(f"✅ File downloaded to: {path}")
-        except Exception as e:
-            print(f"❌ Download failed: {e}")
-            sys.exit(1)
-        return
 
+def _cmd_download(args):
+    print(f"Downloading {args.filename} from {args.repo_id} (revision: {args.revision})...")
+    if args.chunk_size is not None:
+        os.environ["HIPPIUS_CHUNK_SIZE"] = str(args.chunk_size)
+    if args.verify_hash:
+        os.environ["HIPPIUS_VERIFY_HASH"] = "1"
+    try:
+        path = hippius_hub_download(
+            repo_id=args.repo_id, filename=args.filename, revision=args.revision,
+            cache_dir=args.cache_dir,
+        )
+        print(f"✅ File downloaded to: {path}")
+    except Exception as e:
+        msg, code = _format_download_error(e)
+        print(msg)
+        sys.exit(code)
+
+
+def _cmd_upload(args):
+    # Imported lazily so `hippius-hub --help` / `download` don't pay the
+    # cost of pulling in the upload path (huggingface_hub.HfApi etc.).
+    from .file_upload import hippius_hub_upload
+    try:
+        hippius_hub_upload(repo_id=args.repo_id, local_path=args.local_path, revision=args.revision)
+    except Exception as e:
+        msg, code = _format_download_error(e)
+        print(msg)
+        sys.exit(code)
     if args.command == "revisions":
         try:
             cmd_revisions(args)
@@ -651,48 +795,75 @@ def main():
             print(format_report(report))
         return
 
-    if args.command == "login":
-        if args.hippius_token:
-            console.save_api_token(args.hippius_token)
-            print(f"✅ Hippius API token saved.")
-            return
-        username = args.username
-        password = args.password
-        token = args.token
-        if not token and not (username and password):
-            print("Get your API token from https://console.hippius.com, then run:")
-            print("  hippius-hub login --hippius-token <token>")
-            print()
-            print("Alternatively, log in with docker registry credentials:")
-            username = input("Username: ").strip()
-            if username:
-                password = getpass.getpass("Password or CLI secret: ").strip()
-            else:
-                token = getpass.getpass("Token: ").strip()
-        try:
-            login(username=username, password=password, token=token)
-        except ValueError as e:
-            print(f"❌ Login failed: {e}")
-            sys.exit(1)
-        return
 
+def _cmd_login(args):
+    if args.hippius_token:
+        console.save_api_token(args.hippius_token)
+        print("✅ Hippius API token saved.")
+        return
+    username = args.username
+    password = args.password
+    token = args.token
+    if not token and not (username and password):
+        print("Get your API token from https://console.hippius.com, then run:")
+        print("  hippius-hub login --hippius-token <token>")
+        print()
+        print("Alternatively, log in with docker registry credentials:")
+        username = input("Username: ").strip()
+        if username:
+            # Do NOT strip(): a password that legitimately ends in
+            # whitespace would silently lose those bytes and produce
+            # a misleading 401 with no diagnostic clue.
+            password = getpass.getpass("Password or CLI secret: ")
+        else:
+            token = getpass.getpass("Token: ")
+    try:
+        login(username=username, password=password, token=token)
+    except ValueError as e:
+        print(f"❌ Login failed: {e}")
+        sys.exit(1)
+
+
+def _handle_console_error(e: ConsoleError) -> None:
+    """Map a ConsoleError to a user-facing message and exit.
+
+    The 401 branch is what the user hits when their token expired or was
+    never set — the message points them at the exact command and URL,
+    rather than a stack-traced 'HTTP 401'. 404 surfaces the server's own
+    body so 'project not found' vs 'plan not found' stay distinguishable
+    without parsing JSON in the CLI layer.
+    """
+    if e.status_code == 401:
+        print("❌ Not logged in. Run `hippius-hub login --hippius-token <token>` "
+              "(get one from https://console.hippius.com).")
+    elif e.status_code == 404:
+        print(f"❌ Not found: {e.body}")
+    else:
+        print(f"❌ {e}")
+    sys.exit(1)
+
+
+def main():
+    """Parse argv and dispatch to the matching `_cmd_*` handler."""
+    parser = _build_parser()
+    args = parser.parse_args()
+    handlers = {
+        "download": _cmd_download,
+        "upload": _cmd_upload,
+        "login": _cmd_login,
+    }
+    if args.command in handlers:
+        handlers[args.command](args)
+        return
     if args.command in ("registry", "models"):
         if not hasattr(args, "func"):
             parser.print_help()
             sys.exit(1)
         try:
             args.func(args)
-            return
         except ConsoleError as e:
-            if e.status_code == 401:
-                print("❌ Not logged in. Run `hippius-hub login --hippius-token <token>` "
-                      "(get one from https://console.hippius.com).")
-            elif e.status_code == 404:
-                print(f"❌ Not found: {e.body}")
-            else:
-                print(f"❌ {e}")
-            sys.exit(1)
-
+            _handle_console_error(e)
+        return
     parser.print_help()
     sys.exit(1)
 

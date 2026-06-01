@@ -122,6 +122,40 @@ def test_verify_hash_true(tmp_path, cache_dir, logged_in, test_repo, revision, m
     assert sha256_of_file(out) == expected
 
 
+def test_verify_hash_false_skips_verify_but_downloads_correctly(
+    tmp_path, cache_dir, logged_in, test_repo, revision, monkeypatch,
+):
+    """Audit L6 live counterpart to test_download_verify_skip.py.
+
+    When `HIPPIUS_VERIFY_HASH` is unset (or 0), download_file_native
+    returns None from the Rust side — `_download_to_cache` then falls
+    back to the manifest's content digest for the blob filename. The
+    file must still land on disk uncorrupted; the only thing skipped
+    is the post-download sha256 pass.
+
+    Localhost test pins the type contract (`is None`); this live test
+    pins the behavioral invariant against the real registry — bytes
+    match even when the integrity pass is skipped.
+    """
+    src = tmp_path / "verify-skip.bin"
+    expected = write_test_file(src, 64 * 1024, seed=b"verify-skip")
+
+    hippius_hub_upload(repo_id=test_repo, local_path=str(src), revision=revision)
+
+    # Explicit 0 (vs unset) pins the "off" path. `_resolve_verify_hash`
+    # in file_download.py accepts "0" / "" / unset / "false" as off.
+    monkeypatch.setenv("HIPPIUS_VERIFY_HASH", "0")
+    out = hf_hub_download(
+        repo_id=test_repo,
+        filename="verify-skip.bin",
+        revision=revision,
+        cache_dir=cache_dir,
+    )
+    # File bytes must still be correct — we just didn't verify them
+    # ourselves after the download.
+    assert sha256_of_file(out) == expected
+
+
 def test_single_large_file(tmp_path, cache_dir, logged_in, test_repo, revision):
     size = 250 * 1024 * 1024
     src = tmp_path / "big.bin"

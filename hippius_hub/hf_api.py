@@ -6,7 +6,12 @@ having those calls silently hit huggingface.co.
 """
 from typing import Optional, Union
 
-from huggingface_hub import HfApi, ModelCard
+from huggingface_hub import (
+    DatasetCard as _HfDatasetCard,
+    HfApi,
+    ModelCard as _HfModelCard,
+    RepoCard as _HfRepoCard,
+)
 
 from ._repo_ops import (
     create_repo as _create_repo,
@@ -25,6 +30,7 @@ from .auth import (
     logout as _logout_module,
     whoami as _whoami_module,
 )
+from .constants import DEFAULT_REGISTRY_URL
 from .file_download import hf_hub_download as _hf_hub_download
 from .file_upload import upload_file as _upload_file, upload_folder as _upload_folder
 
@@ -46,8 +52,15 @@ class HippiusApi(HfApi):
         user_agent=None,
         headers=None,
     ):
+        # HfApi defaults `endpoint=None` to huggingface_hub.constants.ENDPOINT
+        # (https://huggingface.co). Left unchanged, that default would propagate
+        # through _inject() into every hippius_hub call (upload_file,
+        # hf_hub_download, whoami, ...), silently routing OCI traffic at HF
+        # and producing 404s like the one that surfaced in 26559541574. Force
+        # the Hippius default here so a bare `HippiusApi()` does what the
+        # name says without the caller having to remember an endpoint kwarg.
         super().__init__(
-            endpoint=endpoint,
+            endpoint=endpoint if endpoint is not None else DEFAULT_REGISTRY_URL,
             token=token,
             library_name=library_name,
             library_version=library_version,
@@ -70,12 +83,15 @@ class HippiusApi(HfApi):
     # ---- Phase A ----
 
     def hf_hub_download(self, repo_id, filename, **kwargs):
+        """Download a single file from the Hippius OCI registry (delegates to `file_download.hf_hub_download`)."""
         return _hf_hub_download(repo_id, filename, **self._inject(kwargs))
 
     def snapshot_download(self, repo_id, **kwargs):
+        """Download every file in `repo_id` at a revision (delegates to `_snapshot_download.snapshot_download`)."""
         return _snapshot_download(repo_id, **self._inject(kwargs))
 
     def whoami(self, token=None):
+        """Return the authenticated user/robot identity from Harbor."""
         return _whoami_module(
             token=token if token is not None else self._explicit_token,
             endpoint=self.endpoint,
@@ -84,6 +100,7 @@ class HippiusApi(HfApi):
     # ---- Phase B uploads ----
 
     def upload_file(self, *, path_or_fileobj, path_in_repo, repo_id, **kwargs):
+        """Upload a single file into `repo_id` (delegates to `file_upload.upload_file`)."""
         return _upload_file(
             path_or_fileobj=path_or_fileobj,
             path_in_repo=path_in_repo,
@@ -92,6 +109,7 @@ class HippiusApi(HfApi):
         )
 
     def upload_folder(self, *, repo_id, folder_path, **kwargs):
+        """Upload every file under `folder_path` into `repo_id` (delegates to `file_upload.upload_folder`)."""
         return _upload_folder(
             repo_id=repo_id,
             folder_path=folder_path,
@@ -101,38 +119,48 @@ class HippiusApi(HfApi):
     # ---- Phase B repo CRUD + inspection ----
 
     def create_repo(self, repo_id, **kwargs):
+        """Ensure the Harbor project for `repo_id` exists (delegates to `_repo_ops.create_repo`)."""
         return _create_repo(repo_id, **self._inject(kwargs))
 
     def delete_repo(self, repo_id, **kwargs):
+        """Delete the Harbor repository for `repo_id` (delegates to `_repo_ops.delete_repo`)."""
         return _delete_repo(repo_id, **self._inject(kwargs))
 
     def repo_info(self, repo_id, **kwargs):
+        """Return a ModelInfo describing `repo_id` (delegates to `_repo_ops.repo_info`)."""
         return _repo_info(repo_id, **self._inject(kwargs))
 
     def model_info(self, repo_id, **kwargs):
+        """Return a ModelInfo for a model repo (delegates to `_repo_ops.model_info`)."""
         return _model_info(repo_id, **self._inject(kwargs))
 
     def list_repo_files(self, repo_id, **kwargs):
+        """Return the file list for `repo_id` at a revision (delegates to `_repo_ops.list_repo_files`)."""
         return _list_repo_files(repo_id, **self._inject(kwargs))
 
     def list_repo_refs(self, repo_id, **kwargs):
         return _list_repo_refs(repo_id, **self._inject(kwargs))
 
     def repo_exists(self, repo_id, **kwargs):
+        """True iff `repo_id` has at least one pushed tag (delegates to `_repo_ops.repo_exists`)."""
         return _repo_exists(repo_id, **self._inject(kwargs))
 
     def revision_exists(self, repo_id, revision, **kwargs):
+        """True iff `repo_id:revision` has a manifest (delegates to `_repo_ops.revision_exists`)."""
         return _revision_exists(repo_id, revision, **self._inject(kwargs))
 
     def file_exists(self, repo_id, filename, **kwargs):
+        """True iff `filename` is in `repo_id`'s manifest at a revision (delegates to `_repo_ops.file_exists`)."""
         return _file_exists(repo_id, filename, **self._inject(kwargs))
 
     # ---- Auth pass-throughs ----
 
     def login(self, *args, **kwargs):
+        """Persist credentials for subsequent registry calls (delegates to `auth.login`)."""
         return _login_module(*args, **kwargs)
 
     def logout(self, *args, **kwargs):
+        """Forget any persisted credentials (delegates to `auth.logout`)."""
         return _logout_module(*args, **kwargs)
 
 
@@ -153,6 +181,12 @@ def _stub_method(method_name: str):
         )
     stub.__name__ = method_name
     stub.__qualname__ = f"HippiusApi.{method_name}"
+    # Mirror the HfApi method's identity in the docstring so callers see at a
+    # glance that this is an intentional no-op rather than a missing attribute.
+    stub.__doc__ = (
+        f"Not supported by hippius_hub: HfApi.{method_name}() has no equivalent "
+        f"on the OCI-backed Hippius registry; calling raises NotImplementedError."
+    )
     return stub
 
 
@@ -175,4 +209,72 @@ _install_stubs()
 del _install_stubs
 
 
-__all__ = ["HippiusApi", "ModelCard"]
+# ---- Card subclasses ----
+#
+# `huggingface_hub.RepoCard` (and its `ModelCard` / `DatasetCard` subclasses)
+# carry both data (the README + frontmatter) and action methods (`.load()`
+# and `.push_to_hub()`). The action methods are hardcoded to huggingface.co
+# — `load` calls `huggingface_hub.file_download.hf_hub_download` and
+# `push_to_hub` calls `huggingface_hub.hf_api.upload_file`. Re-exporting the
+# HF classes verbatim under the hippius_hub namespace would silently route
+# README I/O at HF when a user does `from hippius_hub import ModelCard;
+# ModelCard.load("org/m")` — same bug class as the HippiusApi() endpoint
+# default that surfaced in 26559541574.
+#
+# Subclass each card type so the data shape (and `isinstance` checks against
+# the HF class) is preserved, but the network methods raise. `validate` is
+# blocked alongside `push_to_hub`/`load` because huggingface_hub's
+# `RepoCard.validate()` POSTs the card YAML to huggingface.co/api/validate-yaml
+# (repocard.py) — a drop-in caller would otherwise leak metadata to HF.
+# Local-only operations (`save`, `__init__`, `from_template`, dict access,
+# `__repr__`) are inherited unchanged. To push a README to Hippius, use
+# `hippius_hub.upload_file` with `path_in_repo="README.md"`.
+
+
+def _block_card_action(method_name: str, card_class_name: str):
+    def _blocked(*args, **kwargs):
+        raise NotImplementedError(
+            f"{card_class_name}.{method_name}() routes to huggingface.co and is "
+            f"not supported by hippius_hub. Use `hippius_hub.upload_file(..., "
+            f"path_in_repo='README.md', repo_id=...)` to push a README to "
+            f"Hippius, or `hippius_hub.hf_hub_download(..., filename='README.md', "
+            f"repo_id=...)` to pull one."
+        )
+    _blocked.__name__ = method_name
+    _blocked.__qualname__ = f"{card_class_name}.{method_name}"
+    _blocked.__doc__ = (
+        f"Not supported by hippius_hub: {card_class_name}.{method_name}() in "
+        f"huggingface_hub hits huggingface.co directly; calling raises "
+        f"NotImplementedError."
+    )
+    return _blocked
+
+
+class RepoCard(_HfRepoCard):
+    """Hippius wrapper around huggingface_hub.RepoCard.
+
+    Data-shape unchanged (so `isinstance(card, huggingface_hub.RepoCard)`
+    still holds). `push_to_hub`, `load`, and `validate` are blocked because
+    they hit huggingface.co in the parent implementation — use `upload_file` /
+    `hf_hub_download` from this package instead.
+    """
+    push_to_hub = _block_card_action("push_to_hub", "RepoCard")
+    load = classmethod(_block_card_action("load", "RepoCard"))
+    validate = _block_card_action("validate", "RepoCard")
+
+
+class ModelCard(_HfModelCard):
+    """Hippius wrapper around huggingface_hub.ModelCard. See `RepoCard` for rationale."""
+    push_to_hub = _block_card_action("push_to_hub", "ModelCard")
+    load = classmethod(_block_card_action("load", "ModelCard"))
+    validate = _block_card_action("validate", "ModelCard")
+
+
+class DatasetCard(_HfDatasetCard):
+    """Hippius wrapper around huggingface_hub.DatasetCard. See `RepoCard` for rationale."""
+    push_to_hub = _block_card_action("push_to_hub", "DatasetCard")
+    load = classmethod(_block_card_action("load", "DatasetCard"))
+    validate = _block_card_action("validate", "DatasetCard")
+
+
+__all__ = ["HippiusApi", "ModelCard", "DatasetCard", "RepoCard"]

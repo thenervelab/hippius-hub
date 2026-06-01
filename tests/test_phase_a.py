@@ -224,6 +224,22 @@ def test_hf_hub_download_force_download_and_local_files_only_raises_ValueError(t
         )
 
 
+def test_hf_hub_download_dry_run_raises_not_implemented(tmp_path):
+    """Audit M1: hf_hub_download does NOT honor dry_run (snapshot_download
+    does). Pre-M1 the flag was silently ignored and the download would
+    proceed anyway, defeating the intent. Now it raises NotImplementedError
+    at the kwarg-validation step before any network call.
+
+    The error message must point at snapshot_download so a caller who
+    actually wanted dry_run sees the migration path.
+    """
+    with pytest.raises(NotImplementedError, match="snapshot_download"):
+        hf_hub_download(
+            repo_id="any/repo", filename="x.bin",
+            cache_dir=str(tmp_path), dry_run=True,
+        )
+
+
 @pytest.mark.e2e
 def test_hf_hub_download_local_files_only_hit(tmp_path, cache_dir, logged_in, test_repo, revision):
     src = tmp_path / "lfo.bin"

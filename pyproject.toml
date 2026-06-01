@@ -4,9 +4,9 @@ build-backend = "maturin"
 
 [project]
 name = "hippius_hub"
-version = "0.4.7"
+version = "0.5.0"
 description = "Hippius Hub CLI + Python client: manage your registry namespace, search the AI model index, and pull/push models with a Rust-accelerated transport"
-requires-python = ">=3.8"
+requires-python = ">=3.9"
 dependencies = [
     "httpx",
     "typing_extensions",
@@ -15,7 +15,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-test = ["pytest>=7"]
+test = ["pytest>=7", "respx>=0.21", "hypothesis>=6"]
 
 [project.scripts]
 hippius-hub = "hippius_hub.cli:main"
@@ -26,9 +26,17 @@ module-name = "hippius_hub.hippius_core"
 python-source = "."
 
 [tool.pytest.ini_options]
-# No default exclusion — CI runs the full suite. For fast local iteration,
-# pass `-m "not e2e"` to skip tests that hit the registry / huggingface.co.
+# Default selection skips `expensive`: those tests mutate prod state that's
+# slow/costly to revert (on-chain subscriptions debit credits, rotate-token
+# invalidates every parallel runner's robot secret, publicity toggle resizes
+# the project quota). The default run (`pytest`) therefore covers all
+# unit + e2e tests but skips expensive. CI's standard step relies on this
+# default; the release/dispatch step overrides with `-m expensive` (pytest's
+# last-`-m`-wins) so expensive tests fire when their HIPPIUS_TEST_ALLOW_*
+# gates are also set. See .github/workflows/e2e.yml for the wiring.
+addopts = "-m 'not expensive'"
 markers = [
     "e2e: tests that hit the network (registry.hippius.com and/or huggingface.co)",
+    "expensive: tests with hard-to-undo prod side effects (on-chain ops, robot rotation, quota changes)",
 ]
 
