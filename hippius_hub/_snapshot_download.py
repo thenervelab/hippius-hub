@@ -15,7 +15,7 @@ from huggingface_hub.utils import filter_repo_objects
 
 from ._oci import fetch_manifest, layer_titles
 from .auth import get_oci_bearer_token
-from .constants import DEFAULT_CACHE_DIR, resolve_registry
+from .constants import DEFAULT_CACHE_DIR, resolve_registry, resolve_snapshot_workers
 from .errors import LocalEntryNotFoundError
 from .file_download import _cache_dirname, _oci_repo_path, _validate_repo_type, hf_hub_download
 
@@ -78,7 +78,7 @@ def snapshot_download(
     local_files_only: bool = False,
     allow_patterns: Optional[Union[List[str], str]] = None,
     ignore_patterns: Optional[Union[List[str], str]] = None,
-    max_workers: int = 8,
+    max_workers: Optional[int] = None,
     tqdm_class: Optional[type] = None,
     headers: Optional[Dict[str, str]] = None,
     endpoint: Optional[str] = None,
@@ -183,8 +183,11 @@ def snapshot_download(
             _oci_token=oci_token,
         )
 
+    # max_workers defaults to None (HF passes int 8); resolve to the env-tunable
+    # default so HIPPIUS_SNAPSHOT_WORKERS can dial concurrency on slow links.
+    workers = max_workers if max_workers is not None else resolve_snapshot_workers()
     if filtered:
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        with ThreadPoolExecutor(max_workers=workers) as executor:
             futures = [executor.submit(_download_one, name) for name in filtered]
             for fut in as_completed(futures):
                 fut.result()

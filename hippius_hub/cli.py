@@ -15,8 +15,10 @@ import sys
 from typing import Any
 
 from . import __version__
-from .auth import login
-from .file_download import hippius_hub_download
+from .auth import get_oci_bearer_token, login, resolve_token_value
+from .constants import resolve_registry
+from .file_download import _oci_repo_path, hippius_hub_download
+from ._repo_ops import _list_tags, _manifest_digest, _revision_created
 from . import console
 from .console import ConsoleError
 
@@ -509,6 +511,47 @@ def cmd_models_formats(_args):
     print(f"  quantizations:  {', '.join(res.get('quantizations') or [])}")
 
 
+# ----- revisions -----
+
+def cmd_revisions(args):
+    oci_repo = _oci_repo_path(args.repo_id, args.repo_type)
+    registry = resolve_registry(None)
+    oci_token = get_oci_bearer_token(oci_repo, resolve_token_value(None), push=False)
+    tags = _list_tags(registry, oci_repo, oci_token)
+    if tags is None:
+        print("❌ Repository not found.")
+        sys.exit(1)
+    if not tags:
+        print("No revisions yet.")
+        return
+
+    rows = []
+    for tag in tags:
+        rows.append({
+            "revision": tag,
+            "digest": _manifest_digest(registry, oci_repo, tag, oci_token),
+            "created": _revision_created(registry, oci_repo, tag, oci_token),
+        })
+
+    # Newest first: revisions carrying an upload timestamp sort above those
+    # without (e.g. pushed by other tooling); ties break on the revision name.
+    rows.sort(key=lambda r: (r["created"] or "", r["revision"]), reverse=True)
+
+    if args.json:
+        _print_json(rows)
+        return
+
+    print(f"{len(rows)} revision(s) for {args.repo_id}:")
+    marked_latest = False
+    for r in rows:
+        short = r["digest"][:24] if r["digest"] else "—"
+        latest = ""
+        if not marked_latest and r["created"]:
+            latest = "  (latest)"
+            marked_latest = True
+        print(f"  {r['revision']:12} {short:26} created={r['created'] or '—'}{latest}")
+
+
 # ----- top-level -----
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -541,6 +584,23 @@ def _build_parser() -> argparse.ArgumentParser:
     u = sub.add_parser("upload", help="Upload a file or folder to a repository")
     u.add_argument("repo_id"); u.add_argument("local_path")
     u.add_argument("--revision", default="main")
+
+    # Revisions: list a repository's revisions, newest first.
+    rev = sub.add_parser("revisions", help="List a repository's revisions, newest first")
+    rev.add_argument("repo_id")
+    rev.add_argument("--repo-type", default=None)
+    rev.add_argument("--json", action="store_true")
+    rev.set_defaults(func=cmd_revisions)
+
+    # Diagnose: probe the transfer path for a file and print a shareable report
+    dg = sub.add_parser("diagnose",
+                        help="Diagnose download/upload speed for a file and print a shareable report")
+    dg.add_argument("repo_id"); dg.add_argument("filename")
+    dg.add_argument("--revision", default="main")
+    dg.add_argument("--probe-mb", type=int, default=32,
+                    help="How many MB to fetch for the throughput test (default 32)")
+    dg.add_argument("--json", action="store_true", help="Emit the raw report as JSON")
+    dg.add_argument("--verbose", action="store_true", help="Enable verbose transport logging")
 
     # Login: accepts EITHER docker registry creds OR a Hippius API token.
     l = sub.add_parser("login", help="Save credentials. Use --hippius-token for the console API, --username/--password for the docker registry, or --token for either.")
@@ -702,6 +762,24 @@ def _cmd_upload(args):
         sys.exit(code)
 
 
+def _cmd_diagnose(args):
+    # --verbose surfaces per-chunk transport logs (Rust tracing + Python logging).
+    # Set before the import so the native layer picks it up on first call.
+    if args.verbose:
+        os.environ["HIPPIUS_DEBUG"] = "1"
+    from .diagnose import format_report, run_diagnose
+    # Errors are allowed to bubble here: a failed/hung phase is itself the
+    # diagnostic signal we want the user to see and report.
+    report = run_diagnose(
+        repo_id=args.repo_id, filename=args.filename, revision=args.revision,
+        probe_bytes=args.probe_mb * 1024 * 1024,
+    )
+    if args.json:
+        _print_json(report)
+    else:
+        print(format_report(report))
+
+
 def _cmd_login(args):
     if args.hippius_token:
         console.save_api_token(args.hippius_token)
@@ -757,6 +835,8 @@ def main():
         "download": _cmd_download,
         "upload": _cmd_upload,
         "login": _cmd_login,
+        "revisions": cmd_revisions,
+        "diagnose": _cmd_diagnose,
     }
     if args.command in handlers:
         handlers[args.command](args)

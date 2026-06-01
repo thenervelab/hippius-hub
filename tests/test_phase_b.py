@@ -22,6 +22,7 @@ from hippius_hub import (
     delete_repo,
     file_exists,
     list_repo_files,
+    list_repo_refs,
     model_info,
     repo_exists,
     repo_info,
@@ -44,6 +45,7 @@ from tests._helpers import write_test_file
     "repo_info",
     "model_info",
     "list_repo_files",
+    "list_repo_refs",
     "repo_exists",
     "revision_exists",
     "file_exists",
@@ -97,7 +99,7 @@ def test_hippius_api_implements_phase_a_b_methods():
         "hf_hub_download", "snapshot_download", "whoami",
         "upload_file", "upload_folder",
         "create_repo", "delete_repo",
-        "repo_info", "model_info", "list_repo_files",
+        "repo_info", "model_info", "list_repo_files", "list_repo_refs",
         "repo_exists", "revision_exists", "file_exists",
         "login", "logout",
     ]:
@@ -193,6 +195,144 @@ def test_repo_info_alias_works(tmp_path, logged_in, test_repo, revision):
     upload_file(path_or_fileobj=str(src), path_in_repo="ri.bin", repo_id=test_repo, revision=revision)
     info = repo_info(test_repo, revision=revision)
     assert isinstance(info, ModelInfo)
+
+
+@pytest.mark.e2e
+def test_repo_info_last_modified_from_manifest(tmp_path, logged_in, test_repo, revision):
+    """lastModified/createdAt fall back to the manifest's upload timestamp."""
+    src = tmp_path / "ts.bin"
+    write_test_file(src, 64, seed=b"ts")
+    upload_file(path_or_fileobj=str(src), path_in_repo="ts.bin", repo_id=test_repo, revision=revision)
+    info = repo_info(test_repo, revision=revision)
+    assert info.lastModified is not None
+
+
+# ---------- list_repo_refs ----------
+
+def test_list_repo_refs_maps_branches_and_tags(monkeypatch):
+    """Unit-level: `main` goes under branches, everything else under tags. Mocks
+    the network so the GitRefs/GitRefInfo mapping is covered without creds (the
+    other refs tests are e2e-only). target_commit is intentionally None — the
+    tag list doesn't carry digests and resolving them is O(N) round-trips."""
+    from huggingface_hub import GitRefs
+    from hippius_hub import _repo_ops
+
+    monkeypatch.setattr(_repo_ops, "get_oci_bearer_token", lambda *a, **k: "tok")
+    monkeypatch.setattr(_repo_ops, "_list_tags", lambda *a, **k: ["main", "v1", "v2"])
+
+    refs = _repo_ops.list_repo_refs("org/model")
+    assert isinstance(refs, GitRefs)
+    assert [b.name for b in refs.branches] == ["main"]
+    assert refs.branches[0].ref == "refs/heads/main"
+    assert sorted(t.name for t in refs.tags) == ["v1", "v2"]
+    assert all(t.ref.startswith("refs/tags/") for t in refs.tags)
+    assert all(t.target_commit is None for t in refs.tags)
+
+
+def test_list_repo_refs_unknown_repo_raises_unit(monkeypatch):
+    from hippius_hub import _repo_ops
+
+    monkeypatch.setattr(_repo_ops, "get_oci_bearer_token", lambda *a, **k: "tok")
+    monkeypatch.setattr(_repo_ops, "_list_tags", lambda *a, **k: None)
+    with pytest.raises(RepositoryNotFoundError):
+        _repo_ops.list_repo_refs("org/missing")
+
+
+def test_next_link_parsing():
+    from hippius_hub._repo_ops import _next_link
+    reg = "https://reg.example.com"
+    assert _next_link(None, reg) is None
+    # root-relative next → made absolute against the registry
+    assert (
+        _next_link('</v2/r/tags/list?last=x&n=2>; rel="next"', reg)
+        == "https://reg.example.com/v2/r/tags/list?last=x&n=2"
+    )
+    # already-absolute next → returned as-is
+    assert (
+        _next_link('<https://cdn.example/v2/r/tags/list?last=x>; rel="next"', reg)
+        == "https://cdn.example/v2/r/tags/list?last=x"
+    )
+    # only a prev link → no next page
+    assert _next_link('</v2/r/tags/list?last=x>; rel="prev"', reg) is None
+
+
+def test_list_tags_follows_pagination(monkeypatch):
+    """_list_tags requests an explicit page size (the registry's default page
+    omits the Link header and returns a single tag) and then walks Link: rel=next
+    so the full tag set comes back — the bug behind list_repo_refs missing tags."""
+    from hippius_hub import _repo_ops
+
+    class _FakeResp:
+        def __init__(self, tags, link=None):
+            self.status_code = 200
+            self._tags = tags
+            self.headers = {"Link": link} if link else {}
+
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return {"tags": self._tags}
+
+    first = f"https://reg/v2/r/tags/list?n={_repo_ops._TAGS_PAGE_SIZE}"
+    pages = {
+        first: _FakeResp(["a", "b"], '</v2/r/tags/list?last=b&n=2>; rel="next"'),
+        "https://reg/v2/r/tags/list?last=b&n=2": _FakeResp(["c"]),
+    }
+    monkeypatch.setattr(_repo_ops.httpx, "get", lambda url, **kwargs: pages[url])
+    assert _repo_ops._list_tags("https://reg", "r", "tok") == ["a", "b", "c"]
+
+
+def test_normalize_oci_timestamp_to_hf_form():
+    from huggingface_hub.utils import parse_datetime
+    from hippius_hub._repo_ops import _normalize_oci_timestamp
+
+    assert _normalize_oci_timestamp(None) is None
+    assert _normalize_oci_timestamp("") is None
+    # The offset form datetime.isoformat() produces (what crashed ModelInfo).
+    out = _normalize_oci_timestamp("2026-05-26T18:05:32.733878+00:00")
+    assert out == "2026-05-26T18:05:32.733878Z"
+    # And the result is something huggingface_hub can actually parse.
+    parse_datetime(out)
+    # Garbage degrades to None rather than raising.
+    assert _normalize_oci_timestamp("not-a-date") is None
+
+
+@pytest.mark.e2e
+def test_list_repo_refs_includes_uploaded_revision(tmp_path, logged_in, test_repo):
+    import uuid
+    from huggingface_hub import GitRefs
+
+    # Use a dedicated, freshly-created repo rather than the shared test repo. The
+    # shared repo accumulates thousands of tags across CI runs, and the registry's
+    # tag listing lags a push on a repo that large/busy — so a just-uploaded tag
+    # isn't reliably listable right away. On a fresh repo it's immediate; we clean
+    # it up afterwards. (A project-scoped robot creates the repo on first push.)
+    project = test_repo.split("/")[0]
+    repo = f"{project}/refs-{uuid.uuid4().hex[:8]}"
+    src = tmp_path / "ref.bin"
+    write_test_file(src, 64, seed=b"ref")
+    upload_file(path_or_fileobj=str(src), path_in_repo="ref.bin", repo_id=repo, revision="v1")
+
+    try:
+        refs = list_repo_refs(repo)
+        assert isinstance(refs, GitRefs)
+        # A non-main revision is classified as a tag, never a branch.
+        assert "v1" in [t.name for t in refs.tags]
+        assert "v1" not in [b.name for b in refs.branches]
+    finally:
+        # Best-effort cleanup — a push-only robot may lack delete perms, and a
+        # leaked tiny repo shouldn't fail the assertion above.
+        try:
+            delete_repo(repo)
+        except Exception:
+            pass
+
+
+@pytest.mark.e2e
+def test_list_repo_refs_unknown_repo_raises(logged_in):
+    with pytest.raises(RepositoryNotFoundError):
+        list_repo_refs("test/definitely-not-here-zzz")
 
 
 # ---------- upload_file ----------

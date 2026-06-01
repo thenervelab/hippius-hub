@@ -18,6 +18,7 @@ from ._repo_ops import (
     delete_repo as _delete_repo,
     file_exists as _file_exists,
     list_repo_files as _list_repo_files,
+    list_repo_refs as _list_repo_refs,
     model_info as _model_info,
     repo_exists as _repo_exists,
     repo_info as _repo_info,
@@ -136,6 +137,9 @@ class HippiusApi(HfApi):
     def list_repo_files(self, repo_id, **kwargs):
         """Return the file list for `repo_id` at a revision (delegates to `_repo_ops.list_repo_files`)."""
         return _list_repo_files(repo_id, **self._inject(kwargs))
+
+    def list_repo_refs(self, repo_id, **kwargs):
+        return _list_repo_refs(repo_id, **self._inject(kwargs))
 
     def repo_exists(self, repo_id, **kwargs):
         """True iff `repo_id` has at least one pushed tag (delegates to `_repo_ops.repo_exists`)."""

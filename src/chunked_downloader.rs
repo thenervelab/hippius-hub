@@ -15,7 +15,8 @@ use tokio::task::AbortHandle;
 use crate::error::CoreError;
 
 const DEFAULT_CHUNK_SIZE: u64 = 100 * 1024 * 1024; // 100 MB default
-const MAX_CONCURRENT_DOWNLOADS: usize = 32;
+const MAX_CONCURRENT_DOWNLOADS: usize = 32; // default; overridable via HIPPIUS_MAX_CONCURRENT
+const DEFAULT_CONNECT_TIMEOUT_SECS: u64 = 30;
 const MAX_RETRIES: u32 = 3;
 const VERIFY_READ_BUFFER: usize = 8 * 1024 * 1024; // 8 MB read buffer for SHA256 verification
 
@@ -89,7 +90,7 @@ impl ChunkedDownloader {
         // even on a fast edge). Forcing h1 makes each parallel chunk get its own TCP,
         // letting the kernel/qdisc fan out across the available bandwidth.
         let client = Client::builder()
-            .connect_timeout(Duration::from_secs(30))
+            .connect_timeout(Duration::from_secs(DEFAULT_CONNECT_TIMEOUT_SECS))
             .http1_only()
             .pool_max_idle_per_host(MAX_CONCURRENT_DOWNLOADS)
             .tcp_keepalive(Duration::from_secs(30))
