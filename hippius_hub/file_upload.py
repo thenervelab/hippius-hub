@@ -250,7 +250,7 @@ def _commit_annotations(commit_message: Optional[str], commit_description: Optio
 
 def _build_commit_info(
     registry: str,
-    repo_id: str,
+    oci_repo: str,
     revision: str,
     response: httpx.Response,
     commit_message: str,
@@ -258,9 +258,13 @@ def _build_commit_info(
 ) -> CommitInfo:
     oid = response.headers.get("Docker-Content-Digest", "") or revision
     # HF's CommitInfo splits commit_url on "/commit/" and constructs a RepoUrl
-    # from the prefix. Synthesize a URL whose prefix is parseable as a HF
-    # "{namespace}/{repo_id}" URL relative to the registry endpoint.
-    commit_url = f"{registry}/{repo_id}/commit/{oid}"
+    # from the prefix. We pass `oci_repo` (the type-prefixed path from
+    # `_oci_repo_path` — `datasets/…`/`spaces/…` for non-model repos) so that
+    # prefix is a valid HF "repository page" URL, i.e. CommitInfo.repo_url
+    # resolves the correct repo_id AND repo_type. Using the raw repo_id here
+    # would mis-type every dataset/space commit as a model. The `/v2/` OCI
+    # path is deliberately absent: HF's parser rejects it (see _build_repo_url).
+    commit_url = f"{registry}/{oci_repo}/commit/{oid}"
     return CommitInfo(
         commit_url=commit_url,
         commit_message=commit_message,
@@ -347,7 +351,7 @@ def _finalize_upload_manifest(
 
     print(f"📝 Publishing OCI Manifest for {revision}...")
     resp = _put_manifest(registry, oci_repo, revision, oci_token, manifest, if_match=prev_digest)
-    return _build_commit_info(registry, repo_id, revision, resp, commit_message, commit_description)
+    return _build_commit_info(registry, oci_repo, revision, resp, commit_message, commit_description)
 
 
 def _handle_unsupported_kwargs(create_pr, parent_commit, run_as_future):
@@ -441,7 +445,7 @@ def upload_file(
     }
 
     resp = _put_manifest(registry, oci_repo, revision, oci_token, manifest, if_match=prev_digest)
-    return _build_commit_info(registry, repo_id, revision, resp, commit_message, commit_description)
+    return _build_commit_info(registry, oci_repo, revision, resp, commit_message, commit_description)
 
 
 def upload_folder(
