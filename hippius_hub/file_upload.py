@@ -561,9 +561,14 @@ def hippius_hub_upload(
             token=token,
             revision=revision,
         )
+    # Cross-file upload concurrency for the CLI path is tunable via
+    # HIPPIUS_UPLOAD_WORKERS (resolve_upload_workers(), default
+    # DEFAULT_TRANSFER_WORKERS). `upload_folder`'s own default stays 8 so its
+    # public signature is unchanged; operators tune the CLI without touching code.
     return upload_folder(
         repo_id=repo_id,
         folder_path=local_path,
         token=token,
         revision=revision,
+        max_workers=resolve_upload_workers(),
     )
