@@ -6,6 +6,7 @@ via the OCI manifest, then delegates the blob fetch to the Rust extension
 on-disk state is interchangeable.
 """
 import os
+import re
 import shutil
 import tempfile
 import uuid
@@ -40,6 +41,33 @@ except ImportError:
 
 
 _VALID_REPO_TYPES = (None, "model", "dataset", "space")
+
+# OCI distribution-spec repository-name grammar: every '/'-separated component
+# is lowercase alphanumerics joined by '.', '_', '__' or runs of '-'. The
+# registry rejects anything else (notably uppercase) — but it does so with a
+# misleading 401 deep in the upload, after auth has already succeeded, because
+# the token service can't match the malformed path against the granted scope.
+# We validate up front so an uppercase repo_id (common in HF model ids like
+# `Qwen/Qwen2.5-7B`) fails fast with an actionable message instead. The
+# separator alternation mirrors the spec exactly so we never reject a name the
+# registry would actually accept (e.g. `a__b`, `foo--bar`).
+_OCI_COMPONENT = r"[a-z0-9]+(?:(?:[._]|__|-+)[a-z0-9]+)*"
+_OCI_NAME_RE = re.compile(rf"^{_OCI_COMPONENT}(?:/{_OCI_COMPONENT})*$")
+
+
+def _validate_repo_id(repo_id: str) -> None:
+    """Reject repo_ids the OCI registry can't represent (e.g. uppercase).
+
+    Surfacing this here — before any network call — turns the registry's
+    confusing `401 Unauthorized` on push into a clear ValueError that names
+    the offending id and suggests the lowercase form.
+    """
+    if not _OCI_NAME_RE.match(repo_id):
+        raise ValueError(
+            f"repo_id={repo_id!r} is not a valid registry name: only lowercase "
+            f"letters, digits, '.', '_' and '-' are allowed (try "
+            f"{repo_id.lower()!r}). Container registries reject uppercase names."
+        )
 
 
 def _validate_repo_type(repo_type: Optional[str]):
@@ -114,6 +142,7 @@ def _oci_repo_path(repo_id: str, repo_type: Optional[str]) -> str:
     Rejects already-prefixed repo_ids (`datasets/foo` with `repo_type="dataset"`)
     rather than producing a double-prefixed `datasets/datasets/foo` path.
     """
+    _validate_repo_id(repo_id)
     if repo_type in (None, "model"):
         return repo_id
     if repo_type in ("dataset", "space"):
