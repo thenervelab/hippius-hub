@@ -831,6 +831,18 @@ def main():
     """Parse argv and dispatch to the matching `_cmd_*` handler."""
     parser = _build_parser()
     args = parser.parse_args()
+
+    # Best-effort "you're out of date" notice. Runs after parse_args() so
+    # `--help`/`--version` (which argparse exits out of internally) stay
+    # untouched. Wrapped defensively even though check_for_update() already
+    # swallows its own errors — an update nag must never be able to take
+    # down an otherwise-working command.
+    try:
+        from ._update_check import check_for_update
+        check_for_update()
+    except Exception:
+        pass
+
     handlers = {
         "download": _cmd_download,
         "upload": _cmd_upload,
