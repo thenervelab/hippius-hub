@@ -1,10 +1,14 @@
 name: Benchmark (chunked transfer)
 
-# Manual only. A run pushes a multi-hundred-MiB file to the test/e2e-client
-# namespace (no production config/deployment change — chunks are ordinary
-# content-addressed blobs), so it must NOT fire unattended on every push. Trigger
-# it on demand and scale the size via the input.
+# Runs on a push to `staging` (so a merge to staging produces benchmark numbers
+# right next to the e2e run) and on manual dispatch (to scale the file size). A
+# run pushes a few-hundred-MiB file to the test/e2e-client namespace — no
+# production config/deployment change, chunks are ordinary content-addressed
+# blobs — so it stays OFF `main` and every other branch. On a push event the
+# dispatch inputs are empty, so the script falls back to its size defaults.
 on:
+  push:
+    branches: [staging]
   workflow_dispatch:
     inputs:
       size_mib:
