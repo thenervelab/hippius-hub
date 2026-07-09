@@ -15,7 +15,7 @@ eliminating the in-cluster staged receiver and its entire
 data-plane/scaling/ops surface.
 
 **Architecture (Git-LFS/Xet "pointer" shape — "Option B"):** A file ≥ threshold
-is split into K **content-defined** chunk blobs (FastCDC, ~64 MiB average —
+is split into K **content-defined** chunk blobs (FastCDC, ~4 MiB average —
 HF-Xet's block/transfer size), each a normal digest-verified OCI blob pushed
 directly to Harbor in parallel
 (`docker push` semantics). Content-defined boundaries re-sync just past an
@@ -71,24 +71,26 @@ migration.
 
 ### Chunking strategy — content-defined (FastCDC) for v1
 
-Split with **FastCDC** (rolling Gear-hash), **~64 MiB average** (min 16 MiB, max
-256 MiB — standard normalized-chunking ratios) — matching **HF-Xet's block/xorb
-transfer size** (see the two-size note below). Threshold to chunk: the current
-256 MiB threshold; below it, one plain blob (K=1). Per-chunk `HEAD` before PUT
-skips already-present chunks — this *is* the "upload only missing bytes" dedup,
-and it gives **upload resumability for free** (a re-run skips uploaded chunks,
-like S3's skip-uploaded-parts).
+Split with **FastCDC** (rolling Gear-hash), **~4 MiB average** (min 1 MiB, max
+16 MiB — standard normalized-chunking ratios, and the exact ceiling `fastcdc`
+3.2.1 allows). Threshold to chunk: the current 256 MiB threshold; below it, one
+plain blob (K=1). Per-chunk `HEAD` before PUT skips already-present chunks — this
+*is* the "upload only missing bytes" dedup, and it gives **upload resumability for
+free** (a re-run skips uploaded chunks, like S3's skip-uploaded-parts).
 
-**Which HF number this is (and which we can't use).** HF-Xet is two-tier: it
-dedups at a ~**64 KiB** CDC chunk *inside a custom CAS*, then aggregates those
-into ~**64 MiB** block/xorb units that are what actually transfer and store. We
-are single-tier — our OCI blob is *both* the dedup unit and the transfer unit — so
-the number that maps to our blob is HF's **64 MiB transfer unit**, not its 64 KiB
-dedup unit. The 64 KiB unit is unusable as an OCI blob (see §Scope boundary) and
-is exactly the deferred CAS project. Consequence: our dedup granularity is 64 MiB
-(coarse) — a changed region re-sends up to one 64 MiB chunk. If dedup *quality*
-ever outweighs Harbor lightness, drop the average to 8–16 MiB (the only knob);
-CDC at any of these beats fixed-size, which re-sends the whole shifted tail.
+**Why 4 MiB — and why not the 64 MiB first picked.** `fastcdc` 3.2.1 hard-caps the
+average at `AVERAGE_MAX` = 4 MiB (min at `MINIMUM_MAX` = 1 MiB, max at
+`MAXIMUM_MAX` = 16 MiB); a larger average panics `StreamCDC::new` (our derived
+min = avg/4 exceeds `MINIMUM_MAX`). The original plan said ~64 MiB to match
+HF-Xet's block/xorb size, but that number was doubly wrong: `fastcdc` cannot
+produce it, and HF's 64 MiB is a *transfer block* aggregating many ~64 KiB CDC
+dedup chunks — not a CDC average. HF-Xet is two-tier (dedup at ~64 KiB inside a
+custom CAS, aggregate into ~64 MiB xorbs); we are single-tier — our OCI blob is
+*both* the dedup unit and the transfer unit — so neither HF number maps to it
+directly. 4 MiB is the practical ceiling: coarse enough to keep blob counts low,
+fine enough that a changed region re-sends at most one ~4 MiB chunk. For finer
+dedup, drop the average lower (1–2 MiB) at the cost of more blobs; the ~64 KiB CDC
+dedup unit stays the deferred custom-CAS project (see §Scope boundary).
 
 **Why CDC in v1, not deferred.** The dominant real workload is re-uploading a
 slightly-changed model. Content-defined boundaries re-sync just past an
@@ -106,11 +108,12 @@ as OCI blobs (blows the 4 MiB manifest cap, floods `HEAD`, buries Harbor GC and
 `project_blob` quota). Fine-grained dedup requires an indirection layer OCI does
 not provide (a CAS) — that indirection is HF's entire engineering cost. We stay
 at **OCI-native granularity**: each CDC chunk is one ordinary blob, dedup is OCI
-`HEAD`-before-PUT, no new service. At ~64 MiB average a 20 GB file is ~320 blobs —
-light on Harbor GC/quota and the manifest budget. Coarser than Xet's 64 KiB dedup
-unit, so a scattered edit re-sends its whole ~64 MiB chunk — acceptable because
-model fine-tunes change whole tensors (MB–GB), and CDC still deduplicates every
-*unchanged* 64 MiB region after a length shift, which fixed-size cannot.
+`HEAD`-before-PUT, no new service. At ~4 MiB average a 20 GB file is ~5,000 blobs
+— still light on Harbor GC/quota and the manifest budget (~110 B/chunk). Coarser
+than Xet's 64 KiB dedup unit, so a scattered edit re-sends its whole ~4 MiB chunk
+— acceptable because model fine-tunes change whole tensors (MB–GB), and CDC still
+deduplicates every *unchanged* ~4 MiB region after a length shift, which
+fixed-size cannot.
 
 **Determinism is a dedup correctness invariant.** The FastCDC parameters
 (average/min/max size, Gear mask, seed) are **pinned constants and part of the
@@ -144,7 +147,7 @@ determinism-critical primitive we must not hand-roll.
         "com.hippius.file.size": "160000000",
         "com.hippius.file.digest": "sha256:<whole-file>",
         "com.hippius.chunk.count": "3" } },
-    { "mediaType": "application/vnd.hippius.chunk.v1", "digest": "sha256:<chunk0>", "size": 67108864 },
+    { "mediaType": "application/vnd.hippius.chunk.v1", "digest": "sha256:<chunk0>", "size": 4194304 },
     { "mediaType": "application/vnd.hippius.chunk.v1", "digest": "sha256:<chunk1>", "size": 71303168 },
     { "mediaType": "application/vnd.hippius.chunk.v1", "digest": "sha256:<chunk2>", "size": 21587968 },
     { "mediaType": "application/vnd.oci.image.layer.v1.tar", "digest": "sha256:<config.json>", "size": 1234,
@@ -189,9 +192,9 @@ is per-artifact, not per-file. Controls:
   Harbor core re-parsing) — **not** a per-file chunk count. Option B already
   minimizes this: untitled chunk layers carry only mediaType+digest+size
   (~110 B), and file metadata sits once on the pointer.
-- With ~110 B/chunk, ≤ 2 MiB ≈ ~19k chunks ≈ ~1.2 TB per **revision manifest** at
-  64 MiB average. A folder upload merges every file's pointer+chunk layers into
-  that one manifest, so ~1.2 TB is the *combined* budget across all files in the
+- With ~110 B/chunk, ≤ 2 MiB ≈ ~19k chunks ≈ ~75 GB per **revision manifest** at
+  4 MiB average. A folder upload merges every file's pointer+chunk layers into
+  that one manifest, so ~75 GB is the *combined* budget across all files in the
   revision, not a per-file limit — a repo of many large files reaches the cap at a
   total size below it. Still covers every model today. (Dropping the average to 8–16 MiB for finer dedup
   would lower this ceiling proportionally; a real CDC trade if that knob is ever
@@ -228,7 +231,7 @@ blob, so the machinery is unchanged — only granularity changes.
   unaligned insert/delete** — FastCDC re-syncs boundaries just past the change, so
   unchanged regions keep identical chunk digests and `HEAD`-skip. This is the core
   win for re-uploading a slightly-changed model: only the changed chunks (a few
-  ~64 MiB blobs) transfer; everything else is already present.
+  ~4 MiB blobs) transfer; everything else is already present.
 - Transition nuance: the *same* large file stored old-way (one blob) and new-way
   (K chunks) won't cross-dedup — different digests. Transient; only large files
   change representation.
@@ -240,13 +243,13 @@ blob**, warming it into the EU/US ATS edges with a full GET.
   discovers layers dynamically; K chunk layers warm like K image layers.
 - **Chunking retires a real workaround.** ATS 9.2.3 won't store `206 Partial
   Content` for large blobs, so today a multi-GB blob needs a full-blob warm-GET
-  plus `cache.range.lookup=1`. **~64 MiB chunks are each a clean `200 OK`** the
+  plus `cache.range.lookup=1`. **~4 MiB chunks are each a clean `200 OK`** the
   client pulls in parallel — no Range gymnastics, no 206 bug.
 
-**Costs bounded by chunk size (why ~64 MiB, not 64 KiB):** more blobs → more
+**Costs bounded by chunk size (why ~4 MiB, not 64 KiB):** more blobs → more
 warmer tasks + Harbor blob-metadata/GC rows + edge-cache objects; parallel
-cache-miss pulls burst concurrent JuiceFS reads (same total bytes). ~64 MiB (HF's
-transfer unit) keeps a 20 GB file at ~320 blobs — not the ~300k that 64 KiB
+cache-miss pulls burst concurrent JuiceFS reads (same total bytes). ~4 MiB (the
+`fastcdc` ceiling) keeps a 20 GB file at ~5,000 blobs — not the ~300k that 64 KiB
 Xet-style chunks would demand, which OCI blob-per-chunk cannot carry.
 
 ### Guarantee preservation & existing-data compatibility (MUST NOT break client data)
@@ -316,7 +319,7 @@ could render "chunked — N files" but is not required.
 - **Failure mode is now LOUD (the Option-B payoff).** A client that predates
   chunked support, reading a chunked manifest, resolves the file to its one titled
   **pointer** layer and writes the tiny pointer blob (~few hundred bytes) as the
-  file — obviously wrong (size/digest mismatch), not a plausible 64 MiB prefix
+  file — obviously wrong (size/digest mismatch), not a plausible ~4 MiB prefix
   that passes `verify_hash`. Make the pointer self-identifying (a `version` field,
   LFS-style) so the wrong output is diagnosable.
 - **Layered safeguards (no single honor-system guard):**
@@ -355,7 +358,7 @@ files); route `_repo_ops.py:214` siblings, `layer_titles`, and **every**
 **Property:** `group_files` returns exactly one entry per logical file with
 correct whole-file size/digest and ordered chunk digests; round-trips with the
 Phase 3 uploader. Fixtures: K=1 plain, K=3 pointer, mixed, **0-byte file**
-(K=1 empty-sha256 blob), size exactly divisible by 64 MiB (no empty trailing
+(K=1 empty-sha256 blob), size exactly divisible by the chunk size (no empty trailing
 chunk), and a malformed pointer (missing/duplicate index) → error.
 
 ## Phase 2 — Chunked download (parallel pull + concat + verify)
@@ -468,8 +471,11 @@ deliberate:
   pointer blob. The pointer blob still exists (deterministic, self-identifying)
   for pointer-level dedup and old-client loud-fail, but readers don't fetch it, so
   the read side stays a single round-trip.
-- **CDC chunk size is 64 MiB** (HF-Xet's transfer/block unit), not the earlier
-  8 MiB — matches the resolved Open Decision #4.
+- **CDC average is 4 MiB** — `fastcdc` 3.2.1's `AVERAGE_MAX` ceiling. The plan's
+  64 MiB (Open Decision #4) proved **infeasible**: `fastcdc` panics above a 4 MiB
+  average (`min = avg/4` exceeds its `MINIMUM_MAX`), caught by the staging
+  benchmark. HF's 64 MiB is a transfer block aggregating many small CDC chunks,
+  not a CDC average, so it was never the right number either.
 - **Config constants were added, not renamed.** `DEFAULT_CHUNK_THRESHOLD` /
   `DEFAULT_CDC_AVG_SIZE` are new (the download `DEFAULT_CHUNK_SIZE` is a distinct
   Range-size knob); the old `DEFAULT_MULTIPART_*` were deleted with the receiver.
@@ -478,8 +484,9 @@ deliberate:
   PUT once it exceeds the 4 MiB registry cap (`MAX_MANIFEST_BYTES`), so an artifact
   with too many chunks fails with a clear message instead of the registry's opaque
   400 after all blobs are uploaded. Only the *Referrers/index fan-out* (Open
-  Decision #2's expensive half) is deferred; the ~1.2 TB budget (per revision
-  manifest, all files in the revision combined) at 64 MiB covers every model today.
+  Decision #2's expensive half) is deferred; the ~75 GB budget (per revision
+  manifest, all files in the revision combined) at 4 MiB covers typical models; an
+  artifact past ~75 GB/revision needs the index fan-out.
 - New Rust: `src/chunk_fetcher.rs` (parallel chunk pull), `chunk_and_hash` +
   `upload_blob_range_async` in `uploader.rs`, `CoreError::Integrity`. New Python
   errors: `UnsupportedLayoutError`, `MalformedManifestError`, `ManifestTooLargeError`.
@@ -529,8 +536,9 @@ code item — orphaned chunks from a failed upload are only reclaimed if GC runs
   constants; remove the Rust import + dead tests atomically.
 - **Corrected claims:** the "matches Xet's block size" line was wrong (Xet dedups
   at ~64 KiB). Superseded by the CDC revision below.
-- **Revision 2026-07-09 (CDC in v1):** dropped fixed-size for FastCDC ~64 MiB
-  average (HF's block/transfer unit) so cross-version dedup survives
+- **Revision 2026-07-09 (CDC in v1):** dropped fixed-size for FastCDC ~4 MiB
+  average (`fastcdc`'s `AVERAGE_MAX`; the plan's 64 MiB was infeasible — see
+  Implementation status) so cross-version dedup survives
   length-shifting edits. Fixed-size only deduped
   byte-aligned/in-place edits; the common re-upload (add/remove a layer, repack,
   quantization change) shifts every later boundary and defeated it. Coarse CDC
@@ -550,8 +558,9 @@ code item — orphaned chunks from a failed upload are only reclaimed if GC runs
    before enabling writes (a Harbor webhook on `com.hippius.layout` is the only
    true server-side enforcement; otherwise the pointer loud-fail + `artifactType`
    are the safety net).
-4. ~~**CDC later?**~~ **RESOLVED 2026-07-09: coarse CDC (FastCDC ~64 MiB average,
-   HF's block/transfer size) is in v1.** Cross-version dedup of re-uploaded,
+4. ~~**CDC later?**~~ **RESOLVED 2026-07-09: CDC (FastCDC ~4 MiB average — the
+   `fastcdc` `AVERAGE_MAX` ceiling; the initial 64 MiB was infeasible) is in v1.**
+   Cross-version dedup of re-uploaded,
    slightly-changed models is the
    dominant workload and CDC is a localized change (splitter only). The remaining
    deferral is **fine-grained Xet-style dedup** (~64 KiB chunks + a custom CAS) —

@@ -17,14 +17,21 @@ use crate::error::CoreError;
 /// upload works from (offset re-reads the range; digest dedups and addresses).
 pub type ChunkList = Vec<(String, u64, u64)>;
 
-/// `FastCDC` average chunk size bounds. The average is the wire contract (see the
-/// chunked-artifact plan); min = avg/4 and max = avg*4 are the standard
-/// normalized-chunking ratios. The library takes `u32` sizes, so avg*4 must fit
-/// u32 — cap the average at 256 MiB (→ 1 GiB max) and floor it at 256 B (→ 64 B
-/// min, `FastCDC`'s smallest legal minimum). Out-of-range averages are a caller
-/// error, surfaced rather than silently clamped.
-const CDC_MIN_AVG: u64 = 256;
-const CDC_MAX_AVG: u64 = 256 * 1024 * 1024;
+/// `FastCDC` average chunk size bounds — pinned to the library's own average
+/// range `[AVERAGE_MIN, AVERAGE_MAX]` = `[256 B, 4 MiB]`. The average is the wire
+/// contract (see the chunked-artifact plan); min = avg/4 and max = avg*4 are the
+/// standard normalized-chunking ratios. Those derivations must ALSO stay under
+/// `FastCDC`'s *separate* `MINIMUM_MAX` (1 MiB) and `MAXIMUM_MAX` (16 MiB) ceilings
+/// or `StreamCDC::new` panics — and they do so exactly over this interval: at the
+/// 4 MiB ceiling min = 1 MiB = `MINIMUM_MAX` and max = 16 MiB = `MAXIMUM_MAX`, the
+/// caps themselves. So `[256 B, 4 MiB]` is the largest average range that can
+/// never panic. The old 256 MiB cap let averages like the 64 MiB default through
+/// to a `StreamCDC::new` panic (min = 16 MiB > `MINIMUM_MAX`); an out-of-range
+/// average is now surfaced as a caller error, never clamped and never panicked.
+/// (`cdc_bounds_track_fastcdc_limits` asserts these equal the crate constants so a
+/// `FastCDC` bump can't silently reopen the panic.)
+const CDC_MIN_AVG: u64 = 256; // == fastcdc::v2020::AVERAGE_MIN
+const CDC_MAX_AVG: u64 = 4 * 1024 * 1024; // == fastcdc::v2020::AVERAGE_MAX (4 MiB)
 
 /// Chunk a file with `FastCDC` and hash each chunk plus the whole file in one
 /// streaming pass (bounded memory — `StreamCDC` never loads the whole file).
@@ -355,6 +362,34 @@ mod cdc_tests {
     fn out_of_range_avg_is_rejected() {
         assert!(chunk_and_hash_reader(Cursor::new(b"x"), CDC_MIN_AVG - 1).is_err());
         assert!(chunk_and_hash_reader(Cursor::new(b"x"), CDC_MAX_AVG + 1).is_err());
+        // The shipped 64 MiB default used to reach StreamCDC::new and PANIC
+        // (min = avg/4 = 16 MiB > fastcdc MINIMUM_MAX). It must now be a clean
+        // caller error caught before the splitter — the exact value the staging
+        // benchmark tripped.
+        assert!(chunk_and_hash_reader(Cursor::new(b"x"), 64 * 1024 * 1024).is_err());
+    }
+
+    #[test]
+    fn cdc_bounds_track_fastcdc_limits() {
+        use fastcdc::v2020::{AVERAGE_MAX, AVERAGE_MIN};
+        // Our accepted range MUST equal fastcdc's own average bounds: only across
+        // [AVERAGE_MIN, AVERAGE_MAX] do the derived min = avg/4 and max = avg*4 stay
+        // within fastcdc's MINIMUM_MAX/MAXIMUM_MAX, so StreamCDC::new cannot panic.
+        // If a fastcdc bump moves these, fail here rather than ship another panic.
+        assert_eq!(CDC_MIN_AVG, u64::from(AVERAGE_MIN));
+        assert_eq!(CDC_MAX_AVG, u64::from(AVERAGE_MAX));
+    }
+
+    #[test]
+    fn chunks_at_the_ceiling_avg_without_panic() {
+        // The upper bound is INCLUSIVE and valid: at avg = 4 MiB, fastcdc's derived
+        // min = 1 MiB and max = 16 MiB are its exact ceilings — this must chunk, not
+        // panic and not be rejected. A buffer past the 16 MiB max forces >1 chunk.
+        let data = vec![9u8; 20 * 1024 * 1024];
+        match chunk_and_hash_reader(Cursor::new(&data), CDC_MAX_AVG) {
+            Ok((_, chunks)) => assert!(chunks.len() >= 2),
+            Err(_) => unreachable!("chunking at the ceiling avg must succeed"),
+        }
     }
 
     #[test]

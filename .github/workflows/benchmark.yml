@@ -16,9 +16,9 @@ on:
         required: false
         default: '256'
       cdc_avg_mib:
-        description: FastCDC average chunk size in MiB
+        description: FastCDC average chunk size in MiB (max 4 — fastcdc AVERAGE_MAX)
         required: false
-        default: '64'
+        default: '4'
       patch_mib:
         description: Edit size in MiB for the incremental re-upload test
         required: false

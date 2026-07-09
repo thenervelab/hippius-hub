@@ -94,7 +94,14 @@ DEFAULT_TRANSFER_WORKERS = 8            # snapshot/upload ThreadPoolExecutor siz
 # (min/max derived avg/4..avg*4 in the Rust splitter) and is part of the wire
 # contract — a change means a new layout version, not a silent retune.
 DEFAULT_CHUNK_THRESHOLD = 256 * 1024 * 1024  # 256 MiB
-DEFAULT_CDC_AVG_SIZE = 64 * 1024 * 1024       # 64 MiB (HF-Xet block/transfer size)
+# 4 MiB is the LARGEST average fastcdc 3.2.1 can produce: its AVERAGE_MAX cap is
+# 4 MiB, and via min=avg/4 / max=avg*4 the derived 1 MiB min and 16 MiB max are
+# that crate's MINIMUM_MAX / MAXIMUM_MAX ceilings exactly. A larger average — the
+# original 64 MiB "HF value" — panics the splitter (min=16 MiB > MINIMUM_MAX).
+# (HF's 64 MiB is a transfer block aggregating many small CDC chunks, not a CDC
+# average.) Smaller = finer dedup but more blobs; 4 MiB keeps blob counts low
+# while staying inside the caps. src/uploader.rs enforces the same bound.
+DEFAULT_CDC_AVG_SIZE = 4 * 1024 * 1024        # 4 MiB (fastcdc AVERAGE_MAX ceiling)
 
 
 def resolve_chunk_threshold() -> int:

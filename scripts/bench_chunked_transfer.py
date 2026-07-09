@@ -135,7 +135,7 @@ def _emit(lines: list) -> None:
 
 def main() -> None:
     size = _env_int("BENCH_SIZE_MIB", 256)
-    cdc_avg = _env_int("BENCH_CDC_AVG_MIB", 64)
+    cdc_avg = _env_int("BENCH_CDC_AVG_MIB", 4)  # fastcdc AVERAGE_MAX; larger panics
     patch = _env_int("BENCH_PATCH_MIB", 4)
     repo = os.environ.get("HIPPIUS_TEST_REPO", "test/e2e-client")
 
