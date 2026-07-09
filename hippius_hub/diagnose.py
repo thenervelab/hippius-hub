@@ -32,7 +32,7 @@ from .errors import EntryNotFoundError
 from .file_download import _oci_repo_path, _validate_repo_type
 
 try:
-    from .hippius_core import diagnose_blob_native
+    from .hippius_core import diagnose_blob_native, diagnose_upload_native
 except ImportError:
     raise ImportError("hippius_core is not installed. Did you run `maturin develop`?")
 
@@ -188,6 +188,81 @@ def _verdict(report: dict) -> list:
             "measured latency to the server."
         )
     return lines
+
+
+# ----- upload throughput probe (deployment-gate measurement) -----
+
+def run_diagnose_upload(
+    url: str,
+    *,
+    probe_bytes: int = _DEFAULT_PROBE_BYTES,
+    max_concurrent: Optional[int] = None,
+    token=None,
+) -> dict:
+    """Probe single-stream vs N-way PUT throughput to `url` and return a report.
+
+    `url` must accept a discardable PUT — a Harbor upload location (measures the
+    single-stream LAN ingest ceiling from in-cluster), the receiver, or a sink.
+    The probe sends synthetic zero bytes; nothing is stored.
+    """
+    configure_logging()
+    auth_token = resolve_token_value(token)
+    concurrency = max_concurrent if max_concurrent is not None else resolve_max_concurrent()
+    raw = diagnose_upload_native(
+        url=url,
+        probe_bytes=probe_bytes,
+        max_concurrent=concurrency,
+        auth_token=auth_token,
+        connect_timeout_secs=resolve_connect_timeout(),
+    )
+    report = {"url": url, "env": _env_summary(), "upload": json.loads(raw)}
+    report["verdict"] = _upload_verdict(report)
+    return report
+
+
+def _upload_verdict(report: dict) -> list:
+    up = report["upload"]
+    single = up.get("single_stream_mbps")
+    parallel = up.get("parallel_mbps")
+    lines = []
+    if single and parallel:
+        ratio = parallel / single if single else 0.0
+        if ratio >= 1.5:
+            lines.append(
+                f"Parallel upload is {ratio:.1f}x single-stream — the N-way fan-out "
+                f"meaningfully helps this uplink, so the multipart receiver path should "
+                f"pay off for large blobs."
+            )
+        else:
+            lines.append(
+                f"Parallel upload is only {ratio:.1f}x single-stream — this path is not "
+                f"single-stream-limited on upload, so multipart buys little from here. "
+                f"Confirm the vantage point (WAN client vs in-cluster) before concluding."
+            )
+    for note in up.get("errors") or []:
+        lines.append(f"note: {note}")
+    if not lines:
+        lines.append("Insufficient data for an upload verdict.")
+    return lines
+
+
+def format_upload_report(report: dict) -> str:
+    up = report["upload"]
+    out = [f"Upload throughput probe → {report['url']}", ""]
+    out.append("== Upload transfer ==")
+    out.append(f"  probe size:    {_fmt_bytes(up.get('probe_bytes'))}")
+    out.append(f"  single stream: {_mbps(up.get('single_stream_mbps'))}  ({_ms(up.get('single_stream_ms'))})")
+    out.append(
+        f"  parallel ({up.get('max_concurrent')} conns): "
+        f"{_mbps(up.get('parallel_mbps'))}  ({_ms(up.get('parallel_ms'))})"
+    )
+    for note in up.get("errors") or []:
+        out.append(f"  note: {note}")
+    out.append("")
+    out.append("== Verdict ==")
+    for line in report.get("verdict", []):
+        out.append(f"  • {line}")
+    return "\n".join(out)
 
 
 # ----- report formatting -----

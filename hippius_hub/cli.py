@@ -602,6 +602,18 @@ def _build_parser() -> argparse.ArgumentParser:
     dg.add_argument("--json", action="store_true", help="Emit the raw report as JSON")
     dg.add_argument("--verbose", action="store_true", help="Enable verbose transport logging")
 
+    dgu = sub.add_parser(
+        "diagnose-upload",
+        help="Probe single-stream vs parallel PUT throughput to a URL (upload deployment-gate measurement)",
+    )
+    dgu.add_argument("url", help="A URL that accepts a discardable PUT: a Harbor upload location, the receiver, or a sink")
+    dgu.add_argument("--probe-mb", type=int, default=32,
+                     help="How many MB to upload for the throughput test (default 32)")
+    dgu.add_argument("--concurrency", type=int, default=None,
+                     help="Parallel PUT streams (default: HIPPIUS_MAX_CONCURRENT / 32)")
+    dgu.add_argument("--json", action="store_true", help="Emit the raw report as JSON")
+    dgu.add_argument("--verbose", action="store_true", help="Enable verbose transport logging")
+
     # Login: accepts EITHER docker registry creds OR a Hippius API token.
     l = sub.add_parser("login", help="Save credentials. Use --hippius-token for the console API, --username/--password for the docker registry, or --token for either.")
     l.add_argument("--username")
@@ -780,6 +792,22 @@ def _cmd_diagnose(args):
         print(format_report(report))
 
 
+def _cmd_diagnose_upload(args):
+    if args.verbose:
+        os.environ["HIPPIUS_DEBUG"] = "1"
+    from .diagnose import format_upload_report, run_diagnose_upload
+    # Errors bubble: a failed/hung PUT is itself the signal.
+    report = run_diagnose_upload(
+        args.url,
+        probe_bytes=args.probe_mb * 1024 * 1024,
+        max_concurrent=args.concurrency,
+    )
+    if args.json:
+        _print_json(report)
+    else:
+        print(format_upload_report(report))
+
+
 def _cmd_login(args):
     if args.hippius_token:
         console.save_api_token(args.hippius_token)
@@ -837,6 +865,7 @@ def main():
         "login": _cmd_login,
         "revisions": cmd_revisions,
         "diagnose": _cmd_diagnose,
+        "diagnose-upload": _cmd_diagnose_upload,
     }
     if args.command in handlers:
         handlers[args.command](args)

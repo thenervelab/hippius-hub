@@ -370,6 +370,129 @@ pub async fn probe_blob(
     })
 }
 
+// ===== Upload probe (deployment-gate measurement) =====
+//
+// The download probe above answers "does parallel GET recover throughput". The
+// upload probe answers the gate question from the parallel-upload design: how
+// does single-stream PUT throughput compare to an N-way PUT aggregate. Run from
+// a fast client against the receiver it measures the WAN uplink win; run from
+// inside the cluster against a Harbor upload location it measures the
+// single-stream LAN ingest ceiling. The gate clears when that ceiling is at or
+// above the N-way WAN aggregate.
+
+/// A body stream of `total` zero bytes, chunked so the whole payload is never
+/// allocated — the synthetic upload analog of reading a file, so the probe
+/// needs no real blob on disk. Yields `Vec<u8>` (reqwest maps it to `Bytes`).
+fn zero_stream(total: u64) -> impl futures::Stream<Item = Result<Vec<u8>, std::io::Error>> {
+    const CHUNK: u64 = 1 << 20; // 1 MiB per yielded buffer
+    stream::unfold(total, |remaining| async move {
+        if remaining == 0 {
+            return None;
+        }
+        let n = std::cmp::min(remaining, CHUNK);
+        // `n as usize` is lossless: n <= 1 MiB.
+        Some((Ok(vec![0u8; n as usize]), remaining - n))
+    })
+}
+
+/// Time a single streaming PUT of `bytes` synthetic zeros to `url`. No
+/// Content-Length (chunked transfer), matching how the real upload paths send.
+async fn timed_put(client: &Client, url: &str, auth_token: Option<&str>, bytes: u64) -> Result<Duration, DiagError> {
+    let mut req = client
+        .put(url)
+        .header(reqwest::header::CONTENT_TYPE, "application/octet-stream")
+        .body(reqwest::Body::wrap_stream(zero_stream(bytes)));
+    if let Some(t) = auth_token {
+        req = req.bearer_auth(t);
+    }
+    let t0 = Instant::now();
+    let resp = req.send().await?;
+    resp.error_for_status_ref()?;
+    Ok(t0.elapsed())
+}
+
+#[derive(Serialize)]
+pub struct UploadProbeReport {
+    url: String,
+    probe_bytes: u64,
+    max_concurrent: usize,
+    single_stream_mbps: Option<f64>,
+    single_stream_ms: Option<u64>,
+    parallel_mbps: Option<f64>,
+    parallel_ms: Option<u64>,
+    errors: Vec<String>,
+}
+
+/// Measure single-stream vs `n`-way PUT throughput to `url`. The parallel arm
+/// fires `n` concurrent PUTs each carrying `probe_bytes / n`, so the two arms
+/// move the same total bytes and compare like-for-like.
+pub async fn upload_probe(
+    url: &str,
+    probe_bytes: u64,
+    max_concurrent: Option<usize>,
+    auth_token: Option<&str>,
+    connect_timeout_secs: Option<u64>,
+) -> Result<UploadProbeReport, DiagError> {
+    let n = max_concurrent.unwrap_or(16);
+    let connect_timeout = Duration::from_secs(connect_timeout_secs.unwrap_or(30));
+    let mut errors: Vec<String> = Vec::new();
+
+    // Same client shape as the transfer client in `probe_blob`: h1-only, pooled.
+    let client = Client::builder()
+        .connect_timeout(connect_timeout)
+        .http1_only()
+        .pool_max_idle_per_host(n)
+        .tcp_keepalive(Duration::from_secs(30))
+        .build()?;
+
+    let mut single_stream_mbps = None;
+    let mut single_stream_ms = None;
+    let mut parallel_mbps = None;
+    let mut parallel_ms = None;
+
+    if probe_bytes == 0 {
+        errors.push("probe_bytes is 0; nothing to upload".to_string());
+    } else {
+        let elapsed = timed_put(&client, url, auth_token, probe_bytes).await?;
+        single_stream_ms = Some(elapsed.as_millis() as u64);
+        single_stream_mbps = Some(mbps(probe_bytes, elapsed));
+
+        let per = probe_bytes / n as u64;
+        if per == 0 {
+            errors.push("probe_bytes smaller than concurrency; skipping parallel probe".to_string());
+        } else {
+            let par_start = Instant::now();
+            let results: Vec<Result<Duration, DiagError>> = stream::iter(0..n)
+                .map(|_| {
+                    let client = client.clone();
+                    let url = url.to_string();
+                    let token = auth_token.map(ToString::to_string);
+                    async move { timed_put(&client, &url, token.as_deref(), per).await }
+                })
+                .buffer_unordered(n)
+                .collect()
+                .await;
+            let par_elapsed = par_start.elapsed();
+            for r in results {
+                r?;
+            }
+            parallel_ms = Some(par_elapsed.as_millis() as u64);
+            parallel_mbps = Some(mbps(per * n as u64, par_elapsed));
+        }
+    }
+
+    Ok(UploadProbeReport {
+        url: url.to_string(),
+        probe_bytes,
+        max_concurrent: n,
+        single_stream_mbps,
+        single_stream_ms,
+        parallel_mbps,
+        parallel_ms,
+        errors,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -415,5 +538,56 @@ mod tests {
     fn mbps_basic() {
         // 1_000_000 bytes in 1s = 1 MB/s.
         assert!((mbps(1_000_000, Duration::from_secs(1)) - 1.0).abs() < 1e-9);
+    }
+
+    // The upload probe against a 200-sink must produce both throughput numbers
+    // and fan the parallel arm out to `n` PUTs. Uses wiremock (a dev-dep already
+    // present for the multipart client tests) as the sink.
+    #[tokio::test]
+    async fn upload_probe_measures_single_and_parallel() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("PUT"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+
+        let report = upload_probe(&server.uri(), 4 * 1024 * 1024, Some(4), None, Some(5)).await;
+        let Ok(report) = report else {
+            unreachable!("probe against a 200 sink must succeed")
+        };
+        assert_eq!(report.max_concurrent, 4);
+        assert!(report.single_stream_mbps.is_some(), "single-stream throughput must be measured");
+        assert!(report.parallel_mbps.is_some(), "parallel throughput must be measured");
+        assert!(report.errors.is_empty(), "no errors expected: {:?}", report.errors);
+
+        // The parallel arm issues n PUTs; the single arm one — 5 PUTs total.
+        let Some(requests) = server.received_requests().await else {
+            unreachable!("wiremock records requests by default")
+        };
+        let puts = requests.iter().filter(|r| r.method.as_str() == "PUT").count();
+        assert_eq!(puts, 5, "1 single-stream PUT + 4 parallel PUTs");
+    }
+
+    // A probe_bytes of 0 records an error and skips both arms rather than
+    // dividing by zero or hanging on an empty body.
+    #[tokio::test]
+    async fn upload_probe_zero_bytes_is_skipped() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("PUT"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+
+        let Ok(report) = upload_probe(&server.uri(), 0, Some(4), None, Some(5)).await else {
+            unreachable!("a zero-byte probe should still return a report, not error")
+        };
+        assert!(report.single_stream_mbps.is_none());
+        assert!(!report.errors.is_empty(), "zero bytes must be noted as an error");
     }
 }
