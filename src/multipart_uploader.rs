@@ -9,10 +9,11 @@
 //!
 //! Only the *transport* is parallel — the object stays one OCI blob with one
 //! sha256 digest. Reassembly correctness does NOT depend on this module's part
-//! math agreeing with anything global: the receiver writes each part at the
-//! offset the client declares in `Content-Range`, and Harbor hashes the
+//! math agreeing with anything global: the receiver orders parts by their
+//! 1-based part number (the `Content-Range` header is advisory), validates that
+//! each part's length matches the position it claims, and Harbor hashes the
 //! reassembled bytes inline and rejects on digest mismatch. Harbor's inline
-//! hash is the backstop; the part math only has to cover `[0, size)`
+//! hash is the final backstop; the part math only has to cover `[0, size)`
 //! contiguously with no gaps or overlaps — the property the proptest pins.
 
 use std::io::SeekFrom;
@@ -212,8 +213,8 @@ impl MultipartUploader {
         // `start` via `take` — no Content-Length header, so reqwest uses
         // Transfer-Encoding: chunked and the wire length matches whatever the
         // stream yields (the same TOCTOU-avoidance rationale as `uploader.rs`).
-        // The receiver validates the arriving byte count against Content-Range,
-        // and Harbor's inline digest is the final backstop.
+        // The receiver validates the arriving byte count against the length its
+        // part number implies, and Harbor's inline digest is the final backstop.
         let mut file = File::open(plan.path).await?;
         file.seek(SeekFrom::Start(start)).await?;
         let body = reqwest::Body::wrap_stream(FramedRead::new(file.take(len), BytesCodec::new()));
@@ -266,14 +267,19 @@ impl MultipartUploader {
                 return Err(CoreError::ServerError(409, "receiver still missing parts after re-upload".into()));
             }
             let missing: MissingParts = res.json().await?;
+            // The wire carries 1-based part numbers. Bound each against the real
+            // part count before converting to a 0-based index: an out-of-range
+            // value from a buggy/hostile receiver would otherwise drive
+            // `part_bounds` past EOF and underflow `end - start + 1`.
+            let total = num_parts(plan.size, plan.part_size);
             for part_number in missing.missing {
-                // The wire carries 1-based part numbers; convert to the 0-based
-                // index `part_bounds` expects. A reported part 0 is a protocol
-                // violation (1-based space), not a silently-clamped index.
-                let index = part_number
-                    .checked_sub(1)
-                    .ok_or_else(|| CoreError::ServerError(502, "receiver reported part number 0".into()))?;
-                self.upload_part_with_retry(plan, index, pb).await?;
+                if part_number == 0 || part_number > total {
+                    return Err(CoreError::ServerError(
+                        502,
+                        format!("receiver reported out-of-range part {part_number} (of {total})"),
+                    ));
+                }
+                self.upload_part_with_retry(plan, part_number - 1, pb).await?;
             }
         }
     }

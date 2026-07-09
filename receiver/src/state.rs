@@ -8,7 +8,7 @@
 //! no secret sits at rest in the map.
 
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use dashmap::{DashMap, DashSet};
@@ -26,10 +26,19 @@ pub(crate) struct Config {
 pub(crate) struct Session {
     pub repo: String,
     pub digest: String,
+    /// Total blob size and the authoritative (clamped) part size — kept so
+    /// `put_part` can validate that each arriving part is exactly the length
+    /// its position implies (a short/over-long part is rejected, not silently
+    /// accepted and left for Harbor's digest to fail unrecoverably).
+    pub size: u64,
+    pub part_size: u64,
     pub num_parts: u32,
     /// 1-based part numbers whose bytes have fully landed on scratch.
     pub received: DashSet<u32>,
-    pub created: Instant,
+    /// Last time a part landed (or complete was attempted). The TTL sweeper
+    /// evicts on *inactivity*, not creation, so a slow multi-hour upload that
+    /// is still making progress is never reclaimed out from under itself.
+    pub last_activity: Mutex<Instant>,
 }
 
 /// Handler state, cheap to `clone` (all shared behind `Arc`).

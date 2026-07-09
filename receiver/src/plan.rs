@@ -28,6 +28,16 @@ pub(crate) fn missing_parts(num_parts: u32, received: &HashSet<u32>) -> Vec<u32>
     (1..=num_parts).filter(|n| !received.contains(n)).collect()
 }
 
+/// Exact byte length of 0-based part `index` — every part is `part_size` except
+/// the last, which is truncated at EOF. Used to validate an arriving part is
+/// neither short nor over-long. Caller ensures `index < num_parts(size,
+/// part_size)` and `size > 0` (so `start < size`).
+pub(crate) fn part_len(size: u64, part_size: u64, index: u32) -> u64 {
+    let start = u64::from(index) * part_size;
+    let end = std::cmp::min(start + part_size - 1, size - 1);
+    end - start + 1
+}
+
 #[cfg(test)]
 mod tests {
     use super::{clamp_part_size, missing_parts, num_parts};
@@ -46,6 +56,16 @@ mod tests {
         assert_eq!(clamp_part_size(0, 10, 100), 10, "zero clamps up to min");
         assert_eq!(clamp_part_size(50, 10, 100), 50, "in-range passes through");
         assert_eq!(clamp_part_size(999, 10, 100), 100, "over-large caps at max");
+    }
+
+    #[test]
+    fn part_len_matches_the_tiling() {
+        // 10 bytes at part_size 4 -> parts of 4, 4, 2.
+        assert_eq!(super::part_len(10, 4, 0), 4);
+        assert_eq!(super::part_len(10, 4, 1), 4);
+        assert_eq!(super::part_len(10, 4, 2), 2, "last part truncates at EOF");
+        // Exact multiple: 8 bytes at 4 -> 4, 4.
+        assert_eq!(super::part_len(8, 4, 1), 4);
     }
 
     #[test]

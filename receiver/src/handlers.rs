@@ -15,7 +15,7 @@ use tokio::io::AsyncWriteExt;
 
 use crate::error::ReceiverError;
 use crate::harbor::push_blob;
-use crate::plan::{clamp_part_size, missing_parts, num_parts};
+use crate::plan::{clamp_part_size, missing_parts, num_parts, part_len};
 use crate::state::{AppState, Session};
 
 #[derive(Deserialize)]
@@ -32,6 +32,13 @@ pub(crate) struct InitiateResponse {
     part_size: u64,
 }
 
+/// Upper bound on parts per upload. Caps the `Vec<u32>` that `missing_parts`
+/// allocates and the session's bookkeeping: without it, a single unauthenticated
+/// `initiate` with a huge `size` drives `num_parts` toward `u32::MAX`, and the
+/// first `complete` allocates a multi-GB vector -> an out-of-memory kill. 100k parts cover a
+/// ~6 TB blob at the 64 MB default part size with vast margin.
+const MAX_PARTS: u32 = 100_000;
+
 /// Allocate an upload session and its scratch directory, returning the opaque
 /// `upload_id` and the (possibly clamped) authoritative part size.
 pub(crate) async fn initiate(
@@ -45,15 +52,24 @@ pub(crate) async fn initiate(
         return Err(ReceiverError::BadRequest("digest must be sha256:<hex>".to_string()));
     }
     let part_size = clamp_part_size(req.part_size, state.config.min_part_size, state.config.max_part_size);
+    let parts = num_parts(req.size, part_size);
+    if parts == 0 || parts > MAX_PARTS {
+        return Err(ReceiverError::BadRequest(format!(
+            "size/part_size yields {parts} parts; must be 1..={MAX_PARTS}"
+        )));
+    }
+
     let upload_id = uuid::Uuid::new_v4().to_string();
     tokio::fs::create_dir_all(scratch_for(&state, &upload_id)).await?;
 
     let session = Session {
         repo: req.repo,
         digest: req.digest,
-        num_parts: num_parts(req.size, part_size),
+        size: req.size,
+        part_size,
+        num_parts: parts,
         received: dashmap::DashSet::new(),
-        created: std::time::Instant::now(),
+        last_activity: std::sync::Mutex::new(std::time::Instant::now()),
     };
     state.sessions.insert(upload_id.clone(), Arc::new(session));
     Ok((StatusCode::CREATED, Json(InitiateResponse { upload_id, part_size })).into_response())
@@ -72,19 +88,46 @@ pub(crate) async fn put_part(
     if part_number == 0 || part_number > session.num_parts {
         return Err(ReceiverError::InvalidPart(part_number));
     }
+    let expected = part_len(session.size, session.part_size, part_number - 1);
 
     let final_path = scratch_for(&state, &upload_id).join(part_number.to_string());
-    let tmp_path = final_path.with_extension("tmp");
-    let mut file = tokio::fs::File::create(&tmp_path).await?;
+    // Unique tmp name per request: two concurrent PUTs of the same part number
+    // must not interleave writes into one tmp file and rename a torn result.
+    let tmp_path = final_path.with_extension(format!("{}.tmp", uuid::Uuid::new_v4()));
+
+    if let Err(e) = stream_part_to(&tmp_path, body, expected).await {
+        let _ = tokio::fs::remove_file(&tmp_path).await;
+        return Err(e);
+    }
+    tokio::fs::rename(&tmp_path, &final_path).await?;
+    session.received.insert(part_number);
+    touch(&session);
+    Ok(StatusCode::NO_CONTENT.into_response())
+}
+
+/// Stream a part body to `tmp_path`, enforcing that EXACTLY `expected` bytes
+/// arrive. The write is capped (a client cannot exhaust scratch by sending more
+/// than the part's length), and a short body is rejected so a truncated part is
+/// never marked "received" — which would be unrecoverable, since `complete`
+/// would not list it missing and only Harbor's digest (a terminal 502 to the
+/// client) would catch the corruption.
+async fn stream_part_to(tmp_path: &std::path::Path, body: Body, expected: u64) -> Result<(), ReceiverError> {
+    let mut file = tokio::fs::File::create(tmp_path).await?;
     let mut stream = body.into_data_stream();
+    let mut written = 0u64;
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.map_err(|e| ReceiverError::BadRequest(format!("part body read error: {e}")))?;
+        written += chunk.len() as u64;
+        if written > expected {
+            return Err(ReceiverError::BadRequest(format!("part body exceeds its expected {expected} bytes")));
+        }
         file.write_all(&chunk).await?;
     }
     file.flush().await?;
-    tokio::fs::rename(&tmp_path, &final_path).await?;
-    session.received.insert(part_number);
-    Ok(StatusCode::NO_CONTENT.into_response())
+    if written != expected {
+        return Err(ReceiverError::BadRequest(format!("part body is {written} bytes, expected {expected}")));
+    }
+    Ok(())
 }
 
 /// Finalize: if any part is missing, return 409 with the list so the client
@@ -96,6 +139,9 @@ pub(crate) async fn complete(
     headers: HeaderMap,
 ) -> Result<Response, ReceiverError> {
     let session = lookup(&state, &upload_id)?;
+    // Reset the activity clock before the (potentially long) Harbor reassembly
+    // push, so the inactivity sweeper cannot delete scratch mid-`complete`.
+    touch(&session);
 
     let received: HashSet<u32> = session.received.iter().map(|r| *r).collect();
     let missing = missing_parts(session.num_parts, &received);
@@ -139,6 +185,15 @@ fn is_valid_upload_id(upload_id: &str) -> bool {
 
 fn scratch_for(state: &AppState, upload_id: &str) -> std::path::PathBuf {
     state.config.scratch_dir.join(upload_id)
+}
+
+/// Refresh a session's activity clock so the inactivity sweeper does not reclaim
+/// an upload that is still progressing. A poisoned lock is skipped (best effort
+/// — the worst case is one premature sweep of an already-broken session).
+fn touch(session: &Session) {
+    if let Ok(mut last) = session.last_activity.lock() {
+        *last = std::time::Instant::now();
+    }
 }
 
 fn lookup(state: &AppState, upload_id: &str) -> Result<Arc<Session>, ReceiverError> {

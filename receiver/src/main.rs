@@ -98,7 +98,16 @@ async fn sweep_expired(state: &AppState) {
     let expired: Vec<String> = state
         .sessions
         .iter()
-        .filter(|entry| entry.value().created.elapsed() > ttl)
+        .filter(|entry| {
+            // Evict on INACTIVITY, not creation: a slow multi-hour upload still
+            // landing parts keeps refreshing last_activity and is never swept
+            // out from under itself. Poisoned lock -> leave it for a later tick.
+            entry
+                .value()
+                .last_activity
+                .lock()
+                .is_ok_and(|last| last.elapsed() > ttl)
+        })
         .map(|entry| entry.key().clone())
         .collect();
     for id in expired {

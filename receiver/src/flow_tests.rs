@@ -166,6 +166,61 @@ async fn abort_rejects_traversal_upload_id() {
     assert_ne!(resp.status(), StatusCode::NO_CONTENT, "must not be treated as a successful abort");
 }
 
+// A part whose body length doesn't match its position is rejected (400) and NOT
+// marked received, so `complete` reports it missing rather than shipping a torn
+// blob whose only detector would be Harbor's digest (a terminal failure).
+#[tokio::test]
+async fn put_part_wrong_length_rejected_and_not_received() {
+    let harbor = MockServer::start().await;
+    let Ok(tmp) = tempfile::tempdir() else {
+        unreachable!("tempdir must be creatable")
+    };
+    let app = crate::app_router(test_state(harbor.uri(), tmp.path().to_path_buf()));
+    let upload_id = initiate(&app, 10, 4).await; // parts of 4, 4, 2
+
+    // Part 1 must be 4 bytes; send 3.
+    assert_eq!(put_part(&app, &upload_id, 1, vec![0u8; 3]).await, StatusCode::BAD_REQUEST);
+
+    let uri = format!("/v2/blobs/uploads/multipart/{upload_id}/complete");
+    let resp = call(&app, build_request("POST", &uri, &[], Body::empty())).await;
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+    assert_eq!(read_json(resp).await["missing"], serde_json::json!([1, 2, 3]));
+}
+
+// An oversized part body is refused — the scratch-exhaustion cap.
+#[tokio::test]
+async fn put_part_oversized_body_rejected() {
+    let harbor = MockServer::start().await;
+    let Ok(tmp) = tempfile::tempdir() else {
+        unreachable!("tempdir must be creatable")
+    };
+    let app = crate::app_router(test_state(harbor.uri(), tmp.path().to_path_buf()));
+    let upload_id = initiate(&app, 10, 4).await;
+    assert_eq!(put_part(&app, &upload_id, 1, vec![0u8; 9999]).await, StatusCode::BAD_REQUEST);
+}
+
+// A declared size that explodes into too many parts is refused at initiate,
+// before any session or the missing-parts Vec is allocated (OOM guard).
+#[tokio::test]
+async fn initiate_rejects_absurd_part_count() {
+    let harbor = MockServer::start().await;
+    let Ok(tmp) = tempfile::tempdir() else {
+        unreachable!("tempdir must be creatable")
+    };
+    let app = crate::app_router(test_state(harbor.uri(), tmp.path().to_path_buf()));
+    // min_part_size is 1 in tests, so 10M bytes at part_size 1 -> 10M parts.
+    let body = serde_json::json!({
+        "repo": "proj/model", "digest": "sha256:abc", "size": 10_000_000, "part_size": 1
+    })
+    .to_string();
+    let resp = call(
+        &app,
+        build_request("POST", "/v2/blobs/uploads/multipart", &[("content-type", "application/json")], Body::from(body)),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "too many parts must be refused at initiate");
+}
+
 // Unknown upload_id on a part PUT is a 404, not a silent accept.
 #[tokio::test]
 async fn put_part_unknown_upload_is_404() {
