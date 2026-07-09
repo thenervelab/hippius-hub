@@ -63,6 +63,7 @@ fn load_config() -> Config {
         min_part_size: 1024 * 1024,       // 1 MiB
         max_part_size: 512 * 1024 * 1024, // 512 MiB — bounds any single part
         session_ttl: Duration::from_hours(1),
+        max_sessions: 1024,
     }
 }
 

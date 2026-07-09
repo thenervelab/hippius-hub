@@ -5,6 +5,12 @@ don't need to be re-implemented in each module.
 """
 import os
 from typing import Optional
+from urllib.parse import urlparse
+
+# http:// is only tolerated for the receiver when it points at the local host
+# (port-forward / local dev). Any other host over http would put a repo-scoped
+# Harbor push token on the wire in cleartext — see resolve_receiver_url.
+_LOOPBACK_HOSTS = frozenset({"localhost", "127.0.0.1", "::1", ""})
 
 DEFAULT_CACHE_DIR = os.path.expanduser("~/.cache/hippius/hub")
 DEFAULT_REGISTRY_URL = "https://registry.hippius.com"
@@ -133,11 +139,30 @@ def resolve_receiver_url() -> Optional[str]:
     An empty/whitespace-only value is treated as unset rather than as a URL of
     "", so `HIPPIUS_RECEIVER_URL=` in a shell profile disables cleanly instead
     of producing malformed request URLs.
+
+    The scheme is enforced: the client forwards its repo-scoped Harbor push
+    token to the receiver (which replays it to Harbor), so an `http://` hop to a
+    non-loopback host would leak that credential in cleartext. Such a value is
+    rejected loudly rather than silently downgraded; `http://localhost` stays
+    allowed for local port-forward testing.
     """
     raw = os.environ.get("HIPPIUS_RECEIVER_URL")
     if raw is None or not raw.strip():
         return None
-    return raw.strip().rstrip("/")
+    url = raw.strip().rstrip("/")
+    parsed = urlparse(url)
+    if parsed.scheme not in ("http", "https"):
+        raise ValueError(
+            f"HIPPIUS_RECEIVER_URL must be an http(s) URL, got scheme {parsed.scheme!r}"
+        )
+    if parsed.scheme == "http" and (parsed.hostname or "") not in _LOOPBACK_HOSTS:
+        raise ValueError(
+            "HIPPIUS_RECEIVER_URL uses http:// to a non-loopback host "
+            f"({parsed.hostname!r}); the client sends a repo-scoped Harbor push "
+            "token to the receiver, so a cleartext hop would leak it. Use https:// "
+            "(http:// is allowed only for localhost port-forward testing)."
+        )
+    return url
 
 
 def debug_enabled() -> bool:

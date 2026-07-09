@@ -27,6 +27,7 @@ fn test_state(harbor_base: String, scratch: PathBuf) -> AppState {
             min_part_size: 1,
             max_part_size: 1024 * 1024,
             session_ttl: Duration::from_hours(1),
+            max_sessions: 1024,
         }),
         sessions: Arc::new(DashMap::new()),
         http: reqwest::Client::builder()

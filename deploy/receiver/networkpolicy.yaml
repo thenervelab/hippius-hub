@@ -1,0 +1,66 @@
+# Network isolation for the receiver. `initiate` is unauthenticated (only
+# `complete` proves push rights, by replaying the client's token to Harbor), so
+# an in-cluster workload that can reach the ClusterIP could open sessions and
+# stage parts until scratch is exhausted. This policy fails CLOSED: it denies all
+# ingress except from pods you explicitly label as the fronting gateway, and
+# restricts egress to DNS + the Harbor Service.
+#
+# NOT applied by default (absent from kustomization.yaml) because it is
+# cluster-specific and fail-closed — review and adjust before applying:
+#   1. Set the ingress selector to whatever fronts external clients (the
+#      placeholder label `hippius.com/hub-blob-client: "true"` matches nothing
+#      until you put it on that ingress/gateway's pods + namespace).
+#   2. Confirm your CNI does not enforce this against kubelet health probes
+#      (Calico/Cilium usually exempt host-sourced probe traffic; some setups
+#      need an explicit allow for the node CIDR on port 8080).
+#   3. Adjust the Harbor egress namespace/port to match your registry Service.
+# Then add `networkpolicy.yaml` to kustomization.yaml resources.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: hub-blob-receiver
+  labels:
+    app.kubernetes.io/name: hub-blob-receiver
+    app.kubernetes.io/part-of: hippius-hub
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: hub-blob-receiver
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    # Only the fronting gateway may reach the receiver's HTTP port. Label that
+    # workload's namespace and pods to match, or replace with your ingress
+    # controller's own selectors.
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              hippius.com/hub-blob-client: "true"
+          podSelector:
+            matchLabels:
+              hippius.com/hub-blob-client: "true"
+      ports:
+        - protocol: TCP
+          port: 8080
+  egress:
+    # DNS resolution for the Harbor Service name.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    # The LAN leg: the finalize PUT into Harbor.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: harbor
+      ports:
+        - protocol: TCP
+          port: 5000
+        - protocol: TCP
+          port: 443

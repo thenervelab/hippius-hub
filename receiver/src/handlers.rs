@@ -45,6 +45,17 @@ pub(crate) async fn initiate(
     State(state): State<AppState>,
     Json(req): Json<InitiateRequest>,
 ) -> Result<Response, ReceiverError> {
+    // Admission control before any allocation. `initiate` is unauthenticated
+    // (only `complete` proves push rights, by replaying the client's token to
+    // Harbor), so without a cap any workload that can reach the service could
+    // open sessions without bound and stage parts until the scratch `emptyDir`
+    // is exhausted — a DoS against legitimate uploads. A small overshoot under a
+    // burst of concurrent initiates is acceptable: this bounds the session table
+    // and scratch fan-out, it is not a hard invariant. The `NetworkPolicy` in
+    // `deploy/receiver/` is the primary isolation; this is defense in depth.
+    if state.sessions.len() >= state.config.max_sessions {
+        return Err(ReceiverError::AtCapacity);
+    }
     if req.size == 0 {
         return Err(ReceiverError::BadRequest("size must be > 0".to_string()));
     }
@@ -153,7 +164,16 @@ pub(crate) async fn complete(
         .map(|n| scratch_for(&state, &upload_id).join(n.to_string()))
         .collect();
     let auth = headers.get(header::AUTHORIZATION).and_then(|v| v.to_str().ok());
-    let location = push_blob(&state.http, &state.config.harbor_base, &session.repo, &session.digest, auth, part_paths).await?;
+    let location = push_blob(
+        &state.http,
+        &state.config.harbor_base,
+        &session.repo,
+        &session.digest,
+        session.size,
+        auth,
+        part_paths,
+    )
+    .await?;
 
     forget(&state, &upload_id).await;
     Ok((StatusCode::CREATED, [(header::LOCATION, location)]).into_response())

@@ -20,6 +20,9 @@ pub(crate) struct Config {
     pub min_part_size: u64,
     pub max_part_size: u64,
     pub session_ttl: Duration,
+    /// Upper bound on concurrent open sessions — admission control for the
+    /// unauthenticated `initiate` path, sized to the pod's scratch capacity.
+    pub max_sessions: usize,
 }
 
 /// One in-flight multipart upload.

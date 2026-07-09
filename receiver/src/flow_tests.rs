@@ -15,7 +15,7 @@ use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use dashmap::DashMap;
 use tower::ServiceExt;
-use wiremock::matchers::{method, path_regex};
+use wiremock::matchers::{header, method, path_regex};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use crate::state::{AppState, Config};
@@ -49,6 +49,10 @@ async fn read_json(resp: axum::response::Response) -> serde_json::Value {
 }
 
 fn test_state(harbor_base: String, scratch: std::path::PathBuf) -> AppState {
+    state_with(harbor_base, scratch, 1024)
+}
+
+fn state_with(harbor_base: String, scratch: std::path::PathBuf, max_sessions: usize) -> AppState {
     AppState {
         config: Arc::new(Config {
             harbor_base,
@@ -56,6 +60,7 @@ fn test_state(harbor_base: String, scratch: std::path::PathBuf) -> AppState {
             min_part_size: 1, // let a tiny fixture split into real parts
             max_part_size: 1024 * 1024,
             session_ttl: Duration::from_hours(1),
+            max_sessions,
         }),
         sessions: Arc::new(DashMap::new()),
         http: reqwest::Client::builder()
@@ -99,8 +104,14 @@ async fn full_flow_pushes_reassembled_blob_to_harbor() {
         )
         .mount(&harbor)
         .await;
+    // The finalize PUT must carry an explicit Content-Length equal to the blob
+    // size (10), NOT chunked framing: the header matcher only matches when the
+    // receiver set it, so a regression to `Transfer-Encoding: chunked` makes this
+    // mock miss -> push_blob sees a non-2xx -> complete 502s and the assert below
+    // fails. This pins F-3 (fixed-length monolithic LAN push).
     Mock::given(method("PUT"))
         .and(path_regex(r"/blobs/uploads/xyz"))
+        .and(header("content-length", "10"))
         .respond_with(ResponseTemplate::new(201).insert_header("location", "/v2/proj/model/blobs/sha256:abc"))
         .mount(&harbor)
         .await;
@@ -219,6 +230,33 @@ async fn initiate_rejects_absurd_part_count() {
     )
     .await;
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "too many parts must be refused at initiate");
+}
+
+// The unauthenticated `initiate` path is admission-controlled: once the session
+// table is full, a further initiate is refused with 503 (retryable) rather than
+// allocating unbounded scratch. Exercised with a max_sessions of 1 so the second
+// call trips the cap. This is the receiver-side half of the F-1 DoS mitigation.
+#[tokio::test]
+async fn initiate_refuses_when_session_table_is_full() {
+    let harbor = MockServer::start().await;
+    let Ok(tmp) = tempfile::tempdir() else {
+        unreachable!("tempdir must be creatable")
+    };
+    let app = crate::app_router(state_with(harbor.uri(), tmp.path().to_path_buf(), 1));
+
+    let first = initiate(&app, 10, 4).await;
+    assert!(!first.is_empty(), "first initiate under the cap must succeed");
+
+    let body = serde_json::json!({
+        "repo": "proj/model", "digest": "sha256:abc", "size": 10, "part_size": 4
+    })
+    .to_string();
+    let resp = call(
+        &app,
+        build_request("POST", "/v2/blobs/uploads/multipart", &[("content-type", "application/json")], Body::from(body)),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE, "initiate over the cap must 503");
 }
 
 // Unknown upload_id on a part PUT is a 404, not a silent accept.

@@ -76,11 +76,3 @@ mem_forget = "deny"
 # Pedantic relaxations (too noisy)
 module_name_repetitions = "allow"
 similar_names = "allow"
-# pyo3 0.22 `#[pyfunction]` macro expansion emits a `PyErr::from(PyErr)`
-# round-trip on the return type, which clippy reports as a useless
-# conversion. The conversion lives inside the proc-macro output and is
-# unreachable from our source — no `#[expect]` on the function attribute
-# fulfills it because the lint emits at a position the attribute span
-# does not cover. Allowing it crate-wide is the upstream-suggested
-# workaround until pyo3 emits `#[allow]` itself in the generated code.
-useless_conversion = "allow"

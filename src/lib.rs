@@ -51,8 +51,7 @@ fn core_err_to_py(e: &CoreError) -> PyErr {
 /// callers would share threads instead of fighting over two unrelated pools.
 ///
 /// The library's `get_runtime` signature is `pub fn get_runtime<'a>() -> &'a
-/// Runtime` (verified at docs.rs/pyo3-async-runtimes/0.22.0 source line 197);
-/// the `'a` is free elision over the underlying `OnceCell` static, so
+/// Runtime`; the `'a` is free elision over the underlying `OnceCell` static, so
 /// coercion to `&'static` is sound — the storage outlives the process.
 ///
 /// The previous manual `OnceLock` build with a custom `"hippius-core"` thread
@@ -330,9 +329,9 @@ fn diagnose_upload_native(
 
 /// A Python module implemented in Rust.
 ///
-/// pyo3 0.22 migration: the `#[pymodule]` signature now takes
-/// `&Bound<'_, PyModule>` instead of the legacy `(Python, &PyModule)`
-/// pair. `Bound<'py, T>` is the post-0.21 GIL-bound smart pointer; the
+/// The `#[pymodule]` signature takes `&Bound<'_, PyModule>` (the pyo3 0.21+
+/// Bound API, current in 0.29) instead of the legacy `(Python, &PyModule)`
+/// pair. `Bound<'py, T>` is the GIL-bound smart pointer; the
 /// `'py` lifetime ties every Python object the closure produces to the
 /// GIL acquisition, so the borrow checker enforces what 0.20's GIL Refs
 /// proved manually. `wrap_pyfunction!(f, m)` keeps the same call shape

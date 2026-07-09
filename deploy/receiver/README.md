@@ -41,6 +41,32 @@ The client routes to the receiver only when `HIPPIUS_RECEIVER_URL` points at
 this Service and the blob clears `HIPPIUS_MULTIPART_THRESHOLD` (default 256 MB).
 With `HIPPIUS_RECEIVER_URL` unset, uploads are unchanged (single streaming PUT).
 
+`HIPPIUS_RECEIVER_URL` **must be `https://`** for any non-loopback host: the
+client forwards its repo-scoped Harbor push token to the receiver, so an
+`http://` hop would put that credential on the wire in cleartext. The client
+rejects such a value loudly (`http://localhost` stays allowed for port-forward
+testing). Terminate TLS at the ingress that fronts this Service.
+
+## Network isolation (before a prod-reachable deployment)
+
+`initiate` is unauthenticated — only `complete` proves push rights, by replaying
+the client's token to Harbor. Two defenses bound the resulting DoS surface:
+
+- **In-code admission control (always on):** the receiver caps concurrent open
+  sessions (`max_sessions`, default 1024) and refuses further `initiate` with
+  `503` once full, so a flood cannot grow the session table or scratch without
+  bound. Per-part length is validated and total parts are capped independently.
+- **`networkpolicy.yaml` (opt-in, review first):** a fail-closed NetworkPolicy
+  restricting ingress to a labelled fronting gateway and egress to DNS + Harbor.
+  It is intentionally **not** in `kustomization.yaml` because the ingress
+  selector and CNI health-probe behaviour are cluster-specific — see the header
+  comment in the file, adjust, then add it to the kustomization.
+
+The in-cluster leg to Harbor (`HARBOR_BASE`, default `http://…:5000` in the
+shipped Deployment) is plaintext and carries the replayed token; this assumes
+the pod network is a trusted boundary. Point `HARBOR_BASE` at an HTTPS Harbor
+endpoint (or run a service mesh with mTLS) if that assumption does not hold.
+
 ## Scratch sizing
 
 The `emptyDir` `sizeLimit` must cover `maxConcurrentUploads × N × partSize` of

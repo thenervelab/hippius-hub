@@ -20,6 +20,9 @@ pub(crate) enum ReceiverError {
     #[error("bad request: {0}")]
     BadRequest(String),
 
+    #[error("receiver at capacity: too many concurrent uploads")]
+    AtCapacity,
+
     #[error("local I/O error: {0}")]
     Io(#[from] std::io::Error),
 
@@ -35,6 +38,10 @@ impl IntoResponse for ReceiverError {
         let status = match &self {
             ReceiverError::UnknownUpload => StatusCode::NOT_FOUND,
             ReceiverError::InvalidPart(_) | ReceiverError::BadRequest(_) => StatusCode::BAD_REQUEST,
+            // Admission control: the session table is full. 503 (not 4xx) so the
+            // client treats it as transient and retries once load drains, rather
+            // than failing the upload as its own fault.
+            ReceiverError::AtCapacity => StatusCode::SERVICE_UNAVAILABLE,
             // The receiver is an upstream from the client's view; disk/Harbor
             // failures are gateway failures, not the client's fault.
             ReceiverError::Io(_) | ReceiverError::Harbor(_) | ReceiverError::Reqwest(_) => StatusCode::BAD_GATEWAY,

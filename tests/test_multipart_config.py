@@ -49,3 +49,23 @@ def test_receiver_url_empty_is_disabled(monkeypatch):
 def test_receiver_url_trims_trailing_slash(monkeypatch):
     monkeypatch.setenv("HIPPIUS_RECEIVER_URL", "https://receiver.hippius.svc:8080/")
     assert resolve_receiver_url() == "https://receiver.hippius.svc:8080"
+
+
+def test_receiver_url_rejects_http_to_remote_host(monkeypatch):
+    # The client forwards a repo-scoped Harbor push token to the receiver; an
+    # http:// hop to a remote host would leak it in cleartext, so reject loudly.
+    monkeypatch.setenv("HIPPIUS_RECEIVER_URL", "http://receiver.hippius.svc:8080")
+    with pytest.raises(ValueError, match="cleartext"):
+        resolve_receiver_url()
+
+
+def test_receiver_url_allows_http_localhost(monkeypatch):
+    # Local port-forward testing over http://localhost must stay usable.
+    monkeypatch.setenv("HIPPIUS_RECEIVER_URL", "http://localhost:8080/")
+    assert resolve_receiver_url() == "http://localhost:8080"
+
+
+def test_receiver_url_rejects_non_http_scheme(monkeypatch):
+    monkeypatch.setenv("HIPPIUS_RECEIVER_URL", "ftp://receiver.hippius.svc")
+    with pytest.raises(ValueError, match="http"):
+        resolve_receiver_url()

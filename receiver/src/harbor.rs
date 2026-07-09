@@ -22,11 +22,22 @@ const STREAM_CHUNK: usize = 1 << 20; // 1 MiB
 
 /// Push the reassembled blob to Harbor and return the registry's blob
 /// `Location` (or a synthesized `/v2/{repo}/blobs/{digest}` if Harbor omits it).
+///
+/// `size` is the exact reassembled blob length (the sum of the staged parts,
+/// an invariant the receiver already enforces per-part). We send it as an
+/// explicit `Content-Length` so the finalize PUT is a fixed-length monolithic
+/// upload rather than `Transfer-Encoding: chunked` — `Body::wrap_stream` reports
+/// no length, so without this header hyper frames the request chunked, and a
+/// registry/proxy on the LAN path that mishandles a chunked *final* PUT could
+/// fail an otherwise-native push. A mismatch between the header and the streamed
+/// bytes surfaces as a loud send/2xx failure, never silent corruption, and
+/// Harbor's inline digest remains the terminal integrity check.
 pub(crate) async fn push_blob(
     http: &reqwest::Client,
     harbor_base: &str,
     repo: &str,
     digest: &str,
+    size: u64,
     auth: Option<&str>,
     part_paths: Vec<PathBuf>,
 ) -> Result<String, ReceiverError> {
@@ -38,6 +49,7 @@ pub(crate) async fn push_blob(
     let mut put = http
         .put(&put_url)
         .header(header::CONTENT_TYPE, "application/octet-stream")
+        .header(header::CONTENT_LENGTH, size)
         .body(body);
     if let Some(auth) = auth {
         put = put.header(header::AUTHORIZATION, auth);
