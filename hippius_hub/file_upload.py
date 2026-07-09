@@ -247,7 +247,12 @@ def _upload_file_layers(abs_path: str, repo_title: str, registry: str, oci_repo:
     if file_size >= resolve_chunk_threshold() and resolve_chunked_write_enabled():
         return _upload_file_chunked(abs_path, repo_title, file_size, registry, oci_repo, oci_token)
     sha256_hash, size = hash_file_native(abs_path)
-    _ensure_blob_uploaded(registry, oci_repo, oci_token, abs_path, sha256_hash)
+    if not _ensure_blob_uploaded(registry, oci_repo, oci_token, abs_path, sha256_hash):
+        # Blob already present at its digest — the dedup HEAD hit. Surface the same
+        # skip feedback the pre-chunking uploader emitted (dropped in the chunked
+        # refactor); users and test_idempotency both read it as proof that "upload
+        # only the bytes we're missing" is working.
+        tqdm.write(f"✅ Already published (skipped): {repo_title}")
     return [_build_layer(sha256_hash, size, repo_title)]
 
 

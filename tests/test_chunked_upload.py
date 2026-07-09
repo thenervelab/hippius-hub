@@ -257,3 +257,30 @@ def test_upload_small_file_stays_plain(monkeypatch, tmp_path):
     assert "artifactType" not in manifest
     assert LAYOUT_ANNOTATION_KEY not in manifest.get("annotations", {})
     assert manifest["layers"][0]["mediaType"] == "application/octet-stream"
+
+
+@respx.mock
+def test_plain_reupload_reports_skipped(monkeypatch, tmp_path, capsys):
+    # Regression: the chunked refactor dropped the "Already published (skipped)"
+    # feedback on a dedup HEAD hit (it ignored _ensure_blob_uploaded's False
+    # return). A small file whose blob already exists (HEAD 200) must still report
+    # the skip — the offline mirror of the live test_idempotency check, so the
+    # regression is caught without the registry. Exercises the REAL uploader.
+    monkeypatch.setattr("hippius_hub.constants.DEFAULT_REGISTRY_URL", MOCK_REGISTRY)
+    monkeypatch.setattr("hippius_hub.auth.DEFAULT_REGISTRY_URL", MOCK_REGISTRY)
+    monkeypatch.setattr(file_upload, "hash_file_native", lambda path: ("d" * 64, 5))
+
+    token_route(respx.mock)
+    # Every blob HEAD hits (already present) -> the PUT is skipped for each.
+    respx.head(url__regex=rf"{MOCK_REGISTRY}/v2/{REPO}/blobs/.*").mock(return_value=httpx.Response(200))
+    respx.get(f"{MOCK_REGISTRY}/v2/{REPO}/manifests/main").mock(return_value=httpx.Response(404))
+    respx.put(f"{MOCK_REGISTRY}/v2/{REPO}/manifests/main").mock(
+        return_value=httpx.Response(201, headers={"Docker-Content-Digest": "sha256:" + "b" * 64})
+    )
+
+    src = tmp_path / "readme.txt"
+    src.write_bytes(b"hello")
+    upload_file(path_or_fileobj=str(src), path_in_repo="readme.txt", repo_id=REPO, token="tok")
+
+    out = capsys.readouterr()
+    assert "Already published (skipped)" in (out.out + out.err)
