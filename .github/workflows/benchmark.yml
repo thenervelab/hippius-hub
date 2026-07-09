@@ -1,0 +1,71 @@
+name: Benchmark (chunked transfer)
+
+# Manual only. A run pushes a multi-hundred-MiB file to the test/e2e-client
+# namespace (no production config/deployment change — chunks are ordinary
+# content-addressed blobs), so it must NOT fire unattended on every push. Trigger
+# it on demand and scale the size via the input.
+on:
+  workflow_dispatch:
+    inputs:
+      size_mib:
+        description: File size in MiB
+        required: false
+        default: '256'
+      cdc_avg_mib:
+        description: FastCDC average chunk size in MiB
+        required: false
+        default: '64'
+      patch_mib:
+        description: Edit size in MiB for the incremental re-upload test
+        required: false
+        default: '4'
+
+# Serialize benchmark runs so two don't load the test namespace at once. Never
+# cancel an in-flight run — a partial transfer leaves orphan chunk blobs for GC.
+concurrency:
+  group: benchmark
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  benchmark:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      # SHA pins mirror e2e.yml — refresh via `gh api repos/<owner>/<repo>/git/refs/tags/<tag>`.
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5
+        with:
+          python-version: '3.10'
+
+      - name: Set up Rust toolchain
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8  # stable @ 2026-05-27
+        with:
+          toolchain: stable
+
+      - name: Build and install hippius_hub
+        run: |
+          python -m venv .venv
+          .venv/bin/pip install --upgrade pip maturin
+          .venv/bin/maturin develop --release
+
+      # Inputs flow through `env:` (never interpolated into the shell) so a crafted
+      # dispatch input can't inject a command. HIPPIUS_CHUNKED_WRITE is set inside
+      # the script per mode, so it is intentionally not set here.
+      - name: Run chunked-transfer benchmark
+        env:
+          BENCH_SIZE_MIB: ${{ inputs.size_mib }}
+          BENCH_CDC_AVG_MIB: ${{ inputs.cdc_avg_mib }}
+          BENCH_PATCH_MIB: ${{ inputs.patch_mib }}
+          HIPPIUS_TEST_USER: ${{ secrets.HIPPIUS_TEST_USER }}
+          HIPPIUS_TEST_PASS: ${{ secrets.HIPPIUS_TEST_PASS }}
+          HIPPIUS_TEST_TOKEN: ${{ secrets.HIPPIUS_TEST_TOKEN }}
+        run: .venv/bin/python scripts/bench_chunked_transfer.py
