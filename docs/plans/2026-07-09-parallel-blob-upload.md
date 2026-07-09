@@ -129,9 +129,16 @@ Commit.
 
 ---
 
-## Phase 3 — Staged receiver service (new crate/repo `hub-blob-receiver`)
+## Phase 3 — Staged receiver service (in-repo Cargo workspace member)
 
-> Placement: its own repo (does not ship in the `hippius_core` wheel). Scaffold as a standalone Cargo bin; extract before merge. Rust + axum + tokio.
+> **Placement (decided):** the receiver is part of the hub and lives **in this repo** as a Cargo **workspace member** — `receiver/` (crate `hub-blob-receiver`, a `[[bin]]`). Rust + axum + tokio.
+>
+> Structure:
+> - Root `Cargo.toml` gains `[workspace] members = ["receiver"]`; the root package stays the `hippius_core` pyo3 lib, so `[tool.maturin]` and the wheel build are **unchanged** (verify with `uv build` after adding the workspace table).
+> - The receiver does **not** depend on `hippius_core` (that would drag pyo3/Python linkage into a plain binary). If real code sharing emerges (e.g. `CoreError`), extract a pyo3-free `hippius-blob-core` crate that both depend on — not before.
+> - Receiver gets its own strict `[lints.clippy]` block mirroring the root crate's (don't refactor the root manifest into `[workspace.lints]` — keep blast radius off the released package).
+> - `Dockerfile.receiver` at repo root (or `receiver/Dockerfile`) builds `cargo build -p hub-blob-receiver --release`.
+> - CI note: root becoming a workspace root means `cargo test`/`cargo clippy --all` now also cover the receiver — desirable, but expect longer CI and update the workflow if it pins a single package.
 
 ### Task 3.1: Upload session store + part sink
 - In-memory `DashMap<upload_id, UploadSession>`; session holds repo, digest, size, part plan, and a bounded NVMe scratch dir (`emptyDir`). Parts written to `scratch/{upload_id}/{part_number}`.
@@ -158,8 +165,10 @@ Commit.
 **Files:** `src/diagnostics.rs`, `hippius_hub/diagnose.py`
 - Add an upload probe: single-stream PUT throughput into `harbor-registry` vs N-way-into-receiver aggregate, plus receiver scratch I/O under concurrency. Emit into the existing `DiagnosticReport` JSON. This produces the deployment-gate number.
 
-### Task 4.2: k8s manifests (in `hub-blob-receiver` repo)
+### Task 4.2: k8s manifests + image
+- **Code + `Dockerfile.receiver` live in this repo.** k8s manifests go under `deploy/receiver/` here (self-contained + reviewable); the **infra/GitOps repo references or vendors them** to apply to the cluster. Confirm with the infra owner whether manifests should be authored here and synced, or authored in the infra repo against this image — default: author here, infra consumes.
 - Deployment (no PVC — network to `harbor-registry` + robot cred only), Service, PDB, HPA on concurrency, NVMe `emptyDir` sized `maxConcurrentUploads × N × partSize`, resource limits from Task 4.1 I/O numbers.
+- Image published to the same registry as the other hub services (`ghcr.io/thenervelab/…`).
 
 ### Task 4.3: End-to-end test
 - Real client → receiver → Harbor round-trip on a multi-GB fixture; assert `docker pull` of the pushed blob succeeds and digest matches (proves native registration held).
