@@ -319,7 +319,7 @@ Existing code that catches HF's exceptions keeps working.
 | `HIPPIUS_SNAPSHOT_WORKERS` | `8` | Concurrent files in `snapshot_download` |
 | `HIPPIUS_UPLOAD_WORKERS` | `8` | Concurrent files in a folder upload / concurrent chunk uploads per large file |
 | `HIPPIUS_CHUNK_THRESHOLD` | `268435456` (256 MiB) | Files at or above this size upload as content-defined chunks; below it, one plain blob |
-| `HIPPIUS_CDC_AVG_SIZE` | `67108864` (64 MiB) | FastCDC average chunk size (part of the layout wire contract; change with care) |
+| `HIPPIUS_CDC_AVG_SIZE` | `4194304` (4 MiB) | FastCDC average chunk size — 4 MiB is fastcdc's max (larger panics the splitter); part of the layout wire contract |
 | `HIPPIUS_CHUNKED_WRITE` | off | Opt-in for this release. Set to `1`/`true` to store large files as content-defined chunks; unset keeps the pre-chunking single-blob layout until the chunk-aware reader is universally deployed |
 | `HIPPIUS_DEBUG` / `RUST_LOG` | off | Verbose transport logging (per-chunk timings, retries) |
 | `HIPPIUS_API_URL` | `https://api.hippius.com` | Console API base used by the `registry` + `models` CLI subtrees |
@@ -329,7 +329,7 @@ Programmatic overrides via the `endpoint=` kwarg on any function let you point a
 
 ### Large-file chunking
 
-Files at or above `HIPPIUS_CHUNK_THRESHOLD` (256 MiB) are stored as **content-defined chunks** (FastCDC, ~64 MiB average) rather than one blob. Each chunk is an ordinary content-addressed OCI blob, pushed to the registry in parallel and skipped on upload if it already exists (`HEAD`-dedup) — so a re-uploaded, slightly-changed model transfers only its changed chunks, and downloads pull the chunks concurrently. The layout is a Git-LFS-style pointer: one titled pointer layer per file plus its untitled chunk layers, marked with `artifactType` and a `com.hippius.layout: chunked-v1` annotation. Small files and every pre-existing artifact are unchanged (one plain blob), so nothing already stored is rewritten.
+Files at or above `HIPPIUS_CHUNK_THRESHOLD` (256 MiB) are stored as **content-defined chunks** (FastCDC, ~4 MiB average) rather than one blob. Each chunk is an ordinary content-addressed OCI blob, pushed to the registry in parallel and skipped on upload if it already exists (`HEAD`-dedup) — so a re-uploaded, slightly-changed model transfers only its changed chunks, and downloads pull the chunks concurrently. The layout is a Git-LFS-style pointer: one titled pointer layer per file plus its untitled chunk layers, marked with `artifactType` and a `com.hippius.layout: chunked-v1` annotation. Small files and every pre-existing artifact are unchanged (one plain blob), so nothing already stored is rewritten.
 
 Chunked **writes are opt-in for this release** (`HIPPIUS_CHUNKED_WRITE=1`) because the reader-side guard ships in this same release: a client that carries it refuses a chunked artifact loudly (`UnsupportedLayoutError`, with an upgrade hint) instead of misreading it, but no already-released client (≤ v0.5.1) has that guard, so it would silently write the pointer blob as the file. Deploy the chunk-aware reader to every consumer first; once the fleet is upgraded, a later release flips the default on. Set `HIPPIUS_CHUNKED_WRITE=1` on a producer to test end-to-end (e.g. on staging) before then.
 
