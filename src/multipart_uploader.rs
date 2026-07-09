@@ -74,9 +74,13 @@ fn part_bounds(size: u64, part_size: u64, index: u32) -> (u64, u64) {
 }
 
 /// Body of the `initiate` POST — declares the blob the receiver is about to
-/// broker so it can build the part plan and the Harbor finalize URL.
+/// broker so it can build the part plan and the Harbor finalize URL. `repo`
+/// travels in the body (not the URL) because OCI repo paths contain `/`, which
+/// cannot sit mid-path in the receiver's routes; the receiver stores it in the
+/// session and the part/complete URLs are opaque `upload_id`-keyed.
 #[derive(serde::Serialize)]
 struct InitiateRequest<'a> {
+    repo: &'a str,
     digest: &'a str,
     size: u64,
     part_size: u64,
@@ -150,8 +154,10 @@ impl MultipartUploader {
 
     async fn initiate(&self, digest: &str, size: u64, part_size: u64) -> Result<InitiateResponse, CoreError> {
         let client = upload_client()?;
-        let url = format!("{}/v2/{}/blobs/uploads/multipart", self.base, self.repo);
-        let mut req = client.post(&url).json(&InitiateRequest { digest, size, part_size });
+        let url = format!("{}/v2/blobs/uploads/multipart", self.base);
+        let mut req = client
+            .post(&url)
+            .json(&InitiateRequest { repo: &self.repo, digest, size, part_size });
         if let Some(token) = &self.auth_token {
             req = req.bearer_auth(token);
         }
@@ -214,8 +220,8 @@ impl MultipartUploader {
 
         let part_number = index + 1; // OCI/S3 part numbers are 1-based.
         let url = format!(
-            "{}/v2/{}/blobs/uploads/multipart/{}/parts/{}",
-            self.base, self.repo, plan.upload_id, part_number
+            "{}/v2/blobs/uploads/multipart/{}/parts/{}",
+            self.base, plan.upload_id, part_number
         );
         let mut req = client
             .put(&url)
@@ -238,8 +244,8 @@ impl MultipartUploader {
     async fn complete(&self, plan: &PartPlan<'_>, pb: &ProgressBar) -> Result<(), CoreError> {
         let client = upload_client()?;
         let url = format!(
-            "{}/v2/{}/blobs/uploads/multipart/{}/complete",
-            self.base, self.repo, plan.upload_id
+            "{}/v2/blobs/uploads/multipart/{}/complete",
+            self.base, plan.upload_id
         );
         let mut attempt = 0u32;
         loop {
@@ -369,9 +375,10 @@ mod integration_tests {
         path
     }
 
-    fn initiate_ok(repo: &str, part_size: u64) -> Mock {
+    fn initiate_ok(part_size: u64) -> Mock {
+        // Opaque path — repo travels in the request body, not the URL.
         Mock::given(method("POST"))
-            .and(path(format!("/v2/{repo}/blobs/uploads/multipart")))
+            .and(path("/v2/blobs/uploads/multipart"))
             .respond_with(
                 ResponseTemplate::new(201)
                     .set_body_json(serde_json::json!({"upload_id": "u1", "part_size": part_size})),
@@ -396,7 +403,7 @@ mod integration_tests {
     async fn happy_path_initiate_parts_complete() {
         let server = MockServer::start().await;
         let repo = "proj/model";
-        initiate_ok(repo, 4).mount(&server).await;
+        initiate_ok(4).mount(&server).await;
         part_put_ok().mount(&server).await;
         Mock::given(method("POST"))
             .and(path_regex(r"/complete$"))
@@ -424,7 +431,7 @@ mod integration_tests {
     async fn complete_409_reputs_missing_part() {
         let server = MockServer::start().await;
         let repo = "proj/model";
-        initiate_ok(repo, 4).mount(&server).await;
+        initiate_ok(4).mount(&server).await;
         part_put_ok().mount(&server).await;
         Mock::given(method("POST"))
             .and(path_regex(r"/complete$"))
@@ -460,7 +467,7 @@ mod integration_tests {
     async fn permanent_part_error_fails_fast() {
         let server = MockServer::start().await;
         let repo = "proj/model";
-        initiate_ok(repo, 4).mount(&server).await;
+        initiate_ok(4).mount(&server).await;
         Mock::given(method("PUT"))
             .and(path_regex(r"/parts/\d+$"))
             .respond_with(ResponseTemplate::new(401))
