@@ -24,6 +24,48 @@ from huggingface_hub.errors import (
 )
 
 
+class ManifestTooLargeError(ValueError):
+    """The assembled manifest exceeds the registry's maximum manifest body size.
+
+    CNCF Distribution caps a manifest PUT at 4 MiB (`maxManifestBodySize`). An
+    artifact with enough chunk layers to blow that budget (tens of thousands — a
+    >1 TB single file at the 64 MiB chunk average) would be rejected by the
+    registry with an opaque 400 *after* every blob is already uploaded. We check
+    the serialized size before the PUT and raise this instead. The fix for
+    genuinely huge artifacts is Referrers/index fan-out (a documented follow-up).
+    `ValueError` so broad `except ValueError`/`except Exception` handlers catch it.
+    """
+
+
+class MalformedManifestError(ValueError):
+    """A manifest declares a known layout but violates its structural contract.
+
+    Distinct from `UnsupportedLayoutError` (an *unknown* layout we refuse on
+    principle): here the layout is `chunked-v1` — one we claim to read — but the
+    bytes don't hold up (a pointer layer missing its whole-file size/digest, a
+    non-integer chunk count, or fewer trailing chunk layers than the count
+    promises). Reassembling from it would silently produce a truncated or wrong
+    file, so we stop. `ValueError` so callers using broad `except ValueError` /
+    `except Exception` still catch it.
+    """
+
+
+class UnsupportedLayoutError(RuntimeError):
+    """The manifest declares a `com.hippius.layout` this build cannot read.
+
+    Raised at manifest-fetch time when the annotation is present with a value
+    outside `constants.KNOWN_LAYOUTS` — a newer client wrote an artifact layout
+    (e.g. a future `chunked-vN`) this build predates. Reading it as an ordinary
+    manifest would misresolve files (a chunked file's pointer layer would be
+    written verbatim as the file), so we fail loudly with an upgrade hint
+    instead of silently corrupting the download.
+
+    `RuntimeError`, not `HfHubHTTPError`: the condition is a client-capability
+    gap discovered while parsing a successfully-fetched manifest, not an HTTP
+    status — there is no meaningful `response` to attach.
+    """
+
+
 class ConcurrentManifestUpdateError(HfHubHTTPError):
     """Manifest at this revision changed between our read and our write.
 
@@ -65,7 +107,10 @@ __all__ = [
     "HfHubHTTPError",
     "LocalEntryNotFoundError",
     "LocalTokenNotFoundError",
+    "ManifestTooLargeError",
+    "MalformedManifestError",
     "OfflineModeIsEnabled",
     "RepositoryNotFoundError",
     "RevisionNotFoundError",
+    "UnsupportedLayoutError",
 ]

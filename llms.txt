@@ -285,7 +285,10 @@ Multiple parallel `upload_file` calls to the same `repo_id:revision` race on the
 - `HIPPIUS_MAX_CONCURRENT` (default `32`) — parallel connections per file download
 - `HIPPIUS_CONNECT_TIMEOUT` (default `30`) — TCP connect timeout in seconds
 - `HIPPIUS_READ_TIMEOUT` (default unset) — opt-in per-chunk total request timeout in seconds
-- `HIPPIUS_SNAPSHOT_WORKERS` / `HIPPIUS_UPLOAD_WORKERS` (default `8`) — concurrent files in snapshot download / folder upload
+- `HIPPIUS_SNAPSHOT_WORKERS` / `HIPPIUS_UPLOAD_WORKERS` (default `8`) — concurrent files in snapshot download / folder upload (upload workers also bound concurrent chunk uploads per large file)
+- `HIPPIUS_CHUNK_THRESHOLD` (default `268435456` = 256 MiB) — files at/above this size upload as content-defined chunks (pointer + K chunk blobs); below it, one plain blob
+- `HIPPIUS_CDC_AVG_SIZE` (default `67108864` = 64 MiB) — FastCDC average chunk size; part of the layout wire contract, change with care
+- `HIPPIUS_CHUNKED_WRITE` (default on) — set to `0`/`false` to emit the pre-chunking single-blob layout for large files (rollout escape hatch; old readers fail loudly on chunked artifacts via `UnsupportedLayoutError`)
 - `HIPPIUS_DEBUG` / `RUST_LOG` (default off) — verbose transport logging (per-chunk timings, retries)
 - `HIPPIUS_API_URL` (default `https://api.hippius.com`) — console API base for the `registry` + `models` CLI subtrees
 - `HIPPIUS_TEST_REPO` (default `test/e2e-client`) — only used by the e2e test suite

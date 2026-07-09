@@ -166,6 +166,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "fastcdc"
+version = "3.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bf51ceb43e96afbfe4dd5c6f6082af5dfd60e220820b8123792d61963f2ce6bc"
+
+[[package]]
 name = "fastrand"
 version = "2.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -367,6 +373,7 @@ checksum = "7f24254aa9a54b5c858eaee2f5bccdb46aaf0e486a595ed5fd8f86ba55232a70"
 name = "hippius_core"
 version = "0.5.1"
 dependencies = [
+ "fastcdc",
  "futures",
  "hex",
  "indicatif",

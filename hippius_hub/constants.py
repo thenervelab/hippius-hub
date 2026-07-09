@@ -34,6 +34,48 @@ OCI_MANIFEST_ACCEPT = (
 # OCI manifest annotation that carries the in-repo filename for a layer.
 LAYER_TITLE_KEY = "org.opencontainers.image.title"
 
+# Manifest-level annotation marking a hippius-specific artifact layout. A client
+# that does not recognize the value MUST refuse the artifact rather than misread
+# it: a chunked file resolved by a layout-blind client would write the tiny
+# pointer blob verbatim as the file. See `_oci._guard_layout` /
+# `errors.UnsupportedLayoutError`. Absent annotation = the pre-chunking layout
+# (one plain titled blob per file), which every build reads.
+LAYOUT_ANNOTATION_KEY = "com.hippius.layout"
+
+# ----- chunked-artifact layout (docs/plans/2026-07-09-chunked-artifact-layout.md) -----
+# A file >= the chunk threshold is stored as one titled *pointer* layer plus K
+# *untitled* content-defined chunk blobs. These media types + annotation keys are
+# the wire contract shared by the uploader (writes them), the reader (parses
+# them), and the layout guard (gates them). Bump CHUNKED_LAYOUT to a new value if
+# any of this shape changes — a mismatched reader must fail the guard, not
+# misparse (see errors.UnsupportedLayoutError).
+CHUNKED_LAYOUT = "chunked-v1"
+ARTIFACT_TYPE_CHUNKED = "application/vnd.hippius.chunked.v1"
+POINTER_MEDIA_TYPE = "application/vnd.hippius.pointer.v1"
+CHUNK_MEDIA_TYPE = "application/vnd.hippius.chunk.v1"
+# Whole-file metadata carried once, on the pointer layer's annotations (the K
+# chunk layers stay bare — mediaType+digest+size only — to keep the manifest small).
+FILE_SIZE_KEY = "com.hippius.file.size"
+FILE_DIGEST_KEY = "com.hippius.file.digest"
+CHUNK_COUNT_KEY = "com.hippius.chunk.count"
+
+# CNCF Distribution hard-caps a manifest PUT body at 4 MiB (maxManifestBodySize).
+# Past it the registry returns an opaque 400 — AFTER every blob is already
+# uploaded. We check the serialized manifest before the PUT and raise a clear
+# error instead (errors.ManifestTooLargeError). Only reachable by an artifact
+# with tens of thousands of chunk layers (a >1 TB single file at the 64 MiB chunk
+# average); the real fix for such artifacts is Referrers/index fan-out (a
+# documented follow-up in the chunked-artifact plan).
+MAX_MANIFEST_BYTES = 4 * 1024 * 1024
+
+# Layout values THIS build can read. The forward-compat guard (_oci._guard_layout)
+# and chunked-read support ship together in this release — there is no earlier
+# build carrying an empty-floor guard, so no already-deployed reader refuses a
+# chunked artifact. That backward gap is why chunked WRITES are opt-in for this
+# release (resolve_chunked_write_enabled defaults off): readers upgrade first,
+# writers flip the default on in a later release.
+KNOWN_LAYOUTS: frozenset = frozenset({CHUNKED_LAYOUT})
+
 
 # ----- transfer tuning knobs -----
 # Defaults mirror the Rust-side constants in src/chunked_downloader.rs so the
@@ -44,6 +86,44 @@ DEFAULT_CHUNK_SIZE = 100 * 1024 * 1024  # 100 MB; mirrors DEFAULT_CHUNK_SIZE
 DEFAULT_MAX_CONCURRENT = 32             # mirrors MAX_CONCURRENT_DOWNLOADS
 DEFAULT_CONNECT_TIMEOUT = 30            # seconds; mirrors connect_timeout
 DEFAULT_TRANSFER_WORKERS = 8            # snapshot/upload ThreadPoolExecutor size
+
+
+# Chunked-artifact upload. A file at or above the threshold is stored as a
+# pointer + K content-defined chunk blobs; below it, one plain blob (byte-
+# identical to the pre-chunking layout). The CDC average is the FastCDC target
+# (min/max derived avg/4..avg*4 in the Rust splitter) and is part of the wire
+# contract — a change means a new layout version, not a silent retune.
+DEFAULT_CHUNK_THRESHOLD = 256 * 1024 * 1024  # 256 MiB
+DEFAULT_CDC_AVG_SIZE = 64 * 1024 * 1024       # 64 MiB (HF-Xet block/transfer size)
+
+
+def resolve_chunk_threshold() -> int:
+    """Minimum file size (bytes) stored via the chunked layout."""
+    return _resolve_positive_int("HIPPIUS_CHUNK_THRESHOLD", DEFAULT_CHUNK_THRESHOLD)
+
+
+def resolve_cdc_avg_size() -> int:
+    """FastCDC average chunk size (bytes). Pinned; overridable only for testing."""
+    return _resolve_positive_int("HIPPIUS_CDC_AVG_SIZE", DEFAULT_CDC_AVG_SIZE)
+
+
+def resolve_chunked_write_enabled() -> bool:
+    """Whether large files upload chunked, or as one plain blob (default).
+
+    The rollout gate — opt-in for this release. The forward-compat guard that
+    makes an un-upgraded reader refuse a chunked artifact loudly
+    (UnsupportedLayoutError) ships in this SAME release, so no already-deployed
+    reader (<= v0.5.1) carries it. Such a reader instead matches the pointer
+    layer by its title and silently writes the ~200-byte pointer blob AS the
+    file — undetectable even with HIPPIUS_VERIFY_HASH=1, since it checks the
+    pointer blob against its own digest. Defaulting off keeps large-file uploads
+    byte-identical to the pre-chunking layout until the guard-bearing reader is
+    universally deployed; a later release flips the default on. Set
+    HIPPIUS_CHUNKED_WRITE=1 to opt a producer in now (e.g. on staging)."""
+    raw = os.environ.get("HIPPIUS_CHUNKED_WRITE")
+    if not raw or not raw.strip():
+        return False
+    return raw.strip().lower() in ("1", "true", "yes", "on")
 
 
 def _resolve_positive_int(env_var: str, default: int) -> int:

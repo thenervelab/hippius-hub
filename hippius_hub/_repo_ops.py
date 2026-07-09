@@ -13,7 +13,7 @@ from huggingface_hub import GitRefInfo, GitRefs, ModelInfo, RepoUrl
 from ._harbor import (harbor_create_project, harbor_delete_repository,
                       harbor_get_artifact, harbor_get_project, harbor_get_repository,
                       split_repo_id, )
-from ._oci import fetch_manifest, head_manifest, iter_titled_layers, layer_titles
+from ._oci import fetch_manifest, group_files, head_manifest, layer_titles
 from .auth import get_oci_bearer_token, resolve_auth_header, resolve_token_value
 from .constants import DEFAULT_HTTP_TIMEOUT, resolve_registry
 from .errors import (LocalTokenNotFoundError, RepositoryNotFoundError, )
@@ -214,9 +214,11 @@ def repo_info(repo_id: str, *, revision: Optional[str] = None, repo_type: Option
     manifest = fetch_manifest(resolve_registry(endpoint), oci_repo, revision, oci_token).manifest
 
     # ModelInfo's __init__ treats each entry in `siblings` as a dict and
-    # builds the RepoSibling internally — pass raw dicts here.
-    siblings = [{"rfilename": title, "size": layer.get("size"), "blobId": layer.get("digest")} for
-        title, layer in iter_titled_layers(manifest)]
+    # builds the RepoSibling internally — pass raw dicts here. group_files reports
+    # the *whole-file* size/digest for a chunked file (from its pointer's
+    # annotations), so a sibling is the logical file, not the tiny pointer blob.
+    siblings = [{"rfilename": g.title, "size": g.size, "blobId": g.digest}
+        for g in group_files(manifest)]
 
     # Per-revision metadata: artifact info has push_time
     artifact = harbor_get_artifact(auth_header, project, repo, revision,
