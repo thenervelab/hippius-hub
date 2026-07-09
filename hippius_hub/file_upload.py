@@ -23,7 +23,7 @@ from tqdm import tqdm
 from ._oci import fetch_manifest, layer_title
 from .auth import get_oci_bearer_token
 from .constants import DEFAULT_HTTP_TIMEOUT, LAYER_TITLE_KEY, resolve_registry
-from .errors import ConcurrentManifestUpdateError
+from .errors import ConcurrentManifestUpdateError, ManifestTooLargeError
 from .auth import get_oci_bearer_token, get_token, resolve_token_value
 from .constants import (
     ARTIFACT_TYPE_CHUNKED,
@@ -35,6 +35,7 @@ from .constants import (
     FILE_SIZE_KEY,
     LAYER_TITLE_KEY,
     LAYOUT_ANNOTATION_KEY,
+    MAX_MANIFEST_BYTES,
     POINTER_MEDIA_TYPE,
     resolve_cdc_avg_size,
     resolve_chunk_threshold,
@@ -443,7 +444,24 @@ def _assemble_manifest(
     if any(layer.get("mediaType") == POINTER_MEDIA_TYPE for layer in merged_layers):
         manifest["artifactType"] = ARTIFACT_TYPE_CHUNKED
         annotations[LAYOUT_ANNOTATION_KEY] = CHUNKED_LAYOUT
+    _guard_manifest_size(manifest)
     return manifest
+
+
+def _guard_manifest_size(manifest: dict) -> None:
+    """Refuse a manifest that would exceed the registry's 4 MiB PUT cap.
+
+    Checked here, before the blobs' manifest is PUT, so a too-large artifact
+    fails with a clear error instead of the registry's opaque 400 after every
+    blob is already uploaded. Serialized the same way httpx sends it (default
+    `json.dumps` + utf-8) so the measured size matches the wire body."""
+    size = len(json.dumps(manifest).encode("utf-8"))
+    if size > MAX_MANIFEST_BYTES:
+        raise ManifestTooLargeError(
+            f"manifest is {size} bytes with {len(manifest['layers'])} layers, over the "
+            f"{MAX_MANIFEST_BYTES}-byte registry limit; this artifact has too many chunks "
+            "for a single manifest (Referrers/index fan-out is a planned follow-up)."
+        )
 
 
 def _commit_annotations(commit_message: Optional[str], commit_description: Optional[str]) -> dict:

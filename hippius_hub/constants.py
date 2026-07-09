@@ -59,6 +59,15 @@ FILE_SIZE_KEY = "com.hippius.file.size"
 FILE_DIGEST_KEY = "com.hippius.file.digest"
 CHUNK_COUNT_KEY = "com.hippius.chunk.count"
 
+# CNCF Distribution hard-caps a manifest PUT body at 4 MiB (maxManifestBodySize).
+# Past it the registry returns an opaque 400 — AFTER every blob is already
+# uploaded. We check the serialized manifest before the PUT and raise a clear
+# error instead (errors.ManifestTooLargeError). Only reachable by an artifact
+# with tens of thousands of chunk layers (a >1 TB single file at the 64 MiB chunk
+# average); the real fix for such artifacts is Referrers/index fan-out (a
+# documented follow-up in the chunked-artifact plan).
+MAX_MANIFEST_BYTES = 4 * 1024 * 1024
+
 # Layout values THIS build can read. The compatibility guard shipped first as an
 # empty floor; chunked-read support (Phase 1) adds its value here in the same
 # commit that teaches the client to parse it.

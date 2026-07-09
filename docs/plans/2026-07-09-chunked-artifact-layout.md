@@ -465,12 +465,30 @@ deliberate:
 - **Config constants were added, not renamed.** `DEFAULT_CHUNK_THRESHOLD` /
   `DEFAULT_CDC_AVG_SIZE` are new (the download `DEFAULT_CHUNK_SIZE` is a distinct
   Range-size knob); the old `DEFAULT_MULTIPART_*` were deleted with the receiver.
-- **Manifest-size ceiling**: v1 has no Referrers fan-out yet (Open Decision #2 —
-  cap+error deferred as documented); the ~1.2 TB/artifact budget at 64 MiB covers
-  every model today.
+- **Manifest-size ceiling**: the v1 cap+error IS implemented — `_assemble_manifest`
+  measures the serialized manifest and raises `ManifestTooLargeError` before the
+  PUT once it exceeds the 4 MiB registry cap (`MAX_MANIFEST_BYTES`), so an artifact
+  with too many chunks fails with a clear message instead of the registry's opaque
+  400 after all blobs are uploaded. Only the *Referrers/index fan-out* (Open
+  Decision #2's expensive half) is deferred; the ~1.2 TB/artifact budget at 64 MiB
+  covers every model today.
 - New Rust: `src/chunk_fetcher.rs` (parallel chunk pull), `chunk_and_hash` +
   `upload_blob_range_async` in `uploader.rs`, `CoreError::Integrity`. New Python
-  errors: `UnsupportedLayoutError`, `MalformedManifestError`.
+  errors: `UnsupportedLayoutError`, `MalformedManifestError`, `ManifestTooLargeError`.
+
+**Review-fix hardening (PR #34 code review, folded into the same commit):**
+- **Bounded download concurrency.** `download_chunks_native` caps in-flight chunk
+  fetches with a `tokio::Semaphore(max_concurrent)`. Without it, `pool_max_idle_per_host`
+  bounds only the *idle* pool, so a many-thousand-chunk file would open one socket
+  per chunk and exhaust FDs / ephemeral ports / trip Harbor 429s. "K parallel pulls"
+  is therefore *K bounded by `max_concurrent`*.
+- **Whole-file verify is unconditional on chunked assembly** (decoupled from the
+  opt-in `HIPPIUS_VERIFY_HASH`): per-chunk digests prove each chunk's bytes but not
+  its *position*, so the `sha256(concat)` pass is the only check on correct
+  ordering and always runs. This matches §Integrity's stated guarantee.
+- **`chunk.count >= 1` guard.** `group_files` rejects a `count == 0` pointer
+  (`MalformedManifestError`) — it would otherwise collapse to a plain file whose
+  whole-file blob was never uploaded.
 
 Open Decision #5 (**Harbor GC scheduled?**) remains an ops confirmation, not a
 code item — orphaned chunks from a failed upload are only reclaimed if GC runs.
@@ -505,8 +523,10 @@ code item — orphaned chunks from a failed upload are only reclaimed if GC runs
 1. ~~**Harbor version** — confirm ≥ 2.9/2.10 for `artifactType`.~~ **RESOLVED
    2026-07-09: Harbor v2.15.0** (pod image tags, all components). OCI 1.1
    `artifactType` + Referrers fully supported; no fallback needed.
-2. **Manifest-size ceiling behavior** — v1 cap+error with a clear message, vs
-   building the Referrers/index fan-out now. (Recommend cap+error for v1.)
+2. ~~**Manifest-size ceiling behavior**~~ **RESOLVED: v1 cap+error implemented**
+   (`_assemble_manifest` → `ManifestTooLargeError` above `MAX_MANIFEST_BYTES`).
+   The Referrers/index fan-out for genuinely huge artifacts remains the deferred
+   follow-up.
 3. **Client-version floor mechanism** — how the read-capable floor is asserted
    before enabling writes (a Harbor webhook on `com.hippius.layout` is the only
    true server-side enforcement; otherwise the pointer loud-fail + `artifactType`

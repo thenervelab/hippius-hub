@@ -34,7 +34,13 @@ from hippius_hub.constants import (
     LAYOUT_ANNOTATION_KEY,
     POINTER_MEDIA_TYPE,
 )
-from hippius_hub.file_upload import _merge_layers, _partition_groups, upload_file
+from hippius_hub.errors import ManifestTooLargeError
+from hippius_hub.file_upload import (
+    _assemble_manifest,
+    _merge_layers,
+    _partition_groups,
+    upload_file,
+)
 
 from tests.respx_fixtures import MOCK_REGISTRY, token_route
 
@@ -104,6 +110,21 @@ def test_replacing_chunked_file_swaps_whole_group():
     assert digests.count("sha256:new0") == 1
     big = next(g for g in group_files({"layers": merged}) if g.title == "big.bin")
     assert len(big.chunks) == 3
+
+
+def test_manifest_size_guard_accepts_normal():
+    m = _assemble_manifest("sha256:" + "c" * 64, 2, [_plain("readme")], "msg", "")
+    assert m["layers"] == [_plain("readme")]
+
+
+def test_manifest_size_guard_rejects_oversize():
+    # An artifact with tens of thousands of chunk layers exceeds the 4 MiB
+    # registry manifest cap; assembling it must fail loudly before the PUT,
+    # not with an opaque 400 after all blobs are uploaded.
+    chunk = {"mediaType": CHUNK_MEDIA_TYPE, "size": 67108864, "digest": "sha256:" + "a" * 64}
+    layers = [_pointer("big.bin", 40000)] + [dict(chunk) for _ in range(40000)]
+    with pytest.raises(ManifestTooLargeError, match="registry limit"):
+        _assemble_manifest("sha256:" + "c" * 64, 2, layers, "msg", "")
 
 
 def test_delete_pattern_drops_whole_chunked_group():

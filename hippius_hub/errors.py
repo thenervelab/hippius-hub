@@ -24,6 +24,19 @@ from huggingface_hub.errors import (
 )
 
 
+class ManifestTooLargeError(ValueError):
+    """The assembled manifest exceeds the registry's maximum manifest body size.
+
+    CNCF Distribution caps a manifest PUT at 4 MiB (`maxManifestBodySize`). An
+    artifact with enough chunk layers to blow that budget (tens of thousands — a
+    >1 TB single file at the 64 MiB chunk average) would be rejected by the
+    registry with an opaque 400 *after* every blob is already uploaded. We check
+    the serialized size before the PUT and raise this instead. The fix for
+    genuinely huge artifacts is Referrers/index fan-out (a documented follow-up).
+    `ValueError` so broad `except ValueError`/`except Exception` handlers catch it.
+    """
+
+
 class MalformedManifestError(ValueError):
     """A manifest declares a known layout but violates its structural contract.
 
@@ -94,6 +107,7 @@ __all__ = [
     "HfHubHTTPError",
     "LocalEntryNotFoundError",
     "LocalTokenNotFoundError",
+    "ManifestTooLargeError",
     "MalformedManifestError",
     "OfflineModeIsEnabled",
     "RepositoryNotFoundError",
