@@ -174,10 +174,10 @@ async fn timed_get_range(
 /// the final download host's ids override the registry's when we merge).
 fn collect_request_ids(headers: &reqwest::header::HeaderMap, out: &mut BTreeMap<String, String>) {
     for name in REQUEST_ID_HEADERS {
-        if let Some(val) = headers.get(*name) {
-            if let Ok(s) = val.to_str() {
-                out.insert((*name).to_string(), s.to_string());
-            }
+        if let Some(val) = headers.get(*name)
+            && let Ok(s) = val.to_str()
+        {
+            out.insert((*name).to_string(), s.to_string());
         }
     }
 }

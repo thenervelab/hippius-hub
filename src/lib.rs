@@ -85,7 +85,7 @@ fn shared_runtime() -> &'static tokio::runtime::Runtime {
 /// `core_err_to_py` in this file).
 ///
 /// # GIL
-/// Releases the Python GIL across the blocking I/O via `py.allow_threads`
+/// Releases the Python GIL across the blocking I/O via `py.detach`
 /// so other Python threads can make progress during the download.
 #[pyfunction]
 #[pyo3(signature = (url, dest_path, auth_token=None, chunk_size=None, verify_hash=true))]
@@ -113,8 +113,9 @@ fn download_file_native(
 
     // Release the GIL so other Python threads can run during the (long)
     // network/disk I/O. pyo3 acquires the GIL automatically on function
-    // entry; allow_threads explicitly releases it for the closure body.
-    py.allow_threads(|| {
+    // entry; detach (the post-0.27 name for allow_threads) explicitly
+    // releases it for the closure body.
+    py.detach(|| {
         rt.block_on(async { downloader.download(&dest, verify_hash).await })
             .map_err(|e| core_err_to_py(&e))
     })
@@ -139,7 +140,7 @@ fn download_file_native(
 ///
 /// # GIL
 /// Releases the Python GIL across the blocking hash via
-/// `py.allow_threads` so other Python threads can run while the file is
+/// `py.detach` so other Python threads can run while the file is
 /// being read.
 #[pyfunction]
 #[pyo3(signature = (path))]
@@ -148,7 +149,7 @@ fn hash_file_native(py: Python<'_>, path: String) -> PyResult<(String, u64)> {
     let dest = PathBuf::from(path);
 
     // Release the GIL across the blocking hash; see `download_file_native`.
-    py.allow_threads(|| {
+    py.detach(|| {
         rt.block_on(async { uploader::hash_file_async(&dest).await })
             .map_err(|e| core_err_to_py(&e))
     })
@@ -175,7 +176,7 @@ fn hash_file_native(py: Python<'_>, path: String) -> PyResult<(String, u64)> {
 ///
 /// # GIL
 /// Releases the Python GIL across the blocking upload via
-/// `py.allow_threads` so other Python threads can make progress while
+/// `py.detach` so other Python threads can make progress while
 /// the file is being streamed.
 #[pyfunction]
 #[pyo3(signature = (url, path, auth_token=None))]
@@ -193,7 +194,7 @@ fn upload_blob_native(
     let dest = PathBuf::from(path);
 
     // Release the GIL across the blocking upload; see `download_file_native`.
-    py.allow_threads(|| {
+    py.detach(|| {
         rt.block_on(async { uploader::upload_blob_async(&url, &dest, auth_token.as_deref()).await })
             .map_err(|e| core_err_to_py(&e))
     })
@@ -219,7 +220,7 @@ fn diagnose_blob_native(
     connect_timeout_secs: Option<u64>,
 ) -> PyResult<String> {
     let rt = shared_runtime();
-    py.allow_threads(|| {
+    py.detach(|| {
         let report = rt
             .block_on(async {
                 diagnostics::probe_blob(
@@ -260,7 +261,7 @@ fn diagnose_blob_native(
 /// The message carries the full `source()` chain via `\ncaused by:` lines.
 ///
 /// # GIL
-/// Releases the Python GIL across the blocking transfer via `py.allow_threads`.
+/// Releases the Python GIL across the blocking transfer via `py.detach`.
 #[pyfunction]
 #[pyo3(signature = (base_url, repo, digest, size, path, part_size, auth_token=None))]
 #[expect(
@@ -285,7 +286,7 @@ fn upload_blob_multipart_native(
     let dest = PathBuf::from(path);
 
     // Release the GIL across the blocking upload; see `download_file_native`.
-    py.allow_threads(|| {
+    py.detach(|| {
         let uploader = multipart_uploader::MultipartUploader::new(base_url, repo, auth_token);
         rt.block_on(async { uploader.upload(&digest, size, &dest, part_size).await })
             .map_err(|e| core_err_to_py(&e))
