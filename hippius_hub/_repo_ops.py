@@ -22,7 +22,11 @@ from .file_download import _oci_repo_path, _validate_repo_type
 
 def _build_repo_url(repo_id: str, endpoint: Optional[str]) -> RepoUrl:
     base = resolve_registry(endpoint)
-    return RepoUrl(f"{base}/v2/{repo_id}", endpoint=base)
+    # RepoUrl delegates to huggingface_hub's HF URI parser, which expects a
+    # web-style repo page URL (`<host>/<namespace>/<name>`), not an OCI API
+    # route (`/v2/<repo>`). Returning the OCI route raises HfUriError on
+    # recent huggingface_hub releases.
+    return RepoUrl(f"{base.rstrip('/')}/{repo_id}", endpoint=base)
 
 
 _TAGS_PAGE_SIZE = 1000
