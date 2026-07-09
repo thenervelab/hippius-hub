@@ -10,3 +10,5 @@ __pycache__/
 .claude/
 CLAUDE.md
 **/CLAUDE.md
+.DS_Store
+**/.DS_Store
