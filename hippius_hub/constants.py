@@ -45,6 +45,15 @@ DEFAULT_MAX_CONCURRENT = 32             # mirrors MAX_CONCURRENT_DOWNLOADS
 DEFAULT_CONNECT_TIMEOUT = 30            # seconds; mirrors connect_timeout
 DEFAULT_TRANSFER_WORKERS = 8            # snapshot/upload ThreadPoolExecutor size
 
+# Multipart upload routing. A blob is eligible for the parallel receiver path
+# only when it is at least this large AND a receiver URL is configured — below
+# the threshold, the per-blob parallelism overhead (part planning, an extra
+# in-cluster hop) costs more than the single-stream PUT saves. 256 MB is a
+# provisional floor; the real knee (where N-way beats single-stream into
+# harbor-registry) comes from the in-cluster diagnose measurement and should
+# replace this default once measured.
+DEFAULT_MULTIPART_THRESHOLD = 256 * 1024 * 1024  # 256 MB
+
 
 def _resolve_positive_int(env_var: str, default: int) -> int:
     """Read a positive-int env var, falling back to `default` when unset.
@@ -95,6 +104,28 @@ def resolve_snapshot_workers() -> int:
 
 def resolve_upload_workers() -> int:
     return _resolve_positive_int("HIPPIUS_UPLOAD_WORKERS", DEFAULT_TRANSFER_WORKERS)
+
+
+def resolve_multipart_threshold() -> int:
+    """Minimum blob size (bytes) eligible for the parallel receiver path."""
+    return _resolve_positive_int("HIPPIUS_MULTIPART_THRESHOLD", DEFAULT_MULTIPART_THRESHOLD)
+
+
+def resolve_receiver_url() -> Optional[str]:
+    """Base URL of the in-cluster blob receiver, or None when unset.
+
+    This is the feature gate: when `HIPPIUS_RECEIVER_URL` is unset the multipart
+    path is entirely off and uploads behave byte-for-byte as they do today (a
+    single streaming PUT straight to the registry). Trailing slash trimmed so
+    callers can join paths without doubling it — mirrors `resolve_registry`.
+    An empty/whitespace-only value is treated as unset rather than as a URL of
+    "", so `HIPPIUS_RECEIVER_URL=` in a shell profile disables cleanly instead
+    of producing malformed request URLs.
+    """
+    raw = os.environ.get("HIPPIUS_RECEIVER_URL")
+    if raw is None or not raw.strip():
+        return None
+    return raw.strip().rstrip("/")
 
 
 def debug_enabled() -> bool:
