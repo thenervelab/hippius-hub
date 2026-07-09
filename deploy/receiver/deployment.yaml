@@ -1,0 +1,74 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: hub-blob-receiver
+  labels:
+    app.kubernetes.io/name: hub-blob-receiver
+    app.kubernetes.io/part-of: hippius-hub
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: hub-blob-receiver
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: hub-blob-receiver
+    spec:
+      # emptyDir is owned by fsGroup so the non-root uid can write scratch.
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        fsGroup: 10001
+      containers:
+        - name: receiver
+          image: ghcr.io/thenervelab/hub-blob-receiver:latest
+          ports:
+            - name: http
+              containerPort: 8080
+          env:
+            # In-cluster Harbor service — the LAN leg target. Override per env.
+            - name: HARBOR_BASE
+              value: "http://harbor-registry.harbor.svc:5000"
+            - name: SCRATCH_DIR
+              value: "/scratch"
+            - name: BIND
+              value: "0.0.0.0:8080"
+            - name: RUST_LOG
+              value: "info"
+          volumeMounts:
+            - name: scratch
+              mountPath: /scratch
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 2
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 15
+          resources:
+            requests:
+              cpu: "500m"
+              memory: "512Mi"
+            limits:
+              cpu: "2"
+              memory: "2Gi"
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+      volumes:
+        # Local NVMe scratch for staged parts — sized for
+        # maxConcurrentUploads x N x partSize (see deploy/receiver/README.md).
+        # NOT medium: Memory — we want node disk (NVMe), not tmpfs/RAM.
+        - name: scratch
+          emptyDir:
+            sizeLimit: 64Gi
+      # Give in-flight `complete` requests time to drain the LAN push on SIGTERM.
+      terminationGracePeriodSeconds: 60

@@ -1,0 +1,24 @@
+# Build image for the in-cluster staged blob receiver (hub-blob-receiver).
+# Only the receiver binary is built — `-p hub-blob-receiver` skips the
+# hippius_core pyo3 crate (not a dependency of the receiver), so no Python
+# toolchain is needed in the builder.
+FROM rust:1.92-bookworm AS builder
+WORKDIR /build
+# The whole workspace is copied so cargo can resolve the workspace manifest;
+# .dockerignore keeps target/, .git, and the Python venv out of the context.
+COPY . .
+RUN cargo build -p hub-blob-receiver --release --locked
+
+FROM debian:bookworm-slim
+# ca-certificates: the receiver makes an outbound TLS/HTTP call to Harbor.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+COPY --from=builder /build/target/release/hub-blob-receiver /usr/local/bin/hub-blob-receiver
+ENV BIND=0.0.0.0:8080 \
+    SCRATCH_DIR=/scratch \
+    RUST_LOG=info
+EXPOSE 8080
+# Run as a non-root uid; the scratch dir is a mounted emptyDir owned via fsGroup.
+USER 10001:10001
+ENTRYPOINT ["/usr/local/bin/hub-blob-receiver"]

@@ -1,0 +1,16 @@
+# Bounds voluntary disruption. The receiver holds per-upload state in memory on
+# ephemeral scratch, so evicting a pod mid-upload forces the client to restart
+# that blob (see README "Durability"). Keeping a majority available limits how
+# many in-flight uploads a rollout/drain can disrupt at once.
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: hub-blob-receiver
+  labels:
+    app.kubernetes.io/name: hub-blob-receiver
+    app.kubernetes.io/part-of: hippius-hub
+spec:
+  minAvailable: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: hub-blob-receiver

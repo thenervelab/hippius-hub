@@ -1,0 +1,10 @@
+target/
+.git/
+.github/
+.venv/
+**/*.pyc
+__pycache__/
+docs/
+tests/
+*.md
+.DS_Store

@@ -1,0 +1,15 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: hub-blob-receiver
+  labels:
+    app.kubernetes.io/name: hub-blob-receiver
+    app.kubernetes.io/part-of: hippius-hub
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: hub-blob-receiver
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http
