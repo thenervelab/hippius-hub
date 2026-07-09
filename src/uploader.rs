@@ -124,7 +124,7 @@ pub async fn upload_blob_async(url: &str, path: &Path, auth_token: Option<&str>)
 /// dropped unused (RAII); after first init `get()` returns the shared client
 /// immediately. `OnceLock` is valid in statics and never poisoned on panic
 /// (doc.rust-lang.org/std/sync/struct.OnceLock.html).
-fn upload_client() -> Result<&'static Client, CoreError> {
+pub(crate) fn upload_client() -> Result<&'static Client, CoreError> {
     static CLIENT: OnceLock<Client> = OnceLock::new();
     if let Some(client) = CLIENT.get() {
         return Ok(client);

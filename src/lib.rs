@@ -9,6 +9,7 @@ pub use error::{CoreError, Result};
 
 mod chunked_downloader;
 mod diagnostics;
+mod multipart_uploader;
 mod uploader;
 
 use chunked_downloader::ChunkedDownloader;
@@ -236,6 +237,61 @@ fn diagnose_blob_native(
     })
 }
 
+/// Upload a local file to Harbor as one OCI blob via the parallel multipart
+/// receiver, instead of the single streaming PUT of `upload_blob_native`.
+///
+/// # Arguments
+/// - `base_url`: Base URL of the in-cluster receiver (no trailing slash).
+/// - `repo`: OCI repository path (e.g. `library/model`).
+/// - `digest`: `sha256:<hex>` of the whole file; the receiver uses it to build
+///   Harbor's finalize URL and Harbor verifies it inline on completion.
+/// - `size`: Total file size in bytes (drives the part plan).
+/// - `path`: Local filesystem path of the file to upload.
+/// - `part_size`: Requested bytes per part; the receiver may clamp it and
+///   returns the authoritative value.
+/// - `auth_token`: Optional bearer token; `None` means anonymous.
+///
+/// # Returns
+/// `None` on the Python side — success is the absence of an exception. The
+/// digest is not returned (the caller already has it).
+///
+/// # Errors
+/// Raises `PyRuntimeError` on initiate/part/complete failure after retries.
+/// The message carries the full `source()` chain via `\ncaused by:` lines.
+///
+/// # GIL
+/// Releases the Python GIL across the blocking transfer via `py.allow_threads`.
+#[pyfunction]
+#[pyo3(signature = (base_url, repo, digest, size, path, part_size, auth_token=None))]
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "pyo3 #[pyfunction] requires owned values to extract from Python args"
+)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "each parameter is a distinct Python-supplied upload argument; bundling into a #[pyclass] would add a wrapper type for no call-site clarity"
+)]
+fn upload_blob_multipart_native(
+    py: Python<'_>,
+    base_url: String,
+    repo: String,
+    digest: String,
+    size: u64,
+    path: String,
+    part_size: u64,
+    auth_token: Option<String>,
+) -> PyResult<()> {
+    let rt = shared_runtime();
+    let dest = PathBuf::from(path);
+
+    // Release the GIL across the blocking upload; see `download_file_native`.
+    py.allow_threads(|| {
+        let uploader = multipart_uploader::MultipartUploader::new(base_url, repo, auth_token);
+        rt.block_on(async { uploader.upload(&digest, size, &dest, part_size).await })
+            .map_err(|e| core_err_to_py(&e))
+    })
+}
+
 /// A Python module implemented in Rust.
 ///
 /// pyo3 0.22 migration: the `#[pymodule]` signature now takes
@@ -251,6 +307,7 @@ fn hippius_core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(download_file_native, m)?)?;
     m.add_function(wrap_pyfunction!(hash_file_native, m)?)?;
     m.add_function(wrap_pyfunction!(upload_blob_native, m)?)?;
+    m.add_function(wrap_pyfunction!(upload_blob_multipart_native, m)?)?;
     m.add_function(wrap_pyfunction!(diagnose_blob_native, m)?)?;
     Ok(())
 }
