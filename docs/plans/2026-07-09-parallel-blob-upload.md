@@ -41,8 +41,11 @@ No code; this is the shared interface. Client (Phase 2) and receiver (Phase 3) b
 POST   /v2/{repo}/blobs/uploads/multipart
        Authorization: Bearer <oci-token>
        body: {"digest":"sha256:…","size":<u64>,"part_size":<u64>}
-       → 201 {"upload_id":"…","part_size":<u64>,"num_parts":<u32>,"expires_at":"…"}
-       (receiver validates auth against Harbor; computes part plan)
+       → 201 {"upload_id":"…","part_size":<u64>,"expires_at":"…"}
+       (receiver validates auth against Harbor; MAY clamp part_size)
+       NOTE: num_parts is NOT returned — the client derives it as
+       ceil(size / part_size) from the authoritative part_size, so there is
+       one source of truth for the part count and no field to disagree on.
 
 PUT    /v2/{repo}/blobs/uploads/multipart/{upload_id}/parts/{part_number}
        Authorization: Bearer <oci-token>
