@@ -4,6 +4,14 @@ version = "0.5.1"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 
+# The root package stays the pyo3 extension (`hippius_core`) so the maturin
+# wheel build is unchanged; `receiver/` is the in-cluster staged blob receiver,
+# built separately as its own binary. resolver = "2" matches the 2021 edition's
+# per-package default so the workspace does not silently fall back to v1.
+[workspace]
+members = ["receiver"]
+resolver = "2"
+
 [lib]
 name = "hippius_core"
 # rlib makes the crate consumable by Rust's own test harness (`cargo test`).
