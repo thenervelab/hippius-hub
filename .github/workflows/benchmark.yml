@@ -1,20 +1,33 @@
 name: Benchmark (chunked transfer)
 
 # Runs on a push to `staging` (so a merge to staging produces benchmark numbers
-# right next to the e2e run) and on manual dispatch (to scale the file size). A
-# run pushes a few-hundred-MiB file to the test/e2e-client namespace — no
-# production config/deployment change, chunks are ordinary content-addressed
-# blobs — so it stays OFF `main` and every other branch. On a push event the
-# dispatch inputs are empty, so the script falls back to its size defaults.
+# right next to the e2e run) and on manual dispatch (to tune size / runs / probe).
+# A run moves several GiB to the test/e2e-client namespace — a 512 MiB file over 3
+# fresh-content runs per mode plus the Harbor concurrency-sweep probe — no
+# production config/deployment change, chunks are ordinary content-addressed blobs
+# a later GC reclaims — so it stays OFF `main` and every other branch. On a push
+# event the dispatch inputs are empty, so the script uses its built-in defaults.
 on:
   push:
     branches: [staging]
   workflow_dispatch:
     inputs:
       size_mib:
-        description: File size in MiB
+        description: Transfer-benchmark file size in MiB
         required: false
-        default: '256'
+        default: '512'
+      runs:
+        description: Measured runs per mode (median-of-N, fresh content each)
+        required: false
+        default: '3'
+      harbor_probe:
+        description: Run the Harbor-flow bottleneck probe (latency + concurrency sweep)
+        required: false
+        default: 'true'
+      probe_mib:
+        description: Bytes moved per Harbor-probe measurement, in MiB
+        required: false
+        default: '128'
       cdc_avg_mib:
         description: FastCDC average chunk size in MiB (max 4 — fastcdc AVERAGE_MAX)
         required: false
@@ -67,6 +80,9 @@ jobs:
       - name: Run chunked-transfer benchmark
         env:
           BENCH_SIZE_MIB: ${{ inputs.size_mib }}
+          BENCH_RUNS: ${{ inputs.runs }}
+          BENCH_HARBOR_PROBE: ${{ inputs.harbor_probe }}
+          BENCH_PROBE_MIB: ${{ inputs.probe_mib }}
           BENCH_CDC_AVG_MIB: ${{ inputs.cdc_avg_mib }}
           BENCH_PATCH_MIB: ${{ inputs.patch_mib }}
           HIPPIUS_TEST_USER: ${{ secrets.HIPPIUS_TEST_USER }}
