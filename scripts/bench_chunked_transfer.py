@@ -182,6 +182,23 @@ def _probe_latency(client: httpx.Client, registry: str, oci_repo: str, token: st
     return {"head_ms": head_s * 1000, "init_ms": init["init_s"] * 1000}
 
 
+def _probe_srmu(client: httpx.Client, registry: str, oci_repo: str, token: str) -> int:
+    """Does this registry support single-request monolithic upload (SRMU)?
+
+    `POST /blobs/uploads/?digest=<d>` with the body in one request: 201 Created =
+    supported (the single-POST optimization would cut a round-trip per chunk); 202
+    Accepted = NOT supported (the registry wants POST-init then PUT, so single-POST
+    would double-upload and hurt). SRMU is optional and being deprecated in the OCI
+    spec, so this must be measured, not assumed. Fresh random body so it's a real
+    create, not a dedup hit.
+    """
+    data = os.urandom(4096) + uuid.uuid4().bytes
+    digest = "sha256:" + hashlib.sha256(data).hexdigest()
+    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/octet-stream"}
+    return client.post(f"{registry}/v2/{oci_repo}/blobs/uploads/?digest={digest}",
+                       headers=headers, content=data).status_code
+
+
 def _probe_concurrency(registry: str, oci_repo: str, token: str, total: int, workers: int) -> float:
     """Aggregate MiB/s pushing `total` bytes as `workers` fresh parallel blobs."""
     part = max(_MIB, total // workers)
@@ -200,8 +217,13 @@ def _harbor_probe(registry: str, oci_repo: str, token: str, probe: int) -> list:
     """Latency + single-connection throughput + a concurrency sweep."""
     with httpx.Client(timeout=_UPLOAD_TIMEOUT) as client:
         lat = _probe_latency(client, registry, oci_repo, token)
+        srmu = _probe_srmu(client, registry, oci_repo, token)
         single = _put_blob(client, registry, oci_repo, token, os.urandom(probe))
     single_mibps = probe / _MIB / single["put_s"]
+    srmu_verdict = {
+        201: "SUPPORTED — single-POST would cut a round-trip per chunk",
+        202: "NOT supported (202) — single-POST would double-upload; don't build it",
+    }.get(srmu, f"unexpected status {srmu}")
     levels = [1, 2, 4, 8, 16]
     sweep = [(w, _probe_concurrency(registry, oci_repo, token, probe, w)) for w in levels]
     scaling = sweep[-1][1] / sweep[0][1] if sweep[0][1] else 0.0
@@ -213,6 +235,7 @@ def _harbor_probe(registry: str, oci_repo: str, token: str, probe: int) -> list:
     lines = [
         "### Harbor-flow probe",
         f"- per-request latency: HEAD {lat['head_ms']:.0f} ms, POST-init {lat['init_ms']:.0f} ms",
+        f"- single-POST (SRMU) capability: **{srmu} → {srmu_verdict}**",
         f"- single-connection PUT throughput: **{single_mibps:.1f} MiB/s**",
         "",
         "| parallel connections | aggregate MiB/s |",
