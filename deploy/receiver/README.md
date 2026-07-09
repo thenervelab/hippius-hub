@@ -53,9 +53,17 @@ Session state is in memory and parts live on the ephemeral `emptyDir`. A pod
 restart mid-upload loses both, so the client must restart that blob (it gets
 `404 UnknownUpload`). The PDB (`minAvailable: 2`) bounds how many in-flight
 uploads a rollout can disrupt; a durable fix (persist session metadata so a
-fresh pod rehydrates) is tracked as post-v1 hardening. Auth is passed through:
-the receiver replays the client's bearer token to Harbor and holds no
-credential of its own.
+fresh pod rehydrates) is tracked as post-v1 hardening.
+
+Because sessions are per pod, the Service uses `sessionAffinity: ClientIP` so a
+client's `initiate` → parts → `complete` all reach the same pod. **Do not remove
+that affinity while sessions are in memory** — round-robin would send part PUTs
+to pods that never saw the session (`404 UnknownUpload`). Note ClientIP affinity
+pins by source IP, so many clients behind one egress IP share a pod; that trades
+load balancing for correctness until the shared-store fix lands.
+
+Auth is passed through: the receiver replays the client's bearer token to Harbor
+and holds no credential of its own.
 
 ## Deployment gate (not yet run)
 

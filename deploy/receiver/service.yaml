@@ -7,6 +7,15 @@ metadata:
     app.kubernetes.io/part-of: hippius-hub
 spec:
   type: ClusterIP
+  # Session state is in memory per pod, so every request for one upload_id
+  # (initiate -> parts -> complete) MUST land on the pod that did the initiate.
+  # ClientIP affinity pins a client to one backend; without it, round-robin
+  # sends part PUTs to pods that never saw the session -> 404 UnknownUpload.
+  # Remove this once session metadata is externalized (post-v1 durability fix).
+  sessionAffinity: ClientIP
+  sessionAffinityConfig:
+    clientIP:
+      timeoutSeconds: 3600
   selector:
     app.kubernetes.io/name: hub-blob-receiver
   ports:

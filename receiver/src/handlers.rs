@@ -118,8 +118,23 @@ pub(crate) async fn abort(
     State(state): State<AppState>,
     Path(upload_id): Path<String>,
 ) -> Result<Response, ReceiverError> {
+    // Guard BEFORE touching the filesystem: unlike put_part/complete, abort does
+    // not go through `lookup`, so without this a percent-decoded traversal id
+    // would reach `remove_dir_all(scratch_dir.join(upload_id))` and delete an
+    // arbitrary directory (axum decodes `..%2f..` -> `../..` into this string).
+    if !is_valid_upload_id(&upload_id) {
+        return Err(ReceiverError::UnknownUpload);
+    }
     forget(&state, &upload_id).await;
     Ok(StatusCode::NO_CONTENT.into_response())
+}
+
+/// A well-formed `upload_id` is a UUID we minted at `initiate`. Requiring that
+/// shape is the path-traversal guard: a UUID has no `/` or `..`, so
+/// `scratch_dir.join(upload_id)` can never escape the scratch root even though
+/// axum percent-decodes `..%2f..%2fetc` into `../../etc` in the path segment.
+fn is_valid_upload_id(upload_id: &str) -> bool {
+    uuid::Uuid::parse_str(upload_id).is_ok()
 }
 
 fn scratch_for(state: &AppState, upload_id: &str) -> std::path::PathBuf {
@@ -127,6 +142,11 @@ fn scratch_for(state: &AppState, upload_id: &str) -> std::path::PathBuf {
 }
 
 fn lookup(state: &AppState, upload_id: &str) -> Result<Arc<Session>, ReceiverError> {
+    // Reject malformed ids up front (defense in depth): a non-UUID is never a
+    // live session, and this keeps a traversal id from reaching any path build.
+    if !is_valid_upload_id(upload_id) {
+        return Err(ReceiverError::UnknownUpload);
+    }
     state
         .sessions
         .get(upload_id)

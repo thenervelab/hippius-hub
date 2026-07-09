@@ -141,6 +141,31 @@ async fn complete_before_all_parts_reports_missing() {
     assert_eq!(read_json(resp).await["missing"], serde_json::json!([2, 3]));
 }
 
+// A percent-decoded path-traversal upload_id must be rejected before any
+// filesystem path is built — never acted on as a successful abort. axum decodes
+// `..%2f..%2fetc` into `../../etc` in the :upload_id segment; the UUID guard
+// turns that into a client error instead of a `remove_dir_all` on a traversed
+// path (the finding from the PR review).
+#[tokio::test]
+async fn abort_rejects_traversal_upload_id() {
+    let harbor = MockServer::start().await;
+    let Ok(tmp) = tempfile::tempdir() else {
+        unreachable!("tempdir must be creatable")
+    };
+    let app = crate::app_router(test_state(harbor.uri(), tmp.path().to_path_buf()));
+    let resp = call(
+        &app,
+        build_request("DELETE", "/v2/blobs/uploads/multipart/..%2f..%2fetc", &[], Body::empty()),
+    )
+    .await;
+    assert!(
+        resp.status().is_client_error(),
+        "traversal id must be a client-error rejection, got {}",
+        resp.status()
+    );
+    assert_ne!(resp.status(), StatusCode::NO_CONTENT, "must not be treated as a successful abort");
+}
+
 // Unknown upload_id on a part PUT is a 404, not a silent accept.
 #[tokio::test]
 async fn put_part_unknown_upload_is_404() {
