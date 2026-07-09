@@ -97,8 +97,14 @@ def _time(fn) -> float:
 def _chunk_digests(registry: str, oci_repo: str, revision: str, token: str) -> list:
     """The ordered chunk digests of a chunked upload, for the dedup comparison."""
     result = fetch_manifest(registry, oci_repo, revision, token)
-    (group,) = [g for g in group_files(result.manifest) if g.title == "bench.bin"]
-    return [c.digest for c in group.chunks]
+    groups = group_files(result.manifest)
+    match = [g for g in groups if g.title == "bench.bin"]
+    if not match:
+        raise RuntimeError(
+            f"revision {revision!r} has no 'bench.bin' group; titles present: "
+            f"{[g.title for g in groups]}"
+        )
+    return [c.digest for c in match[0].chunks]
 
 
 def _upload_download(local: str, repo: str, revision: str, cache_dir: str, size: int) -> dict:
@@ -159,7 +165,11 @@ def main() -> None:
     v1_chunks = _chunk_digests(registry, oci_repo, rev_v1, token)
 
     # --- axis 2: incremental re-upload (chunked only; a plain blob re-sends 100%) ---
-    src_v2 = os.path.join(work, "bench_v2.bin")
+    # The mutated file must keep the SAME basename ("bench.bin") so it maps to the
+    # same repo title/group as v1 — that identity is what the chunk-digest diff
+    # below measures. A different name (bench_v2.bin) would be a distinct file.
+    src_v2 = os.path.join(work, "v2", "bench.bin")
+    os.makedirs(os.path.dirname(src_v2), exist_ok=True)
     _mutate_middle(src, src_v2, patch)
     rev_v2 = f"bench-{tag}-chunked-v2"
     reup_s = _time(lambda: hippius_hub_upload(repo_id=repo, local_path=src_v2, revision=rev_v2))
