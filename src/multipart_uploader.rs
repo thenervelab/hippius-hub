@@ -342,3 +342,139 @@ mod tests {
         }
     }
 }
+
+// Orchestration tests kept separate from the pure-math module above: these
+// drive the real reqwest initiate/parts/complete flow against a wiremock
+// receiver, covering the wire behavior (part fan-out, the 409 re-put loop)
+// that the part math alone cannot. `MockServer` speaks plain HTTP/1.1, which
+// the shared `upload_client` (http1_only, rustls only kicks in for https) talks
+// to directly.
+#[cfg(test)]
+mod integration_tests {
+    use super::MultipartUploader;
+    use std::path::PathBuf;
+
+    use wiremock::matchers::{method, path, path_regex};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    // Write `size` bytes to a unique temp file and return its path; the caller
+    // removes it. A single fixture file does not justify a `tempfile` dev-dep.
+    // `unwrap`/`expect` are denied crate-wide, so failures destructure via
+    // `let ... else { unreachable! }` like the sibling downloader tests.
+    fn write_temp(size: usize, tag: &str) -> PathBuf {
+        let path = std::env::temp_dir().join(format!("hippius_mp_{}_{tag}", std::process::id()));
+        let Ok(()) = std::fs::write(&path, vec![0u8; size]) else {
+            unreachable!("temp fixture write must succeed in the test environment")
+        };
+        path
+    }
+
+    fn initiate_ok(repo: &str, part_size: u64) -> Mock {
+        Mock::given(method("POST"))
+            .and(path(format!("/v2/{repo}/blobs/uploads/multipart")))
+            .respond_with(
+                ResponseTemplate::new(201)
+                    .set_body_json(serde_json::json!({"upload_id": "u1", "part_size": part_size})),
+            )
+    }
+
+    fn part_put_ok() -> Mock {
+        Mock::given(method("PUT"))
+            .and(path_regex(r"/parts/\d+$"))
+            .respond_with(ResponseTemplate::new(204))
+    }
+
+    fn count_puts_to(requests: &[wiremock::Request], suffix: &str) -> usize {
+        requests
+            .iter()
+            .filter(|r| r.method.as_str() == "PUT" && r.url.path().ends_with(suffix))
+            .count()
+    }
+
+    // 10 bytes at part_size 4 -> parts (0..=3),(4..=7),(8..=9): three PUTs.
+    #[tokio::test]
+    async fn happy_path_initiate_parts_complete() {
+        let server = MockServer::start().await;
+        let repo = "proj/model";
+        initiate_ok(repo, 4).mount(&server).await;
+        part_put_ok().mount(&server).await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/complete$"))
+            .respond_with(ResponseTemplate::new(201))
+            .mount(&server)
+            .await;
+
+        let file = write_temp(10, "happy");
+        let uploader = MultipartUploader::new(server.uri(), repo.into(), None);
+        let res = uploader.upload("sha256:abc", 10, &file, 4).await;
+        let _ = std::fs::remove_file(&file);
+
+        assert!(res.is_ok(), "happy path must succeed: {res:?}");
+        let Some(requests) = server.received_requests().await else {
+            unreachable!("wiremock records requests by default")
+        };
+        let puts = requests.iter().filter(|r| r.method.as_str() == "PUT").count();
+        assert_eq!(puts, 3, "one PUT per part for 10 bytes at part_size 4");
+    }
+
+    // First `complete` reports part 2 missing; the client must re-PUT exactly
+    // part 2 and re-complete. Success proves the 409 loop ran; the request
+    // count proves it targeted the right part.
+    #[tokio::test]
+    async fn complete_409_reputs_missing_part() {
+        let server = MockServer::start().await;
+        let repo = "proj/model";
+        initiate_ok(repo, 4).mount(&server).await;
+        part_put_ok().mount(&server).await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/complete$"))
+            .respond_with(
+                ResponseTemplate::new(409).set_body_json(serde_json::json!({"missing": [2]})),
+            )
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/complete$"))
+            .respond_with(ResponseTemplate::new(201))
+            .mount(&server)
+            .await;
+
+        let file = write_temp(10, "reput");
+        let uploader = MultipartUploader::new(server.uri(), repo.into(), None);
+        let res = uploader.upload("sha256:abc", 10, &file, 4).await;
+        let _ = std::fs::remove_file(&file);
+
+        assert!(res.is_ok(), "409-then-complete must succeed: {res:?}");
+        let Some(requests) = server.received_requests().await else {
+            unreachable!("wiremock records requests by default")
+        };
+        assert!(
+            count_puts_to(&requests, "/parts/2") >= 2,
+            "part 2 must be re-PUT after the 409"
+        );
+    }
+
+    // A permanent 4xx on a part is not retried and fails the whole upload.
+    #[tokio::test]
+    async fn permanent_part_error_fails_fast() {
+        let server = MockServer::start().await;
+        let repo = "proj/model";
+        initiate_ok(repo, 4).mount(&server).await;
+        Mock::given(method("PUT"))
+            .and(path_regex(r"/parts/\d+$"))
+            .respond_with(ResponseTemplate::new(401))
+            .mount(&server)
+            .await;
+
+        let file = write_temp(10, "perm");
+        let uploader = MultipartUploader::new(server.uri(), repo.into(), None);
+        let res = uploader.upload("sha256:abc", 10, &file, 4).await;
+        let _ = std::fs::remove_file(&file);
+
+        let Err(err) = res else {
+            unreachable!("a 401 on a part must fail the upload")
+        };
+        assert!(!err.is_retryable(), "surfaced error should be the terminal 401");
+    }
+}
