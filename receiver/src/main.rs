@@ -13,6 +13,9 @@ mod state;
 #[cfg(test)]
 mod flow_tests;
 
+#[cfg(test)]
+mod e2e_tests;
+
 use std::sync::Arc;
 use std::time::Duration;
 
