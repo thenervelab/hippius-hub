@@ -27,6 +27,9 @@ futures = "0.3"
 # Mock Harbor for the receiver's complete-path tests.
 wiremock = "0.6"
 tempfile = "3"
+# `ServiceExt::oneshot` drives the axum Router in-process (no bind) for the
+# initiate/parts/complete flow tests.
+tower = { version = "0.5", features = ["util"] }
 
 [lints.clippy]
 pedantic = { level = "warn", priority = -1 }

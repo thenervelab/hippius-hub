@@ -10,6 +10,9 @@ mod harbor;
 mod plan;
 mod state;
 
+#[cfg(test)]
+mod flow_tests;
+
 use std::sync::Arc;
 use std::time::Duration;
 
