@@ -1,5 +1,5 @@
+use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::exceptions::PyRuntimeError;
 use std::error::Error as StdError;
 use std::fmt::Write as _;
 use std::path::PathBuf;
@@ -7,10 +7,12 @@ use std::path::PathBuf;
 mod error;
 pub use error::{CoreError, Result};
 
+mod chunk_fetcher;
 mod chunked_downloader;
 mod diagnostics;
 mod uploader;
 
+use chunk_fetcher::{ChunkAssembler, ChunkPlan};
 use chunked_downloader::ChunkedDownloader;
 
 /// Render a `CoreError` (plus its full `source()` chain) as a single
@@ -50,8 +52,7 @@ fn core_err_to_py(e: &CoreError) -> PyErr {
 /// callers would share threads instead of fighting over two unrelated pools.
 ///
 /// The library's `get_runtime` signature is `pub fn get_runtime<'a>() -> &'a
-/// Runtime` (verified at docs.rs/pyo3-async-runtimes/0.22.0 source line 197);
-/// the `'a` is free elision over the underlying `OnceCell` static, so
+/// Runtime`; the `'a` is free elision over the underlying `OnceCell` static, so
 /// coercion to `&'static` is sound — the storage outlives the process.
 ///
 /// The previous manual `OnceLock` build with a custom `"hippius-core"` thread
@@ -107,15 +108,108 @@ fn download_file_native(
     // sentinel-shaped trap if a future SHA-0-like algorithm ever
     // produced an empty digest).
     let rt = shared_runtime();
-    let downloader = ChunkedDownloader::new(url, auth_token, chunk_size).map_err(|e| core_err_to_py(&e))?;
+    let downloader =
+        ChunkedDownloader::new(url, auth_token, chunk_size).map_err(|e| core_err_to_py(&e))?;
     let dest = PathBuf::from(dest_path);
 
     // Release the GIL so other Python threads can run during the (long)
     // network/disk I/O. pyo3 acquires the GIL automatically on function
-    // entry; detach explicitly releases it for the closure body.
+    // entry; detach (the post-0.27 name for allow_threads) explicitly
+    // releases it for the closure body.
     py.detach(|| {
         rt.block_on(async { downloader.download(&dest, verify_hash).await })
             .map_err(|e| core_err_to_py(&e))
+    })
+}
+
+/// Download a chunked artifact's K chunk blobs concurrently and assemble them.
+///
+/// Companion to `download_file_native` (which parallelises ONE blob via Range
+/// requests, kept for pre-chunking artifacts): here each chunk is its own
+/// content-addressed blob fetched as a full `200 OK` and written to its offset.
+///
+/// # Arguments
+/// - `urls`: the K chunk-blob URLs, in file order.
+/// - `chunk_digests`: the K expected chunk sha256s (lowercase hex, no
+///   `sha256:` prefix), parallel to `urls`.
+/// - `chunk_sizes`: the K chunk byte lengths, parallel to `urls`; their running
+///   sum is each chunk's write offset and their total is the file size.
+/// - `dest_path`: local path to assemble into (pre-allocated to the total).
+/// - `file_digest`: whole-file sha256 hex, or `None` to skip the whole-file
+///   verify pass. Per-chunk verification always runs regardless.
+/// - `auth_token`: optional bearer token; `None` means anonymous.
+/// - `max_concurrent`: connection-pool bound; defaults to 32.
+///
+/// # Returns
+/// `Optional[str]` on the Python side — the assembled file's sha256 hex when
+/// `file_digest` was provided (and verified equal), else `None`.
+///
+/// # Errors
+/// `PyValueError` if the three parallel arrays differ in length or the sizes
+/// overflow a `u64`; `PyRuntimeError` (with the full `caused by:` chain) on any
+/// fetch, I/O, or integrity failure.
+///
+/// # GIL
+/// Releases the Python GIL across the blocking transfer via `py.detach`.
+#[pyfunction]
+#[pyo3(signature = (urls, chunk_digests, chunk_sizes, dest_path, file_digest=None, auth_token=None, max_concurrent=None))]
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "pyo3 #[pyfunction] requires owned values to extract from Python args"
+)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "each parameter is a distinct Python-supplied download argument; bundling into a #[pyclass] would add a wrapper type for no call-site clarity"
+)]
+fn download_chunks_native(
+    py: Python<'_>,
+    urls: Vec<String>,
+    chunk_digests: Vec<String>,
+    chunk_sizes: Vec<u64>,
+    dest_path: String,
+    file_digest: Option<String>,
+    auth_token: Option<String>,
+    max_concurrent: Option<usize>,
+) -> PyResult<Option<String>> {
+    if urls.len() != chunk_digests.len() || urls.len() != chunk_sizes.len() {
+        return Err(PyValueError::new_err(format!(
+            "urls ({}), chunk_digests ({}), and chunk_sizes ({}) must have equal length",
+            urls.len(),
+            chunk_digests.len(),
+            chunk_sizes.len()
+        )));
+    }
+
+    // Cumulative offsets; checked_add so a pathological size list can't wrap the
+    // u64 and silently overlap chunk ranges.
+    let mut plans: Vec<ChunkPlan> = Vec::with_capacity(urls.len());
+    let mut offset: u64 = 0;
+    for ((url, expected_sha256), size) in urls.into_iter().zip(chunk_digests).zip(chunk_sizes) {
+        plans.push(ChunkPlan {
+            url,
+            expected_sha256,
+            size,
+            offset,
+        });
+        offset = offset
+            .checked_add(size)
+            .ok_or_else(|| PyValueError::new_err("chunk sizes overflow u64 total"))?;
+    }
+    let total_size = offset;
+
+    let rt = shared_runtime();
+    let dest = PathBuf::from(dest_path);
+    let concurrency = max_concurrent.unwrap_or(32).max(1);
+
+    py.detach(|| {
+        let assembler =
+            ChunkAssembler::new(auth_token, concurrency).map_err(|e| core_err_to_py(&e))?;
+        rt.block_on(async {
+            assembler
+                .assemble(&dest, &plans, file_digest.as_deref(), total_size)
+                .await
+        })
+        .map_err(|e| core_err_to_py(&e))
     })
 }
 
@@ -150,6 +244,78 @@ fn hash_file_native(py: Python<'_>, path: String) -> PyResult<(String, u64)> {
     py.detach(|| {
         rt.block_on(async { uploader::hash_file_async(&dest).await })
             .map_err(|e| core_err_to_py(&e))
+    })
+}
+
+/// Split a file into content-defined chunks and hash each chunk + the whole file.
+///
+/// The upload-side companion to `download_chunks_native`: chunk once here, then
+/// `HEAD`-dedup and `upload_blob_range_native` each chunk from Python.
+///
+/// # Arguments
+/// - `path`: local file to chunk.
+/// - `avg_size`: `FastCDC` target average chunk size in bytes (min/max derived
+///   as avg/4 .. avg*4). Pinned by the caller — it is part of the layout's wire
+///   contract, so identical files chunk identically and dedup.
+///
+/// # Returns
+/// `tuple[str, list[tuple[str, int, int]]]` — the whole-file sha256 hex, and the
+/// per-chunk `(sha256_hex, offset, length)` list in file order.
+///
+/// # Errors
+/// `PyRuntimeError` if the file cannot be read or `avg_size` is out of range.
+///
+/// # GIL
+/// Releases the Python GIL across the blocking chunk+hash pass via `py.detach`.
+#[pyfunction]
+#[pyo3(signature = (path, avg_size))]
+fn chunk_and_hash_native(
+    py: Python<'_>,
+    path: String,
+    avg_size: u64,
+) -> PyResult<(String, uploader::ChunkList)> {
+    let dest = PathBuf::from(path);
+    // Sync CPU+I/O pass; no runtime needed. Detach releases the GIL for it.
+    py.detach(|| uploader::chunk_and_hash(&dest, avg_size).map_err(|e| core_err_to_py(&e)))
+}
+
+/// Upload exactly `length` bytes at `offset` of a file as one OCI blob (the
+/// chunked-artifact upload primitive; parallelised across chunks by the caller).
+///
+/// # Arguments
+/// - `url`: OCI upload-location URL (from a prior `POST .../blobs/uploads/`,
+///   suffixed with `?digest=<sha256:...>` by the caller).
+/// - `path`: local file to read the range from.
+/// - `offset` / `length`: the chunk's byte range in `path`.
+/// - `auth_token`: optional bearer token.
+///
+/// # Errors
+/// `PyRuntimeError` (with the full `caused by:` chain) on any upload failure.
+///
+/// # GIL
+/// Releases the Python GIL across the blocking upload via `py.detach`.
+#[pyfunction]
+#[pyo3(signature = (url, path, offset, length, auth_token=None))]
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "pyo3 #[pyfunction] requires owned values to extract from Python args"
+)]
+fn upload_blob_range_native(
+    py: Python<'_>,
+    url: String,
+    path: String,
+    offset: u64,
+    length: u64,
+    auth_token: Option<String>,
+) -> PyResult<()> {
+    let rt = shared_runtime();
+    let dest = PathBuf::from(path);
+    py.detach(|| {
+        rt.block_on(async {
+            uploader::upload_blob_range_async(&url, &dest, offset, length, auth_token.as_deref())
+                .await
+        })
+        .map_err(|e| core_err_to_py(&e))
     })
 }
 
@@ -238,9 +404,9 @@ fn diagnose_blob_native(
 
 /// A Python module implemented in Rust.
 ///
-/// pyo3 0.22 migration: the `#[pymodule]` signature now takes
-/// `&Bound<'_, PyModule>` instead of the legacy `(Python, &PyModule)`
-/// pair. `Bound<'py, T>` is the post-0.21 GIL-bound smart pointer; the
+/// The `#[pymodule]` signature takes `&Bound<'_, PyModule>` (the pyo3 0.21+
+/// Bound API, current in 0.29) instead of the legacy `(Python, &PyModule)`
+/// pair. `Bound<'py, T>` is the GIL-bound smart pointer; the
 /// `'py` lifetime ties every Python object the closure produces to the
 /// GIL acquisition, so the borrow checker enforces what 0.20's GIL Refs
 /// proved manually. `wrap_pyfunction!(f, m)` keeps the same call shape
@@ -249,7 +415,10 @@ fn diagnose_blob_native(
 #[pymodule]
 fn hippius_core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(download_file_native, m)?)?;
+    m.add_function(wrap_pyfunction!(download_chunks_native, m)?)?;
     m.add_function(wrap_pyfunction!(hash_file_native, m)?)?;
+    m.add_function(wrap_pyfunction!(chunk_and_hash_native, m)?)?;
+    m.add_function(wrap_pyfunction!(upload_blob_range_native, m)?)?;
     m.add_function(wrap_pyfunction!(upload_blob_native, m)?)?;
     m.add_function(wrap_pyfunction!(diagnose_blob_native, m)?)?;
     Ok(())

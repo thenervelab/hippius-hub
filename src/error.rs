@@ -117,6 +117,17 @@ pub enum CoreError {
     /// discriminant.
     #[error("server did not return Content-Length")]
     MissingContentLength,
+
+    /// A downloaded chunk (or the assembled whole file) did not match its
+    /// content-addressed digest or its declared byte length. Distinct from
+    /// `ServerError`: transport succeeded and the bytes arrived, but they are
+    /// the *wrong* bytes — so a content-addressed blob will serve the same
+    /// wrong bytes on retry (see `is_retryable`, which classifies this
+    /// permanent). The string carries the offending context (chunk offset /
+    /// "assembled file") plus expected-vs-got so the Python side can surface a
+    /// diagnosable message.
+    #[error("integrity check failed: {0}")]
+    Integrity(String),
 }
 
 impl CoreError {
@@ -177,9 +188,13 @@ impl CoreError {
             //     loop already declared unrecoverable.
             //   - MissingContentLength is a HEAD-response shape error,
             //     not a transient network condition.
+            //   - Integrity is a wrong-bytes error on a content-addressed
+            //     blob: the source serves the same bytes on retry, so it is
+            //     permanent, not a transient blip to back off and re-attempt.
             CoreError::ChunkFailed { .. }
             | CoreError::JoinFailed { .. }
-            | CoreError::MissingContentLength => false,
+            | CoreError::MissingContentLength
+            | CoreError::Integrity(_) => false,
         }
     }
 }
@@ -213,8 +228,16 @@ mod tests {
             current = s.source();
         }
 
-        assert_eq!(chain.len(), 2, "expected wrapper + inner ServerError in chain, got {chain:?}");
-        assert!(chain[0].contains("chunk 7 failed"), "wrapper display: {}", chain[0]);
+        assert_eq!(
+            chain.len(),
+            2,
+            "expected wrapper + inner ServerError in chain, got {chain:?}"
+        );
+        assert!(
+            chain[0].contains("chunk 7 failed"),
+            "wrapper display: {}",
+            chain[0]
+        );
         assert!(chain[1].contains("503"), "inner display: {}", chain[1]);
     }
 
@@ -233,8 +256,10 @@ mod tests {
         // Coercing the closure to a fully-typed `fn(...)` pointer is
         // the compile-time check: a field rename or type change
         // surfaces here, not just at faraway use sites.
-        let ctor: fn(tokio::task::JoinError) -> CoreError =
-            |source| CoreError::JoinFailed { index: None, source };
+        let ctor: fn(tokio::task::JoinError) -> CoreError = |source| CoreError::JoinFailed {
+            index: None,
+            source,
+        };
         // Use `ctor` as a value so the binding has an observed
         // effect (clippy::no_effect_underscore_binding). Pointer
         // equality against itself is the smallest observation that
@@ -249,7 +274,10 @@ mod tests {
     fn from_io_error_routes_to_io_variant() {
         let io_err = std::io::Error::other("test");
         let core_err: CoreError = io_err.into();
-        assert!(matches!(core_err, CoreError::Io(_)), "expected Io variant, got {core_err:?}");
+        assert!(
+            matches!(core_err, CoreError::Io(_)),
+            "expected Io variant, got {core_err:?}"
+        );
     }
 
     // Verify the `Result<T>` alias is exported as a `Result<T,
@@ -261,6 +289,9 @@ mod tests {
         fn returns_core_err() -> Result<()> {
             Err(CoreError::MissingContentLength)
         }
-        assert!(matches!(returns_core_err(), Err(CoreError::MissingContentLength)));
+        assert!(matches!(
+            returns_core_err(),
+            Err(CoreError::MissingContentLength)
+        ));
     }
 }

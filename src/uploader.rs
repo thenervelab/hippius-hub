@@ -1,14 +1,77 @@
+use fastcdc::v2020::StreamCDC;
 use futures::stream::StreamExt;
 use indicatif::{ProgressBar, ProgressStyle};
-use reqwest::{header, Client};
+use reqwest::{Client, header};
 use sha2::{Digest, Sha256};
+use std::io::SeekFrom;
 use std::path::Path;
 use std::sync::OnceLock;
 use std::time::Duration;
 use tokio::fs::File;
+use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use tokio_util::codec::{BytesCodec, FramedRead};
 
 use crate::error::CoreError;
+
+/// Per-chunk `(sha256_hex, offset, length)` in file order — the plan a chunked
+/// upload works from (offset re-reads the range; digest dedups and addresses).
+pub type ChunkList = Vec<(String, u64, u64)>;
+
+/// `FastCDC` average chunk size bounds. The average is the wire contract (see the
+/// chunked-artifact plan); min = avg/4 and max = avg*4 are the standard
+/// normalized-chunking ratios. The library takes `u32` sizes, so avg*4 must fit
+/// u32 — cap the average at 256 MiB (→ 1 GiB max) and floor it at 256 B (→ 64 B
+/// min, `FastCDC`'s smallest legal minimum). Out-of-range averages are a caller
+/// error, surfaced rather than silently clamped.
+const CDC_MIN_AVG: u64 = 256;
+const CDC_MAX_AVG: u64 = 256 * 1024 * 1024;
+
+/// Chunk a file with `FastCDC` and hash each chunk plus the whole file in one
+/// streaming pass (bounded memory — `StreamCDC` never loads the whole file).
+///
+/// Returns `(whole_file_sha256_hex, [(chunk_sha256_hex, offset, length)])` in
+/// file order. The offsets let the caller re-read each chunk's byte range for a
+/// parallel upload; the digests drive `HEAD`-dedup and content-addressing.
+/// Determinism: for a fixed `avg_size` the boundaries are a pure function of the
+/// bytes, so identical files chunk identically and dedup — hence `avg_size` is
+/// pinned by the caller, not tuned per upload.
+pub fn chunk_and_hash(path: &Path, avg_size: u64) -> Result<(String, ChunkList), CoreError> {
+    chunk_and_hash_reader(std::fs::File::open(path)?, avg_size)
+}
+
+/// Reader-based core of [`chunk_and_hash`], split out so tests can drive it from
+/// an in-memory `Cursor` (no temp file, no I/O `unwrap`). Semantics are
+/// identical: `StreamCDC` yields the same boundaries whether the source is a
+/// file or a cursor over the same bytes.
+fn chunk_and_hash_reader<R: std::io::Read>(
+    source: R,
+    avg_size: u64,
+) -> Result<(String, ChunkList), CoreError> {
+    if !(CDC_MIN_AVG..=CDC_MAX_AVG).contains(&avg_size) {
+        return Err(CoreError::Integrity(format!(
+            "FastCDC average size {avg_size} out of range [{CDC_MIN_AVG}, {CDC_MAX_AVG}]"
+        )));
+    }
+    // The range check above guarantees min/avg/max fit u32; try_from keeps that
+    // provable to clippy without an unchecked `as` cast.
+    let to_u32 = |v: u64| -> Result<u32, CoreError> {
+        u32::try_from(v).map_err(|_| CoreError::Integrity(format!("chunk size {v} exceeds u32")))
+    };
+    let (min, max) = (to_u32(avg_size / 4)?, to_u32(avg_size * 4)?);
+    let avg = to_u32(avg_size)?;
+
+    let chunker = StreamCDC::new(source, min, avg, max);
+
+    let mut whole = Sha256::new();
+    let mut chunks: ChunkList = Vec::new();
+    for result in chunker {
+        let cd = result.map_err(|e| CoreError::Io(std::io::Error::other(e)))?;
+        whole.update(&cd.data);
+        let chunk_hex = hex::encode(Sha256::digest(&cd.data));
+        chunks.push((chunk_hex, cd.offset, cd.length as u64));
+    }
+    Ok((hex::encode(whole.finalize()), chunks))
+}
 
 // Phase 3.8 (audit U4): the local UploadError was folded into the
 // crate-wide `CoreError`. The single thiserror-derived enum carries
@@ -76,7 +139,11 @@ const UPLOAD_MAX_RETRIES: u32 = 3;
 /// fresh handle. Backoff schedule: 200, 400, 800, 1600 ms — four
 /// attempts total, ~3 s of backoff before surfacing a transient 5xx as
 /// terminal. A 4xx never burns backoff.
-pub async fn upload_blob_async(url: &str, path: &Path, auth_token: Option<&str>) -> Result<(), CoreError> {
+pub async fn upload_blob_async(
+    url: &str,
+    path: &Path,
+    auth_token: Option<&str>,
+) -> Result<(), CoreError> {
     let mut retries: u32 = 0;
     loop {
         match try_upload_blob_once(url, path, auth_token).await {
@@ -124,7 +191,7 @@ pub async fn upload_blob_async(url: &str, path: &Path, auth_token: Option<&str>)
 /// dropped unused (RAII); after first init `get()` returns the shared client
 /// immediately. `OnceLock` is valid in statics and never poisoned on panic
 /// (doc.rust-lang.org/std/sync/struct.OnceLock.html).
-fn upload_client() -> Result<&'static Client, CoreError> {
+pub(crate) fn upload_client() -> Result<&'static Client, CoreError> {
     static CLIENT: OnceLock<Client> = OnceLock::new();
     if let Some(client) = CLIENT.get() {
         return Ok(client);
@@ -141,23 +208,27 @@ fn upload_client() -> Result<&'static Client, CoreError> {
     Ok(CLIENT.get_or_init(|| built))
 }
 
-async fn try_upload_blob_once(url: &str, path: &Path, auth_token: Option<&str>) -> Result<(), CoreError> {
-    // Reuse the process-global client so the keep-alive connection pool
-    // survives across blobs and retries (audit N-4 / RUST-3).
+/// Stream `reader` to `url` as a chunked-encoded PUT body, ticking a progress
+/// bar sized `pb_total`. Shared by the whole-file and byte-range upload paths.
+///
+/// No explicit Content-Length: reqwest falls back to Transfer-Encoding: chunked
+/// for a `wrap_stream` body, so the wire length matches whatever the reader
+/// actually yields — the TOCTOU-safe behaviour audit U2 established for the
+/// whole-file path. For a range upload the reader is a `Take` bounded to the
+/// chunk length, so the body is exactly that range regardless.
+async fn put_streaming<R>(
+    url: &str,
+    reader: R,
+    pb_total: u64,
+    basename: &str,
+    auth_token: Option<&str>,
+) -> Result<(), CoreError>
+where
+    R: tokio::io::AsyncRead + Send + 'static,
+{
     let client = upload_client()?;
 
-    let file = File::open(path).await?;
-    // Snapshot file size for the progress bar UI only. We deliberately
-    // do NOT send this as Content-Length because the file may change
-    // between this stat() and the actual stream consumption — reqwest
-    // uses Transfer-Encoding: chunked when Content-Length is omitted,
-    // which sidesteps that TOCTOU race entirely. If the file changes
-    // mid-upload the progress bar may briefly read >100% or <100%;
-    // that UI quirk is preferable to an HTTP-level length mismatch.
-    let file_size = file.metadata().await?.len();
-
-    // Progress bar — the stream wrapper updates it on every chunk emitted to reqwest.
-    let pb = ProgressBar::new(file_size);
+    let pb = ProgressBar::new(pb_total);
     // The template string is a compile-time literal; `indicatif` only errors on
     // malformed format directives, which we control at the call site.
     #[expect(clippy::expect_used, reason = "infallible static template")]
@@ -169,15 +240,12 @@ async fn try_upload_blob_once(url: &str, path: &Path, auth_token: Option<&str>) 
             .expect("indicatif template is static and infallible")
             .progress_chars("#>-"),
     );
-    let basename = path
-        .file_name()
-        .map_or_else(|| "blob".to_string(), |n| n.to_string_lossy().into_owned());
     pb.set_message(format!("📤 {basename}"));
 
     // Wrap the stream so we tick the progress bar on every body chunk emitted
     // to reqwest. ProgressBar is Arc-internally → cloning is cheap.
     let pb_stream = pb.clone();
-    let stream = FramedRead::new(file, BytesCodec::new()).map(move |chunk_result| {
+    let stream = FramedRead::new(reader, BytesCodec::new()).map(move |chunk_result| {
         if let Ok(ref bytes) = chunk_result {
             pb_stream.inc(bytes.len() as u64);
         }
@@ -185,21 +253,15 @@ async fn try_upload_blob_once(url: &str, path: &Path, auth_token: Option<&str>) 
     });
     let body = reqwest::Body::wrap_stream(stream);
 
-    // No explicit Content-Length: reqwest falls back to
-    // Transfer-Encoding: chunked for a `Body::wrap_stream` body, so the wire
-    // length matches whatever `FramedRead` actually delivers at stream time —
-    // not whatever `metadata().len()` reported a few syscalls earlier.
     let mut req = client
         .put(url)
         .header(header::CONTENT_TYPE, "application/octet-stream")
         .body(body);
-
     if let Some(token) = auth_token {
         req = req.bearer_auth(token);
     }
 
     let res = req.send().await?;
-
     if !res.status().is_success() {
         pb.finish_with_message(format!("❌ {basename} failed"));
         return Err(CoreError::ServerError(
@@ -207,9 +269,168 @@ async fn try_upload_blob_once(url: &str, path: &Path, auth_token: Option<&str>) 
             format!("Upload failed: {:?}", res.status()),
         ));
     }
-
     pb.finish_with_message(format!("✅ {basename} uploaded"));
     Ok(())
+}
+
+fn basename_of(path: &Path) -> String {
+    path.file_name()
+        .map_or_else(|| "blob".to_string(), |n| n.to_string_lossy().into_owned())
+}
+
+async fn try_upload_blob_once(
+    url: &str,
+    path: &Path,
+    auth_token: Option<&str>,
+) -> Result<(), CoreError> {
+    let file = File::open(path).await?;
+    // Size is for the progress bar only — see put_streaming on why it is not a
+    // Content-Length.
+    let file_size = file.metadata().await?.len();
+    put_streaming(url, file, file_size, &basename_of(path), auth_token).await
+}
+
+/// Upload exactly `length` bytes starting at `offset` of `path` as one OCI blob.
+///
+/// This is the chunked-artifact upload primitive: the file is chunked once (by
+/// `chunk_and_hash`) and each chunk's byte range is pushed as its own
+/// content-addressed blob, in parallel across chunks. Retries share the
+/// downloader/uploader classifier via [`CoreError::is_retryable`]; each attempt
+/// re-opens and re-seeks so the body is fresh (the previous `wrap_stream` was
+/// consumed).
+pub async fn upload_blob_range_async(
+    url: &str,
+    path: &Path,
+    offset: u64,
+    length: u64,
+    auth_token: Option<&str>,
+) -> Result<(), CoreError> {
+    let mut retries: u32 = 0;
+    loop {
+        match try_upload_range_once(url, path, offset, length, auth_token).await {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                retries += 1;
+                if !e.is_retryable() || retries > UPLOAD_MAX_RETRIES {
+                    return Err(e);
+                }
+                let wait_time = 2u64.pow(retries) * 100;
+                tokio::time::sleep(Duration::from_millis(wait_time)).await;
+            }
+        }
+    }
+}
+
+async fn try_upload_range_once(
+    url: &str,
+    path: &Path,
+    offset: u64,
+    length: u64,
+    auth_token: Option<&str>,
+) -> Result<(), CoreError> {
+    let mut file = File::open(path).await?;
+    file.seek(SeekFrom::Start(offset)).await?;
+    // `take(length)` bounds the body to exactly this chunk's bytes, so the
+    // chunked-encoded PUT sends the range and nothing past it.
+    let reader = file.take(length);
+    put_streaming(url, reader, length, &basename_of(path), auth_token).await
+}
+
+#[cfg(test)]
+mod cdc_tests {
+    use super::{CDC_MAX_AVG, CDC_MIN_AVG, chunk_and_hash_reader};
+    use sha2::{Digest, Sha256};
+    use std::io::Cursor;
+
+    const AVG: u64 = 512; // → min 128, max 2048; small enough for fast tests
+
+    fn chunk(data: &[u8]) -> (String, super::ChunkList) {
+        match chunk_and_hash_reader(Cursor::new(data), AVG) {
+            Ok(v) => v,
+            Err(_) => unreachable!("chunking valid bytes with a valid avg cannot fail"),
+        }
+    }
+
+    #[test]
+    fn out_of_range_avg_is_rejected() {
+        assert!(chunk_and_hash_reader(Cursor::new(b"x"), CDC_MIN_AVG - 1).is_err());
+        assert!(chunk_and_hash_reader(Cursor::new(b"x"), CDC_MAX_AVG + 1).is_err());
+    }
+
+    #[test]
+    fn whole_file_digest_matches_reference() {
+        let data = vec![7u8; 5000];
+        let (whole, _) = chunk(&data);
+        assert_eq!(whole, hex::encode(Sha256::digest(&data)));
+    }
+
+    #[test]
+    fn boundaries_reshuffle_only_locally_on_a_late_edit() {
+        // Determinism + shift-locality (the CDC payoff): inserting a byte near
+        // the END must leave the FIRST chunk's digest unchanged — content-defined
+        // boundaries re-sync, so unchanged early regions still dedup.
+        let mut data = vec![0u8; 8000];
+        for (i, b) in data.iter_mut().enumerate() {
+            *b = u8::try_from(i * 31 % 251).unwrap_or(0); // deterministic, non-degenerate
+        }
+        let (_, before) = chunk(&data);
+
+        let mut edited = data.clone();
+        edited.insert(7000, 0xFF); // late insert shifts only the tail
+        let (_, after) = chunk(&edited);
+
+        assert!(
+            before.len() > 1 && after.len() > 1,
+            "need multiple chunks to test locality"
+        );
+        assert_eq!(
+            before[0].0, after[0].0,
+            "first chunk digest must survive a late edit"
+        );
+    }
+
+    proptest::proptest! {
+        // Partition + determinism over arbitrary byte vectors. `Cursor` drives
+        // the reader core directly so each case is pure CPU (no temp file).
+        #[test]
+        fn cdc_partitions_and_is_deterministic(
+            data in proptest::collection::vec(proptest::prelude::any::<u8>(), 0..20_000usize),
+        ) {
+            let (whole, chunks) = chunk(&data);
+
+            // Contiguous, gapless offsets summing to the file length.
+            let mut expected_offset = 0u64;
+            for (_, off, len) in &chunks {
+                proptest::prop_assert_eq!(*off, expected_offset);
+                expected_offset += *len;
+            }
+            proptest::prop_assert_eq!(expected_offset, data.len() as u64);
+
+            // Whole-file digest is the reference sha256 of exactly these bytes.
+            proptest::prop_assert_eq!(&whole, &hex::encode(Sha256::digest(&data)));
+
+            // Determinism: same bytes → identical chunk boundaries + digests.
+            let (whole2, chunks2) = chunk(&data);
+            proptest::prop_assert_eq!(whole, whole2);
+            proptest::prop_assert_eq!(chunks, chunks2);
+        }
+
+        // Size bounds: every chunk is <= max, and every chunk except the last is
+        // >= min (FastCDC only lets the final chunk fall below the minimum).
+        #[test]
+        fn cdc_respects_size_bounds(
+            data in proptest::collection::vec(proptest::prelude::any::<u8>(), 1..20_000usize),
+        ) {
+            let (min, max) = (AVG / 4, AVG * 4);
+            let (_, chunks) = chunk(&data);
+            for (i, (_, _, len)) in chunks.iter().enumerate() {
+                proptest::prop_assert!(*len <= max, "chunk {} len {} exceeds max {}", i, len, max);
+                if i + 1 < chunks.len() {
+                    proptest::prop_assert!(*len >= min, "non-final chunk {} len {} below min {}", i, len, min);
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]

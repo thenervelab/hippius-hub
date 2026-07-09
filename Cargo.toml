@@ -24,6 +24,12 @@ indicatif = "0.17.8"
 futures = "0.3"
 hex = "0.4"
 thiserror = "1.0"
+# Content-defined chunking for the chunked-artifact upload path. FastCDC's
+# rolling Gear-hash is a correctness- and determinism-critical primitive (its
+# boundaries are part of the wire contract — identical content must re-chunk
+# identically for cross-version dedup), so we use the audited crate rather than
+# hand-roll it. `StreamCDC` chunks a `Read` in bounded memory (no whole-file load).
+fastcdc = "3"
 # Diagnostics probe (src/diagnostics.rs) serializes its DiagnosticReport into
 # a JSON string handed back to Python.
 serde = { version = "1", features = ["derive"] }

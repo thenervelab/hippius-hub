@@ -7,6 +7,7 @@ parallelise per-file via a ThreadPoolExecutor.
 """
 import datetime
 import hashlib
+import json
 import os
 import tempfile
 import warnings
@@ -24,11 +25,32 @@ from .auth import get_oci_bearer_token
 from .constants import DEFAULT_HTTP_TIMEOUT, LAYER_TITLE_KEY, resolve_registry
 from .errors import ConcurrentManifestUpdateError
 from .auth import get_oci_bearer_token, get_token, resolve_token_value
-from .constants import DEFAULT_HTTP_TIMEOUT, LAYER_TITLE_KEY, resolve_registry, resolve_upload_workers
+from .constants import (
+    ARTIFACT_TYPE_CHUNKED,
+    CHUNK_COUNT_KEY,
+    CHUNK_MEDIA_TYPE,
+    CHUNKED_LAYOUT,
+    DEFAULT_HTTP_TIMEOUT,
+    FILE_DIGEST_KEY,
+    FILE_SIZE_KEY,
+    LAYER_TITLE_KEY,
+    LAYOUT_ANNOTATION_KEY,
+    POINTER_MEDIA_TYPE,
+    resolve_cdc_avg_size,
+    resolve_chunk_threshold,
+    resolve_chunked_write_enabled,
+    resolve_registry,
+    resolve_upload_workers,
+)
 from .file_download import _oci_repo_path, _validate_repo_type
 
 try:
-    from .hippius_core import hash_file_native, upload_blob_native
+    from .hippius_core import (
+        chunk_and_hash_native,
+        hash_file_native,
+        upload_blob_native,
+        upload_blob_range_native,
+    )
 except ImportError:
     raise ImportError("hippius_core is not installed. Did you run `maturin develop`?")
 
@@ -47,22 +69,11 @@ def _empty_config_blob_descriptor() -> tuple:
     return data, digest, len(data)
 
 
-def _ensure_blob_uploaded(
-    registry: str,
-    repo_id: str,
-    oci_token: str,
-    file_path: str,
-    sha256_hash: str,
-    file_size: int,
-) -> bool:
-    """POST/PUT a blob if not already present at its digest. Returns True if a
-    new upload happened, False if the blob already existed and was skipped."""
-    digest = f"sha256:{sha256_hash}"
+def _upload_blob_single_put(registry: str, repo_id: str, oci_token: str, file_path: str, digest: str) -> None:
+    """OCI blob-upload init against the registry, then one streaming PUT-with-digest
+    straight to it. This is the path for a plain (sub-threshold) whole-file blob;
+    large files go through the chunked path instead (`_upload_file_chunked`)."""
     headers = {"Authorization": f"Bearer {oci_token}"}
-    check = httpx.head(f"{registry}/v2/{repo_id}/blobs/{digest}", headers=headers, timeout=DEFAULT_HTTP_TIMEOUT)
-    if check.status_code == 200:
-        return False
-
     init_headers = {**headers, "Content-Length": "0"}
     init = httpx.post(f"{registry}/v2/{repo_id}/blobs/uploads/", headers=init_headers, timeout=DEFAULT_HTTP_TIMEOUT)
     init.raise_for_status()
@@ -73,6 +84,24 @@ def _ensure_blob_uploaded(
         location = f"{registry}{location}"
     sep = "&" if "?" in location else "?"
     upload_blob_native(f"{location}{sep}digest={digest}", file_path, oci_token)
+
+
+def _ensure_blob_uploaded(
+    registry: str,
+    repo_id: str,
+    oci_token: str,
+    file_path: str,
+    sha256_hash: str,
+) -> bool:
+    """Upload a plain whole-file blob if not already present at its digest.
+    Returns True if a new upload happened, False if the blob already existed and
+    was skipped (the dedup HEAD)."""
+    digest = f"sha256:{sha256_hash}"
+    headers = {"Authorization": f"Bearer {oci_token}"}
+    check = httpx.head(f"{registry}/v2/{repo_id}/blobs/{digest}", headers=headers, timeout=DEFAULT_HTTP_TIMEOUT)
+    if check.status_code == 200:
+        return False
+    _upload_blob_single_put(registry, repo_id, oci_token, file_path, digest)
     return True
 
 
@@ -92,13 +121,135 @@ def _ensure_config_blob_uploaded(registry: str, repo_id: str, oci_token: str) ->
         if loc and loc.startswith("/"):
             loc = f"{registry}{loc}"
         sep = "&" if "?" in loc else "?"
-        httpx.put(
+        # Raise on a failed config PUT: otherwise the manifest PUT that follows
+        # fails later with an opaque MANIFEST_BLOB_UNKNOWN instead of the real
+        # cause (matches _ensure_bytes_blob_uploaded / _upload_blob_single_put).
+        put = httpx.put(
             f"{loc}{sep}digest={digest}",
             headers={**headers, "Content-Type": "application/octet-stream"},
             content=data,
             timeout=DEFAULT_HTTP_TIMEOUT,
         )
+        put.raise_for_status()
     return digest, size
+
+
+def _ensure_bytes_blob_uploaded(registry: str, repo_id: str, oci_token: str, data: bytes, digest: str) -> None:
+    """Push an in-memory blob (the pointer blob) if not already present at its
+    digest. HEAD-dedups first, then runs the OCI init + PUT-with-digest dance."""
+    headers = {"Authorization": f"Bearer {oci_token}"}
+    check = httpx.head(f"{registry}/v2/{repo_id}/blobs/{digest}", headers=headers, timeout=DEFAULT_HTTP_TIMEOUT)
+    if check.status_code == 200:
+        return
+    init = httpx.post(f"{registry}/v2/{repo_id}/blobs/uploads/", headers={**headers, "Content-Length": "0"}, timeout=DEFAULT_HTTP_TIMEOUT)
+    init.raise_for_status()
+    location = init.headers.get("Location")
+    if not location:
+        raise ValueError("Registry did not return a Location header for upload initiation")
+    if location.startswith("/"):
+        location = f"{registry}{location}"
+    sep = "&" if "?" in location else "?"
+    put = httpx.put(f"{location}{sep}digest={digest}", headers={**headers, "Content-Type": "application/octet-stream"}, content=data, timeout=DEFAULT_HTTP_TIMEOUT)
+    put.raise_for_status()
+
+
+def _ensure_chunk_uploaded(registry: str, repo_id: str, oci_token: str, abs_path: str, digest: str, offset: int, size: int) -> None:
+    """Upload one content-defined chunk's byte range if absent at its digest.
+
+    The `HEAD` is the 'upload only the bytes we're missing' core: a chunk that a
+    prior upload already stored (an unchanged region of a re-uploaded file) is
+    skipped, so a slightly-changed large file re-transfers only its changed
+    chunks. Missing chunks stream straight to Harbor via the Rust range PUT."""
+    headers = {"Authorization": f"Bearer {oci_token}"}
+    check = httpx.head(f"{registry}/v2/{repo_id}/blobs/{digest}", headers=headers, timeout=DEFAULT_HTTP_TIMEOUT)
+    if check.status_code == 200:
+        return
+    init = httpx.post(f"{registry}/v2/{repo_id}/blobs/uploads/", headers={**headers, "Content-Length": "0"}, timeout=DEFAULT_HTTP_TIMEOUT)
+    init.raise_for_status()
+    location = init.headers.get("Location")
+    if not location:
+        raise ValueError("Registry did not return a Location header for upload initiation")
+    if location.startswith("/"):
+        location = f"{registry}{location}"
+    sep = "&" if "?" in location else "?"
+    upload_blob_range_native(
+        url=f"{location}{sep}digest={digest}",
+        path=abs_path,
+        offset=offset,
+        length=size,
+        auth_token=oci_token,
+    )
+
+
+def _pointer_blob_bytes(whole_hex: str, file_size: int, chunk_metas: list) -> bytes:
+    """Serialize the deterministic pointer blob for a chunked file.
+
+    Content = layout version + whole-file size/digest + the ordered chunk list.
+    Canonical JSON (sorted keys, no whitespace, NO timestamps) so two identical
+    files produce the same pointer digest and dedup at the pointer level too. It
+    is self-identifying (the `version` field) so any reader that predates chunked
+    support and writes this blob verbatim as the file fails an obvious size/digest
+    check rather than corrupting silently."""
+    doc = {
+        "version": CHUNKED_LAYOUT,
+        "file": {"size": file_size, "digest": f"sha256:{whole_hex}"},
+        "chunks": [{"digest": f"sha256:{h}", "size": size} for h, _offset, size in chunk_metas],
+    }
+    return json.dumps(doc, sort_keys=True, separators=(",", ":")).encode("utf-8")
+
+
+def _upload_file_chunked(abs_path: str, repo_title: str, file_size: int, registry: str, oci_repo: str, oci_token: str) -> List[dict]:
+    """Store a large file as a pointer + K content-defined chunk blobs.
+
+    Returns the layer list for this file: one titled pointer layer followed by K
+    untitled chunk layers, in file order. Chunks are HEAD-deduped and pushed
+    concurrently (the WAN-parallelism win); the pointer blob is written last so a
+    crash before it leaves only unreferenced chunk blobs for Harbor GC to reclaim,
+    never a half-referenced manifest."""
+    whole_hex, chunk_metas = chunk_and_hash_native(abs_path, resolve_cdc_avg_size())
+
+    def _one(meta) -> dict:
+        chunk_hex, offset, size = meta
+        digest = f"sha256:{chunk_hex}"
+        _ensure_chunk_uploaded(registry, oci_repo, oci_token, abs_path, digest, offset, size)
+        return {"mediaType": CHUNK_MEDIA_TYPE, "size": size, "digest": digest}
+
+    # ThreadPoolExecutor.map preserves input order, so chunk layers stay in file
+    # order — which the reader relies on to assemble the file correctly.
+    with ThreadPoolExecutor(max_workers=resolve_upload_workers()) as executor:
+        chunk_layers = list(executor.map(_one, chunk_metas))
+
+    pointer_bytes = _pointer_blob_bytes(whole_hex, file_size, chunk_metas)
+    pointer_digest = f"sha256:{hashlib.sha256(pointer_bytes).hexdigest()}"
+    _ensure_bytes_blob_uploaded(registry, oci_repo, oci_token, pointer_bytes, pointer_digest)
+
+    pointer_layer = {
+        "mediaType": POINTER_MEDIA_TYPE,
+        "size": len(pointer_bytes),
+        "digest": pointer_digest,
+        "annotations": {
+            LAYER_TITLE_KEY: repo_title.replace("\\", "/"),
+            FILE_SIZE_KEY: str(file_size),
+            FILE_DIGEST_KEY: f"sha256:{whole_hex}",
+            CHUNK_COUNT_KEY: str(len(chunk_metas)),
+        },
+    }
+    return [pointer_layer, *chunk_layers]
+
+
+def _upload_file_layers(abs_path: str, repo_title: str, registry: str, oci_repo: str, oci_token: str) -> List[dict]:
+    """Upload one file and return its manifest layer(s).
+
+    A file at or above the chunk threshold is stored chunked (pointer + K chunks)
+    unless the rollout gate (`HIPPIUS_CHUNKED_WRITE=0`) forces plain uploads;
+    below the threshold, one plain blob — byte-identical to the pre-chunking
+    layout, so small files and existing artifacts cross-dedup unchanged."""
+    file_size = os.path.getsize(abs_path)
+    if file_size >= resolve_chunk_threshold() and resolve_chunked_write_enabled():
+        return _upload_file_chunked(abs_path, repo_title, file_size, registry, oci_repo, oci_token)
+    sha256_hash, size = hash_file_native(abs_path)
+    _ensure_blob_uploaded(registry, oci_repo, oci_token, abs_path, sha256_hash)
+    return [_build_layer(sha256_hash, size, repo_title)]
 
 
 def _prev_digest_or_warn(existing, repo_id: str, revision: str) -> Optional[str]:
@@ -218,22 +369,81 @@ def _build_layer(sha256_hash: str, file_size: int, path_in_repo: str) -> dict:
     }
 
 
+def _partition_groups(layers: List[dict]) -> List[tuple]:
+    """Split a layer list into (title, [layers]) file-groups.
+
+    A titled layer starts a group; untitled chunk layers attach to the preceding
+    group. So a chunked file's pointer + K chunk layers are one indivisible unit:
+    dropping it by title drops its chunks too, and keeping it keeps them all.
+    This is what makes `_merge_layers` group-aware — the fix for the data-loss
+    bug where a title-keyed merge either collapsed a chunked file to its pointer
+    or wiped its chunk layers when an unrelated file was committed."""
+    groups: List[tuple] = []
+    for layer in layers:
+        title = layer_title(layer)
+        if title or not groups:
+            groups.append((title, [layer]))
+        else:
+            groups[-1][1].append(layer)
+    return groups
+
+
 def _merge_layers(
     existing: List[dict],
     new_layers: List[dict],
     delete_titles: Optional[set] = None,
 ) -> List[dict]:
-    """Build a layer list combining `existing` with `new_layers`.
-    New layers replace existing ones with the same title; titles in `delete_titles` are dropped."""
+    """Combine `existing` with `new_layers` at file-group granularity.
+
+    An existing file-group is dropped when its title is being replaced by
+    `new_layers` or is in `delete_titles`; every surviving group is preserved
+    INTACT (pointer + all its chunk layers), then the new layers are appended.
+    A file's group is never partially rewritten, so committing one file can't
+    damage another chunked file, and replacing a chunked file swaps its whole
+    group. For plain single-layer files this reduces to the old title-keyed
+    behavior (new replaces same-title, deletes drop, others preserved)."""
     delete_titles = delete_titles or set()
-    by_title = {}
-    for layer in existing:
-        title = layer_title(layer)
-        if title and title not in delete_titles:
-            by_title[title] = layer
-    for layer in new_layers:
-        by_title[layer["annotations"][LAYER_TITLE_KEY]] = layer
-    return list(by_title.values())
+    new_titles = {title for title, _ in _partition_groups(new_layers) if title}
+    result: List[dict] = []
+    for title, group_layers in _partition_groups(existing):
+        if title is not None and (title in delete_titles or title in new_titles):
+            continue
+        result.extend(group_layers)
+    result.extend(new_layers)
+    return result
+
+
+def _assemble_manifest(
+    config_digest: str,
+    config_size: int,
+    merged_layers: List[dict],
+    commit_message: Optional[str],
+    commit_description: Optional[str],
+) -> dict:
+    """Build the OCI manifest, typing it as a chunked artifact only when it holds
+    at least one chunked file.
+
+    A manifest with any pointer layer gets `artifactType` (so image tooling / Trivy
+    treat it as a generic artifact, not a broken image) and the
+    `com.hippius.layout` annotation (so a layout-blind client hits the Phase 0
+    guard). A purely-plain manifest stays byte-identical to the pre-chunking
+    output, preserving cross-dedup with existing artifacts."""
+    annotations = _commit_annotations(commit_message, commit_description)
+    manifest = {
+        "schemaVersion": 2,
+        "mediaType": "application/vnd.oci.image.manifest.v1+json",
+        "config": {
+            "mediaType": "application/vnd.oci.empty.v1+json",
+            "digest": config_digest,
+            "size": config_size,
+        },
+        "layers": merged_layers,
+        "annotations": annotations,
+    }
+    if any(layer.get("mediaType") == POINTER_MEDIA_TYPE for layer in merged_layers):
+        manifest["artifactType"] = ARTIFACT_TYPE_CHUNKED
+        annotations[LAYOUT_ANNOTATION_KEY] = CHUNKED_LAYOUT
+    return manifest
 
 
 def _commit_annotations(commit_message: Optional[str], commit_description: Optional[str]) -> dict:
@@ -278,27 +488,19 @@ def _upload_one_file(
     registry: str,
     oci_repo: str,
     oci_token: str,
-) -> dict:
-    """Upload one file from a folder and return its layer dict for the manifest.
+) -> List[dict]:
+    """Upload one file from a folder and return its manifest layer(s).
 
-    Extracted from the per-file closure inside `upload_folder` so the thread-pool
-    body is testable in isolation and `upload_folder` stays under the project
-    line-length limit. Keeping this module-private (and not reused by
-    `upload_file`) because the two paths diverge in titling and progress output —
-    sharing them would re-introduce the very coupling this split removes.
+    Returns a LIST because a chunked file contributes a pointer layer plus K
+    chunk layers (a plain file contributes one). Extracted from the per-file
+    closure in `upload_folder` so the thread-pool body is testable in isolation.
     """
     abs_path = os.path.join(base_dir, rel_path)
-    sha256_hash, file_size = hash_file_native(abs_path)
     repo_title = f"{path_in_repo}/{rel_path}" if path_in_repo else rel_path
-    tqdm.write(f"🚀 Uploading: {repo_title} ({file_size} bytes)...")
-    uploaded = _ensure_blob_uploaded(
-        registry, oci_repo, oci_token, abs_path, sha256_hash, file_size,
-    )
-    if uploaded:
-        tqdm.write(f"✅ Uploaded: {repo_title}")
-    else:
-        tqdm.write(f"✅ Already published (skipped): {repo_title}")
-    return _build_layer(sha256_hash, file_size, repo_title)
+    tqdm.write(f"🚀 Uploading: {repo_title} ({os.path.getsize(abs_path)} bytes)...")
+    layers = _upload_file_layers(abs_path, repo_title, registry, oci_repo, oci_token)
+    tqdm.write(f"✅ Uploaded: {repo_title}")
+    return layers
 
 
 def _finalize_upload_manifest(
@@ -333,17 +535,9 @@ def _finalize_upload_manifest(
     merged_layers = _merge_layers(existing_layers, new_layers, delete_titles=delete_titles)
 
     config_digest, config_size = _ensure_config_blob_uploaded(registry, oci_repo, oci_token)
-    manifest = {
-        "schemaVersion": 2,
-        "mediaType": "application/vnd.oci.image.manifest.v1+json",
-        "config": {
-            "mediaType": "application/vnd.oci.empty.v1+json",
-            "digest": config_digest,
-            "size": config_size,
-        },
-        "layers": merged_layers,
-        "annotations": _commit_annotations(commit_message, commit_description),
-    }
+    manifest = _assemble_manifest(
+        config_digest, config_size, merged_layers, commit_message, commit_description
+    )
 
     print(f"📝 Publishing OCI Manifest for {revision}...")
     resp = _put_manifest(registry, oci_repo, revision, oci_token, manifest, if_match=prev_digest)
@@ -416,29 +610,19 @@ def upload_file(
 
     file_path, cleanup = _normalize_path_or_fileobj(path_or_fileobj)
     try:
-        sha256_hash, file_size = hash_file_native(file_path)
-        _ensure_blob_uploaded(registry, oci_repo, oci_token, file_path, sha256_hash, file_size)
-        new_layer = _build_layer(sha256_hash, file_size, path_in_repo)
+        new_layers = _upload_file_layers(file_path, path_in_repo, registry, oci_repo, oci_token)
     finally:
         cleanup()
 
     existing = fetch_manifest(registry, oci_repo, revision, oci_token, missing_ok=True)
     existing_layers = existing.manifest.get("layers", []) if existing else []
     prev_digest = _prev_digest_or_warn(existing, repo_id, revision)
-    merged_layers = _merge_layers(existing_layers, [new_layer])
+    merged_layers = _merge_layers(existing_layers, new_layers)
 
     config_digest, config_size = _ensure_config_blob_uploaded(registry, oci_repo, oci_token)
-    manifest = {
-        "schemaVersion": 2,
-        "mediaType": "application/vnd.oci.image.manifest.v1+json",
-        "config": {
-            "mediaType": "application/vnd.oci.empty.v1+json",
-            "digest": config_digest,
-            "size": config_size,
-        },
-        "layers": merged_layers,
-        "annotations": _commit_annotations(commit_message, commit_description),
-    }
+    manifest = _assemble_manifest(
+        config_digest, config_size, merged_layers, commit_message, commit_description
+    )
 
     resp = _put_manifest(registry, oci_repo, revision, oci_token, manifest, if_match=prev_digest)
     return _build_commit_info(registry, repo_id, revision, resp, commit_message, commit_description)
@@ -526,7 +710,7 @@ def upload_folder(
                 for rel in filtered
             ]
             for fut in tqdm(as_completed(futures), total=len(filtered), desc="Uploading", unit="file"):
-                new_layers.append(fut.result())
+                new_layers.extend(fut.result())
 
     commit_info = _finalize_upload_manifest(
         registry=registry,
@@ -539,10 +723,9 @@ def upload_folder(
         commit_message=commit_message,
         commit_description=commit_description,
     )
-    # Kept in the caller (not the finalize helper) because the count refers to
-    # files just iterated here, not layers actually written to the manifest —
-    # the two differ when delete_patterns trims pre-existing titles.
-    print(f"🎉 Successfully pushed {len(new_layers)} file(s) to {repo_id}:{revision}")
+    # Count logical files uploaded, not manifest layers: a chunked file expands
+    # to a pointer + K chunk layers, so len(new_layers) would overcount.
+    print(f"🎉 Successfully pushed {len(filtered)} file(s) to {repo_id}:{revision}")
     return commit_info
 
 

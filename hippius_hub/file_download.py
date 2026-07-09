@@ -14,7 +14,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Optional, Union
 
-from ._oci import fetch_manifest, layer_title
+from ._oci import fetch_manifest, group_files
 from .auth import get_oci_bearer_token, get_token, resolve_token_value
 from .constants import (
     DEFAULT_CACHE_DIR,
@@ -34,7 +34,7 @@ from .errors import (
 )
 
 try:
-    from .hippius_core import download_file_native
+    from .hippius_core import download_chunks_native, download_file_native
 except ImportError:
     raise ImportError("hippius_core is not installed. Did you run `maturin develop`?")
 
@@ -222,24 +222,30 @@ def _resolve_dest_paths(
     )
 
 
-def _resolve_target_digest(
+def _digest_hex(digest: str) -> str:
+    """Strip an OCI `algo:` prefix, yielding the bare hex the Rust layer verifies
+    against and the cache uses as a blob name. Tolerates an already-bare hex."""
+    return digest.split(":", 1)[-1]
+
+
+def _resolve_file_group(
     manifest: Dict,
     filename: str,
     repo_id: str,
     revision: str,
-) -> str:
-    """Find the layer whose title matches `filename` and return its digest.
+):
+    """Find the logical file named `filename` and return its FileGroup.
 
-    Raises EntryNotFoundError if no layer matches OR if a matching layer has
-    no digest — preserves the exact behavior of the inline `if not target_digest`
-    fall-through that previously lived in hf_hub_download (both the "no match"
-    and "matched but digest is falsy" cases produced the same error message).
+    Works across layouts: a plain file resolves to a K=0 group carrying its own
+    blob digest; a chunked file resolves to its pointer group carrying the
+    whole-file digest and the ordered chunk list. Preserves the old
+    `_resolve_target_digest` contract — a match whose (plain) digest is falsy is
+    treated as "not found" so callers never fetch a blob at an empty digest.
     """
-    for layer in manifest.get("layers", []):
-        if layer_title(layer) == filename:
-            digest = layer.get("digest")
-            if digest:
-                return digest
+    for group in group_files(manifest):
+        if group.title == filename:
+            if group.is_chunked or group.digest:
+                return group
             break
     raise EntryNotFoundError(
         f"File '{filename}' not found in the OCI manifest of '{repo_id}:{revision}'"
@@ -353,8 +359,25 @@ def hf_hub_download(
         oci_token=oci_token,
         cached=_resolved_manifest,
     )
-    target_digest = _resolve_target_digest(manifest, filename, repo_id, revision)
-    blob_url = f"{registry}/v2/{oci_repo}/blobs/{target_digest}"
+    group = _resolve_file_group(manifest, filename, repo_id, revision)
+    # Chunked files pull K content-addressed chunk blobs in parallel and assemble
+    # them; plain files keep the single-blob Range-parallel path unchanged, so
+    # every pre-chunking artifact downloads exactly as before.
+    if group.is_chunked:
+        if local_dir is not None:
+            return _download_chunked_to_local_dir(
+                group, registry, oci_repo, paths.dest_file, oci_token
+            )
+        return _download_chunked_to_cache(
+            group=group,
+            registry=registry,
+            oci_repo=oci_repo,
+            repo_dir=paths.repo_dir,
+            snapshots_dir=paths.snapshots_dir,
+            filename=filename,
+            oci_token=oci_token,
+        )
+    blob_url = f"{registry}/v2/{oci_repo}/blobs/{group.digest}"
     if local_dir is not None:
         return _download_to_local_dir(blob_url, paths.dest_file, oci_token)
     return _download_to_cache(
@@ -363,7 +386,7 @@ def hf_hub_download(
         snapshots_dir=paths.snapshots_dir,
         filename=filename,
         oci_token=oci_token,
-        target_digest=target_digest,
+        target_digest=group.digest,
     )
 
 
@@ -481,6 +504,103 @@ def _download_to_local_dir(blob_url, dest_file, oci_token):
         # Remove the partial temp file before propagating. The inner OSError
         # swallow mirrors `_download_to_cache`: a cleanup failure must not
         # shadow the original download exception (or KeyboardInterrupt).
+        if os.path.exists(temp_path):
+            try:
+                os.remove(temp_path)
+            except OSError:
+                pass
+        raise
+    os.replace(temp_path, dest_file)
+    return dest_file
+
+
+def _pull_chunks(group, registry, oci_repo, temp_path, oci_token) -> Optional[str]:
+    """Fetch a chunked file's chunk blobs into `temp_path` via the Rust engine.
+
+    Per-chunk digest verification is always on in the native layer. The whole-file
+    digest is ALSO always verified here — unlike the single-blob path's opt-in
+    HIPPIUS_VERIFY_HASH — because per-chunk digests prove each chunk's *bytes* but
+    not its *position*: the whole-file `sha256(concat)` pass is the only check
+    that the K chunks were concatenated in the right order. It is one sequential
+    read, cheap next to the multi-GB download it guards. Returns the computed
+    whole-file hash.
+    """
+    urls = [f"{registry}/v2/{oci_repo}/blobs/{c.digest}" for c in group.chunks]
+    chunk_digests = [_digest_hex(c.digest) for c in group.chunks]
+    chunk_sizes = [c.size for c in group.chunks]
+    file_digest = _digest_hex(group.digest)
+    return download_chunks_native(
+        urls=urls,
+        chunk_digests=chunk_digests,
+        chunk_sizes=chunk_sizes,
+        dest_path=temp_path,
+        file_digest=file_digest,
+        auth_token=oci_token,
+        max_concurrent=resolve_max_concurrent(),
+    )
+
+
+def _download_chunked_to_cache(
+    *, group, registry, oci_repo, repo_dir, snapshots_dir, filename, oci_token
+):
+    """Chunked-file analog of `_download_to_cache`.
+
+    Assembles the chunk blobs into a temp file, then places it in the
+    content-addressed cache under the *whole-file* digest and symlinks it into
+    the snapshot — so a chunked file dedups on disk against identical content
+    stored plainly, and the snapshot layout is identical to the single-blob path.
+    """
+    blobs_dir = os.path.join(repo_dir, "blobs")
+    os.makedirs(blobs_dir, exist_ok=True)
+    os.makedirs(snapshots_dir, exist_ok=True)
+    file_path = os.path.join(snapshots_dir, filename)
+
+    safe_name = filename.replace("/", "_")
+    fd, temp_path = tempfile.mkstemp(dir=blobs_dir, prefix=f"tmp_{safe_name}_")
+    os.close(fd)
+
+    print(f"Downloading {filename} ({len(group.chunks)} chunks, parallel)...")
+    try:
+        computed = _pull_chunks(group, registry, oci_repo, temp_path, oci_token)
+    except BaseException:
+        # Mirror the single-blob cleanup: drop the partial temp on any failure
+        # (including KeyboardInterrupt) so a later cache-hit check can't serve it.
+        if os.path.exists(temp_path):
+            try:
+                os.remove(temp_path)
+            except OSError:
+                pass
+        raise
+
+    # When verification is skipped the native call returns None; the whole-file
+    # digest from the pointer is authoritative for naming the blob either way.
+    final_hash = computed if computed is not None else _digest_hex(group.digest)
+    blob_path = os.path.join(blobs_dir, f"sha256:{final_hash}")
+    if not os.path.exists(blob_path):
+        os.rename(temp_path, blob_path)
+    elif os.path.exists(temp_path):
+        os.remove(temp_path)
+
+    _create_symlink(blob_path, file_path)
+    return file_path
+
+
+def _download_chunked_to_local_dir(group, registry, oci_repo, dest_file, oci_token):
+    """Chunked-file analog of `_download_to_local_dir`: assemble to a temp
+    sibling, then atomically `os.replace` into `dest_file` only on full success,
+    so a failed/interrupted assemble never leaves a partial file at the user path.
+    """
+    parent = os.path.dirname(dest_file)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    print(f"Downloading {os.path.basename(dest_file)} ({len(group.chunks)} chunks, parallel)...")
+    fd, temp_path = tempfile.mkstemp(
+        dir=parent or ".", prefix=f".tmp_{os.path.basename(dest_file)}_"
+    )
+    os.close(fd)
+    try:
+        _pull_chunks(group, registry, oci_repo, temp_path, oci_token)
+    except BaseException:
         if os.path.exists(temp_path):
             try:
                 os.remove(temp_path)

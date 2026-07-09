@@ -34,6 +34,36 @@ OCI_MANIFEST_ACCEPT = (
 # OCI manifest annotation that carries the in-repo filename for a layer.
 LAYER_TITLE_KEY = "org.opencontainers.image.title"
 
+# Manifest-level annotation marking a hippius-specific artifact layout. A client
+# that does not recognize the value MUST refuse the artifact rather than misread
+# it: a chunked file resolved by a layout-blind client would write the tiny
+# pointer blob verbatim as the file. See `_oci._guard_layout` /
+# `errors.UnsupportedLayoutError`. Absent annotation = the pre-chunking layout
+# (one plain titled blob per file), which every build reads.
+LAYOUT_ANNOTATION_KEY = "com.hippius.layout"
+
+# ----- chunked-artifact layout (docs/plans/2026-07-09-chunked-artifact-layout.md) -----
+# A file >= the chunk threshold is stored as one titled *pointer* layer plus K
+# *untitled* content-defined chunk blobs. These media types + annotation keys are
+# the wire contract shared by the uploader (writes them), the reader (parses
+# them), and the layout guard (gates them). Bump CHUNKED_LAYOUT to a new value if
+# any of this shape changes — a mismatched reader must fail the guard, not
+# misparse (see errors.UnsupportedLayoutError).
+CHUNKED_LAYOUT = "chunked-v1"
+ARTIFACT_TYPE_CHUNKED = "application/vnd.hippius.chunked.v1"
+POINTER_MEDIA_TYPE = "application/vnd.hippius.pointer.v1"
+CHUNK_MEDIA_TYPE = "application/vnd.hippius.chunk.v1"
+# Whole-file metadata carried once, on the pointer layer's annotations (the K
+# chunk layers stay bare — mediaType+digest+size only — to keep the manifest small).
+FILE_SIZE_KEY = "com.hippius.file.size"
+FILE_DIGEST_KEY = "com.hippius.file.digest"
+CHUNK_COUNT_KEY = "com.hippius.chunk.count"
+
+# Layout values THIS build can read. The compatibility guard shipped first as an
+# empty floor; chunked-read support (Phase 1) adds its value here in the same
+# commit that teaches the client to parse it.
+KNOWN_LAYOUTS: frozenset = frozenset({CHUNKED_LAYOUT})
+
 
 # ----- transfer tuning knobs -----
 # Defaults mirror the Rust-side constants in src/chunked_downloader.rs so the
@@ -44,6 +74,39 @@ DEFAULT_CHUNK_SIZE = 100 * 1024 * 1024  # 100 MB; mirrors DEFAULT_CHUNK_SIZE
 DEFAULT_MAX_CONCURRENT = 32             # mirrors MAX_CONCURRENT_DOWNLOADS
 DEFAULT_CONNECT_TIMEOUT = 30            # seconds; mirrors connect_timeout
 DEFAULT_TRANSFER_WORKERS = 8            # snapshot/upload ThreadPoolExecutor size
+
+
+# Chunked-artifact upload. A file at or above the threshold is stored as a
+# pointer + K content-defined chunk blobs; below it, one plain blob (byte-
+# identical to the pre-chunking layout). The CDC average is the FastCDC target
+# (min/max derived avg/4..avg*4 in the Rust splitter) and is part of the wire
+# contract — a change means a new layout version, not a silent retune.
+DEFAULT_CHUNK_THRESHOLD = 256 * 1024 * 1024  # 256 MiB
+DEFAULT_CDC_AVG_SIZE = 64 * 1024 * 1024       # 64 MiB (HF-Xet block/transfer size)
+
+
+def resolve_chunk_threshold() -> int:
+    """Minimum file size (bytes) stored via the chunked layout."""
+    return _resolve_positive_int("HIPPIUS_CHUNK_THRESHOLD", DEFAULT_CHUNK_THRESHOLD)
+
+
+def resolve_cdc_avg_size() -> int:
+    """FastCDC average chunk size (bytes). Pinned; overridable only for testing."""
+    return _resolve_positive_int("HIPPIUS_CDC_AVG_SIZE", DEFAULT_CDC_AVG_SIZE)
+
+
+def resolve_chunked_write_enabled() -> bool:
+    """Whether large files upload chunked (default) or as one plain blob.
+
+    The rollout gate. Chunked writes are safe to publish because a reader that
+    predates chunked support fails LOUDLY (UnsupportedLayoutError + upgrade hint)
+    rather than corrupting — so this defaults on. An operator mid-rollout can set
+    HIPPIUS_CHUNKED_WRITE=0 to keep emitting the pre-chunking single-blob layout
+    until every consumer has the chunk-aware reader deployed."""
+    raw = os.environ.get("HIPPIUS_CHUNKED_WRITE")
+    if not raw or not raw.strip():
+        return True
+    return raw.strip().lower() not in ("0", "false", "no", "off")
 
 
 def _resolve_positive_int(env_var: str, default: int) -> int:

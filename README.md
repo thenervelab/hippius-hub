@@ -317,12 +317,21 @@ Existing code that catches HF's exceptions keeps working.
 | `HIPPIUS_CONNECT_TIMEOUT` | `30` | TCP connect timeout (seconds) |
 | `HIPPIUS_READ_TIMEOUT` | unset | Opt-in per-chunk total request timeout (seconds) |
 | `HIPPIUS_SNAPSHOT_WORKERS` | `8` | Concurrent files in `snapshot_download` |
-| `HIPPIUS_UPLOAD_WORKERS` | `8` | Concurrent files in a folder upload |
+| `HIPPIUS_UPLOAD_WORKERS` | `8` | Concurrent files in a folder upload / concurrent chunk uploads per large file |
+| `HIPPIUS_CHUNK_THRESHOLD` | `268435456` (256 MiB) | Files at or above this size upload as content-defined chunks; below it, one plain blob |
+| `HIPPIUS_CDC_AVG_SIZE` | `67108864` (64 MiB) | FastCDC average chunk size (part of the layout wire contract; change with care) |
+| `HIPPIUS_CHUNKED_WRITE` | on | Set to `0`/`false` to keep emitting the pre-chunking single-blob layout for large files (rollout escape hatch) |
 | `HIPPIUS_DEBUG` / `RUST_LOG` | off | Verbose transport logging (per-chunk timings, retries) |
 | `HIPPIUS_API_URL` | `https://api.hippius.com` | Console API base used by the `registry` + `models` CLI subtrees |
 | `HIPPIUS_TEST_REPO` | `test/e2e-client` | Override the test repo used by the e2e suite |
 
 Programmatic overrides via the `endpoint=` kwarg on any function let you point at an alternative Hippius registry.
+
+### Large-file chunking
+
+Files at or above `HIPPIUS_CHUNK_THRESHOLD` (256 MiB) are stored as **content-defined chunks** (FastCDC, ~64 MiB average) rather than one blob. Each chunk is an ordinary content-addressed OCI blob, pushed to the registry in parallel and skipped on upload if it already exists (`HEAD`-dedup) — so a re-uploaded, slightly-changed model transfers only its changed chunks, and downloads pull the chunks concurrently. The layout is a Git-LFS-style pointer: one titled pointer layer per file plus its untitled chunk layers, marked with `artifactType` and a `com.hippius.layout: chunked-v1` annotation. Small files and every pre-existing artifact are unchanged (one plain blob), so nothing already stored is rewritten.
+
+A client that predates chunked support refuses a chunked artifact loudly (`UnsupportedLayoutError`, with an upgrade hint) instead of misreading it. During a rollout, deploy the chunk-aware reader to consumers first; operators who need the old behavior meanwhile can set `HIPPIUS_CHUNKED_WRITE=0` to keep emitting single-blob uploads.
 
 ### Diagnosing slow transfers
 

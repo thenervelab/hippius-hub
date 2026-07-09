@@ -5,6 +5,36 @@ All notable changes to `hippius_hub` are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **Chunked-artifact layout for large files.** Files at or above
+  `HIPPIUS_CHUNK_THRESHOLD` (256 MiB) are stored as content-defined chunks
+  (FastCDC, ~64 MiB average) — a titled pointer layer plus K untitled,
+  content-addressed chunk blobs, typed with `artifactType` and a
+  `com.hippius.layout: chunked-v1` annotation. Chunks are `HEAD`-deduped and
+  pushed/pulled in parallel, so a re-uploaded slightly-changed model transfers
+  only its changed chunks and large-file transfer parallelizes across chunks.
+  Small files and every pre-existing artifact are unchanged (one plain blob).
+- New Rust extension functions: `chunk_and_hash_native`,
+  `upload_blob_range_native`, `download_chunks_native`.
+- New env vars: `HIPPIUS_CHUNK_THRESHOLD`, `HIPPIUS_CDC_AVG_SIZE`,
+  `HIPPIUS_CHUNKED_WRITE` (rollout escape hatch — set to `0` to keep the
+  single-blob layout for large files during a staged rollout).
+- Forward-compatibility guard: a manifest with an unknown `com.hippius.layout`
+  is refused with `UnsupportedLayoutError` (new) instead of misread. Malformed
+  chunked manifests raise `MalformedManifestError` (new).
+
+### Removed
+
+- The in-cluster staged blob **receiver** (`receiver/` crate,
+  `Dockerfile.receiver`, `deploy/receiver/`) and the client multipart upload
+  route it fronted (`upload_blob_multipart_native`, `HIPPIUS_RECEIVER_URL`,
+  `HIPPIUS_MULTIPART_*`, the `diagnose-upload` CLI and its upload throughput
+  probe). Chunking pushes chunk blobs straight to Harbor, so the receiver is
+  superseded. The download `diagnose` command and its probe are unchanged.
+
 ## [0.5.0] — 2026-05-27
 
 A consolidation release that lands the 45-finding security/correctness audit
