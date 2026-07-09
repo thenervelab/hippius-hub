@@ -216,10 +216,14 @@ def group_files(manifest: dict) -> List[FileGroup]:
 
     Walks layers in order. A titled pointer layer plus its trailing untitled
     chunk layers become one chunked group; any other titled layer is a plain
-    K=1 file; stray untitled layers (a chunk with no preceding pointer) are a
-    malformed manifest. This is the single read-side chokepoint every consumer
-    (siblings, list_repo_files, file_exists, snapshot, single-file download)
-    routes through, so they all agree on what "a file" is regardless of layout.
+    K=1 file. An untitled CHUNK layer with no preceding pointer is genuine
+    corruption of our layout and raises; any other untitled layer is third-party
+    content co-located in the repo (a `docker`/`oras` push) and is skipped, so a
+    foreign manifest degrades to its titled subset instead of hard-failing every
+    read API — matching the pre-chunking reader's silent-skip behavior. This is
+    the single read-side chokepoint every consumer (siblings, list_repo_files,
+    file_exists, snapshot, single-file download) routes through, so they all
+    agree on what "a file" is regardless of layout.
     """
     layers = manifest.get("layers", [])
     groups: List[FileGroup] = []
@@ -228,10 +232,17 @@ def group_files(manifest: dict) -> List[FileGroup]:
         layer = layers[i]
         title = layer_title(layer)
         if not title:
-            raise MalformedManifestError(
-                f"untitled layer at index {i} ({layer.get('mediaType')!r}) has no "
-                "preceding pointer layer to attach to"
-            )
+            # A stray untitled chunk layer means our own layout is corrupt (its
+            # whole-file context — the pointer — is gone), so fail loudly. Every
+            # other untitled layer belongs to foreign tooling sharing the repo;
+            # skip it rather than break reads of a co-located non-hippius manifest.
+            if layer.get("mediaType") == CHUNK_MEDIA_TYPE:
+                raise MalformedManifestError(
+                    f"untitled chunk layer at index {i} has no preceding pointer "
+                    "layer to attach to"
+                )
+            i += 1
+            continue
         if layer.get("mediaType") == POINTER_MEDIA_TYPE:
             group, consumed = _pointer_group(title, layer, layers[i + 1:])
             groups.append(group)

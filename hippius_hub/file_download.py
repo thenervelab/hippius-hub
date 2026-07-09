@@ -15,18 +15,14 @@ from pathlib import Path
 from typing import Dict, Optional, Union
 
 from ._oci import fetch_manifest, group_files
-from .auth import get_oci_bearer_token, get_token, resolve_token_value
+from .auth import get_oci_bearer_token
 from .constants import (
     DEFAULT_CACHE_DIR,
     resolve_chunk_size,
-    resolve_connect_timeout,
     resolve_max_concurrent,
-    resolve_read_timeout,
     resolve_registry,
     resolve_verify_hash,
 )
-from .auth import get_oci_bearer_token
-from .constants import DEFAULT_CACHE_DIR, resolve_registry
 from .errors import (
     EntryNotFoundError,
     LocalEntryNotFoundError,

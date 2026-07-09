@@ -1,8 +1,10 @@
 """Env-gate config for the chunked-artifact upload path.
 
 Pins the chunk threshold / CDC-average resolvers and the rollout write-gate:
-`HIPPIUS_CHUNKED_WRITE` is the switch that lets an operator keep emitting the
-pre-chunking single-blob layout until every consumer has the chunk-aware reader.
+`HIPPIUS_CHUNKED_WRITE` is opt-in for this release — off unless explicitly set to
+a truthy value — because the reader-side layout guard ships in this same release,
+so no already-deployed consumer would refuse (rather than mis-write) a chunked
+artifact. A producer opts in with `=1` once the chunk-aware reader is deployed.
 """
 import pytest
 
@@ -38,9 +40,11 @@ def test_threshold_rejects_non_positive(monkeypatch):
         resolve_chunk_threshold()
 
 
-def test_chunked_write_enabled_by_default(monkeypatch):
+def test_chunked_write_disabled_by_default(monkeypatch):
+    # Opt-in this release: unset must NOT emit the chunked layout, because no
+    # deployed reader (<= v0.5.1) carries the guard that refuses it.
     monkeypatch.delenv("HIPPIUS_CHUNKED_WRITE", raising=False)
-    assert resolve_chunked_write_enabled() is True
+    assert resolve_chunked_write_enabled() is False
 
 
 @pytest.mark.parametrize("value", ["0", "false", "False", "no", "off", "OFF"])
@@ -49,13 +53,22 @@ def test_chunked_write_disabled_by_falsy_values(monkeypatch, value):
     assert resolve_chunked_write_enabled() is False
 
 
-@pytest.mark.parametrize("value", ["1", "true", "yes", "on", "anything"])
+@pytest.mark.parametrize("value", ["1", "true", "TRUE", "yes", "Yes", "on", "ON"])
 def test_chunked_write_enabled_by_truthy_values(monkeypatch, value):
     monkeypatch.setenv("HIPPIUS_CHUNKED_WRITE", value)
     assert resolve_chunked_write_enabled() is True
 
 
-def test_empty_write_gate_defaults_enabled(monkeypatch):
-    # An empty `HIPPIUS_CHUNKED_WRITE=` in a profile must not silently disable.
+@pytest.mark.parametrize("value", ["anything", "enabled", "2", "  yep  "])
+def test_chunked_write_unrecognized_value_stays_off(monkeypatch, value):
+    # Fail safe: only an explicit truthy token opts in. An unrecognized value
+    # must not accidentally enable chunked writes during the opt-in period.
+    monkeypatch.setenv("HIPPIUS_CHUNKED_WRITE", value)
+    assert resolve_chunked_write_enabled() is False
+
+
+def test_empty_write_gate_defaults_disabled(monkeypatch):
+    # An empty/whitespace `HIPPIUS_CHUNKED_WRITE=` in a profile falls back to the
+    # default, which is off (opt-in) for this release.
     monkeypatch.setenv("HIPPIUS_CHUNKED_WRITE", "  ")
-    assert resolve_chunked_write_enabled() is True
+    assert resolve_chunked_write_enabled() is False

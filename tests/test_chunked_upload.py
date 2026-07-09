@@ -144,6 +144,7 @@ WHOLE_HEX = "cc" * 32
 @respx.mock
 def test_upload_large_file_emits_chunked_manifest(monkeypatch, tmp_path):
     monkeypatch.setenv("HIPPIUS_CHUNK_THRESHOLD", "1")  # force the chunked path
+    monkeypatch.setenv("HIPPIUS_CHUNKED_WRITE", "1")  # opt in — off by default this release
     monkeypatch.setattr(file_upload, "chunk_and_hash_native", lambda path, avg: (WHOLE_HEX, CHUNK_METAS))
     monkeypatch.setattr(file_upload, "upload_blob_range_native", lambda **kw: None)
     monkeypatch.setattr("hippius_hub.constants.DEFAULT_REGISTRY_URL", MOCK_REGISTRY)

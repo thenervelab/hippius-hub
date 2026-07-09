@@ -183,10 +183,36 @@ def test_reject_missing_file_size_annotation():
 
 
 def test_reject_orphan_chunk_without_pointer():
-    # An untitled chunk layer with no preceding pointer is unattachable.
+    # An untitled *chunk* layer with no preceding pointer is our-layout corruption
+    # (its whole-file context is gone) — must raise, not skip.
     m = {"schemaVersion": 2, "layers": [_chunk_layer(_digest(b"orphan"), 5)]}
     with pytest.raises(MalformedManifestError, match="preceding pointer"):
         group_files(m)
+
+
+def test_skip_foreign_untitled_layers():
+    # A repo shared with other tooling can hold untitled layers of some OTHER
+    # media type (a `docker`/`oras` push). group_files must SKIP them (degrade to
+    # the titled subset, as the pre-chunking reader did) instead of hard-failing
+    # every read API on a co-located foreign manifest. Foreign layers appear both
+    # between our files and trailing, to exercise the mid-loop and end-of-loop skip.
+    foreign = {
+        "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
+        "size": 999,
+        "digest": _digest(b"foreign"),
+    }  # untitled, non-chunk
+    m = {
+        "schemaVersion": 2,
+        "layers": [
+            _plain_layer("model.bin", _digest(b"m"), 42),
+            foreign,
+            _plain_layer("config.json", _digest(b"c"), 7),
+            foreign,
+        ],
+    }
+    groups = group_files(m)
+    assert [g.title for g in groups] == ["model.bin", "config.json"]
+    assert all(not g.is_chunked for g in groups)
 
 
 def test_reject_chunk_run_interrupted_by_titled_layer():

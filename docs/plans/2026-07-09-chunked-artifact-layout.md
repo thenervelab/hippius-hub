@@ -189,8 +189,11 @@ is per-artifact, not per-file. Controls:
   Harbor core re-parsing) — **not** a per-file chunk count. Option B already
   minimizes this: untitled chunk layers carry only mediaType+digest+size
   (~110 B), and file metadata sits once on the pointer.
-- With ~110 B/chunk, ≤ 2 MiB ≈ ~19k chunks ≈ ~1.2 TB/artifact at 64 MiB average —
-  covers every model today. (Dropping the average to 8–16 MiB for finer dedup
+- With ~110 B/chunk, ≤ 2 MiB ≈ ~19k chunks ≈ ~1.2 TB per **revision manifest** at
+  64 MiB average. A folder upload merges every file's pointer+chunk layers into
+  that one manifest, so ~1.2 TB is the *combined* budget across all files in the
+  revision, not a per-file limit — a repo of many large files reaches the cap at a
+  total size below it. Still covers every model today. (Dropping the average to 8–16 MiB for finer dedup
   would lower this ceiling proportionally; a real CDC trade if that knob is ever
   turned.) For artifacts past the ceiling, fan out via an
   **OCI image index / Referrers**
@@ -436,14 +439,19 @@ gate.
 
 ## Phase 5 — Rollout
 
-1. Release the Phase 0 guard (its own commit — empty `KNOWN_LAYOUTS`); let it
-   become the deployed floor.
-2. Release Phases 1–3 (read + write) as the new client.
-3. **Enable chunked writes** only once the read-capable client is the floor. The
-   gate is `HIPPIUS_CHUNKED_WRITE` (`resolve_chunked_write_enabled`, default on):
-   ship it on because an old reader fails LOUDLY (`UnsupportedLayoutError`), not
-   silently; operators mid-rollout set it to `0` to keep the single-blob layout
-   until every consumer has the chunk-aware reader.
+1. The forward-compat guard (`_oci._guard_layout` + `KNOWN_LAYOUTS`) ships together
+   with read + write in this PR — there is no earlier release carrying it as an
+   empty floor, so no already-deployed reader (≤ v0.5.1) refuses a chunked
+   artifact. This backward gap is the reason writes are opt-in below.
+2. Release read + write as the new client, chunked writes **off** by default.
+3. **Enable chunked writes** only once the read-capable (guard-bearing) client is
+   the deployed floor. The gate is `HIPPIUS_CHUNKED_WRITE`
+   (`resolve_chunked_write_enabled`, **default off / opt-in this release**): an old
+   reader lacking the guard does NOT fail loudly — it matches the pointer layer by
+   its title and silently writes the ~200-byte pointer blob as the file — so the
+   default stays off until the guard-bearing reader is universal. A producer sets
+   `HIPPIUS_CHUNKED_WRITE=1` to opt in (e.g. staging e2e); a later release flips the
+   default on once the fleet is upgraded.
 4. Measure large-file upload wall-clock (K-way parallel) and download wall-clock
    (new parallelism) vs the pre-chunk baseline. No Harbor/JuiceFS change; scaling
    is Harbor's existing horizontal core replicas.
@@ -470,8 +478,8 @@ deliberate:
   PUT once it exceeds the 4 MiB registry cap (`MAX_MANIFEST_BYTES`), so an artifact
   with too many chunks fails with a clear message instead of the registry's opaque
   400 after all blobs are uploaded. Only the *Referrers/index fan-out* (Open
-  Decision #2's expensive half) is deferred; the ~1.2 TB/artifact budget at 64 MiB
-  covers every model today.
+  Decision #2's expensive half) is deferred; the ~1.2 TB budget (per revision
+  manifest, all files in the revision combined) at 64 MiB covers every model today.
 - New Rust: `src/chunk_fetcher.rs` (parallel chunk pull), `chunk_and_hash` +
   `upload_blob_range_async` in `uploader.rs`, `CoreError::Integrity`. New Python
   errors: `UnsupportedLayoutError`, `MalformedManifestError`, `ManifestTooLargeError`.
@@ -489,6 +497,17 @@ deliberate:
 - **`chunk.count >= 1` guard.** `group_files` rejects a `count == 0` pointer
   (`MalformedManifestError`) — it would otherwise collapse to a plain file whose
   whole-file blob was never uploaded.
+- **Chunked writes default OFF (opt-in this release).** The forward-compat guard
+  ships in this same release, so no deployed reader (≤ v0.5.1) carries it: an
+  un-upgraded reader would silently write the pointer blob as the file, not fail
+  loudly. `resolve_chunked_write_enabled` defaults off; a producer sets
+  `HIPPIUS_CHUNKED_WRITE=1` to opt in. A later release flips the default on once the
+  guard-bearing reader is universally deployed.
+- **`group_files` skips foreign untitled layers.** An untitled layer of a non-chunk
+  media type (a co-located `docker`/`oras` push) is skipped — a foreign manifest
+  degrades to its titled subset instead of hard-failing every read API. A stray
+  untitled *chunk* layer still raises: that is our-layout corruption, not third-party
+  content.
 
 Open Decision #5 (**Harbor GC scheduled?**) remains an ops confirmation, not a
 code item — orphaned chunks from a failed upload are only reclaimed if GC runs.

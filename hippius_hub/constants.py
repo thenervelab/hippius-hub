@@ -68,9 +68,12 @@ CHUNK_COUNT_KEY = "com.hippius.chunk.count"
 # documented follow-up in the chunked-artifact plan).
 MAX_MANIFEST_BYTES = 4 * 1024 * 1024
 
-# Layout values THIS build can read. The compatibility guard shipped first as an
-# empty floor; chunked-read support (Phase 1) adds its value here in the same
-# commit that teaches the client to parse it.
+# Layout values THIS build can read. The forward-compat guard (_oci._guard_layout)
+# and chunked-read support ship together in this release — there is no earlier
+# build carrying an empty-floor guard, so no already-deployed reader refuses a
+# chunked artifact. That backward gap is why chunked WRITES are opt-in for this
+# release (resolve_chunked_write_enabled defaults off): readers upgrade first,
+# writers flip the default on in a later release.
 KNOWN_LAYOUTS: frozenset = frozenset({CHUNKED_LAYOUT})
 
 
@@ -105,17 +108,22 @@ def resolve_cdc_avg_size() -> int:
 
 
 def resolve_chunked_write_enabled() -> bool:
-    """Whether large files upload chunked (default) or as one plain blob.
+    """Whether large files upload chunked, or as one plain blob (default).
 
-    The rollout gate. Chunked writes are safe to publish because a reader that
-    predates chunked support fails LOUDLY (UnsupportedLayoutError + upgrade hint)
-    rather than corrupting — so this defaults on. An operator mid-rollout can set
-    HIPPIUS_CHUNKED_WRITE=0 to keep emitting the pre-chunking single-blob layout
-    until every consumer has the chunk-aware reader deployed."""
+    The rollout gate — opt-in for this release. The forward-compat guard that
+    makes an un-upgraded reader refuse a chunked artifact loudly
+    (UnsupportedLayoutError) ships in this SAME release, so no already-deployed
+    reader (<= v0.5.1) carries it. Such a reader instead matches the pointer
+    layer by its title and silently writes the ~200-byte pointer blob AS the
+    file — undetectable even with HIPPIUS_VERIFY_HASH=1, since it checks the
+    pointer blob against its own digest. Defaulting off keeps large-file uploads
+    byte-identical to the pre-chunking layout until the guard-bearing reader is
+    universally deployed; a later release flips the default on. Set
+    HIPPIUS_CHUNKED_WRITE=1 to opt a producer in now (e.g. on staging)."""
     raw = os.environ.get("HIPPIUS_CHUNKED_WRITE")
     if not raw or not raw.strip():
-        return True
-    return raw.strip().lower() not in ("0", "false", "no", "off")
+        return False
+    return raw.strip().lower() in ("1", "true", "yes", "on")
 
 
 def _resolve_positive_int(env_var: str, default: int) -> int:
