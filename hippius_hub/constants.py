@@ -54,6 +54,13 @@ DEFAULT_TRANSFER_WORKERS = 8            # snapshot/upload ThreadPoolExecutor siz
 # replace this default once measured.
 DEFAULT_MULTIPART_THRESHOLD = 256 * 1024 * 1024  # 256 MB
 
+# Requested bytes per part. The receiver may clamp this and returns the value
+# it actually used; the client derives its part count from that. Parts hit the
+# receiver (NOT S3), so there is no 5 MB S3-multipart floor — 64 MB keeps the
+# part count small (a 2.6 GB shard is ~41 parts) so the part-plan and any
+# re-drive stay cheap.
+DEFAULT_MULTIPART_PART_SIZE = 64 * 1024 * 1024  # 64 MB
+
 
 def _resolve_positive_int(env_var: str, default: int) -> int:
     """Read a positive-int env var, falling back to `default` when unset.
@@ -109,6 +116,11 @@ def resolve_upload_workers() -> int:
 def resolve_multipart_threshold() -> int:
     """Minimum blob size (bytes) eligible for the parallel receiver path."""
     return _resolve_positive_int("HIPPIUS_MULTIPART_THRESHOLD", DEFAULT_MULTIPART_THRESHOLD)
+
+
+def resolve_multipart_part_size() -> int:
+    """Requested bytes per part for the receiver path (receiver may clamp)."""
+    return _resolve_positive_int("HIPPIUS_MULTIPART_PART_SIZE", DEFAULT_MULTIPART_PART_SIZE)
 
 
 def resolve_receiver_url() -> Optional[str]:

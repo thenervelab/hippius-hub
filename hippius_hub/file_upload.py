@@ -24,11 +24,19 @@ from .auth import get_oci_bearer_token
 from .constants import DEFAULT_HTTP_TIMEOUT, LAYER_TITLE_KEY, resolve_registry
 from .errors import ConcurrentManifestUpdateError
 from .auth import get_oci_bearer_token, get_token, resolve_token_value
-from .constants import DEFAULT_HTTP_TIMEOUT, LAYER_TITLE_KEY, resolve_registry, resolve_upload_workers
+from .constants import (
+    DEFAULT_HTTP_TIMEOUT,
+    LAYER_TITLE_KEY,
+    resolve_multipart_part_size,
+    resolve_multipart_threshold,
+    resolve_receiver_url,
+    resolve_registry,
+    resolve_upload_workers,
+)
 from .file_download import _oci_repo_path, _validate_repo_type
 
 try:
-    from .hippius_core import hash_file_native, upload_blob_native
+    from .hippius_core import hash_file_native, upload_blob_multipart_native, upload_blob_native
 except ImportError:
     raise ImportError("hippius_core is not installed. Did you run `maturin develop`?")
 
@@ -47,22 +55,18 @@ def _empty_config_blob_descriptor() -> tuple:
     return data, digest, len(data)
 
 
-def _ensure_blob_uploaded(
-    registry: str,
-    repo_id: str,
-    oci_token: str,
-    file_path: str,
-    sha256_hash: str,
-    file_size: int,
-) -> bool:
-    """POST/PUT a blob if not already present at its digest. Returns True if a
-    new upload happened, False if the blob already existed and was skipped."""
-    digest = f"sha256:{sha256_hash}"
-    headers = {"Authorization": f"Bearer {oci_token}"}
-    check = httpx.head(f"{registry}/v2/{repo_id}/blobs/{digest}", headers=headers, timeout=DEFAULT_HTTP_TIMEOUT)
-    if check.status_code == 200:
-        return False
+def _should_use_multipart(file_size: int, receiver_url: Optional[str]) -> bool:
+    """Route a blob to the receiver only when a receiver is configured AND the
+    blob clears the size threshold. Both conditions must hold, so with no
+    receiver configured the answer is always False and uploads are unchanged."""
+    return receiver_url is not None and file_size >= resolve_multipart_threshold()
 
+
+def _upload_blob_single_put(registry: str, repo_id: str, oci_token: str, file_path: str, digest: str) -> None:
+    """Legacy path: OCI blob-upload init against the registry, then one
+    streaming PUT-with-digest straight to it. Unchanged from the pre-multipart
+    behavior; this is what runs whenever the receiver route is not selected."""
+    headers = {"Authorization": f"Bearer {oci_token}"}
     init_headers = {**headers, "Content-Length": "0"}
     init = httpx.post(f"{registry}/v2/{repo_id}/blobs/uploads/", headers=init_headers, timeout=DEFAULT_HTTP_TIMEOUT)
     init.raise_for_status()
@@ -73,6 +77,48 @@ def _ensure_blob_uploaded(
         location = f"{registry}{location}"
     sep = "&" if "?" in location else "?"
     upload_blob_native(f"{location}{sep}digest={digest}", file_path, oci_token)
+
+
+def _ensure_blob_uploaded(
+    registry: str,
+    repo_id: str,
+    oci_token: str,
+    file_path: str,
+    sha256_hash: str,
+    file_size: int,
+) -> bool:
+    """Upload a blob if not already present at its digest. Returns True if a
+    new upload happened, False if the blob already existed and was skipped.
+
+    Two upload paths share one dedup check: a large blob routes to the parallel
+    receiver (which brokers the native OCI push to the registry) when
+    `HIPPIUS_RECEIVER_URL` is set and the size clears the threshold; otherwise
+    the legacy single streaming PUT runs. The dedup HEAD is identical for both,
+    so an already-published blob is skipped before either path is chosen."""
+    digest = f"sha256:{sha256_hash}"
+    headers = {"Authorization": f"Bearer {oci_token}"}
+    check = httpx.head(f"{registry}/v2/{repo_id}/blobs/{digest}", headers=headers, timeout=DEFAULT_HTTP_TIMEOUT)
+    if check.status_code == 200:
+        return False
+
+    receiver_url = resolve_receiver_url()
+    if _should_use_multipart(file_size, receiver_url):
+        # The receiver owns the Harbor handshake (initiate -> reassemble ->
+        # native PUT), so the client does NOT run the /blobs/uploads/ dance here
+        # — it hands the bytes to the receiver in parallel parts and lets the
+        # registry verify the reassembled digest inline.
+        upload_blob_multipart_native(
+            base_url=receiver_url,
+            repo=repo_id,
+            digest=digest,
+            size=file_size,
+            path=file_path,
+            part_size=resolve_multipart_part_size(),
+            auth_token=oci_token,
+        )
+        return True
+
+    _upload_blob_single_put(registry, repo_id, oci_token, file_path, digest)
     return True
 
 
