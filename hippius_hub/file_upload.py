@@ -222,12 +222,25 @@ def _build_dedup_index(existing, registry: str, oci_repo: str, oci_token: str) -
     for layer in manifest.get("layers", []):
         if layer.get("mediaType") == PACK_MEDIA_TYPE:
             pack_sizes[layer["digest"]] = layer["size"]
-    for group in group_files(manifest):
-        if group.layout != CHUNKED_LAYOUT_V2 or group.pointer_digest is None:
-            continue
-        blob = _fetch_blob(registry, oci_repo, group.pointer_digest, oci_token)
-        for ref in parse_pointer_v2(blob):
-            chunk_index.setdefault(ref.chunk_digest, (ref.pack_digest, ref.pack_offset))
+    # Fetch every prior chunked file's pointer blob CONCURRENTLY (independent,
+    # small, read-only GETs) before the first new byte leaves the machine, then
+    # merge in group order so the index stays deterministic (setdefault = first
+    # wins). Uses the shared pooled httpx client, so the fan-out reuses warm
+    # connections instead of re-handshaking per pointer.
+    pointer_digests = [
+        g.pointer_digest
+        for g in group_files(manifest)
+        if g.layout == CHUNKED_LAYOUT_V2 and g.pointer_digest is not None
+    ]
+    if pointer_digests:
+        with ThreadPoolExecutor(max_workers=resolve_upload_workers()) as executor:
+            blobs = list(executor.map(
+                lambda pd: _fetch_blob(registry, oci_repo, pd, oci_token),
+                pointer_digests,
+            ))
+        for blob in blobs:
+            for ref in parse_pointer_v2(blob):
+                chunk_index.setdefault(ref.chunk_digest, (ref.pack_digest, ref.pack_offset))
     return chunk_index, pack_sizes
 
 
@@ -726,17 +739,25 @@ def _upload_one_file(
     registry: str,
     oci_repo: str,
     oci_token: str,
+    dedup_index: Optional[Dict[str, tuple]] = None,
+    pack_sizes: Optional[Dict[str, int]] = None,
 ) -> List[dict]:
     """Upload one file from a folder and return its manifest layer(s).
 
     Returns a LIST because a chunked file contributes a pointer layer plus K
     chunk layers (a plain file contributes one). Extracted from the per-file
     closure in `upload_folder` so the thread-pool body is testable in isolation.
+
+    `dedup_index`/`pack_sizes` come from the prior revision (built once by
+    `upload_folder`) so a chunked file references already-stored chunks by range
+    instead of re-uploading them; empty/None for plain uploads.
     """
     abs_path = os.path.join(base_dir, rel_path)
     repo_title = f"{path_in_repo}/{rel_path}" if path_in_repo else rel_path
     tqdm.write(f"🚀 Uploading: {repo_title} ({os.path.getsize(abs_path)} bytes)...")
-    layers = _upload_file_layers(abs_path, repo_title, registry, oci_repo, oci_token)
+    layers = _upload_file_layers(
+        abs_path, repo_title, registry, oci_repo, oci_token, dedup_index, pack_sizes
+    )
     tqdm.write(f"✅ Uploaded: {repo_title}")
     return layers
 
@@ -942,6 +963,18 @@ def upload_folder(
     registry = resolve_registry(endpoint)
     oci_token = _oci_bearer(oci_repo, token, push=True, endpoint=endpoint)
 
+    # Build the chunked-v2 dedup index ONCE from the prior revision (as upload_file
+    # does) so every large file in the folder references chunks already stored
+    # instead of re-packing and re-uploading them. Read-only and taken before the
+    # fan-out; _finalize_upload_manifest re-fetches for the merge + If-Match, so
+    # this does not widen that write's read-modify-write window. Only built under
+    # HIPPIUS_CHUNKED_WRITE — plain uploads dedup per-blob via HEAD.
+    dedup_index: Dict[str, tuple] = {}
+    pack_sizes: Dict[str, int] = {}
+    if resolve_chunked_write_enabled():
+        prior = fetch_manifest(registry, oci_repo, revision, oci_token, missing_ok=True)
+        dedup_index, pack_sizes = _build_dedup_index(prior, registry, oci_repo, oci_token)
+
     new_layers = []
     if filtered:
         print(f"📦 Preparing to upload {len(filtered)} file(s) to {repo_id}:{revision}...")
@@ -955,6 +988,8 @@ def upload_folder(
                     registry=registry,
                     oci_repo=oci_repo,
                     oci_token=oci_token,
+                    dedup_index=dedup_index,
+                    pack_sizes=pack_sizes,
                 )
                 for rel in filtered
             ]
