@@ -12,13 +12,14 @@ import os
 import shutil
 import subprocess
 import sys
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
 from . import __version__
 from .auth import get_oci_bearer_token, login, resolve_token_value
 from .constants import resolve_registry
 from .file_download import _oci_repo_path, hippius_hub_download
-from ._repo_ops import _list_tags, _manifest_digest, _revision_created
+from ._repo_ops import _list_tags, _revision_digest_and_created
 from . import console
 from .console import ConsoleError
 
@@ -525,13 +526,16 @@ def cmd_revisions(args):
         print("No revisions yet.")
         return
 
-    rows = []
-    for tag in tags:
-        rows.append({
-            "revision": tag,
-            "digest": _manifest_digest(registry, oci_repo, tag, oci_token),
-            "created": _revision_created(registry, oci_repo, tag, oci_token),
-        })
+    # One GET per tag (fetch_manifest returns both the digest header and the created
+    # annotation, so the old per-tag HEAD was redundant), fanned out concurrently:
+    # 2N serial round-trips -> N parallel. Rows are re-sorted below, so completion
+    # order doesn't matter.
+    def _row(tag):
+        digest, created = _revision_digest_and_created(registry, oci_repo, tag, oci_token)
+        return {"revision": tag, "digest": digest, "created": created}
+
+    with ThreadPoolExecutor(max_workers=8) as ex:
+        rows = list(ex.map(_row, tags))
 
     # Newest first: revisions carrying an upload timestamp sort above those
     # without (e.g. pushed by other tooling); ties break on the revision name.
