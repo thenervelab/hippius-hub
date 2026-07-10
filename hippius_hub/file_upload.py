@@ -134,10 +134,11 @@ def _ensure_config_blob_uploaded(registry: str, repo_id: str, oci_token: str) ->
     """Push the empty-object config blob if missing. Returns (digest, size).
 
     Skips the HEAD once this (registry, repo) is confirmed (see
-    `_config_blob_present`). Edge: if every tag in the repo were deleted
-    mid-process the blob could be GC'd and the following manifest PUT would fail
-    loudly -- an acceptable trade for a within-process cache; a fresh process
-    re-confirms on its first upload."""
+    `_config_blob_present`). Edge: if every tag in the repo were deleted mid-process
+    and Harbor GC then reaped the `{}` config, the skip means the following manifest
+    PUT sees a 400 MANIFEST_BLOB_UNKNOWN. `_put_manifest` evicts this cache entry on
+    a persistent BLOB_UNKNOWN, so re-running the upload re-HEADs/re-PUTs the config
+    rather than skipping and failing the same way again."""
     data, digest, size = _empty_config_blob_descriptor()
     cache_key = (registry, repo_id)
     with _config_blob_lock:
@@ -519,6 +520,12 @@ def _put_manifest(
         )
         time.sleep(delay)
 
+    # A BLOB_UNKNOWN that outlived the retry budget may be a blob we cache-skip (the
+    # empty `{}` config), GC'd since we last confirmed it — not the transient
+    # commit-visibility race the retries assume. Evict the config-blob cache entry so
+    # a re-run re-confirms/re-PUTs it instead of skipping and failing identically.
+    if resp is not None and _is_blob_commit_race(resp):
+        _config_blob_present.discard((registry, repo_id))
     raise httpx.HTTPStatusError(
         f"manifest PUT for {repo_id}:{revision} failed with {resp.status_code} "
         f"after {attempt + 1} attempt(s): {_manifest_error_detail(resp)}",

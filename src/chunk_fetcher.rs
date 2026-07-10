@@ -42,7 +42,11 @@ const CHUNK_REQUEST_TIMEOUT: Duration = Duration::from_mins(5);
 /// (kept-alive) connections, not in-flight requests — the per-file `Semaphore`
 /// (`PackAssembler`) and spawn count (`ChunkedDownloader`) are the real concurrency
 /// bounds, so a fixed value is safe regardless of a caller's `max_concurrent`. 32
-/// matches the default `max_concurrent`.
+/// matches the default `max_concurrent`. This does change the pack path's idle-pool
+/// sizing (previously `pool_max_idle_per_host(max_concurrent)`) to a fixed cap; a
+/// caller running `HIPPIUS_MAX_CONCURRENT` above 32 keeps up to 32 warm idle
+/// connections rather than `max_concurrent`, which only affects idle reuse, not the
+/// real (semaphore-bounded) concurrency.
 const DOWNLOAD_POOL_MAX_IDLE: usize = 32;
 
 /// Process-global HTTP/1 client shared by both download paths (pack assembly here

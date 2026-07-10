@@ -17,7 +17,7 @@ pytest_plugins = ["tests.respx_fixtures"]
 
 
 @pytest.fixture(autouse=True)
-def _clear_oci_token_cache():
+def _clear_process_caches():
     """Prevent cross-test contamination of module-level process caches.
 
     Two survive across tests: `auth._OCI_TOKEN_CACHE` (bearer JWTs) and

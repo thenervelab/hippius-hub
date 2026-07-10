@@ -20,7 +20,7 @@ const VERIFY_READ_BUFFER: usize = 8 * 1024 * 1024; // 8 MB read buffer for SHA25
 
 /// Per-chunk request timeout (audit D6).
 ///
-/// The `Client::builder().connect_timeout(30s)` on line 64 covers the
+/// The shared `chunk_fetcher::download_client`'s `connect_timeout(30s)` covers the
 /// TCP handshake; this constant is the FULL-REQUEST budget applied
 /// per chunk GET via `.timeout(...)`. A slow-loris server that
 /// completes the handshake then dribbles bytes can hold a connection
@@ -167,11 +167,15 @@ impl ChunkedDownloader {
         // bubbled an error up. We now collect the spawn-side `AbortHandle`s eagerly
         // and call `.abort()` on every survivor before propagating the error, so
         // the survivors stop at their next await point instead of racing the next
-        // download. The chunk-level HTTP concurrency bound that `buffer_unordered`
-        // used to enforce is now carried by `pool_max_idle_per_host` on the shared
-        // `download_client` (a fixed idle cap) — beyond pool capacity, reqwest
-        // queues HTTP requests on the existing connections, so eager spawn does not
-        // multiply network concurrency.
+        // download. NOTE: this legacy path has no `Semaphore`, so it eager-spawns
+        // one task per chunk and the actual concurrent-connection count IS
+        // `num_chunks` — `pool_max_idle_per_host` on the shared `download_client`
+        // caps only IDLE (retained) connections, NOT in-flight requests (reqwest/
+        // hyper open a new connection rather than queueing an h1 request). At the
+        // 100 MiB default chunk size this is a handful of tasks; a small
+        // caller-set `HIPPIUS_CHUNK_SIZE` on a huge file would open many
+        // connections. Bounding in-flight would need an explicit `Semaphore` like
+        // the pack path (a tracked follow-up).
         let mut joins: FuturesUnordered<tokio::task::JoinHandle<(usize, Result<(), CoreError>)>> =
             FuturesUnordered::new();
         let mut abort_handles: Vec<AbortHandle> = Vec::with_capacity(num_chunks);
@@ -437,8 +441,9 @@ async fn try_download_chunk_to_offset(
     dest_path: &Path,
     pb: &ProgressBar,
 ) -> Result<(), CoreError> {
-    // Audit D6: per-request timeout on the chunk GET. The `Client` (line 97)
-    // sets `connect_timeout(30s)` but no full-request timeout, so a slow-loris
+    // Audit D6: per-request timeout on the chunk GET. The shared
+    // `chunk_fetcher::download_client` sets `connect_timeout(30s)` but no
+    // full-request timeout, so a slow-loris
     // server could hold a TCP open and dribble bytes indefinitely without ever
     // tripping the connect phase. 5 minutes per chunk is generous given the
     // 100 MB `DEFAULT_CHUNK_SIZE` (≈ 333 KB/s floor before timing out) — enough

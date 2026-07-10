@@ -351,7 +351,8 @@ def hf_hub_download(
         )
 
     registry = resolve_registry(endpoint)
-    # _oci_token / _resolved_manifest let snapshot_download avoid N+1 round-trips.
+    # _oci_token / _resolved_manifest / _resolved_group let snapshot_download skip
+    # per-file token, manifest-fetch, and group-parse work (see each kwarg's note).
     # Token resolution + the off-origin credential guard happen inside
     # get_oci_bearer_token, which mints from `registry` (= resolve_registry(endpoint)).
     oci_token = _oci_token or get_oci_bearer_token(oci_repo, token, endpoint=endpoint)
@@ -370,6 +371,14 @@ def hf_hub_download(
         if _resolved_group is not None
         else _resolve_file_group(manifest, filename, repo_id, revision)
     )
+    # Re-assert _resolve_file_group's guard on the threaded path: a snapshot-supplied
+    # group skips that call, so without this a titled plain layer with a falsy digest
+    # would reach the plain path and build a `.../blobs/None` URL instead of raising
+    # the same EntryNotFoundError a direct hf_hub_download would.
+    if not group.is_chunked and not group.digest:
+        raise EntryNotFoundError(
+            f"File '{filename}' not found in the OCI manifest of '{repo_id}:{revision}'"
+        )
     # Chunked files pull K content-addressed chunk blobs in parallel and assemble
     # them; plain files keep the single-blob Range-parallel path unchanged, so
     # every pre-chunking artifact downloads exactly as before.

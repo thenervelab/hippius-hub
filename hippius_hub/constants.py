@@ -86,12 +86,12 @@ KNOWN_LAYOUTS: frozenset = frozenset({CHUNKED_LAYOUT_V2})
 
 
 # ----- transfer tuning knobs -----
-# Defaults mirror the Rust-side constants in src/chunked_downloader.rs so the
-# native engine and the Python layer agree. Each is overridable via env so a
+# Defaults mirror the Rust-side constants in src/chunked_downloader.rs and
+# src/chunk_fetcher.rs so the native engine and the Python layer agree. Each is overridable via env so a
 # user on a slow/restricted link (or we, while diagnosing) can A/B them without
 # rebuilding the extension.
 DEFAULT_CHUNK_SIZE = 100 * 1024 * 1024  # 100 MB; mirrors DEFAULT_CHUNK_SIZE
-DEFAULT_MAX_CONCURRENT = 32             # mirrors MAX_CONCURRENT_DOWNLOADS
+DEFAULT_MAX_CONCURRENT = 32             # default parallel connections; mirrors chunk_fetcher::DOWNLOAD_POOL_MAX_IDLE
 DEFAULT_CONNECT_TIMEOUT = 30            # seconds; mirrors connect_timeout
 DEFAULT_TRANSFER_WORKERS = 8            # snapshot/upload ThreadPoolExecutor size
 

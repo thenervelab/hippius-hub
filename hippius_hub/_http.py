@@ -16,10 +16,13 @@ serializes its own bookkeeping), so the folder/snapshot upload/download
 ThreadPoolExecutors and the metadata fan-outs all share this single instance.
 
 Contract: this module owns ONLY the transport pool. Every call site still passes
-its own ``headers=``/``timeout=``/``params=`` exactly as before, so per-request
-behavior -- including which credential goes to which origin -- is byte-for-byte
-what it was pre-pooling. No auth or routing state is ever baked into the shared
-client, so it can never forward one origin's credential to another.
+its own ``headers=``/``timeout=``/``params=`` exactly as before. Two deliberate,
+benign differences from the old throwaway-per-call clients: a process-wide cookie
+jar now persists ``Set-Cookie`` across same-origin control-plane calls (httpx
+scopes cookies by domain, so nothing crosses origins -- a sticky-session LB
+benefits), and idle connections are reused between calls. No auth is ever baked
+into the client -- credentials are per-request headers -- so it can never forward
+one origin's credential to another.
 """
 from __future__ import annotations
 
@@ -50,15 +53,21 @@ def client() -> httpx.Client:
                     # Keep connections warm across one operation's control-plane
                     # sequence (token -> manifest -> config/blob HEADs -> PUT...);
                     # httpx's 5s default idle expiry would drop them between steps.
-                    # max_keepalive tracks the transfer concurrency so a folder
-                    # fan-out reuses connections instead of re-handshaking.
+                    # max_connections=None keeps the pre-pooling property that
+                    # concurrent control-plane requests are never capped process-wide
+                    # (each throwaway client opened its own connection), so a high
+                    # upload_folder(max_workers=) / HIPPIUS_SNAPSHOT_WORKERS never
+                    # trips a shared httpx.PoolTimeout that the old path couldn't
+                    # produce; up to 32 idle connections are still retained for reuse.
                     limits=httpx.Limits(
                         max_keepalive_connections=32,
-                        max_connections=100,
+                        max_connections=None,
                         keepalive_expiry=30.0,
                     ),
-                    # No client-level timeout: every call site keeps passing its
-                    # own timeout=, so per-request timeout behavior is unchanged.
+                    # No client-level timeout: the call sites that pass timeout= keep
+                    # theirs; the few Harbor admin calls that pass none inherit the
+                    # Client default, which is httpx's Timeout(5.0) -- identical to
+                    # the pre-pooling module-level httpx.get default.
                 )
                 atexit.register(_close)
     return _CLIENT
