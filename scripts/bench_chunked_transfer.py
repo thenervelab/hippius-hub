@@ -89,14 +89,17 @@ def _mutate_middle(src: str, dst: str, patch: int) -> None:
         f.write(data)
 
 
-def _set_mode(chunked: bool, cdc_avg: int) -> None:
-    if chunked:
-        os.environ["HIPPIUS_CHUNKED_WRITE"] = "1"
-        os.environ["HIPPIUS_CHUNK_THRESHOLD"] = "1"
-        os.environ["HIPPIUS_CDC_AVG_SIZE"] = str(cdc_avg)
-    else:
+def _set_mode(mode: str, cdc_avg: int) -> None:
+    """Point the uploader at one of: 'plain', 'v1' (chunk blobs), 'v2' (packs)."""
+    if mode == "plain":
         os.environ["HIPPIUS_CHUNKED_WRITE"] = "0"
         os.environ.pop("HIPPIUS_CHUNK_THRESHOLD", None)
+        os.environ.pop("HIPPIUS_CHUNKED_LAYOUT", None)
+        return
+    os.environ["HIPPIUS_CHUNKED_WRITE"] = "1"
+    os.environ["HIPPIUS_CHUNK_THRESHOLD"] = "1"
+    os.environ["HIPPIUS_CDC_AVG_SIZE"] = str(cdc_avg)
+    os.environ["HIPPIUS_CHUNKED_LAYOUT"] = "v2" if mode == "v2" else "v1"
 
 
 def _time(fn) -> float:
@@ -249,33 +252,39 @@ def _harbor_probe(registry: str, oci_repo: str, token: str, probe: int) -> list:
 # ---------------- main ----------------
 
 def _transfer_rows(work: str, repo: str, tag: str, size: int, runs: int, cdc_avg: int) -> list:
-    """Median-of-`runs` upload/download for plain then chunked, fresh content each run."""
-    plain, chunked = {"up": [], "down": []}, {"up": [], "down": []}
+    """Median-of-`runs` upload/download for plain, v1 (chunk blobs) and v2 (packs).
+
+    Fresh random content each run so every upload actually transfers. v2's win is
+    fewer round-trips (~size/64MiB pack PUTs vs ~size/4MiB chunk PUTs), so this is
+    where the pack layout should show a lower upload wall-clock than v1.
+    """
+    modes = [("plain (prod baseline)", "plain", "cp"),
+             ("v1 (chunk blobs)", "v1", "c1"),
+             ("v2 (packs)", "v2", "c2")]
+    times = {label: {"up": [], "down": []} for label, _m, _d in modes}
     src = os.path.join(work, "bench.bin")
     for r in range(runs):
-        _fill_random(src, size)  # fresh bytes so each run actually transfers
-        _set_mode(chunked=False, cdc_avg=cdc_avg)
-        p = _upload_download(src, repo, f"bench-{tag}-plain-{r}", os.path.join(work, "cp"), size)
-        _set_mode(chunked=True, cdc_avg=cdc_avg)
-        c = _upload_download(src, repo, f"bench-{tag}-chunked-{r}", os.path.join(work, "cc"), size)
-        for k in ("up", "down"):
-            plain[k].append(p[k])
-            chunked[k].append(c[k])
-        shutil.rmtree(os.path.join(work, "cp"), ignore_errors=True)
-        shutil.rmtree(os.path.join(work, "cc"), ignore_errors=True)
-    return [
+        _fill_random(src, size)
+        for label, mode, cache in modes:
+            _set_mode(mode, cdc_avg)
+            res = _upload_download(src, repo, f"bench-{tag}-{mode}-{r}", os.path.join(work, cache), size)
+            times[label]["up"].append(res["up"])
+            times[label]["down"].append(res["down"])
+            shutil.rmtree(os.path.join(work, cache), ignore_errors=True)
+    rows = [
         "### Transfer wall-clock (median of "
         f"{runs} run{'s' if runs > 1 else ''}, fresh content each)",
         "| mode | upload | download |",
         "|------|-------:|---------:|",
-        f"| plain (prod baseline) | {_stat(plain['up'])} | {_stat(plain['down'])} |",
-        f"| chunked | {_stat(chunked['up'])} | {_stat(chunked['down'])} |",
     ]
+    rows += [f"| {label} | {_stat(times[label]['up'])} | {_stat(times[label]['down'])} |"
+             for label, _m, _d in modes]
+    return rows
 
 
 def _incremental_rows(work, repo, tag, registry, oci_repo, token, size, patch, cdc_avg) -> list:
     """The dedup win: a localized edit re-uploads only the changed chunks."""
-    _set_mode(chunked=True, cdc_avg=cdc_avg)
+    _set_mode("v1", cdc_avg)  # dedup diff reads v1 chunk layers; v2 dedup is proven by e2e
     v1 = os.path.join(work, "v1", "bench.bin")
     os.makedirs(os.path.dirname(v1), exist_ok=True)
     _fill_random(v1, size)
