@@ -14,7 +14,9 @@ use futures::stream::{FuturesUnordered, StreamExt};
 use indicatif::{ProgressBar, ProgressStyle};
 use reqwest::Client;
 use sha2::{Digest, Sha256};
+use std::collections::HashMap;
 use std::path::Path;
+use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use tokio::fs::OpenOptions;
@@ -93,6 +95,21 @@ fn global_pack_gate(max_concurrent: usize) -> Arc<Semaphore> {
     Arc::clone(GATE.get_or_init(|| Arc::new(Semaphore::new(max_concurrent))))
 }
 
+/// Extents `(file_offset, size)` one completed pack contributes to the whole-file
+/// hasher — the payload of the incremental-hash channel. One byte of the file
+/// belongs to exactly one extent, so the extents across all packs tile the file.
+type HashSignal = Vec<(u64, u64)>;
+
+/// The join handle for the background incremental hasher; yields the whole-file
+/// digest, or `None` when the incremental pass could not cover the file (see
+/// `incremental_hash`).
+type HasherTask = tokio::task::JoinHandle<Option<String>>;
+
+/// What `spawn_incremental_hasher` hands back: the sender each pack signals
+/// completion on and the task handle to await, or `(None, None)` when the caller
+/// requested no whole-file digest.
+type IncrementalHash = (Option<Sender<HashSignal>>, Option<HasherTask>);
+
 /// One chunk to carve out of a fetched pack: where it sits in the pack, its size,
 /// where it lands in the assembled file, and its content digest (hex, no prefix).
 pub struct PackChunkTarget {
@@ -144,6 +161,7 @@ impl PackAssembler {
         expected_file_sha256: Option<&str>,
         total_size: u64,
     ) -> Result<Option<String>, CoreError> {
+        validate_pack_plan(packs, total_size)?;
         let parent = dest.parent().unwrap_or_else(|| Path::new("."));
         tokio::fs::create_dir_all(parent).await?;
         {
@@ -167,6 +185,13 @@ impl PackAssembler {
         );
         pb.set_message("📥 Downloading packs");
 
+        // Verify the whole-file digest incrementally, overlapped with the fetch,
+        // instead of a second full read afterwards (see `spawn_incremental_hasher` /
+        // `incremental_hash`). Best-effort: it falls back to a full re-read if it
+        // cannot cover the file in order, so correctness never depends on it.
+        let (hash_tx, hasher_task) =
+            spawn_incremental_hasher(dest, total_size, expected_file_sha256.is_some());
+
         let mut joins: FuturesUnordered<tokio::task::JoinHandle<(usize, Result<(), CoreError>)>> =
             FuturesUnordered::new();
         let mut abort_handles: Vec<AbortHandle> = Vec::with_capacity(packs.len());
@@ -187,6 +212,7 @@ impl PackAssembler {
             let pack_pb = pb.clone();
             let permits = Arc::clone(&permits);
             let global = Arc::clone(&global);
+            let hash_tx = hash_tx.clone();
 
             let handle = tokio::spawn(async move {
                 // Per-file permit bounds THIS file's concurrency; the global permit
@@ -204,11 +230,26 @@ impl PackAssembler {
                     &client, &url, token.as_deref(), pack_size, &targets, &path, &pack_pb,
                 )
                 .await;
+                if res.is_ok() {
+                    if let Some(tx) = &hash_tx {
+                        // Signal the file-offset extents this pack verified+wrote, once,
+                        // only AFTER the retry loop succeeded — a retried pack must not
+                        // double-count. A closed channel means the hasher task already
+                        // exited (error/abort), so a dropped signal merely forgoes the
+                        // incremental fast path; the whole-file check then re-reads.
+                        let done: HashSignal = targets.iter().map(|t| (t.2, t.1)).collect();
+                        let _ = tx.send(done);
+                    }
+                }
                 (i, res)
             });
             abort_handles.push(handle.abort_handle());
             joins.push(handle);
         }
+        // Drop the original sender so the channel closes once every pack task has
+        // finished (each task holds its own clone); that unblocks the hasher task's
+        // final `recv` and lets it finalize (or fall back).
+        drop(hash_tx);
 
         while let Some(res) = joins.next().await {
             match res {
@@ -230,16 +271,79 @@ impl PackAssembler {
         pb.finish_with_message("✅ Packs complete");
 
         if let Some(expected_file) = expected_file_sha256 {
-            let got = compute_sha256(dest).await?;
-            if got != expected_file {
-                return Err(CoreError::Integrity(format!(
-                    "assembled file: expected sha256 {expected_file}, got {got}"
-                )));
-            }
-            return Ok(Some(got));
+            return Ok(Some(verify_file_digest(hasher_task, dest, expected_file).await?));
         }
         Ok(None)
     }
+}
+
+/// Reject a pack plan whose chunk placement would write outside the declared file
+/// length, before any byte is fetched. `fetch_pack` writes each chunk at its
+/// `file_offset` with `seek`+`write_all`, which silently extends the file past
+/// `total_size` (leaving a zero hole) for an out-of-bounds chunk; that file hashes
+/// differently from `[0, total_size)`, so a malformed or adversarial plan could
+/// otherwise append trailing bytes to an otherwise-verifying file. Catching it here
+/// keeps the assembled file exactly `total_size` bytes, which is what both the
+/// incremental hasher and the `compute_sha256` fallback assume. `checked_add` guards
+/// a `file_offset + size` that would itself overflow `u64`.
+fn validate_pack_plan(packs: &[PackPlanEntry], total_size: u64) -> Result<(), CoreError> {
+    for pack in packs {
+        for c in &pack.chunks {
+            let end = c.file_offset.checked_add(c.size).ok_or_else(|| {
+                CoreError::Integrity(format!("chunk at file offset {} size {} overflows u64", c.file_offset, c.size))
+            })?;
+            if end > total_size {
+                return Err(CoreError::Integrity(format!(
+                    "chunk at file offset {} size {} overruns file length {total_size}",
+                    c.file_offset, c.size
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Spawn the background incremental hasher (see `incremental_hash`) when the caller
+/// asked for whole-file verification, handing back the sender packs signal
+/// completion on and the task handle to await. Returns `(None, None)` when no digest
+/// was requested, so the fan-out and finalize paths stay uniform either way.
+fn spawn_incremental_hasher(dest: &Path, total_size: u64, verify: bool) -> IncrementalHash {
+    if !verify {
+        return (None, None);
+    }
+    let (tx, rx) = std::sync::mpsc::channel::<HashSignal>();
+    let hash_path = dest.to_path_buf();
+    let task = tokio::task::spawn_blocking(move || incremental_hash(&rx, &hash_path, total_size));
+    (Some(tx), Some(task))
+}
+
+/// Resolve the whole-file digest once every pack has landed: prefer the digest the
+/// background hasher computed (its work overlapped the download), else fall back to
+/// a full re-read when the incremental pass could not cover the file in order. Both
+/// hash the same on-disk bytes, so the fallback is a slower route to an identical
+/// answer. A `JoinError` means the hasher task panicked — surfaced rather than
+/// masked (the fn is written not to panic, so it is effectively unreachable, but a
+/// silent fallback would hide a real defect). Errors on a digest mismatch, which is
+/// exactly the cross-pack ordering failure this whole-file check exists to catch.
+async fn verify_file_digest(
+    hasher_task: Option<HasherTask>,
+    dest: &Path,
+    expected_file: &str,
+) -> Result<String, CoreError> {
+    let got = match hasher_task {
+        Some(task) => match task.await {
+            Ok(Some(digest)) => digest,
+            Ok(None) => compute_sha256(dest).await?,
+            Err(join_err) => return Err(CoreError::Io(std::io::Error::other(join_err))),
+        },
+        None => compute_sha256(dest).await?,
+    };
+    if got != expected_file {
+        return Err(CoreError::Integrity(format!(
+            "assembled file: expected sha256 {expected_file}, got {got}"
+        )));
+    }
+    Ok(got)
 }
 
 async fn fetch_pack_with_retry(
@@ -347,6 +451,75 @@ async fn compute_sha256(path: &Path) -> Result<String, CoreError> {
     .map_err(|join_err| CoreError::Io(std::io::Error::other(join_err)))?
 }
 
+/// Whole-file SHA-256 folded together incrementally from packs as they land, used
+/// to prove chunk *ordering* across packs (the one property per-chunk digests
+/// cannot). Runs on the blocking pool for the same reason as `compute_sha256`: the
+/// digest loop is CPU-bound and would starve the runtime's fetch tasks inline.
+///
+/// Each `recv` carries the `(file_offset, size)` extents one completed pack wrote.
+/// `pending` (keyed by start offset) is the reorder buffer for out-of-order packs;
+/// it holds only metadata — the bytes are already on disk — so it stays a few bytes
+/// per chunk and can never grow to the file size the way an in-memory byte reorder
+/// buffer would. `watermark` is the end of the region contiguously covered from
+/// offset 0; it advances only when the extent starting exactly at the watermark has
+/// arrived. Whenever the watermark moves past `hashed`, the newly-contiguous span is
+/// read straight from the just-written (page-cache-warm) file and folded into the
+/// hasher, in strict offset order. Reads and the concurrent pack writes never touch
+/// the same bytes (each byte is written once and flushed before its extent is
+/// signalled), so the separate read handle is page-cache-coherent without locking.
+///
+/// Best-effort by contract: returns `Some(digest)` ONLY after consuming exactly
+/// `[0, total_size)` in order AND draining every signalled extent (so no pack wrote
+/// past `total_size`); any shortfall — an abort closing the channel early, a coverage
+/// gap, a read error, or an out-of-bounds extent left in `pending` — yields `None` so
+/// the caller re-reads. It therefore hashes the identical bytes `compute_sha256`
+/// would and can only ever be a faster route to the same digest, never a different
+/// verdict.
+fn incremental_hash(rx: &Receiver<HashSignal>, path: &Path, total_size: u64) -> Option<String> {
+    use std::io::Read;
+
+    let mut file = std::fs::File::open(path).ok()?;
+    let mut hasher = Sha256::new();
+    let mut buf = vec![0u8; VERIFY_READ_BUFFER];
+    let mut pending: HashMap<u64, u64> = HashMap::new();
+    // Invariant: `hashed` == the file read position == bytes folded into `hasher`,
+    // and `hashed <= watermark <= total_size` holds throughout.
+    let mut watermark: u64 = 0;
+    let mut hashed: u64 = 0;
+
+    while let Ok(extents) = rx.recv() {
+        for (start, size) in extents {
+            pending.insert(start, size);
+        }
+        while let Some(size) = pending.remove(&watermark) {
+            watermark = watermark.checked_add(size)?;
+        }
+        while hashed < watermark {
+            let want = usize::try_from((watermark - hashed).min(buf.len() as u64)).ok()?;
+            let n = file.read(&mut buf[..want]).ok()?;
+            if n == 0 {
+                return None; // file shorter than the extents claimed — give up, re-read
+            }
+            hasher.update(&buf[..n]);
+            hashed += n as u64;
+        }
+    }
+
+    // Channel closed: every pack task has finished. Require BOTH that the hash
+    // covered exactly `total_size` AND that `pending` drained. A leftover extent
+    // means a pack wrote beyond the contiguous [0, total_size) region — an
+    // out-of-bounds placement leaves the on-disk file longer than total_size — so
+    // returning the prefix digest here would ACCEPT a file the full re-read rejects.
+    // Any leftover instead forces None, and the caller re-reads to EOF and catches
+    // it. (validate_pack_plan already rejects such plans up front; this is the
+    // matching defense inside the hasher so the two paths can never disagree.)
+    if hashed == total_size && pending.is_empty() {
+        Some(hex::encode(hasher.finalize()))
+    } else {
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -374,5 +547,382 @@ mod tests {
     fn assembler_new_builds() {
         let a = PackAssembler::new(Some("tok".into()), 16);
         assert!(a.is_ok());
+    }
+
+    // --- incremental_hash ---
+    //
+    // The contract under test: for ANY file content, ANY chunk tiling, and ANY
+    // order the completion signals arrive in, `incremental_hash` yields the plain
+    // sequential SHA-256 of the file — or `None` (never a wrong digest) when it
+    // cannot cover the file. Tests avoid `unwrap`/`expect` (crate-wide `deny`) by
+    // returning `io::Result` and using `?`.
+    use std::io::Write as _;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
+
+    /// RAII guard: removes the scratch file on drop so a failing assertion (which
+    /// returns early) still cleans up. Ignoring the remove error is intentional —
+    /// a leftover temp file is harmless and there is nothing to recover.
+    struct TempFileGuard(PathBuf);
+    impl Drop for TempFileGuard {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
+    /// Distinct scratch path per call (process id + monotonic counter) so parallel
+    /// tests never collide.
+    fn scratch_path(tag: &str) -> PathBuf {
+        let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!("hippius_ihash_{tag}_{}_{seq}.bin", std::process::id()))
+    }
+
+    /// A varied (non-constant) byte pattern so a mis-ordering across a chunk
+    /// boundary changes the digest — a constant fill would hide reorder bugs.
+    fn pattern(n: usize) -> Vec<u8> {
+        let seed = b"HIPPIUS-hub-chunked-v2";
+        (0..n).map(|i| seed[i % seed.len()]).collect()
+    }
+
+    fn reference(content: &[u8]) -> String {
+        hex::encode(Sha256::digest(content))
+    }
+
+    /// Write `content`, push each message (a pack's extents) onto the channel, then
+    /// run the hasher to completion. Messages are enqueued before the sender drops,
+    /// so `recv` drains them in order and the buffered-then-closed channel models a
+    /// batch of packs completing in the given order.
+    fn drive(content: &[u8], messages: &[Vec<(u64, u64)>]) -> std::io::Result<Option<String>> {
+        let path = scratch_path("unit");
+        let _guard = TempFileGuard(path.clone());
+        std::fs::File::create(&path)?.write_all(content)?;
+        let (tx, rx) = std::sync::mpsc::channel::<Vec<(u64, u64)>>();
+        for m in messages {
+            let _ = tx.send(m.clone());
+        }
+        drop(tx);
+        Ok(incremental_hash(&rx, &path, content.len() as u64))
+    }
+
+    // Tests return `()` and assert (the crate denies both `unwrap`/`expect` AND
+    // `panic_in_result_fn`, so a `Result`-returning test with `assert_eq!` is
+    // rejected): `drive` carries the fallible I/O and its `.ok()` folds a setup
+    // failure into `None`, which the assertion then flags as a test failure.
+    #[test]
+    fn incremental_in_order_matches_reference() {
+        let content = pattern(1000);
+        let msgs = vec![vec![(0, 400)], vec![(400, 300)], vec![(700, 300)]];
+        assert_eq!(drive(&content, &msgs).ok(), Some(Some(reference(&content))));
+    }
+
+    #[test]
+    fn incremental_reverse_order_matches_reference() {
+        let content = pattern(1000);
+        let msgs = vec![vec![(700, 300)], vec![(400, 300)], vec![(0, 400)]];
+        assert_eq!(drive(&content, &msgs).ok(), Some(Some(reference(&content))));
+    }
+
+    #[test]
+    fn incremental_multichunk_pack_before_prefix() {
+        // A pack carrying two non-leading extents arrives before the pack that
+        // fills [0, 400): the watermark must stay parked until the gap closes.
+        let content = pattern(1000);
+        let msgs = vec![vec![(400, 300), (700, 300)], vec![(0, 400)]];
+        assert_eq!(drive(&content, &msgs).ok(), Some(Some(reference(&content))));
+    }
+
+    #[test]
+    fn incremental_single_chunk_covers_whole_file() {
+        let content = pattern(777);
+        let msgs = vec![vec![(0, content.len() as u64)]];
+        assert_eq!(drive(&content, &msgs).ok(), Some(Some(reference(&content))));
+    }
+
+    #[test]
+    fn incremental_incomplete_coverage_returns_none() {
+        // The final [700, 1000) extent never arrives, so the file is never fully
+        // covered: must yield None (→ caller re-reads), not a partial digest.
+        let content = pattern(1000);
+        let msgs = vec![vec![(0, 400)], vec![(400, 300)]];
+        assert_eq!(drive(&content, &msgs).ok(), Some(None));
+    }
+
+    #[test]
+    fn incremental_empty_file_hashes_empty() {
+        // total_size == 0: no extents, channel closes immediately, hashed == 0 ==
+        // total_size → the SHA-256 of the empty input.
+        let content: Vec<u8> = Vec::new();
+        assert_eq!(drive(&content, &[]).ok(), Some(Some(reference(&content))));
+    }
+
+    #[tokio::test]
+    async fn incremental_agrees_with_compute_sha256() {
+        // Pin that the incremental path yields the byte-for-byte same digest as the
+        // authoritative re-read it is allowed to replace.
+        let content = pattern(5000);
+        let path = scratch_path("cmp");
+        let _guard = TempFileGuard(path.clone());
+        let wrote = std::fs::File::create(&path).and_then(|mut f| f.write_all(&content));
+        assert!(wrote.is_ok());
+        let authoritative = compute_sha256(&path).await.ok();
+        assert!(authoritative.is_some());
+        let (tx, rx) = std::sync::mpsc::channel::<Vec<(u64, u64)>>();
+        let _ = tx.send(vec![(0, content.len() as u64)]);
+        drop(tx);
+        assert_eq!(incremental_hash(&rx, &path, content.len() as u64), authoritative);
+    }
+
+    proptest::proptest! {
+        // For any content, any tiling into extents, and any completion order, the
+        // incremental digest equals the sequential SHA-256. The shrinker surfaces
+        // reorder-bookkeeping bugs a hand-picked fixture would miss (axiom 111).
+        #[test]
+        fn incremental_agrees_with_reference_under_any_completion_order(
+            content in proptest::collection::vec(proptest::prelude::any::<u8>(), 0..4096usize),
+            raw_bounds in proptest::collection::vec(0..4096usize, 0..12usize),
+            priorities in proptest::collection::vec(proptest::prelude::any::<u64>(), 0..16usize),
+        ) {
+            let len = content.len();
+            // Build extents [start, size) tiling [0, len) from sorted unique interior bounds.
+            let mut bounds: Vec<usize> = raw_bounds.into_iter().filter(|&b| b > 0 && b < len).collect();
+            bounds.sort_unstable();
+            bounds.dedup();
+            let mut extents: Vec<(u64, u64)> = Vec::new();
+            let mut prev = 0usize;
+            for b in bounds {
+                extents.push((prev as u64, (b - prev) as u64));
+                prev = b;
+            }
+            if len > 0 {
+                extents.push((prev as u64, (len - prev) as u64));
+            }
+            // Permute the completion order deterministically from `priorities` (an
+            // unstable sort of 0..n by any key is always a valid permutation).
+            let n = extents.len();
+            let mut order: Vec<usize> = (0..n).collect();
+            order.sort_unstable_by_key(|&i| priorities.get(i).copied().unwrap_or(0));
+
+            let path = scratch_path("pt");
+            let _guard = TempFileGuard(path.clone());
+            proptest::prop_assert!(std::fs::write(&path, &content).is_ok());
+            let (tx, rx) = std::sync::mpsc::channel::<Vec<(u64, u64)>>();
+            for &i in &order {
+                let _ = tx.send(vec![extents[i]]);
+            }
+            drop(tx);
+            let got = incremental_hash(&rx, &path, len as u64);
+            proptest::prop_assert_eq!(got, Some(reference(&content)));
+        }
+    }
+
+    // --- validate_pack_plan ---
+
+    fn chunk_target(offset_in_pack: u64, size: u64, file_offset: u64, sha: String) -> PackChunkTarget {
+        PackChunkTarget { offset_in_pack, size, file_offset, expected_sha256: sha }
+    }
+
+    #[test]
+    fn validate_pack_plan_accepts_in_bounds_tiling() {
+        let packs = vec![PackPlanEntry {
+            url: String::new(),
+            size: 1000,
+            chunks: vec![chunk_target(0, 400, 0, String::new()), chunk_target(400, 600, 400, String::new())],
+        }];
+        assert!(validate_pack_plan(&packs, 1000).is_ok());
+    }
+
+    #[test]
+    fn validate_pack_plan_rejects_out_of_bounds_chunk() {
+        // A chunk at file_offset 1005 in a 1000-byte file would extend the assembled
+        // file past total_size — exactly the over-length false-accept the whole-file
+        // digest must never miss. It must be rejected before any fetch.
+        let packs = vec![PackPlanEntry {
+            url: String::new(),
+            size: 1100,
+            chunks: vec![chunk_target(0, 1000, 0, String::new()), chunk_target(1000, 100, 1005, String::new())],
+        }];
+        assert!(matches!(validate_pack_plan(&packs, 1000), Err(CoreError::Integrity(_))));
+    }
+
+    #[test]
+    fn validate_pack_plan_rejects_offset_size_overflow() {
+        let packs = vec![PackPlanEntry {
+            url: String::new(),
+            size: 10,
+            chunks: vec![chunk_target(0, u64::MAX, 1, String::new())],
+        }];
+        assert!(matches!(validate_pack_plan(&packs, u64::MAX), Err(CoreError::Integrity(_))));
+    }
+
+    #[test]
+    fn incremental_extent_beyond_total_size_returns_none() {
+        // A stray extent past total_size (a pack that wrote beyond the file end) must
+        // NOT be accepted via the [0, total_size) prefix: the leftover in `pending`
+        // forces None so the caller re-reads to EOF and catches the over-length file.
+        let content = pattern(1000);
+        let msgs = vec![vec![(0, 1000)], vec![(1005, 100)]];
+        assert_eq!(drive(&content, &msgs).ok(), Some(None));
+    }
+
+    // --- verify_file_digest (fallback / mismatch / JoinError wiring) ---
+
+    #[tokio::test]
+    async fn verify_file_digest_prefers_incremental_without_reread() {
+        // Some(correct) is returned directly; `missing` never exists, so a stray
+        // fallback re-read would error and fail this assertion.
+        let missing = scratch_path("verify_fast");
+        let expected = reference(b"payload");
+        let e = expected.clone();
+        let task = tokio::spawn(async move { Some(e) });
+        assert_eq!(verify_file_digest(Some(task), &missing, &expected).await.ok(), Some(expected));
+    }
+
+    #[tokio::test]
+    async fn verify_file_digest_falls_back_to_reread_when_incremental_none() {
+        let content = pattern(2048);
+        let path = scratch_path("verify_fallback");
+        let _g = TempFileGuard(path.clone());
+        let wrote = std::fs::File::create(&path).and_then(|mut f| f.write_all(&content));
+        assert!(wrote.is_ok());
+        let task = tokio::spawn(async { None });
+        assert_eq!(verify_file_digest(Some(task), &path, &reference(&content)).await.ok(), Some(reference(&content)));
+    }
+
+    #[tokio::test]
+    async fn verify_file_digest_none_task_reads_from_disk() {
+        let content = pattern(2048);
+        let path = scratch_path("verify_notask");
+        let _g = TempFileGuard(path.clone());
+        let wrote = std::fs::File::create(&path).and_then(|mut f| f.write_all(&content));
+        assert!(wrote.is_ok());
+        assert_eq!(verify_file_digest(None, &path, &reference(&content)).await.ok(), Some(reference(&content)));
+    }
+
+    #[tokio::test]
+    async fn verify_file_digest_rejects_mismatch() {
+        // Incremental yields a digest that disagrees with `expected` -> Integrity, not
+        // an accept. Guards the `got != expected_file` comparison against inversion.
+        let missing = scratch_path("verify_mismatch");
+        let task = tokio::spawn(async { Some("a".repeat(64)) });
+        let expected = "b".repeat(64);
+        assert!(matches!(verify_file_digest(Some(task), &missing, &expected).await, Err(CoreError::Integrity(_))));
+    }
+
+    #[tokio::test]
+    async fn verify_file_digest_surfaces_hasher_join_error_as_io() {
+        // A JoinError (task cancelled/panicked) surfaces as CoreError::Io rather than
+        // being masked. Aborting a pending task yields the JoinError without a panic!
+        // macro (which the crate denies).
+        let missing = scratch_path("verify_join");
+        let task: HasherTask = tokio::spawn(async { std::future::pending::<Option<String>>().await });
+        task.abort();
+        assert!(matches!(verify_file_digest(Some(task), &missing, &"c".repeat(64)).await, Err(CoreError::Io(_))));
+    }
+
+    // --- assemble (end-to-end orchestration over a local pack server) ---
+
+    /// Minimal HTTP/1 server for tests: serves each registered path's bytes as a 200
+    /// with Content-Length and `connection: close` (one request per connection, so
+    /// there is no keep-alive framing to parse). Returns the base URL; the accept loop
+    /// lives in a spawned task the test's runtime cancels on completion.
+    async fn serve_packs(routes: HashMap<String, Vec<u8>>) -> std::io::Result<String> {
+        use tokio::io::AsyncReadExt as _;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let addr = listener.local_addr()?;
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let routes = routes.clone();
+                tokio::spawn(async move {
+                    let mut req = Vec::new();
+                    let mut tmp = [0u8; 1024];
+                    while !req.windows(4).any(|w| w == b"\r\n\r\n") {
+                        match sock.read(&mut tmp).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => req.extend_from_slice(&tmp[..n]),
+                        }
+                    }
+                    let head = String::from_utf8_lossy(&req);
+                    let path = head.lines().next().and_then(|l| l.split(' ').nth(1)).unwrap_or("/");
+                    let (status, body): (&str, &[u8]) = match routes.get(path) {
+                        Some(b) => ("200 OK", b.as_slice()),
+                        None => ("404 Not Found", b"".as_slice()),
+                    };
+                    let resp = format!("HTTP/1.1 {status}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n", body.len());
+                    let _ = sock.write_all(resp.as_bytes()).await;
+                    let _ = sock.write_all(body).await;
+                    let _ = sock.shutdown().await;
+                });
+            }
+        });
+        Ok(format!("http://{addr}"))
+    }
+
+    /// A 3000-byte file split into three 1000-byte chunks across two packs, with the
+    /// leading and trailing chunks scattered into pack A (non-contiguous file offsets)
+    /// and the middle chunk in pack B — so the plan exercises cross-pack scatter and
+    /// out-of-order arrival, not a trivial single-pack copy.
+    fn three_pack_plan(base: &str, content: &[u8]) -> Vec<PackPlanEntry> {
+        vec![
+            PackPlanEntry {
+                url: format!("{base}/packA"),
+                size: 2000,
+                chunks: vec![
+                    chunk_target(0, 1000, 0, reference(&content[0..1000])),
+                    chunk_target(1000, 1000, 2000, reference(&content[2000..3000])),
+                ],
+            },
+            PackPlanEntry {
+                url: format!("{base}/packB"),
+                size: 1000,
+                chunks: vec![chunk_target(0, 1000, 1000, reference(&content[1000..2000]))],
+            },
+        ]
+    }
+
+    #[tokio::test]
+    async fn assemble_reconstructs_scattered_packs_and_verifies() {
+        let content = pattern(3000);
+        let pack_a = [&content[0..1000], &content[2000..3000]].concat();
+        let pack_b = content[1000..2000].to_vec();
+        let mut routes = HashMap::new();
+        routes.insert("/packA".to_string(), pack_a);
+        routes.insert("/packB".to_string(), pack_b);
+        let Some(base) = serve_packs(routes).await.ok() else { return };
+        let dest = scratch_path("asm_ok");
+        let _g = TempFileGuard(dest.clone());
+        let Some(assembler) = PackAssembler::new(None, 4).ok() else { return };
+        let packs = three_pack_plan(&base, &content);
+        // Timeout-guarded: a channel-lifecycle regression (e.g. dropping `drop(hash_tx)`)
+        // would hang the hasher's recv forever, surfacing here as a failure not a hang.
+        let expected = reference(&content);
+        let fut = assembler.assemble(&dest, &packs, Some(&expected), content.len() as u64);
+        let digest = match tokio::time::timeout(Duration::from_secs(30), fut).await {
+            Ok(Ok(Some(d))) => Some(d),
+            _ => None,
+        };
+        assert_eq!(digest, Some(expected));
+    }
+
+    #[tokio::test]
+    async fn assemble_rejects_wrong_whole_file_digest() {
+        let content = pattern(3000);
+        let pack_a = [&content[0..1000], &content[2000..3000]].concat();
+        let pack_b = content[1000..2000].to_vec();
+        let mut routes = HashMap::new();
+        routes.insert("/packA".to_string(), pack_a);
+        routes.insert("/packB".to_string(), pack_b);
+        let Some(base) = serve_packs(routes).await.ok() else { return };
+        let dest = scratch_path("asm_bad");
+        let _g = TempFileGuard(dest.clone());
+        let Some(assembler) = PackAssembler::new(None, 4).ok() else { return };
+        let packs = three_pack_plan(&base, &content);
+        // The bytes assemble correctly, but the declared whole-file digest disagrees:
+        // the cross-pack ordering check must reject with Integrity.
+        let wrong = "f".repeat(64);
+        let fut = assembler.assemble(&dest, &packs, Some(&wrong), content.len() as u64);
+        let got = tokio::time::timeout(Duration::from_secs(30), fut).await;
+        assert!(matches!(got, Ok(Err(CoreError::Integrity(_)))));
     }
 }
