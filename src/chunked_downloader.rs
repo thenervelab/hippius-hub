@@ -15,8 +15,6 @@ use tokio::task::AbortHandle;
 use crate::error::CoreError;
 
 const DEFAULT_CHUNK_SIZE: u64 = 100 * 1024 * 1024; // 100 MB default
-const MAX_CONCURRENT_DOWNLOADS: usize = 32; // default; overridable via HIPPIUS_MAX_CONCURRENT
-const DEFAULT_CONNECT_TIMEOUT_SECS: u64 = 30;
 const MAX_RETRIES: u32 = 3;
 const VERIFY_READ_BUFFER: usize = 8 * 1024 * 1024; // 8 MB read buffer for SHA256 verification
 
@@ -85,17 +83,14 @@ pub struct ChunkedDownloader {
 impl ChunkedDownloader {
     /// Construct a new concurrent downloader.
     pub fn new(url: String, auth_token: Option<String>, chunk_size_bytes: Option<u64>) -> Result<Self, CoreError> {
-        // Force HTTP/1.1: with h2 reqwest multiplexes all chunks on a single TCP,
-        // which caps aggregate throughput at the per-connection BBR ceiling (~150 MB/s
-        // even on a fast edge). Forcing h1 makes each parallel chunk get its own TCP,
-        // letting the kernel/qdisc fan out across the available bandwidth.
-        let client = Client::builder()
-            .connect_timeout(Duration::from_secs(DEFAULT_CONNECT_TIMEOUT_SECS))
-            .http1_only()
-            .pool_max_idle_per_host(MAX_CONCURRENT_DOWNLOADS)
-            .tcp_keepalive(Duration::from_secs(30))
-            .build()?;
-
+        // Clone the process-global download client (shared with the pack path)
+        // rather than building a fresh client + empty pool per file, so connections
+        // stay warm across back-to-back downloads. It is HTTP/1-only for the same
+        // reason as before: with h2 reqwest multiplexes all chunks on a single TCP
+        // and caps aggregate throughput at the per-connection ceiling, whereas h1
+        // lets each parallel chunk get its own TCP and fan out across the available
+        // bandwidth. See `chunk_fetcher::download_client`.
+        let client = crate::chunk_fetcher::download_client()?.clone();
         Ok(Self {
             client,
             url,
@@ -164,7 +159,7 @@ impl ChunkedDownloader {
         // 3. Launch concurrent downloads — each streams directly to its
         //    correct offset in the final file.
         //
-        // Audit D4: previously this used `buffer_unordered(MAX_CONCURRENT_DOWNLOADS)`
+        // Audit D4: previously this used `buffer_unordered(32)`
         // and early-returned on the first error, but dropping the `Buffered` stream
         // does NOT cancel the `tokio::spawn`'d tasks behind it — `JoinHandle::drop`
         // detaches a tokio task, leaving it running in the background where it
@@ -172,12 +167,11 @@ impl ChunkedDownloader {
         // bubbled an error up. We now collect the spawn-side `AbortHandle`s eagerly
         // and call `.abort()` on every survivor before propagating the error, so
         // the survivors stop at their next await point instead of racing the next
-        // download. The chunk-level HTTP concurrency bound that
-        // `buffer_unordered(MAX_CONCURRENT_DOWNLOADS)` used to enforce is now
-        // carried by `pool_max_idle_per_host(MAX_CONCURRENT_DOWNLOADS)` on the
-        // reqwest client (line 98) — beyond pool capacity, reqwest queues HTTP
-        // requests on the existing connections, so eager spawn does not multiply
-        // network concurrency.
+        // download. The chunk-level HTTP concurrency bound that `buffer_unordered`
+        // used to enforce is now carried by `pool_max_idle_per_host` on the shared
+        // `download_client` (a fixed idle cap) — beyond pool capacity, reqwest
+        // queues HTTP requests on the existing connections, so eager spawn does not
+        // multiply network concurrency.
         let mut joins: FuturesUnordered<tokio::task::JoinHandle<(usize, Result<(), CoreError>)>> =
             FuturesUnordered::new();
         let mut abort_handles: Vec<AbortHandle> = Vec::with_capacity(num_chunks);

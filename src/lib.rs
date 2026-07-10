@@ -108,15 +108,18 @@ fn download_file_native(
     // sentinel-shaped trap if a future SHA-0-like algorithm ever
     // produced an empty digest).
     let rt = shared_runtime();
-    let downloader =
-        ChunkedDownloader::new(url, auth_token, chunk_size).map_err(|e| core_err_to_py(&e))?;
     let dest = PathBuf::from(dest_path);
 
     // Release the GIL so other Python threads can run during the (long)
     // network/disk I/O. pyo3 acquires the GIL automatically on function
     // entry; detach (the post-0.27 name for allow_threads) explicitly
-    // releases it for the closure body.
+    // releases it for the closure body. Building the downloader — which now
+    // clones the shared download client rather than constructing a fresh one —
+    // happens inside the closure so client access never holds the GIL, matching
+    // download_packs_native (where PackAssembler::new already runs detached).
     py.detach(|| {
+        let downloader =
+            ChunkedDownloader::new(url, auth_token, chunk_size).map_err(|e| core_err_to_py(&e))?;
         rt.block_on(async { downloader.download(&dest, verify_hash).await })
             .map_err(|e| core_err_to_py(&e))
     })

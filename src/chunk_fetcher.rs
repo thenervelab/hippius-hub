@@ -15,7 +15,7 @@ use indicatif::{ProgressBar, ProgressStyle};
 use reqwest::Client;
 use sha2::{Digest, Sha256};
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use tokio::fs::OpenOptions;
 use tokio::io::{AsyncSeekExt, AsyncWriteExt, SeekFrom};
@@ -37,6 +37,43 @@ const VERIFY_READ_BUFFER: usize = 8 * 1024 * 1024;
 /// regression test can pin the value and clippy's dead-code lint enforces its
 /// call site.
 const CHUNK_REQUEST_TIMEOUT: Duration = Duration::from_mins(5);
+
+/// Idle-connection cap for the shared download client. Bounds only *idle*
+/// (kept-alive) connections, not in-flight requests — the per-file `Semaphore`
+/// (`PackAssembler`) and spawn count (`ChunkedDownloader`) are the real concurrency
+/// bounds, so a fixed value is safe regardless of a caller's `max_concurrent`. 32
+/// matches the default `max_concurrent`.
+const DOWNLOAD_POOL_MAX_IDLE: usize = 32;
+
+/// Process-global HTTP/1 client shared by both download paths (pack assembly here
+/// and the legacy Range downloader). Mirrors `uploader::upload_client`: building a
+/// `Client` per native call starts with an empty pool and forces a fresh
+/// DNS+TCP+TLS handshake to the registry host on every file; the `OnceLock` hoists
+/// construction out of the per-file path so warm connections survive across files
+/// (the win for many-small-file snapshots). Auth is applied per request, so the
+/// shared client carries no per-file credential across origins.
+///
+/// HTTP/1-only for the same reason the per-call clients were: h2 would multiplex
+/// every parallel chunk onto one TCP and cap aggregate throughput at the
+/// per-connection ceiling; h1 lets each chunk claim its own connection.
+///
+/// Construction is fallible (the TLS backend may fail to init), so this returns
+/// `Result` rather than `expect`-ing inside a `get_or_init` closure — the crate
+/// denies `panic`/`unwrap`. On an init race the loser's freshly built client is
+/// dropped unused (RAII); `OnceLock` is valid in statics and never poisoned.
+pub(crate) fn download_client() -> Result<&'static Client, CoreError> {
+    static CLIENT: OnceLock<Client> = OnceLock::new();
+    if let Some(client) = CLIENT.get() {
+        return Ok(client);
+    }
+    let built = Client::builder()
+        .connect_timeout(Duration::from_secs(CONNECT_TIMEOUT_SECS))
+        .http1_only()
+        .pool_max_idle_per_host(DOWNLOAD_POOL_MAX_IDLE)
+        .tcp_keepalive(Duration::from_secs(30))
+        .build()?;
+    Ok(CLIENT.get_or_init(|| built))
+}
 
 /// One chunk to carve out of a fetched pack: where it sits in the pack, its size,
 /// where it lands in the assembled file, and its content digest (hex, no prefix).
@@ -68,15 +105,14 @@ pub struct PackAssembler {
 }
 
 impl PackAssembler {
-    /// HTTP/1 client with an idle pool sized to `max_concurrent`; the semaphore in
-    /// `assemble` — not the pool — is the real concurrency bound. Only fallible step.
+    /// Clones the shared process-global `download_client` (warm pool across files);
+    /// the semaphore in `assemble` — not the client's fixed idle pool — is the real
+    /// concurrency bound. Fallible only on the client's first-time build.
     pub fn new(auth_token: Option<String>, max_concurrent: usize) -> Result<Self, CoreError> {
-        let client = Client::builder()
-            .connect_timeout(Duration::from_secs(CONNECT_TIMEOUT_SECS))
-            .http1_only()
-            .pool_max_idle_per_host(max_concurrent)
-            .tcp_keepalive(Duration::from_secs(30))
-            .build()?;
+        // Clone the process-global client (an Arc-backed handle sharing one pool)
+        // instead of building a fresh client + empty pool per file. `max_concurrent`
+        // still bounds real concurrency via the `Semaphore` in `assemble`.
+        let client = download_client()?.clone();
         Ok(Self { client, auth_token, max_concurrent: max_concurrent.max(1) })
     }
 
