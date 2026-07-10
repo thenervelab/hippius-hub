@@ -2,24 +2,51 @@ name: Benchmark (chunked transfer)
 
 # Runs on a push to `staging` (so a merge to staging produces benchmark numbers
 # right next to the e2e run) and on manual dispatch (to tune size / runs / probe).
-# A run moves several GiB to the test/e2e-client namespace — a 512 MiB file over 3
-# fresh-content runs per mode plus the Harbor concurrency-sweep probe — no
-# production config/deployment change, chunks are ordinary content-addressed blobs
-# a later GC reclaims — so it stays OFF `main` and every other branch. On a push
-# event the dispatch inputs are empty, so the script uses its built-in defaults.
+# The push-triggered run stays within a hosted runner: a 512 MiB single file over
+# 3 fresh-content runs per mode, plus a small folder tier (4 × 128 MiB) that
+# saturates the real worker pools so its measured peak RSS validates — and projects
+# — the production memory ceiling WITHOUT moving GB. No production config/deployment
+# change; chunks are ordinary content-addressed blobs a later GC reclaims — so it
+# stays OFF `main` and every other branch. On a push event the dispatch inputs are
+# empty, so the script uses its built-in defaults. Dispatch with larger shard/size
+# from a machine with capacity to measure the true 2–3 GB shard shape directly.
 on:
   push:
     branches: [staging]
   workflow_dispatch:
     inputs:
+      tiers:
+        description: Comma-separated tiers to run (single,folder)
+        required: false
+        default: 'single,folder'
       size_mib:
-        description: Transfer-benchmark file size in MiB
+        description: Single-file transfer-benchmark file size in MiB
         required: false
         default: '512'
       runs:
         description: Measured runs per mode (median-of-N, fresh content each)
         required: false
         default: '3'
+      pack_mib:
+        description: Pack blob size in MiB (production default 64 — the memory projection extrapolates to this)
+        required: false
+        default: '64'
+      upload_workers:
+        description: Concurrent packs per file (HIPPIUS_UPLOAD_WORKERS)
+        required: false
+        default: '8'
+      folder_shards:
+        description: Folder-tier shard count (raise toward ~30 to match an 80 GB model)
+        required: false
+        default: '4'
+      shard_mib:
+        description: Folder-tier per-shard size in MiB (raise toward 2048–3072 for the real shard size)
+        required: false
+        default: '128'
+      folder_file_workers:
+        description: Concurrent files in the folder tier (upload_folder max_workers)
+        required: false
+        default: '8'
       harbor_probe:
         description: Run the Harbor-flow bottleneck probe (latency + concurrency sweep)
         required: false
@@ -79,8 +106,14 @@ jobs:
       # the script per mode, so it is intentionally not set here.
       - name: Run chunked-transfer benchmark
         env:
+          BENCH_TIERS: ${{ inputs.tiers }}
           BENCH_SIZE_MIB: ${{ inputs.size_mib }}
           BENCH_RUNS: ${{ inputs.runs }}
+          BENCH_PACK_MIB: ${{ inputs.pack_mib }}
+          BENCH_UPLOAD_WORKERS: ${{ inputs.upload_workers }}
+          BENCH_FOLDER_SHARDS: ${{ inputs.folder_shards }}
+          BENCH_SHARD_MIB: ${{ inputs.shard_mib }}
+          BENCH_FOLDER_FILE_WORKERS: ${{ inputs.folder_file_workers }}
           BENCH_HARBOR_PROBE: ${{ inputs.harbor_probe }}
           BENCH_PROBE_MIB: ${{ inputs.probe_mib }}
           BENCH_CDC_AVG_MIB: ${{ inputs.cdc_avg_mib }}

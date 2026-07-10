@@ -1,41 +1,62 @@
 """Benchmark + Harbor-flow probe for the chunked-artifact layout.
 
-Two parts, both against the `test/e2e-client` namespace (no production config or
+Three parts, all against the `test/e2e-client` namespace (no production config or
 deployment change — every blob is an ordinary content-addressed blob a later GC
 reclaims):
 
-1. **Transfer benchmark** — warmed, median-of-N (each run on FRESH random content
-   so an upload actually moves bytes instead of dedup-skipping) upload+download of
-   a large file, chunked vs plain, plus the incremental re-upload dedup win.
+1. **Single-file transfer benchmark** — warmed, median-of-N (each run on FRESH
+   random content so an upload actually moves bytes instead of dedup-skipping)
+   upload+download of one large file, plain vs v1 (chunk blobs) vs v2 (packs),
+   plus the incremental re-upload dedup win.
 
-2. **Harbor-flow probe** — localizes the *upload* bottleneck the transfer numbers
-   can't explain on their own:
-   - per-request round-trip latency (HEAD dedup check, POST upload-init),
-   - single-connection PUT throughput,
-   - aggregate throughput swept over parallel-connection counts.
-   Reading it: if aggregate throughput RISES with concurrency, the link is
-   per-connection limited — raising `HIPPIUS_UPLOAD_WORKERS` genuinely helps. If it
-   PLATEAUS, we're aggregate-bandwidth bound and more workers won't move it.
+2. **Folder (multi-file) tier** — the shape real clients use: an 80 GB model is
+   uploaded as ~30 shards of 2–3 GB each via `upload_folder`, which runs files
+   concurrently AND each file runs its packs concurrently. Peak upload memory is
+   therefore `min(file_workers, shards) × min(pack_workers, packs/shard) ×
+   pack_size` — ~4 GB at the production defaults (8×8×64 MiB). A GitHub-hosted
+   runner can't hold that, so we don't move it: we run a SMALL folder that
+   saturates the same worker pools, measure the real peak RSS (which validates
+   the formula), and project it to the production config. That surfaces the 4 GB
+   ceiling without needing 4 GB.
 
-Env: `HIPPIUS_TEST_*` for auth; `BENCH_SIZE_MIB` (512), `BENCH_RUNS` (3),
-`BENCH_PATCH_MIB` (4), `BENCH_CDC_AVG_MIB` (4), `BENCH_PROBE_MIB` (128),
-`BENCH_HARBOR_PROBE` (1), `HIPPIUS_TEST_REPO` (test/e2e-client).
+3. **Harbor-flow probe** — localizes the *upload* bottleneck the transfer numbers
+   can't explain on their own: per-request latency, single-connection PUT
+   throughput, and aggregate throughput swept over parallel-connection counts.
+   If aggregate throughput RISES with concurrency, the link is per-connection
+   limited — raising `HIPPIUS_UPLOAD_WORKERS` helps. If it PLATEAUS, we're
+   aggregate-bandwidth bound and more workers won't move it.
+
+Peak RSS is sampled on a background thread from `/proc/self/status` (Linux only —
+where CI runs and where scale matters); other platforms report `n/a`. It is a
+measured fact for the run's config; only the *memory* projection extrapolates
+(pack buffers scale linearly with pack_size). Wall-clock does NOT extrapolate —
+it is network-bound, so each number is reported at the size it was measured.
+
+Env: `HIPPIUS_TEST_*` for auth; `BENCH_TIERS` (single,folder), `BENCH_SIZE_MIB`
+(512), `BENCH_RUNS` (3), `BENCH_PATCH_MIB` (4), `BENCH_CDC_AVG_MIB` (4),
+`BENCH_PACK_MIB` (64, the production pack size), `BENCH_UPLOAD_WORKERS` (8),
+`BENCH_FOLDER_SHARDS` (4), `BENCH_SHARD_MIB` (128), `BENCH_FOLDER_FILE_WORKERS`
+(8), `BENCH_PROBE_MIB` (128), `BENCH_HARBOR_PROBE` (1), `HIPPIUS_TEST_REPO`
+(test/e2e-client). Dispatch a run with larger shards/size from a machine with
+capacity to measure the true GB-scale shape.
 
     HIPPIUS_TEST_TOKEN=... python scripts/bench_chunked_transfer.py
 """
 import hashlib
+import math
 import os
 import shutil
 import statistics
 import sys
 import tempfile
+import threading
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 
 import httpx
 
-from hippius_hub import auth, hf_hub_download, hippius_hub_upload
+from hippius_hub import auth, hf_hub_download, hippius_hub_upload, upload_folder
 from hippius_hub._oci import fetch_manifest, group_files
 from hippius_hub.auth import get_oci_bearer_token
 from hippius_hub.constants import resolve_registry
@@ -43,6 +64,12 @@ from hippius_hub.file_download import _oci_repo_path
 
 _MIB = 1024 * 1024
 _UPLOAD_TIMEOUT = httpx.Timeout(900.0)
+# Production defaults the memory projection extrapolates to: an 80 GB model is
+# ~30 shards, uploaded 8-files-at-once, each file packing 8-at-once at 64 MiB.
+_PROD_FILE_WORKERS = 8
+_PROD_PACK_WORKERS = 8
+_PROD_SHARDS = 30
+_PROD_SHARD_BYTES = 3 * 1024 * _MIB  # 3 GiB, the upper end of the 2–3 GB shard range
 
 
 def _env_int(name: str, default_mib: int) -> int:
@@ -69,6 +96,71 @@ def _env_flag(name: str, default: bool) -> bool:
     return raw.strip().lower() in ("1", "true", "yes", "on")
 
 
+def _env_tiers() -> set:
+    raw = os.environ.get("BENCH_TIERS")
+    if not raw or not raw.strip():
+        return {"single", "folder"}
+    return {t.strip().lower() for t in raw.split(",") if t.strip()}
+
+
+# ---------------- peak-RSS sampler (Linux /proc; n/a elsewhere) ----------------
+
+def _read_vmrss_kib():
+    """Current resident set size in KiB from /proc/self/status, or None off-Linux."""
+    try:
+        with open("/proc/self/status") as f:
+            for line in f:
+                if line.startswith("VmRSS:"):
+                    return int(line.split()[1])
+    except OSError:
+        pass
+    return None
+
+
+class _PeakRSS:
+    """Sample VmRSS on a daemon thread; expose the peak MiB seen inside the block.
+
+    The kernel's VmHWM high-water mark is monotonic over the whole process life and
+    cannot be reset, so it can't isolate one operation's peak across sequential
+    modes. Sampling VmRSS during the block gives a per-operation peak instead.
+    """
+
+    def __init__(self, interval: float = 0.05):
+        self._interval = interval
+        self._peak_kib = 0
+        self._stop = threading.Event()
+        self._thread = None
+        self._supported = _read_vmrss_kib() is not None
+
+    def __enter__(self):
+        if self._supported:
+            self._thread = threading.Thread(target=self._run, daemon=True)
+            self._thread.start()
+        return self
+
+    def _run(self) -> None:
+        while not self._stop.is_set():
+            cur = _read_vmrss_kib()
+            if cur and cur > self._peak_kib:
+                self._peak_kib = cur
+            self._stop.wait(self._interval)
+
+    def __exit__(self, *exc) -> None:
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join()
+
+    @property
+    def peak_mib(self):
+        if not self._supported or not self._peak_kib:
+            return None
+        return self._peak_kib / 1024
+
+
+def _fmt_mib(mib) -> str:
+    return f"{mib:.0f} MiB" if mib is not None else "n/a"
+
+
 def _fill_random(path: str, size: int) -> None:
     """Write `size` bytes of incompressible random data in 8 MiB blocks."""
     remaining = size
@@ -80,16 +172,21 @@ def _fill_random(path: str, size: int) -> None:
 
 
 def _mutate_middle(src: str, dst: str, patch: int) -> None:
-    """Copy `src` to `dst`, overwriting `patch` bytes in the middle (a localized edit)."""
-    with open(src, "rb") as f:
-        data = bytearray(f.read())
-    start = max(0, (len(data) - patch) // 2)
-    data[start:start + patch] = os.urandom(min(patch, len(data) - start))
-    with open(dst, "wb") as f:
-        f.write(data)
+    """Copy `src` to `dst`, overwriting `patch` bytes in the middle (a localized edit).
+
+    Streams via copyfile + a seek/overwrite so a multi-GB source never lands in
+    memory as a whole-file `bytearray` — the harness must not OOM before the
+    client it measures does.
+    """
+    shutil.copyfile(src, dst)
+    size = os.path.getsize(dst)
+    start = max(0, (size - patch) // 2)
+    with open(dst, "r+b") as f:
+        f.seek(start)
+        f.write(os.urandom(min(patch, size - start)))
 
 
-def _set_mode(mode: str, cdc_avg: int) -> None:
+def _set_mode(mode: str, cdc_avg: int, pack_size: int, upload_workers: int) -> None:
     """Point the uploader at one of: 'plain', 'v1' (chunk blobs), 'v2' (packs)."""
     if mode == "plain":
         os.environ["HIPPIUS_CHUNKED_WRITE"] = "0"
@@ -99,6 +196,8 @@ def _set_mode(mode: str, cdc_avg: int) -> None:
     os.environ["HIPPIUS_CHUNKED_WRITE"] = "1"
     os.environ["HIPPIUS_CHUNK_THRESHOLD"] = "1"
     os.environ["HIPPIUS_CDC_AVG_SIZE"] = str(cdc_avg)
+    os.environ["HIPPIUS_PACK_SIZE"] = str(pack_size)
+    os.environ["HIPPIUS_UPLOAD_WORKERS"] = str(upload_workers)
     os.environ["HIPPIUS_CHUNKED_LAYOUT"] = "v2" if mode == "v2" else "v1"
 
 
@@ -108,10 +207,22 @@ def _time(fn) -> float:
     return time.perf_counter() - start
 
 
+def _timed_peak(fn):
+    """Return (elapsed_s, peak_mib_or_None) for `fn`, sampling RSS across the call."""
+    with _PeakRSS() as rss:
+        elapsed = _time(fn)
+    return elapsed, rss.peak_mib
+
+
 def _stat(xs: list) -> str:
     """median (min–max) over the measured runs, formatted in seconds."""
     lo, hi, med = min(xs), max(xs), statistics.median(xs)
     return f"{med:.1f}s ({lo:.1f}–{hi:.1f})" if len(xs) > 1 else f"{med:.1f}s"
+
+
+def _peak_stat(xs: list) -> str:
+    present = [x for x in xs if x is not None]
+    return _fmt_mib(max(present)) if present else "n/a"
 
 
 def _login() -> None:
@@ -135,11 +246,11 @@ def _emit(lines: list) -> None:
             f.write(report + "\n")
 
 
-def _upload_download(local: str, repo: str, revision: str, cache_dir: str, size: int) -> dict:
-    up = _time(lambda: hippius_hub_upload(repo_id=repo, local_path=local, revision=revision))
+def _upload_download(local: str, repo: str, revision: str, cache_dir: str) -> dict:
+    up, peak = _timed_peak(lambda: hippius_hub_upload(repo_id=repo, local_path=local, revision=revision))
     down = _time(lambda: hf_hub_download(
         repo_id=repo, filename="bench.bin", revision=revision, cache_dir=cache_dir))
-    return {"up": up, "down": down}
+    return {"up": up, "down": down, "peak": peak}
 
 
 def _chunk_digests(registry: str, oci_repo: str, revision: str, token: str) -> list:
@@ -249,42 +360,45 @@ def _harbor_probe(registry: str, oci_repo: str, token: str, probe: int) -> list:
     return lines
 
 
-# ---------------- main ----------------
+# ---------------- single-file transfer tier ----------------
 
-def _transfer_rows(work: str, repo: str, tag: str, size: int, runs: int, cdc_avg: int) -> list:
+def _transfer_rows(work, repo, tag, size, runs, cdc_avg, pack_size, upload_workers) -> list:
     """Median-of-`runs` upload/download for plain, v1 (chunk blobs) and v2 (packs).
 
     Fresh random content each run so every upload actually transfers. v2's win is
-    fewer round-trips (~size/64MiB pack PUTs vs ~size/4MiB chunk PUTs), so this is
-    where the pack layout should show a lower upload wall-clock than v1.
+    fewer round-trips (~size/pack_size pack PUTs vs ~size/4MiB chunk PUTs), so this
+    is where the pack layout should show a lower upload wall-clock than v1. Peak RSS
+    is reported alongside so a per-stream memory regression shows up next to speed.
     """
     modes = [("plain (prod baseline)", "plain", "cp"),
              ("v1 (chunk blobs)", "v1", "c1"),
              ("v2 (packs)", "v2", "c2")]
-    times = {label: {"up": [], "down": []} for label, _m, _d in modes}
+    times = {label: {"up": [], "down": [], "peak": []} for label, _m, _d in modes}
     src = os.path.join(work, "bench.bin")
     for r in range(runs):
         _fill_random(src, size)
         for label, mode, cache in modes:
-            _set_mode(mode, cdc_avg)
-            res = _upload_download(src, repo, f"bench-{tag}-{mode}-{r}", os.path.join(work, cache), size)
+            _set_mode(mode, cdc_avg, pack_size, upload_workers)
+            res = _upload_download(src, repo, f"bench-{tag}-{mode}-{r}", os.path.join(work, cache))
             times[label]["up"].append(res["up"])
             times[label]["down"].append(res["down"])
+            times[label]["peak"].append(res["peak"])
             shutil.rmtree(os.path.join(work, cache), ignore_errors=True)
     rows = [
-        "### Transfer wall-clock (median of "
+        "### Single-file transfer wall-clock (median of "
         f"{runs} run{'s' if runs > 1 else ''}, fresh content each)",
-        "| mode | upload | download |",
-        "|------|-------:|---------:|",
+        "| mode | upload | download | peak RSS |",
+        "|------|-------:|---------:|---------:|",
     ]
-    rows += [f"| {label} | {_stat(times[label]['up'])} | {_stat(times[label]['down'])} |"
+    rows += [f"| {label} | {_stat(times[label]['up'])} | {_stat(times[label]['down'])} "
+             f"| {_peak_stat(times[label]['peak'])} |"
              for label, _m, _d in modes]
     return rows
 
 
-def _incremental_rows(work, repo, tag, registry, oci_repo, token, size, patch, cdc_avg) -> list:
+def _incremental_rows(work, repo, tag, registry, oci_repo, token, size, patch, cdc_avg, pack_size, workers) -> list:
     """The dedup win: a localized edit re-uploads only the changed chunks."""
-    _set_mode("v1", cdc_avg)  # dedup diff reads v1 chunk layers; v2 dedup is proven by e2e
+    _set_mode("v1", cdc_avg, pack_size, workers)  # dedup diff reads v1 chunk layers; v2 dedup is proven by e2e
     v1 = os.path.join(work, "v1", "bench.bin")
     os.makedirs(os.path.dirname(v1), exist_ok=True)
     _fill_random(v1, size)
@@ -305,12 +419,84 @@ def _incremental_rows(work, repo, tag, registry, oci_repo, token, size, patch, c
     ]
 
 
+# ---------------- folder (multi-file) tier ----------------
+
+def _packs_per_shard(shard: int, pack_size: int) -> int:
+    return max(1, math.ceil(shard / pack_size))
+
+
+def _inflight_ceiling(file_workers, shards, pack_workers, packs_per_shard, pack_size) -> int:
+    """Bytes resident when every busy worker holds one full pack.
+
+    A folder upload runs `file_workers` files at once, each running `pack_workers`
+    packs at once, and each in-flight pack is exactly `pack_size` bytes buffered by
+    `read_ranges`. The worker pools — not the file count — cap concurrency, so the
+    ceiling is the product of the *effective* (pool-capped) parallelism.
+    """
+    return min(file_workers, shards) * min(pack_workers, packs_per_shard) * pack_size
+
+
+def _folder_rows(work, repo, tag, shards, shard, cdc_avg, pack_size, file_workers, pack_workers) -> list:
+    """Upload a folder of shards (the 80 GB-model shape) and measure peak memory.
+
+    The run is deliberately small so a hosted runner survives it, but it saturates
+    the SAME worker pools as production, so the measured peak RSS validates the
+    `_inflight_ceiling` model. We then project that model to the production config
+    (~30 × 3 GiB shards, 8×8 workers, 64 MiB packs) — the ceiling a client actually
+    hits, which no hosted-runner run can move directly.
+    """
+    _set_mode("v2", cdc_avg, pack_size, pack_workers)
+    src_dir = os.path.join(work, "folder-src")
+    os.makedirs(src_dir, exist_ok=True)
+    for i in range(shards):
+        _fill_random(os.path.join(src_dir, f"model-{i:05d}.bin"), shard)
+
+    rev = f"bench-{tag}-folder"
+    up, peak = _timed_peak(lambda: upload_folder(
+        repo_id=repo, folder_path=src_dir, revision=rev, max_workers=file_workers))
+
+    # Correctness spot-check: one shard round-trips (proves the folder manifest is
+    # readable, not just writable) — a cheap guard that the fanout didn't corrupt.
+    cache = os.path.join(work, "folder-cache")
+    os.makedirs(cache, exist_ok=True)
+    got = hf_hub_download(repo_id=repo, filename="model-00000.bin", revision=rev, cache_dir=cache)
+    ok = os.path.getsize(got) == shard
+    shutil.rmtree(cache, ignore_errors=True)
+
+    pps = _packs_per_shard(shard, pack_size)
+    measured_ceiling = _inflight_ceiling(file_workers, shards, pack_workers, pps, pack_size)
+    prod_pps = _packs_per_shard(_PROD_SHARD_BYTES, pack_size)
+    prod_ceiling = _inflight_ceiling(_PROD_FILE_WORKERS, _PROD_SHARDS, _PROD_PACK_WORKERS, prod_pps, pack_size)
+    total_mib = shards * shard // _MIB
+    return [
+        "### Folder tier (multi-file — the 80 GB-model shape)",
+        f"- uploaded **{shards} shard(s) × {shard // _MIB} MiB = {total_mib} MiB** "
+        f"via `upload_folder` ({file_workers} files × {pack_workers} packs concurrent, "
+        f"{pack_size // _MIB} MiB packs)",
+        f"- upload wall-clock: **{up:.1f}s**; one-shard round-trip: **{'OK' if ok else 'MISMATCH'}**",
+        f"- measured peak RSS: **{_fmt_mib(peak)}** "
+        f"(model ceiling for this config: {_fmt_mib(measured_ceiling / _MIB)} of in-flight pack buffers)",
+        f"- **projected peak at production** (~{_PROD_SHARDS} × {_PROD_SHARD_BYTES // _MIB} MiB shards, "
+        f"{_PROD_FILE_WORKERS}×{_PROD_PACK_WORKERS} workers, {pack_size // _MIB} MiB packs): "
+        f"**~{_fmt_mib(prod_ceiling / _MIB)}** of concurrent pack buffers — "
+        "cap `HIPPIUS_UPLOAD_WORKERS` / `max_workers` to bound it",
+    ]
+
+
+# ---------------- main ----------------
+
 def main() -> None:
+    tiers = _env_tiers()
     size = _env_int("BENCH_SIZE_MIB", 512)
     runs = _env_count("BENCH_RUNS", 3)
     cdc_avg = _env_int("BENCH_CDC_AVG_MIB", 4)
+    pack_size = _env_int("BENCH_PACK_MIB", 64)
+    upload_workers = _env_count("BENCH_UPLOAD_WORKERS", _PROD_PACK_WORKERS)
     patch = _env_int("BENCH_PATCH_MIB", 4)
     probe = _env_int("BENCH_PROBE_MIB", 128)
+    shards = _env_count("BENCH_FOLDER_SHARDS", 4)
+    shard = _env_int("BENCH_SHARD_MIB", 128)
+    file_workers = _env_count("BENCH_FOLDER_FILE_WORKERS", _PROD_FILE_WORKERS)
     do_probe = _env_flag("BENCH_HARBOR_PROBE", True)
     repo = os.environ.get("HIPPIUS_TEST_REPO", "test/e2e-client")
 
@@ -325,9 +511,15 @@ def main() -> None:
     with httpx.Client(timeout=_UPLOAD_TIMEOUT) as client:
         _put_blob(client, registry, oci_repo, token, os.urandom(8 * _MIB))
 
-    out = [f"## Chunked-layout benchmark ({size // _MIB} MiB file, {cdc_avg // _MIB} MiB CDC avg)", ""]
-    out += _transfer_rows(work, repo, tag, size, runs, cdc_avg) + [""]
-    out += _incremental_rows(work, repo, tag, registry, oci_repo, token, size, patch, cdc_avg) + [""]
+    out = [f"## Chunked-layout benchmark ({size // _MIB} MiB file, "
+           f"{cdc_avg // _MIB} MiB CDC avg, {pack_size // _MIB} MiB packs)", ""]
+    if "single" in tiers:
+        out += _transfer_rows(work, repo, tag, size, runs, cdc_avg, pack_size, upload_workers) + [""]
+        out += _incremental_rows(work, repo, tag, registry, oci_repo, token,
+                                 size, patch, cdc_avg, pack_size, upload_workers) + [""]
+    if "folder" in tiers:
+        out += _folder_rows(work, repo, tag, shards, shard, cdc_avg,
+                            pack_size, file_workers, upload_workers) + [""]
     if do_probe:
         out += _harbor_probe(registry, oci_repo, token, probe)
     _emit(out)
