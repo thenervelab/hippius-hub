@@ -57,9 +57,9 @@ from concurrent.futures import ThreadPoolExecutor
 import httpx
 
 from hippius_hub import auth, hf_hub_download, hippius_hub_upload, upload_folder
-from hippius_hub._oci import fetch_manifest, group_files
+from hippius_hub._oci import fetch_manifest
 from hippius_hub.auth import get_oci_bearer_token
-from hippius_hub.constants import resolve_max_inflight_packs, resolve_registry
+from hippius_hub.constants import PACK_MEDIA_TYPE, resolve_max_inflight_packs, resolve_registry
 from hippius_hub.file_download import _oci_repo_path
 
 _MIB = 1024 * 1024
@@ -192,18 +192,16 @@ def _mutate_middle(src: str, dst: str, patch: int) -> None:
 
 
 def _set_mode(mode: str, cdc_avg: int, pack_size: int, upload_workers: int) -> None:
-    """Point the uploader at one of: 'plain', 'v1' (chunk blobs), 'v2' (packs)."""
+    """Point the uploader at one of: 'plain' (one blob) or 'v2' (chunked-v2 packs)."""
     if mode == "plain":
         os.environ["HIPPIUS_CHUNKED_WRITE"] = "0"
         os.environ.pop("HIPPIUS_CHUNK_THRESHOLD", None)
-        os.environ.pop("HIPPIUS_CHUNKED_LAYOUT", None)
         return
     os.environ["HIPPIUS_CHUNKED_WRITE"] = "1"
     os.environ["HIPPIUS_CHUNK_THRESHOLD"] = "1"
     os.environ["HIPPIUS_CDC_AVG_SIZE"] = str(cdc_avg)
     os.environ["HIPPIUS_PACK_SIZE"] = str(pack_size)
     os.environ["HIPPIUS_UPLOAD_WORKERS"] = str(upload_workers)
-    os.environ["HIPPIUS_CHUNKED_LAYOUT"] = "v2" if mode == "v2" else "v1"
 
 
 def _time(fn) -> float:
@@ -258,12 +256,19 @@ def _upload_download(local: str, repo: str, revision: str, cache_dir: str) -> di
     return {"up": up, "down": down, "peak": peak}
 
 
-def _chunk_digests(registry: str, oci_repo: str, revision: str, token: str) -> list:
+def _pack_digests(registry: str, oci_repo: str, revision: str, token: str) -> set:
+    """The set of pack-blob digests a revision's manifest references.
+
+    Chunked-v2 lists every referenced pack (new and reused-by-range) as a layer, so
+    the intersection across two revisions is the pack-level dedup a localized edit
+    achieves — the readable analogue of v1's per-chunk HEAD-dedup count.
+    """
     result = fetch_manifest(registry, oci_repo, revision, token)
-    match = [g for g in group_files(result.manifest) if g.title == "bench.bin"]
-    if not match:
-        raise RuntimeError(f"revision {revision!r} has no 'bench.bin' group")
-    return [c.digest for c in match[0].chunks]
+    return {
+        layer["digest"]
+        for layer in result.manifest.get("layers", [])
+        if layer.get("mediaType") == PACK_MEDIA_TYPE
+    }
 
 
 # ---------------- Harbor-flow probe (raw OCI blob-upload primitives) ----------------
@@ -368,15 +373,14 @@ def _harbor_probe(registry: str, oci_repo: str, token: str, probe: int) -> list:
 # ---------------- single-file transfer tier ----------------
 
 def _transfer_rows(work, repo, tag, size, runs, cdc_avg, pack_size, upload_workers) -> list:
-    """Median-of-`runs` upload/download for plain, v1 (chunk blobs) and v2 (packs).
+    """Median-of-`runs` upload/download for plain (one blob) vs v2 (chunked packs).
 
     Fresh random content each run so every upload actually transfers. v2's win is
-    fewer round-trips (~size/pack_size pack PUTs vs ~size/4MiB chunk PUTs), so this
-    is where the pack layout should show a lower upload wall-clock than v1. Peak RSS
-    is reported alongside so a per-stream memory regression shows up next to speed.
+    fewer round-trips (~size/pack_size pack PUTs) plus a smaller streamed body per
+    request; peak RSS is reported alongside so a per-stream memory regression shows
+    up next to speed.
     """
     modes = [("plain (prod baseline)", "plain", "cp"),
-             ("v1 (chunk blobs)", "v1", "c1"),
              ("v2 (packs)", "v2", "c2")]
     times = {label: {"up": [], "down": [], "peak": []} for label, _m, _d in modes}
     src = os.path.join(work, "bench.bin")
@@ -402,25 +406,34 @@ def _transfer_rows(work, repo, tag, size, runs, cdc_avg, pack_size, upload_worke
 
 
 def _incremental_rows(work, repo, tag, registry, oci_repo, token, size, patch, cdc_avg, pack_size, workers) -> list:
-    """The dedup win: a localized edit re-uploads only the changed chunks."""
-    _set_mode("v1", cdc_avg, pack_size, workers)  # dedup diff reads v1 chunk layers; v2 dedup is proven by e2e
-    v1 = os.path.join(work, "v1", "bench.bin")
-    os.makedirs(os.path.dirname(v1), exist_ok=True)
-    _fill_random(v1, size)
-    hippius_hub_upload(repo_id=repo, local_path=v1, revision=f"bench-{tag}-inc-v1")
-    v1_chunks = _chunk_digests(registry, oci_repo, f"bench-{tag}-inc-v1", token)
-    v2 = os.path.join(work, "v2", "bench.bin")
-    os.makedirs(os.path.dirname(v2), exist_ok=True)
-    _mutate_middle(v1, v2, patch)
-    reup_s = _time(lambda: hippius_hub_upload(repo_id=repo, local_path=v2, revision=f"bench-{tag}-inc-v2"))
-    v2_chunks = _chunk_digests(registry, oci_repo, f"bench-{tag}-inc-v2", token)
-    shared = set(v1_chunks) & set(v2_chunks)
-    reused_pct = 100.0 * len(shared) / len(v2_chunks) if v2_chunks else 0.0
+    """The dedup win: a localized edit re-uploads only the packs holding new chunks.
+
+    Uploads to a revision, records its pack set, edits the middle, and re-uploads to
+    the SAME revision (so the dedup index built from that revision's manifest sees
+    the prior packs). Unchanged chunks are referenced by range into existing packs;
+    the intersection of the two pack sets is the reuse.
+    """
+    _set_mode("v2", cdc_avg, pack_size, workers)
+    rev = f"bench-{tag}-inc"
+    orig = os.path.join(work, "inc", "bench.bin")
+    os.makedirs(os.path.dirname(orig), exist_ok=True)
+    _fill_random(orig, size)
+    hippius_hub_upload(repo_id=repo, local_path=orig, revision=rev)
+    packs_before = _pack_digests(registry, oci_repo, rev, token)
+
+    edited = os.path.join(work, "inc2", "bench.bin")  # same basename -> same title/group
+    os.makedirs(os.path.dirname(edited), exist_ok=True)
+    _mutate_middle(orig, edited, patch)
+    reup_s = _time(lambda: hippius_hub_upload(repo_id=repo, local_path=edited, revision=rev))
+    packs_after = _pack_digests(registry, oci_repo, rev, token)
+
+    reused = packs_before & packs_after
+    reused_pct = 100.0 * len(reused) / len(packs_after) if packs_after else 0.0
     return [
         f"### Incremental re-upload after a {patch // _MIB} MiB edit",
         f"- re-upload wall-clock: **{reup_s:.1f}s** (plain re-sends the whole {size // _MIB} MiB)",
-        f"- chunks reused via HEAD-dedup: **{len(shared)}/{len(v2_chunks)} ({reused_pct:.0f}%)**",
-        f"- new chunks transferred: **{len(v2_chunks) - len(shared)}**",
+        f"- packs reused by range: **{len(reused)}/{len(packs_after)} ({reused_pct:.0f}%)**",
+        f"- new packs transferred: **{len(packs_after) - len(reused)}**",
     ]
 
 

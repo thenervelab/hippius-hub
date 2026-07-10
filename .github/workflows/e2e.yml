@@ -136,34 +136,19 @@ jobs:
           HIPPIUS_TEST_CONSOLE_TOKEN: ${{ secrets.HIPPIUS_TEST_CONSOLE_TOKEN }}
         run: .venv/bin/pytest -v
 
-      # Chunked-artifact layout e2e — STAGING ONLY, against the test/e2e-client
+      # Chunked-v2 (pack layout) e2e — STAGING ONLY, against the test/e2e-client
       # namespace. The chunked WRITE path is opt-in this release (default off)
       # because the reader-side layout guard ships in the same release, so no
-      # already-deployed reader carries it. We exercise it only on staging, never
-      # main. Setting HIPPIUS_CHUNKED_WRITE=1 both enables the feature AND un-skips
-      # the gated live test (test_live_chunked_roundtrip.py). Nothing in production
-      # config/deployment changes: chunks are ordinary content-addressed blobs in a
-      # test namespace (org-wide trace: chunking is a self-contained client change).
-      # `github.ref` is compared to a literal — no untrusted input reaches `run:`.
-      - name: Chunked-layout e2e (staging only, test namespace)
-        if: github.ref == 'refs/heads/staging'
-        env:
-          HIPPIUS_CHUNKED_WRITE: '1'
-          HIPPIUS_TEST_USER: ${{ secrets.HIPPIUS_TEST_USER }}
-          HIPPIUS_TEST_PASS: ${{ secrets.HIPPIUS_TEST_PASS }}
-          HIPPIUS_TEST_TOKEN: ${{ secrets.HIPPIUS_TEST_TOKEN }}
-        run: .venv/bin/pytest -v tests/test_live_chunked_roundtrip.py
-
-      # Chunked-v2 (pack layout) e2e — STAGING ONLY. Opts into v2 via
-      # HIPPIUS_CHUNKED_LAYOUT=v2 (which also un-skips the gated live test) to
-      # exercise the native pack upload/download + re-upload dedup against the
-      # test/e2e-client namespace. v2 is a new layout value, so a reader that
-      # predates it refuses it loudly — never on main.
+      # already-deployed reader carries it. Setting HIPPIUS_CHUNKED_WRITE=1 both
+      # enables the feature AND un-skips the gated live test, exercising the native
+      # pack upload/download + re-upload dedup + many-packs ordering. Nothing in
+      # production config/deployment changes: packs are ordinary content-addressed
+      # blobs in a test namespace. `github.ref` is compared to a literal — no
+      # untrusted input reaches `run:`.
       - name: Chunked-v2 pack-layout e2e (staging only, test namespace)
         if: github.ref == 'refs/heads/staging'
         env:
           HIPPIUS_CHUNKED_WRITE: '1'
-          HIPPIUS_CHUNKED_LAYOUT: v2
           HIPPIUS_TEST_USER: ${{ secrets.HIPPIUS_TEST_USER }}
           HIPPIUS_TEST_PASS: ${{ secrets.HIPPIUS_TEST_PASS }}
           HIPPIUS_TEST_TOKEN: ${{ secrets.HIPPIUS_TEST_TOKEN }}

@@ -19,7 +19,6 @@ import httpx
 from ._oci import fetch_manifest, group_files, parse_pointer_v2
 from .auth import get_oci_bearer_token
 from .constants import (
-    CHUNKED_LAYOUT_V2,
     DEFAULT_CACHE_DIR,
     DEFAULT_HTTP_TIMEOUT,
     PACK_MEDIA_TYPE,
@@ -36,7 +35,6 @@ from .errors import (
 
 try:
     from .hippius_core import (
-        download_chunks_native,
         download_file_native,
         download_packs_native,
     )
@@ -574,30 +572,15 @@ def _fetch_blob_bytes(registry, oci_repo, digest, oci_token) -> bytes:
 
 
 def _pull_chunks(group, registry, oci_repo, temp_path, oci_token, manifest=None) -> Optional[str]:
-    """Fetch a chunked file's blobs into `temp_path` via the Rust engine.
+    """Fetch a chunked-v2 file's pack blobs into `temp_path` via the Rust engine.
 
-    Dispatches on layout: v2 pulls pack blobs (`_pull_packs`); v1 pulls K
-    content-addressed chunk blobs. Per-chunk digest verification is always on in
-    the native layer; the whole-file digest is ALSO always verified — unlike the
-    single-blob path's opt-in HIPPIUS_VERIFY_HASH — because per-chunk digests prove
-    each chunk's *bytes* but not its *position*, and the whole-file `sha256(concat)`
-    pass is the only check on ordering. Returns the computed whole-file hash.
+    Per-chunk digest verification is always on in the native layer; the whole-file
+    digest is ALSO always verified — unlike the single-blob path's opt-in
+    HIPPIUS_VERIFY_HASH — because per-chunk digests prove each chunk's *bytes* but
+    not its *position*, and the whole-file `sha256(concat)` pass is the only check
+    on ordering. Returns the computed whole-file hash.
     """
-    if group.layout == CHUNKED_LAYOUT_V2:
-        return _pull_packs(group, manifest or {}, registry, oci_repo, temp_path, oci_token)
-    urls = [f"{registry}/v2/{oci_repo}/blobs/{c.digest}" for c in group.chunks]
-    chunk_digests = [_digest_hex(c.digest) for c in group.chunks]
-    chunk_sizes = [c.size for c in group.chunks]
-    file_digest = _digest_hex(group.digest)
-    return download_chunks_native(
-        urls=urls,
-        chunk_digests=chunk_digests,
-        chunk_sizes=chunk_sizes,
-        dest_path=temp_path,
-        file_digest=file_digest,
-        auth_token=oci_token,
-        max_concurrent=resolve_max_concurrent(),
-    )
+    return _pull_packs(group, manifest or {}, registry, oci_repo, temp_path, oci_token)
 
 
 def _download_chunked_to_cache(

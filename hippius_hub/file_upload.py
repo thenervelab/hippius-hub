@@ -25,11 +25,8 @@ from ._oci import fetch_manifest, group_files, layer_title, parse_pointer_v2
 from ._packing import plan_packs, pointer_v2_bytes, resolve_pointer_chunks
 from .auth import get_oci_bearer_token
 from .constants import (
-    ARTIFACT_TYPE_CHUNKED,
     ARTIFACT_TYPE_CHUNKED_V2,
     CHUNK_COUNT_KEY,
-    CHUNK_MEDIA_TYPE,
-    CHUNKED_LAYOUT,
     CHUNKED_LAYOUT_V2,
     DEFAULT_HTTP_TIMEOUT,
     FILE_DIGEST_KEY,
@@ -38,11 +35,9 @@ from .constants import (
     LAYOUT_ANNOTATION_KEY,
     MAX_MANIFEST_BYTES,
     PACK_MEDIA_TYPE,
-    POINTER_MEDIA_TYPE,
     POINTER_MEDIA_TYPE_V2,
     resolve_cdc_avg_size,
     resolve_chunk_threshold,
-    resolve_chunked_layout,
     resolve_chunked_write_enabled,
     resolve_max_inflight_packs,
     resolve_pack_size,
@@ -58,7 +53,6 @@ try:
         hash_file_native,
         pack_upload_native,
         upload_blob_native,
-        upload_blob_range_native,
     )
 except ImportError:
     raise ImportError("hippius_core is not installed. Did you run `maturin develop`?")
@@ -81,7 +75,7 @@ def _empty_config_blob_descriptor() -> tuple:
 def _upload_blob_single_put(registry: str, repo_id: str, oci_token: str, file_path: str, digest: str) -> None:
     """OCI blob-upload init against the registry, then one streaming PUT-with-digest
     straight to it. This is the path for a plain (sub-threshold) whole-file blob;
-    large files go through the chunked path instead (`_upload_file_chunked`)."""
+    large files go through the chunked-v2 path instead (`_upload_file_chunked_v2`)."""
     headers = {"Authorization": f"Bearer {oci_token}"}
     init_headers = {**headers, "Content-Length": "0"}
     init = httpx.post(f"{registry}/v2/{repo_id}/blobs/uploads/", headers=init_headers, timeout=DEFAULT_HTTP_TIMEOUT)
@@ -162,90 +156,6 @@ def _ensure_bytes_blob_uploaded(registry: str, repo_id: str, oci_token: str, dat
     put.raise_for_status()
 
 
-def _ensure_chunk_uploaded(registry: str, repo_id: str, oci_token: str, abs_path: str, digest: str, offset: int, size: int) -> None:
-    """Upload one content-defined chunk's byte range if absent at its digest.
-
-    The `HEAD` is the 'upload only the bytes we're missing' core: a chunk that a
-    prior upload already stored (an unchanged region of a re-uploaded file) is
-    skipped, so a slightly-changed large file re-transfers only its changed
-    chunks. Missing chunks stream straight to Harbor via the Rust range PUT."""
-    headers = {"Authorization": f"Bearer {oci_token}"}
-    check = httpx.head(f"{registry}/v2/{repo_id}/blobs/{digest}", headers=headers, timeout=DEFAULT_HTTP_TIMEOUT)
-    if check.status_code == 200:
-        return
-    init = httpx.post(f"{registry}/v2/{repo_id}/blobs/uploads/", headers={**headers, "Content-Length": "0"}, timeout=DEFAULT_HTTP_TIMEOUT)
-    init.raise_for_status()
-    location = init.headers.get("Location")
-    if not location:
-        raise ValueError("Registry did not return a Location header for upload initiation")
-    if location.startswith("/"):
-        location = f"{registry}{location}"
-    sep = "&" if "?" in location else "?"
-    upload_blob_range_native(
-        url=f"{location}{sep}digest={digest}",
-        path=abs_path,
-        offset=offset,
-        length=size,
-        auth_token=oci_token,
-    )
-
-
-def _pointer_blob_bytes(whole_hex: str, file_size: int, chunk_metas: list) -> bytes:
-    """Serialize the deterministic pointer blob for a chunked file.
-
-    Content = layout version + whole-file size/digest + the ordered chunk list.
-    Canonical JSON (sorted keys, no whitespace, NO timestamps) so two identical
-    files produce the same pointer digest and dedup at the pointer level too. It
-    is self-identifying (the `version` field) so any reader that predates chunked
-    support and writes this blob verbatim as the file fails an obvious size/digest
-    check rather than corrupting silently."""
-    doc = {
-        "version": CHUNKED_LAYOUT,
-        "file": {"size": file_size, "digest": f"sha256:{whole_hex}"},
-        "chunks": [{"digest": f"sha256:{h}", "size": size} for h, _offset, size in chunk_metas],
-    }
-    return json.dumps(doc, sort_keys=True, separators=(",", ":")).encode("utf-8")
-
-
-def _upload_file_chunked(abs_path: str, repo_title: str, file_size: int, registry: str, oci_repo: str, oci_token: str) -> List[dict]:
-    """Store a large file as a pointer + K content-defined chunk blobs.
-
-    Returns the layer list for this file: one titled pointer layer followed by K
-    untitled chunk layers, in file order. Chunks are HEAD-deduped and pushed
-    concurrently (the WAN-parallelism win); the pointer blob is written last so a
-    crash before it leaves only unreferenced chunk blobs for Harbor GC to reclaim,
-    never a half-referenced manifest."""
-    whole_hex, chunk_metas = chunk_and_hash_native(abs_path, resolve_cdc_avg_size())
-
-    def _one(meta) -> dict:
-        chunk_hex, offset, size = meta
-        digest = f"sha256:{chunk_hex}"
-        _ensure_chunk_uploaded(registry, oci_repo, oci_token, abs_path, digest, offset, size)
-        return {"mediaType": CHUNK_MEDIA_TYPE, "size": size, "digest": digest}
-
-    # ThreadPoolExecutor.map preserves input order, so chunk layers stay in file
-    # order — which the reader relies on to assemble the file correctly.
-    with ThreadPoolExecutor(max_workers=resolve_upload_workers()) as executor:
-        chunk_layers = list(executor.map(_one, chunk_metas))
-
-    pointer_bytes = _pointer_blob_bytes(whole_hex, file_size, chunk_metas)
-    pointer_digest = f"sha256:{hashlib.sha256(pointer_bytes).hexdigest()}"
-    _ensure_bytes_blob_uploaded(registry, oci_repo, oci_token, pointer_bytes, pointer_digest)
-
-    pointer_layer = {
-        "mediaType": POINTER_MEDIA_TYPE,
-        "size": len(pointer_bytes),
-        "digest": pointer_digest,
-        "annotations": {
-            LAYER_TITLE_KEY: repo_title.replace("\\", "/"),
-            FILE_SIZE_KEY: str(file_size),
-            FILE_DIGEST_KEY: f"sha256:{whole_hex}",
-            CHUNK_COUNT_KEY: str(len(chunk_metas)),
-        },
-    }
-    return [pointer_layer, *chunk_layers]
-
-
 def _fetch_blob(registry: str, oci_repo: str, digest: str, oci_token: str) -> bytes:
     """GET a blob's raw bytes (used to read prior-revision v2 pointer blobs)."""
     resp = httpx.get(
@@ -262,11 +172,10 @@ def _build_dedup_index(existing, registry: str, oci_repo: str, oci_token: str) -
     location and record each pack's size — the v2 "upload only new chunks" index.
 
     Returns `(chunk_index, pack_sizes)`: `chunk_index[chunk_digest] = (pack_digest,
-    pack_offset)` for every chunk in a prior v2 file (fetched from its pointer
-    blob), and `pack_sizes[pack_digest] = size` from the manifest's pack layers (so
-    a reused pack can be re-listed with its size). Only v2 files contribute — a v1
-    file's chunks are their own blobs, not pack-resident, so they don't cross-dedup
-    into packs (a transient cost, bounded, as with the v1→v2 transition generally).
+    pack_offset)` for every chunk in a prior chunked-v2 file (fetched from its
+    pointer blob), and `pack_sizes[pack_digest] = size` from the manifest's pack
+    layers (so a reused pack can be re-listed with its size). A prior plain-blob
+    revision contributes nothing — there are no packs to reuse.
     """
     chunk_index: Dict[str, tuple] = {}
     pack_sizes: Dict[str, int] = {}
@@ -396,19 +305,17 @@ def _upload_file_layers(
 ) -> List[dict]:
     """Upload one file and return its manifest layer(s).
 
-    A file at or above the chunk threshold is stored chunked unless the rollout
-    gate (`HIPPIUS_CHUNKED_WRITE=0`) forces plain uploads. `HIPPIUS_CHUNKED_LAYOUT`
-    picks v1 (pointer + K chunk blobs) or v2 (pointer + ~64 MiB packs, reusing
-    prior chunks by range via `dedup_index`). Below the threshold, one plain blob
-    — byte-identical to the pre-chunking layout, so small files cross-dedup."""
+    A file at or above the chunk threshold is stored as chunked-v2 (a pointer +
+    ~64 MiB packs, reusing prior chunks by range via `dedup_index`) unless the
+    rollout gate (`HIPPIUS_CHUNKED_WRITE=0`) forces plain uploads. Below the
+    threshold, one plain blob — byte-identical to the pre-chunking layout, so
+    small files cross-dedup."""
     file_size = os.path.getsize(abs_path)
     if file_size >= resolve_chunk_threshold() and resolve_chunked_write_enabled():
-        if resolve_chunked_layout() == CHUNKED_LAYOUT_V2:
-            return _upload_file_chunked_v2(
-                abs_path, repo_title, file_size, registry, oci_repo, oci_token,
-                dedup_index or {}, pack_sizes or {},
-            )
-        return _upload_file_chunked(abs_path, repo_title, file_size, registry, oci_repo, oci_token)
+        return _upload_file_chunked_v2(
+            abs_path, repo_title, file_size, registry, oci_repo, oci_token,
+            dedup_index or {}, pack_sizes or {},
+        )
     sha256_hash, size = hash_file_native(abs_path)
     if not _ensure_blob_uploaded(registry, oci_repo, oci_token, abs_path, sha256_hash):
         # Blob already present at its digest — the dedup HEAD hit. Surface the same
@@ -607,16 +514,11 @@ def _assemble_manifest(
         "layers": merged_layers,
         "annotations": annotations,
     }
-    # Type by the newest chunked layout present. A v2 pointer wins (v2 readers
-    # read v1 too); a manifest may mix v1 and v2 files across revisions, and the
-    # layout annotation gates the whole manifest, so the annotation must name a
-    # layout that can read every file in it — v2.
+    # Tag the manifest chunked-v2 if any file in it uses the pack layout; the layout
+    # annotation gates the whole manifest through the reader's forward-compat guard.
     if any(layer.get("mediaType") == POINTER_MEDIA_TYPE_V2 for layer in merged_layers):
         manifest["artifactType"] = ARTIFACT_TYPE_CHUNKED_V2
         annotations[LAYOUT_ANNOTATION_KEY] = CHUNKED_LAYOUT_V2
-    elif any(layer.get("mediaType") == POINTER_MEDIA_TYPE for layer in merged_layers):
-        manifest["artifactType"] = ARTIFACT_TYPE_CHUNKED
-        annotations[LAYOUT_ANNOTATION_KEY] = CHUNKED_LAYOUT
     _guard_manifest_size(manifest)
     return manifest
 
@@ -806,7 +708,7 @@ def upload_file(
     existing = fetch_manifest(registry, oci_repo, revision, oci_token, missing_ok=True)
     dedup_index: Dict[str, tuple] = {}
     pack_sizes: Dict[str, int] = {}
-    if resolve_chunked_write_enabled() and resolve_chunked_layout() == CHUNKED_LAYOUT_V2:
+    if resolve_chunked_write_enabled():
         dedup_index, pack_sizes = _build_dedup_index(existing, registry, oci_repo, oci_token)
 
     file_path, cleanup = _normalize_path_or_fileobj(path_or_fileobj)

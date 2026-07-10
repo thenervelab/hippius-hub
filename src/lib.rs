@@ -12,7 +12,7 @@ mod chunked_downloader;
 mod diagnostics;
 mod uploader;
 
-use chunk_fetcher::{ChunkAssembler, ChunkPlan, PackAssembler, PackChunkTarget, PackPlanEntry};
+use chunk_fetcher::{PackAssembler, PackChunkTarget, PackPlanEntry};
 use chunked_downloader::ChunkedDownloader;
 
 /// Render a `CoreError` (plus its full `source()` chain) as a single
@@ -122,97 +122,6 @@ fn download_file_native(
     })
 }
 
-/// Download a chunked artifact's K chunk blobs concurrently and assemble them.
-///
-/// Companion to `download_file_native` (which parallelises ONE blob via Range
-/// requests, kept for pre-chunking artifacts): here each chunk is its own
-/// content-addressed blob fetched as a full `200 OK` and written to its offset.
-///
-/// # Arguments
-/// - `urls`: the K chunk-blob URLs, in file order.
-/// - `chunk_digests`: the K expected chunk sha256s (lowercase hex, no
-///   `sha256:` prefix), parallel to `urls`.
-/// - `chunk_sizes`: the K chunk byte lengths, parallel to `urls`; their running
-///   sum is each chunk's write offset and their total is the file size.
-/// - `dest_path`: local path to assemble into (pre-allocated to the total).
-/// - `file_digest`: whole-file sha256 hex, or `None` to skip the whole-file
-///   verify pass. Per-chunk verification always runs regardless.
-/// - `auth_token`: optional bearer token; `None` means anonymous.
-/// - `max_concurrent`: connection-pool bound; defaults to 32.
-///
-/// # Returns
-/// `Optional[str]` on the Python side — the assembled file's sha256 hex when
-/// `file_digest` was provided (and verified equal), else `None`.
-///
-/// # Errors
-/// `PyValueError` if the three parallel arrays differ in length or the sizes
-/// overflow a `u64`; `PyRuntimeError` (with the full `caused by:` chain) on any
-/// fetch, I/O, or integrity failure.
-///
-/// # GIL
-/// Releases the Python GIL across the blocking transfer via `py.detach`.
-#[pyfunction]
-#[pyo3(signature = (urls, chunk_digests, chunk_sizes, dest_path, file_digest=None, auth_token=None, max_concurrent=None))]
-#[expect(
-    clippy::needless_pass_by_value,
-    reason = "pyo3 #[pyfunction] requires owned values to extract from Python args"
-)]
-#[expect(
-    clippy::too_many_arguments,
-    reason = "each parameter is a distinct Python-supplied download argument; bundling into a #[pyclass] would add a wrapper type for no call-site clarity"
-)]
-fn download_chunks_native(
-    py: Python<'_>,
-    urls: Vec<String>,
-    chunk_digests: Vec<String>,
-    chunk_sizes: Vec<u64>,
-    dest_path: String,
-    file_digest: Option<String>,
-    auth_token: Option<String>,
-    max_concurrent: Option<usize>,
-) -> PyResult<Option<String>> {
-    if urls.len() != chunk_digests.len() || urls.len() != chunk_sizes.len() {
-        return Err(PyValueError::new_err(format!(
-            "urls ({}), chunk_digests ({}), and chunk_sizes ({}) must have equal length",
-            urls.len(),
-            chunk_digests.len(),
-            chunk_sizes.len()
-        )));
-    }
-
-    // Cumulative offsets; checked_add so a pathological size list can't wrap the
-    // u64 and silently overlap chunk ranges.
-    let mut plans: Vec<ChunkPlan> = Vec::with_capacity(urls.len());
-    let mut offset: u64 = 0;
-    for ((url, expected_sha256), size) in urls.into_iter().zip(chunk_digests).zip(chunk_sizes) {
-        plans.push(ChunkPlan {
-            url,
-            expected_sha256,
-            size,
-            offset,
-        });
-        offset = offset
-            .checked_add(size)
-            .ok_or_else(|| PyValueError::new_err("chunk sizes overflow u64 total"))?;
-    }
-    let total_size = offset;
-
-    let rt = shared_runtime();
-    let dest = PathBuf::from(dest_path);
-    let concurrency = max_concurrent.unwrap_or(32).max(1);
-
-    py.detach(|| {
-        let assembler =
-            ChunkAssembler::new(auth_token, concurrency).map_err(|e| core_err_to_py(&e))?;
-        rt.block_on(async {
-            assembler
-                .assemble(&dest, &plans, file_digest.as_deref(), total_size)
-                .await
-        })
-        .map_err(|e| core_err_to_py(&e))
-    })
-}
-
 /// Compute the SHA-256 and byte length of a local file.
 ///
 /// # Arguments
@@ -249,8 +158,8 @@ fn hash_file_native(py: Python<'_>, path: String) -> PyResult<(String, u64)> {
 
 /// Split a file into content-defined chunks and hash each chunk + the whole file.
 ///
-/// The upload-side companion to `download_chunks_native`: chunk once here, then
-/// `HEAD`-dedup and `upload_blob_range_native` each chunk from Python.
+/// The chunked-v2 upload primitive: chunk once here, then the Python layer plans
+/// packs (`_packing.plan_packs`) and pushes each new pack via `pack_upload_native`.
 ///
 /// # Arguments
 /// - `path`: local file to chunk.
@@ -277,46 +186,6 @@ fn chunk_and_hash_native(
     let dest = PathBuf::from(path);
     // Sync CPU+I/O pass; no runtime needed. Detach releases the GIL for it.
     py.detach(|| uploader::chunk_and_hash(&dest, avg_size).map_err(|e| core_err_to_py(&e)))
-}
-
-/// Upload exactly `length` bytes at `offset` of a file as one OCI blob (the
-/// chunked-artifact upload primitive; parallelised across chunks by the caller).
-///
-/// # Arguments
-/// - `url`: OCI upload-location URL (from a prior `POST .../blobs/uploads/`,
-///   suffixed with `?digest=<sha256:...>` by the caller).
-/// - `path`: local file to read the range from.
-/// - `offset` / `length`: the chunk's byte range in `path`.
-/// - `auth_token`: optional bearer token.
-///
-/// # Errors
-/// `PyRuntimeError` (with the full `caused by:` chain) on any upload failure.
-///
-/// # GIL
-/// Releases the Python GIL across the blocking upload via `py.detach`.
-#[pyfunction]
-#[pyo3(signature = (url, path, offset, length, auth_token=None))]
-#[expect(
-    clippy::needless_pass_by_value,
-    reason = "pyo3 #[pyfunction] requires owned values to extract from Python args"
-)]
-fn upload_blob_range_native(
-    py: Python<'_>,
-    url: String,
-    path: String,
-    offset: u64,
-    length: u64,
-    auth_token: Option<String>,
-) -> PyResult<()> {
-    let rt = shared_runtime();
-    let dest = PathBuf::from(path);
-    py.detach(|| {
-        rt.block_on(async {
-            uploader::upload_blob_range_async(&url, &dest, offset, length, auth_token.as_deref())
-                .await
-        })
-        .map_err(|e| core_err_to_py(&e))
-    })
 }
 
 /// Upload a local file to `url` as the body of a chunked HTTP PUT.
@@ -528,10 +397,8 @@ fn download_packs_native(
 #[pymodule]
 fn hippius_core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(download_file_native, m)?)?;
-    m.add_function(wrap_pyfunction!(download_chunks_native, m)?)?;
     m.add_function(wrap_pyfunction!(hash_file_native, m)?)?;
     m.add_function(wrap_pyfunction!(chunk_and_hash_native, m)?)?;
-    m.add_function(wrap_pyfunction!(upload_blob_range_native, m)?)?;
     m.add_function(wrap_pyfunction!(upload_blob_native, m)?)?;
     m.add_function(wrap_pyfunction!(pack_upload_native, m)?)?;
     m.add_function(wrap_pyfunction!(download_packs_native, m)?)?;

@@ -9,19 +9,23 @@ the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 
 ### Added
 
-- **Chunked-artifact layout for large files.** Files at or above
+- **Chunked-v2 (pack) layout for large files.** Files at or above
   `HIPPIUS_CHUNK_THRESHOLD` (256 MiB) are stored as content-defined chunks
-  (FastCDC, ~64 MiB average) — a titled pointer layer plus K untitled,
-  content-addressed chunk blobs, typed with `artifactType` and a
-  `com.hippius.layout: chunked-v1` annotation. Chunks are `HEAD`-deduped and
-  pushed/pulled in parallel, so a re-uploaded slightly-changed model transfers
-  only its changed chunks and large-file transfer parallelizes across chunks.
-  Small files and every pre-existing artifact are unchanged (one plain blob).
-- New Rust extension functions: `chunk_and_hash_native`,
-  `upload_blob_range_native`, `download_chunks_native`.
+  (FastCDC, ~4 MiB average) packed into ~64 MiB content-addressed *pack* blobs —
+  a titled `pointer.v2` layer (mapping each chunk to its pack, offset, and size)
+  plus the untitled pack blobs it references, typed with `artifactType` and a
+  `com.hippius.layout: chunked-v2` annotation. A re-uploaded slightly-changed
+  model references unchanged chunks by range into existing packs and uploads only
+  the packs holding new chunks; downloads fetch each pack once and slice its
+  chunks to their file offsets. Concurrent pack uploads are bounded across all
+  files by a shared cap so folder uploads don't multiply resident memory. Small
+  files and every pre-existing artifact are unchanged (one plain blob).
+- New Rust extension functions: `chunk_and_hash_native`, `pack_upload_native`,
+  `download_packs_native`.
 - New env vars: `HIPPIUS_CHUNK_THRESHOLD`, `HIPPIUS_CDC_AVG_SIZE`,
-  `HIPPIUS_CHUNKED_WRITE` (rollout escape hatch — set to `0` to keep the
-  single-blob layout for large files during a staged rollout).
+  `HIPPIUS_PACK_SIZE`, `HIPPIUS_MAX_INFLIGHT_PACKS`, `HIPPIUS_CHUNKED_WRITE`
+  (rollout escape hatch — the chunked-v2 write path is opt-in this release; unset
+  or `0` keeps the single-blob layout for large files).
 - Forward-compatibility guard: a manifest with an unknown `com.hippius.layout`
   is refused with `UnsupportedLayoutError` (new) instead of misread. Malformed
   chunked manifests raise `MalformedManifestError` (new).
