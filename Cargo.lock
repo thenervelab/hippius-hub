@@ -373,6 +373,7 @@ checksum = "7f24254aa9a54b5c858eaee2f5bccdb46aaf0e486a595ed5fd8f86ba55232a70"
 name = "hippius_core"
 version = "0.5.1"
 dependencies = [
+ "bytes",
  "fastcdc",
  "futures",
  "hex",

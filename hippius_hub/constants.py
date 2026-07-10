@@ -225,6 +225,20 @@ def resolve_upload_workers() -> int:
     return _resolve_positive_int("HIPPIUS_UPLOAD_WORKERS", DEFAULT_TRANSFER_WORKERS)
 
 
+def resolve_max_inflight_packs() -> int:
+    """Cap on chunked-v2 packs being uploaded across ALL files at once.
+
+    Folder uploads nest parallelism — `upload_folder` runs files concurrently and
+    each file uploads its packs concurrently — so without a shared bound peak
+    resident memory is `file_workers × pack_workers × pack_size`, ~4 GB at the
+    defaults (and higher once per-pack I/O and HTTP buffers count). This bounds the
+    product to one ceiling. Defaults to `resolve_upload_workers()` so a single-file
+    upload keeps its current concurrency; only the multiplying folder case is
+    reined in. Raising it buys nothing when the link is bandwidth-bound (the
+    Harbor-flow probe measures ~0.9× throughput scaling from 1→16 connections)."""
+    return _resolve_positive_int("HIPPIUS_MAX_INFLIGHT_PACKS", resolve_upload_workers())
+
+
 def debug_enabled() -> bool:
     """True when verbose transport logging is requested (HIPPIUS_DEBUG truthy
     or RUST_LOG set). The CLI also flips HIPPIUS_DEBUG on for `--verbose`."""

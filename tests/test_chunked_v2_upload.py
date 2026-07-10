@@ -11,6 +11,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import threading
+import time
 
 import httpx
 import pytest
@@ -170,3 +172,41 @@ def test_v2_reupload_dedups_unchanged_chunk(monkeypatch, tmp_path):
     refs = parse_pointer_v2(ptr_blob)
     assert refs[0].pack_digest == p0  # "a" reused from the old pack
     assert refs[1].pack_digest != p0  # "b" in a freshly uploaded pack
+
+
+@respx.mock
+def test_v2_pack_uploads_respect_inflight_cap(monkeypatch, tmp_path):
+    """The shared gate bounds concurrent pack uploads to the cap even when the
+    per-file worker pool would allow more — this is what stops a folder upload's
+    nested file×pack parallelism from multiplying resident pack memory. With two
+    packs, a 4-wide pool, and cap=1, the two uploads MUST serialize."""
+    monkeypatch.setenv("HIPPIUS_CHUNK_THRESHOLD", "1")
+    monkeypatch.setenv("HIPPIUS_CHUNKED_WRITE", "1")
+    monkeypatch.setenv("HIPPIUS_CHUNKED_LAYOUT", "v2")
+    monkeypatch.setenv("HIPPIUS_PACK_SIZE", "40")        # chunk "a" (40) closes pack 0 -> two packs
+    monkeypatch.setenv("HIPPIUS_UPLOAD_WORKERS", "4")    # pool would run both at once...
+    monkeypatch.setenv("HIPPIUS_MAX_INFLIGHT_PACKS", "1")  # ...but the cap serializes them
+    captured = {}
+    _wire_registry(monkeypatch, captured)
+
+    state = {"cur": 0, "max": 0}
+    lock = threading.Lock()
+
+    def _slow_pack(uploads_url, path, ranges, auth_token):
+        with lock:
+            state["cur"] += 1
+            state["max"] = max(state["max"], state["cur"])
+        time.sleep(0.05)  # hold the slot so a concurrency breach would overlap here
+        with lock:
+            state["cur"] -= 1
+        return _pack_digest(ranges)
+
+    monkeypatch.setattr(file_upload, "pack_upload_native", _slow_pack)
+
+    src = tmp_path / "big.bin"
+    src.write_bytes(b"x" * 100)
+    upload_file(path_or_fileobj=str(src), path_in_repo="big.bin", repo_id=REPO, token="tok")
+
+    # Two packs were produced (so concurrency was possible) but never overlapped.
+    assert len(captured["manifest"]["layers"]) >= 3  # pointer + 2 packs
+    assert state["max"] == 1, "cap=1 must serialize pack uploads despite a 4-wide pool"

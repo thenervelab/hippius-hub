@@ -20,6 +20,10 @@ pyo3-async-runtimes = { version = "0.29", features = ["tokio-runtime"] }
 tokio = { version = "1.35", features = ["rt", "rt-multi-thread", "macros", "fs", "time", "net"] }
 tokio-util = { version = "0.7", features = ["codec"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+# Already in the tree via reqwest/tokio-util; declared direct so the pack-upload
+# body can be an O(1)-cloneable `Bytes` (one allocation per in-flight pack, shared
+# across retries) instead of a per-attempt `Vec` copy.
+bytes = "1"
 indicatif = "0.17.8"
 futures = "0.3"
 hex = "0.4"
