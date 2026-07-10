@@ -65,21 +65,33 @@ pub async fn hash_file_async(path: &Path) -> Result<(String, u64), CoreError> {
 /// `try_upload_blob_once` for the per-attempt body.
 const UPLOAD_MAX_RETRIES: u32 = 3;
 
-/// Stream-upload a file to the OCI URL returned by /blobs/uploads/ (the PUT-with-digest finalises the blob).
-/// Shows a per-call progress bar — useful for large blobs (multi-GB).
+/// Open a fresh OCI upload session and stream a file into it, finalising the
+/// blob. `uploads_url` is the `/v2/{repo}/blobs/uploads/` endpoint (a POST
+/// starts a session); `digest` is the `sha256:...` finalised via the PUT's
+/// `?digest=`. Shows a per-call progress bar — useful for large blobs (multi-GB).
 ///
 /// Audit U3 (Phase 3.11): wraps [`try_upload_blob_once`] in an
 /// exponential-backoff retry loop with the same shape as
-/// [`crate::chunked_downloader::download_chunk_with_retry`]. Each
-/// attempt re-opens the file inside `try_upload_blob_once` (the
-/// previous `FramedRead` stream has been consumed), so the retry sees a
-/// fresh handle. Backoff schedule: 200, 400, 800, 1600 ms — four
-/// attempts total, ~3 s of backoff before surfacing a transient 5xx as
-/// terminal. A 4xx never burns backoff.
-pub async fn upload_blob_async(url: &str, path: &Path, auth_token: Option<&str>) -> Result<(), CoreError> {
+/// [`crate::chunked_downloader::download_chunk_with_retry`]. Backoff schedule:
+/// 200, 400, 800, 1600 ms — four attempts total, ~3 s of backoff before
+/// surfacing a transient 5xx as terminal. A 4xx never burns backoff.
+///
+/// Fresh-session fix: each attempt calls `try_upload_blob_once`, which starts a
+/// BRAND-NEW upload session (its own POST) before streaming the PUT. Re-using
+/// one session across retries was a production bug — when a mid-stream
+/// disconnect left the registry's session at a nonzero offset, the retry's
+/// monolithic PUT (offset 0) was rejected with "upload resumed at wrong offset"
+/// (404 `BLOB_UPLOAD_INVALID`), turning a *recoverable* disconnect into a hard
+/// failure. A new session per attempt always starts at offset 0.
+pub async fn upload_blob_async(
+    uploads_url: &str,
+    digest: &str,
+    path: &Path,
+    auth_token: Option<&str>,
+) -> Result<(), CoreError> {
     let mut retries: u32 = 0;
     loop {
-        match try_upload_blob_once(url, path, auth_token).await {
+        match try_upload_blob_once(uploads_url, digest, path, auth_token).await {
             Ok(()) => return Ok(()),
             Err(e) => {
                 retries += 1;
@@ -141,10 +153,65 @@ fn upload_client() -> Result<&'static Client, CoreError> {
     Ok(CLIENT.get_or_init(|| built))
 }
 
-async fn try_upload_blob_once(url: &str, path: &Path, auth_token: Option<&str>) -> Result<(), CoreError> {
+async fn try_upload_blob_once(
+    uploads_url: &str,
+    digest: &str,
+    path: &Path,
+    auth_token: Option<&str>,
+) -> Result<(), CoreError> {
     // Reuse the process-global client so the keep-alive connection pool
     // survives across blobs and retries (audit N-4 / RUST-3).
     let client = upload_client()?;
+
+    // Start a FRESH upload session on every attempt. Doing the POST here (not
+    // once in the caller) is what makes the retry loop in `upload_blob_async`
+    // get a new session — at offset 0 — each time; re-using one session across
+    // retries is what caused the "upload resumed at wrong offset" /
+    // BLOB_UPLOAD_INVALID failures after a mid-stream disconnect.
+    // Harbor requires an explicit Content-Length: 0 on the upload-init POST (the
+    // old Python path set it too); reqwest omits it for a body-less POST, which
+    // Harbor answers with 400. Set it via the lowercase literal header name — a
+    // valid header, and NOT the `header::CONTENT_LENGTH` token the streaming-PUT
+    // source guard forbids (that guard is about the PUT body, not this POST).
+    let mut init = client.post(uploads_url).header("content-length", "0");
+    if let Some(token) = auth_token {
+        init = init.bearer_auth(token);
+    }
+    let init_res = init.send().await?;
+    let init_status = init_res.status();
+    if !init_status.is_success() {
+        return Err(CoreError::ServerError(
+            init_status.as_u16(),
+            format!("Upload session init failed: {init_status:?}"),
+        ));
+    }
+    let location = init_res
+        .headers()
+        .get(header::LOCATION)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned)
+        .ok_or_else(|| {
+            CoreError::ServerError(
+                init_status.as_u16(),
+                "Registry did not return a Location header for upload initiation".to_owned(),
+            )
+        })?;
+    // Resolve a possibly-relative Location against the session endpoint, then
+    // append the finalising `?digest=` — using `&` if the registry already put
+    // a `?_state=` query on the Location (matching the old Python separator).
+    let put_url = init_res
+        .url()
+        .join(&location)
+        .map(|abs| {
+            let sep = if abs.query().is_some() { '&' } else { '?' };
+            format!("{abs}{sep}digest={digest}")
+        })
+        .map_err(|e| {
+            CoreError::ServerError(
+                init_status.as_u16(),
+                format!("invalid upload Location {location:?}: {e}"),
+            )
+        })?;
 
     let file = File::open(path).await?;
     // Snapshot file size for the progress bar UI only. We deliberately
@@ -190,7 +257,7 @@ async fn try_upload_blob_once(url: &str, path: &Path, auth_token: Option<&str>) 
     // length matches whatever `FramedRead` actually delivers at stream time —
     // not whatever `metadata().len()` reported a few syscalls earlier.
     let mut req = client
-        .put(url)
+        .put(&put_url)
         .header(header::CONTENT_TYPE, "application/octet-stream")
         .body(body);
 

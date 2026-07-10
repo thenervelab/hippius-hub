@@ -177,14 +177,15 @@ fn hash_file_native(py: Python<'_>, path: String) -> PyResult<(String, u64)> {
 /// `py.detach` so other Python threads can make progress while
 /// the file is being streamed.
 #[pyfunction]
-#[pyo3(signature = (url, path, auth_token=None))]
+#[pyo3(signature = (uploads_url, digest, path, auth_token=None))]
 #[expect(
     clippy::needless_pass_by_value,
     reason = "pyo3 #[pyfunction] requires owned values to extract from Python args"
 )]
 fn upload_blob_native(
     py: Python<'_>,
-    url: String,
+    uploads_url: String,
+    digest: String,
     path: String,
     auth_token: Option<String>,
 ) -> PyResult<()> {
@@ -192,9 +193,14 @@ fn upload_blob_native(
     let dest = PathBuf::from(path);
 
     // Release the GIL across the blocking upload; see `download_file_native`.
+    // `uploads_url` is the /blobs/uploads/ session endpoint; the POST that starts
+    // a session happens per-attempt inside `upload_blob_async`, so each retry gets
+    // a fresh session (fixes the "wrong offset" BLOB_UPLOAD_INVALID failures).
     py.detach(|| {
-        rt.block_on(async { uploader::upload_blob_async(&url, &dest, auth_token.as_deref()).await })
-            .map_err(|e| core_err_to_py(&e))
+        rt.block_on(async {
+            uploader::upload_blob_async(&uploads_url, &digest, &dest, auth_token.as_deref()).await
+        })
+        .map_err(|e| core_err_to_py(&e))
     })
 }
 
