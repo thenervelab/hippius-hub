@@ -2,6 +2,7 @@ use futures::stream::{FuturesUnordered, StreamExt};
 use reqwest::{header, Client};
 use sha2::{Digest, Sha256};
 use std::path::Path;
+use std::sync::Arc;
 use std::time::Duration;
 use indicatif::{ProgressBar, ProgressStyle};
 use tokio::fs::OpenOptions;
@@ -10,12 +11,17 @@ use tokio::fs::OpenOptions;
 // trait inside `compute_sha256`, so the async-read trait is no longer
 // needed at module scope.
 use tokio::io::{AsyncSeekExt, AsyncWriteExt, SeekFrom, BufWriter};
+use tokio::sync::Semaphore;
 use tokio::task::AbortHandle;
 
 use crate::error::CoreError;
 
 const DEFAULT_CHUNK_SIZE: u64 = 100 * 1024 * 1024; // 100 MB default
 const MAX_RETRIES: u32 = 3;
+/// In-flight cap for the legacy Range downloader's eager-spawned chunk tasks, so a
+/// small caller-set `HIPPIUS_CHUNK_SIZE` on a huge file can't open O(file/chunk)
+/// connections at once. 32 mirrors the pack path's default concurrency.
+const MAX_INFLIGHT_CHUNKS: usize = 32;
 const VERIFY_READ_BUFFER: usize = 8 * 1024 * 1024; // 8 MB read buffer for SHA256 verification
 
 /// Per-chunk request timeout (audit D6).
@@ -184,13 +190,14 @@ impl ChunkedDownloader {
         // `num_chunks` — `pool_max_idle_per_host` on the shared `download_client`
         // caps only IDLE (retained) connections, NOT in-flight requests (reqwest/
         // hyper open a new connection rather than queueing an h1 request). At the
-        // 100 MiB default chunk size this is a handful of tasks; a small
-        // caller-set `HIPPIUS_CHUNK_SIZE` on a huge file would open many
-        // connections. Bounding in-flight would need an explicit `Semaphore` like
-        // the pack path (a tracked follow-up).
+        // 100 MiB default chunk size that is a handful of tasks, but a small
+        // caller-set `HIPPIUS_CHUNK_SIZE` on a huge file would open O(file/chunk)
+        // connections — so the `permits` Semaphore below caps in-flight chunk GETs
+        // at MAX_INFLIGHT_CHUNKS, matching the pack path's per-file bound.
         let mut joins: FuturesUnordered<tokio::task::JoinHandle<(usize, Result<(), CoreError>)>> =
             FuturesUnordered::new();
         let mut abort_handles: Vec<AbortHandle> = Vec::with_capacity(num_chunks);
+        let permits = Arc::new(Semaphore::new(MAX_INFLIGHT_CHUNKS));
 
         for i in 0..num_chunks {
             let (start, end) = chunk_bounds(content_length, self.chunk_size, i);
@@ -200,8 +207,14 @@ impl ChunkedDownloader {
             let token = self.auth_token.clone();
             let chunk_pb = pb.clone();
             let path = dest_path_buf.clone();
+            let permits = Arc::clone(&permits);
 
             let handle = tokio::spawn(async move {
+                // Bound concurrent connections; RAII-released on completion or abort.
+                let _permit = match permits.acquire_owned().await {
+                    Ok(p) => p,
+                    Err(e) => return (i, Err(CoreError::Io(std::io::Error::other(e)))),
+                };
                 let res = download_chunk_with_retry(client, url, token, start, end, i, path, chunk_pb).await;
                 (i, res)
             });
