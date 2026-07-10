@@ -298,52 +298,6 @@ async fn try_upload_blob_once(
     put_streaming(url, file, file_size, &basename_of(path), auth_token).await
 }
 
-/// Upload exactly `length` bytes starting at `offset` of `path` as one OCI blob.
-///
-/// This is the chunked-artifact upload primitive: the file is chunked once (by
-/// `chunk_and_hash`) and each chunk's byte range is pushed as its own
-/// content-addressed blob, in parallel across chunks. Retries share the
-/// downloader/uploader classifier via [`CoreError::is_retryable`]; each attempt
-/// re-opens and re-seeks so the body is fresh (the previous `wrap_stream` was
-/// consumed).
-pub async fn upload_blob_range_async(
-    url: &str,
-    path: &Path,
-    offset: u64,
-    length: u64,
-    auth_token: Option<&str>,
-) -> Result<(), CoreError> {
-    let mut retries: u32 = 0;
-    loop {
-        match try_upload_range_once(url, path, offset, length, auth_token).await {
-            Ok(()) => return Ok(()),
-            Err(e) => {
-                retries += 1;
-                if !e.is_retryable() || retries > UPLOAD_MAX_RETRIES {
-                    return Err(e);
-                }
-                let wait_time = 2u64.pow(retries) * 100;
-                tokio::time::sleep(Duration::from_millis(wait_time)).await;
-            }
-        }
-    }
-}
-
-async fn try_upload_range_once(
-    url: &str,
-    path: &Path,
-    offset: u64,
-    length: u64,
-    auth_token: Option<&str>,
-) -> Result<(), CoreError> {
-    let mut file = File::open(path).await?;
-    file.seek(SeekFrom::Start(offset)).await?;
-    // `take(length)` bounds the body to exactly this chunk's bytes, so the
-    // chunked-encoded PUT sends the range and nothing past it.
-    let reader = file.take(length);
-    put_streaming(url, reader, length, &basename_of(path), auth_token).await
-}
-
 /// Read the given file byte-ranges in order into one pack blob and push it via a
 /// fresh OCI upload session (POST init + monolithic PUT-with-digest). Returns the
 /// pack's sha256 hex — the chunked-v2 caller records it in the pointer blob.

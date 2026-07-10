@@ -42,19 +42,9 @@ LAYER_TITLE_KEY = "org.opencontainers.image.title"
 # (one plain titled blob per file), which every build reads.
 LAYOUT_ANNOTATION_KEY = "com.hippius.layout"
 
-# ----- chunked-artifact layout (docs/plans/2026-07-09-chunked-artifact-layout.md) -----
-# A file >= the chunk threshold is stored as one titled *pointer* layer plus K
-# *untitled* content-defined chunk blobs. These media types + annotation keys are
-# the wire contract shared by the uploader (writes them), the reader (parses
-# them), and the layout guard (gates them). Bump CHUNKED_LAYOUT to a new value if
-# any of this shape changes — a mismatched reader must fail the guard, not
-# misparse (see errors.UnsupportedLayoutError).
-CHUNKED_LAYOUT = "chunked-v1"
-ARTIFACT_TYPE_CHUNKED = "application/vnd.hippius.chunked.v1"
-POINTER_MEDIA_TYPE = "application/vnd.hippius.pointer.v1"
-CHUNK_MEDIA_TYPE = "application/vnd.hippius.chunk.v1"
-# Whole-file metadata carried once, on the pointer layer's annotations (the K
-# chunk layers stay bare — mediaType+digest+size only — to keep the manifest small).
+# ----- chunked-artifact annotation keys (shared by the pack layout below) -----
+# Whole-file metadata carried once, on the pointer layer's annotations, so the
+# metadata read path (siblings/list_repo_files) never fetches the pointer blob.
 FILE_SIZE_KEY = "com.hippius.file.size"
 FILE_DIGEST_KEY = "com.hippius.file.digest"
 CHUNK_COUNT_KEY = "com.hippius.chunk.count"
@@ -89,12 +79,10 @@ DEFAULT_PACK_SIZE = 64 * 1024 * 1024
 MAX_MANIFEST_BYTES = 4 * 1024 * 1024
 
 # Layout values THIS build can read. The forward-compat guard (_oci._guard_layout)
-# and chunked-read support ship together in this release — there is no earlier
-# build carrying an empty-floor guard, so no already-deployed reader refuses a
-# chunked artifact. That backward gap is why chunked WRITES are opt-in for this
-# release (resolve_chunked_write_enabled defaults off): readers upgrade first,
-# writers flip the default on in a later release.
-KNOWN_LAYOUTS: frozenset = frozenset({CHUNKED_LAYOUT, CHUNKED_LAYOUT_V2})
+# refuses any other value loudly rather than misparsing. chunked WRITES stay opt-in
+# for this release (resolve_chunked_write_enabled defaults off): readers upgrade
+# first, writers flip the default on in a later release.
+KNOWN_LAYOUTS: frozenset = frozenset({CHUNKED_LAYOUT_V2})
 
 
 # ----- transfer tuning knobs -----
@@ -109,10 +97,11 @@ DEFAULT_TRANSFER_WORKERS = 8            # snapshot/upload ThreadPoolExecutor siz
 
 
 # Chunked-artifact upload. A file at or above the threshold is stored as a
-# pointer + K content-defined chunk blobs; below it, one plain blob (byte-
-# identical to the pre-chunking layout). The CDC average is the FastCDC target
-# (min/max derived avg/4..avg*4 in the Rust splitter) and is part of the wire
-# contract — a change means a new layout version, not a silent retune.
+# pointer + content-defined chunks packed into ~64 MiB pack blobs (chunked-v2);
+# below it, one plain blob (byte-identical to the pre-chunking layout). The CDC
+# average is the FastCDC target (min/max derived avg/4..avg*4 in the Rust
+# splitter) and is part of the wire contract — a change means a new layout
+# version, not a silent retune.
 DEFAULT_CHUNK_THRESHOLD = 256 * 1024 * 1024  # 256 MiB
 # 4 MiB is the LARGEST average fastcdc 3.2.1 can produce: its AVERAGE_MAX cap is
 # 4 MiB, and via min=avg/4 / max=avg*4 the derived 1 MiB min and 16 MiB max are
@@ -137,22 +126,6 @@ def resolve_cdc_avg_size() -> int:
 def resolve_pack_size() -> int:
     """Target pack size (bytes) for the chunked-v2 layout. Overridable for testing."""
     return _resolve_positive_int("HIPPIUS_PACK_SIZE", DEFAULT_PACK_SIZE)
-
-
-def resolve_chunked_layout() -> str:
-    """Which chunked layout new large-file uploads emit: 'chunked-v1' (default) or
-    'chunked-v2' (Xet-style packs). Opt-in for v2 the same way writes are opt-in:
-    v2 is a NEW layout value, so a reader that predates v2 refuses it loudly rather
-    than misreading — flip the default to v2 only once the v2-capable reader is the
-    deployed floor. `HIPPIUS_CHUNKED_LAYOUT=v2` opts a producer in now (staging)."""
-    raw = (os.environ.get("HIPPIUS_CHUNKED_LAYOUT") or "").strip().lower()
-    if raw in ("v2", "chunked-v2", "2"):
-        return CHUNKED_LAYOUT_V2
-    if raw in ("", "v1", "chunked-v1", "1"):
-        return CHUNKED_LAYOUT
-    raise ValueError(
-        f"HIPPIUS_CHUNKED_LAYOUT must be 'v1' or 'v2', got {raw!r}"
-    )
 
 
 def resolve_chunked_write_enabled() -> bool:

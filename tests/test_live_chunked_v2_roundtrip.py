@@ -1,9 +1,10 @@
 """Live chunked-v2 (pack layout) round-trip against the real registry.
 
-Gated on `HIPPIUS_CHUNKED_LAYOUT=v2` (opt-in), so it runs only where a producer
-opted into v2 — the staging CI step, never main. Exercises the pieces the offline
-tests can't: the native pack upload (POST-init + monolithic PUT of concatenated
-ranges) and the native pack download (fetch each pack once, slice+verify chunks).
+Gated on `HIPPIUS_CHUNKED_WRITE` (opt-in), so it runs only where a producer opted
+into the chunked-v2 pack layout — the staging CI step, never main. Exercises the
+pieces the offline tests can't: the native pack upload (POST-init + monolithic PUT
+of concatenated ranges) and the native pack download (fetch each pack once,
+slice+verify chunks).
 
 Proves: write (manifest is chunked-v2 with pack layers), read (bytes round-trip,
 which also proves cross-pack chunk ordering via the whole-file digest), and dedup
@@ -21,7 +22,7 @@ from hippius_hub.constants import (
     ARTIFACT_TYPE_CHUNKED_V2,
     CHUNKED_LAYOUT_V2,
     PACK_MEDIA_TYPE,
-    resolve_chunked_layout,
+    resolve_chunked_write_enabled,
     resolve_registry,
 )
 from hippius_hub.file_download import _oci_repo_path
@@ -37,8 +38,8 @@ def _pack_layer_count(registry, oci_repo, revision, token) -> int:
 
 
 def test_chunked_v2_live_roundtrip(tmp_path, cache_dir, logged_in, test_repo, revision, monkeypatch):
-    if resolve_chunked_layout() != CHUNKED_LAYOUT_V2:
-        pytest.skip("HIPPIUS_CHUNKED_LAYOUT != v2; the pack layout is opt-in")
+    if not resolve_chunked_write_enabled():
+        pytest.skip("HIPPIUS_CHUNKED_WRITE not enabled; the chunked-v2 write path is opt-in")
 
     # Multi-chunk file split into a few packs: low threshold, small CDC average,
     # small pack size so a 4 MiB file yields multiple packs (exercises coalescing
@@ -98,8 +99,8 @@ def test_chunked_v2_many_packs_ordering(tmp_path, cache_dir, logged_in, test_rep
     digest on download is the only check that catches a mis-ordered many-pack
     reassembly.
     """
-    if resolve_chunked_layout() != CHUNKED_LAYOUT_V2:
-        pytest.skip("HIPPIUS_CHUNKED_LAYOUT != v2; the pack layout is opt-in")
+    if not resolve_chunked_write_enabled():
+        pytest.skip("HIPPIUS_CHUNKED_WRITE not enabled; the chunked-v2 write path is opt-in")
 
     monkeypatch.setenv("HIPPIUS_CHUNK_THRESHOLD", str(1 * 1024 * 1024))
     monkeypatch.setenv("HIPPIUS_CDC_AVG_SIZE", str(256 * 1024))  # max chunk = avg*4 = 1 MiB
