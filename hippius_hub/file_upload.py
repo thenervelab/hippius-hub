@@ -20,33 +20,41 @@ from huggingface_hub import CommitInfo
 from huggingface_hub.utils import filter_repo_objects
 from tqdm import tqdm
 
-from ._oci import fetch_manifest, layer_title
+from ._oci import fetch_manifest, group_files, layer_title, parse_pointer_v2
+from ._packing import plan_packs, pointer_v2_bytes, resolve_pointer_chunks
 from .auth import get_oci_bearer_token
 from .constants import (
     ARTIFACT_TYPE_CHUNKED,
+    ARTIFACT_TYPE_CHUNKED_V2,
     CHUNK_COUNT_KEY,
     CHUNK_MEDIA_TYPE,
     CHUNKED_LAYOUT,
+    CHUNKED_LAYOUT_V2,
     DEFAULT_HTTP_TIMEOUT,
     FILE_DIGEST_KEY,
     FILE_SIZE_KEY,
     LAYER_TITLE_KEY,
     LAYOUT_ANNOTATION_KEY,
     MAX_MANIFEST_BYTES,
+    PACK_MEDIA_TYPE,
     POINTER_MEDIA_TYPE,
+    POINTER_MEDIA_TYPE_V2,
     resolve_cdc_avg_size,
     resolve_chunk_threshold,
+    resolve_chunked_layout,
     resolve_chunked_write_enabled,
+    resolve_pack_size,
     resolve_registry,
     resolve_upload_workers,
 )
-from .errors import ConcurrentManifestUpdateError, ManifestTooLargeError
+from .errors import ConcurrentManifestUpdateError, MalformedManifestError, ManifestTooLargeError
 from .file_download import _oci_repo_path, _validate_repo_type
 
 try:
     from .hippius_core import (
         chunk_and_hash_native,
         hash_file_native,
+        pack_upload_native,
         upload_blob_native,
         upload_blob_range_native,
     )
@@ -236,15 +244,143 @@ def _upload_file_chunked(abs_path: str, repo_title: str, file_size: int, registr
     return [pointer_layer, *chunk_layers]
 
 
-def _upload_file_layers(abs_path: str, repo_title: str, registry: str, oci_repo: str, oci_token: str) -> List[dict]:
+def _fetch_blob(registry: str, oci_repo: str, digest: str, oci_token: str) -> bytes:
+    """GET a blob's raw bytes (used to read prior-revision v2 pointer blobs)."""
+    resp = httpx.get(
+        f"{registry}/v2/{oci_repo}/blobs/{digest}",
+        headers={"Authorization": f"Bearer {oci_token}"},
+        timeout=DEFAULT_HTTP_TIMEOUT,
+    )
+    resp.raise_for_status()
+    return resp.content
+
+
+def _build_dedup_index(existing, registry: str, oci_repo: str, oci_token: str) -> tuple:
+    """From the prior revision's manifest, map already-stored chunks to their pack
+    location and record each pack's size — the v2 "upload only new chunks" index.
+
+    Returns `(chunk_index, pack_sizes)`: `chunk_index[chunk_digest] = (pack_digest,
+    pack_offset)` for every chunk in a prior v2 file (fetched from its pointer
+    blob), and `pack_sizes[pack_digest] = size` from the manifest's pack layers (so
+    a reused pack can be re-listed with its size). Only v2 files contribute — a v1
+    file's chunks are their own blobs, not pack-resident, so they don't cross-dedup
+    into packs (a transient cost, bounded, as with the v1→v2 transition generally).
+    """
+    chunk_index: Dict[str, tuple] = {}
+    pack_sizes: Dict[str, int] = {}
+    if existing is None:
+        return chunk_index, pack_sizes
+    manifest = existing.manifest
+    for layer in manifest.get("layers", []):
+        if layer.get("mediaType") == PACK_MEDIA_TYPE:
+            pack_sizes[layer["digest"]] = layer["size"]
+    for group in group_files(manifest):
+        if group.layout != CHUNKED_LAYOUT_V2 or group.pointer_digest is None:
+            continue
+        blob = _fetch_blob(registry, oci_repo, group.pointer_digest, oci_token)
+        for ref in parse_pointer_v2(blob):
+            chunk_index.setdefault(ref.chunk_digest, (ref.pack_digest, ref.pack_offset))
+    return chunk_index, pack_sizes
+
+
+def _upload_file_chunked_v2(
+    abs_path: str,
+    repo_title: str,
+    file_size: int,
+    registry: str,
+    oci_repo: str,
+    oci_token: str,
+    dedup_index: Dict[str, tuple],
+    pack_sizes: Dict[str, int],
+) -> List[dict]:
+    """Store a large file as a chunked-v2 pointer + ~64 MiB pack blobs.
+
+    Chunks at the same 4 MiB CDC boundaries as v1, but chunks already present
+    (per `dedup_index`) are referenced by range into their existing packs — only
+    NEW chunks are packed and uploaded. The manifest lists the pointer plus every
+    pack it references (new and reused) so each stays GC-safe. Pointer written
+    last, like v1, so a crash leaves only unreferenced packs for GC."""
+    whole_hex, chunk_metas = chunk_and_hash_native(abs_path, resolve_cdc_avg_size())
+    chunks = [(f"sha256:{h}", size, offset) for h, offset, size in chunk_metas]
+    plan = plan_packs(chunks, dedup_index, resolve_pack_size())
+    uploads_url = f"{registry}/v2/{oci_repo}/blobs/uploads/"
+
+    def _upload_pack(new_pack) -> str:
+        hex_digest = pack_upload_native(
+            uploads_url=uploads_url,
+            path=abs_path,
+            ranges=list(new_pack.ranges),
+            auth_token=oci_token,
+        )
+        return f"sha256:{hex_digest}"
+
+    # Packs are independent blobs → upload in parallel (the round-trip win: ~K/16
+    # pack PUTs instead of K chunk PUTs). Order is preserved so digests line up
+    # with plan.new_packs for resolve_pointer_chunks.
+    with ThreadPoolExecutor(max_workers=resolve_upload_workers()) as executor:
+        new_pack_digests = list(executor.map(_upload_pack, plan.new_packs))
+
+    pointer_chunks = resolve_pointer_chunks(plan, new_pack_digests)
+    pointer_bytes = pointer_v2_bytes(whole_hex, file_size, pointer_chunks)
+    pointer_digest = f"sha256:{hashlib.sha256(pointer_bytes).hexdigest()}"
+    _ensure_bytes_blob_uploaded(registry, oci_repo, oci_token, pointer_bytes, pointer_digest)
+
+    all_pack_sizes = dict(pack_sizes)
+    for new_pack, digest in zip(plan.new_packs, new_pack_digests):
+        all_pack_sizes[digest] = new_pack.size
+
+    pointer_layer = {
+        "mediaType": POINTER_MEDIA_TYPE_V2,
+        "size": len(pointer_bytes),
+        "digest": pointer_digest,
+        "annotations": {
+            LAYER_TITLE_KEY: repo_title.replace("\\", "/"),
+            FILE_SIZE_KEY: str(file_size),
+            FILE_DIGEST_KEY: f"sha256:{whole_hex}",
+            CHUNK_COUNT_KEY: str(len(chunk_metas)),
+        },
+    }
+    # One pack layer per referenced pack, in first-appearance order (deterministic).
+    referenced: Dict[str, int] = {}
+    for _cd, _sz, pack_digest, _off in pointer_chunks:
+        if pack_digest not in referenced:
+            try:
+                referenced[pack_digest] = all_pack_sizes[pack_digest]
+            except KeyError as exc:
+                raise MalformedManifestError(
+                    f"chunked-v2 references pack {pack_digest} with no known size "
+                    "(prior manifest and pack layer are inconsistent)"
+                ) from exc
+    pack_layers = [
+        {"mediaType": PACK_MEDIA_TYPE, "size": size, "digest": pd}
+        for pd, size in referenced.items()
+    ]
+    return [pointer_layer, *pack_layers]
+
+
+def _upload_file_layers(
+    abs_path: str,
+    repo_title: str,
+    registry: str,
+    oci_repo: str,
+    oci_token: str,
+    dedup_index: Optional[Dict[str, tuple]] = None,
+    pack_sizes: Optional[Dict[str, int]] = None,
+) -> List[dict]:
     """Upload one file and return its manifest layer(s).
 
-    A file at or above the chunk threshold is stored chunked (pointer + K chunks)
-    unless the rollout gate (`HIPPIUS_CHUNKED_WRITE=0`) forces plain uploads;
-    below the threshold, one plain blob — byte-identical to the pre-chunking
-    layout, so small files and existing artifacts cross-dedup unchanged."""
+    A file at or above the chunk threshold is stored chunked unless the rollout
+    gate (`HIPPIUS_CHUNKED_WRITE=0`) forces plain uploads. `HIPPIUS_CHUNKED_LAYOUT`
+    picks v1 (pointer + K chunk blobs) or v2 (pointer + ~64 MiB packs, reusing
+    prior chunks by range via `dedup_index`). Below the threshold, one plain blob
+    — byte-identical to the pre-chunking layout, so small files cross-dedup."""
     file_size = os.path.getsize(abs_path)
     if file_size >= resolve_chunk_threshold() and resolve_chunked_write_enabled():
+        if resolve_chunked_layout() == CHUNKED_LAYOUT_V2:
+            return _upload_file_chunked_v2(
+                abs_path, repo_title, file_size, registry, oci_repo, oci_token,
+                dedup_index or {}, pack_sizes or {},
+            )
         return _upload_file_chunked(abs_path, repo_title, file_size, registry, oci_repo, oci_token)
     sha256_hash, size = hash_file_native(abs_path)
     if not _ensure_blob_uploaded(registry, oci_repo, oci_token, abs_path, sha256_hash):
@@ -444,7 +580,14 @@ def _assemble_manifest(
         "layers": merged_layers,
         "annotations": annotations,
     }
-    if any(layer.get("mediaType") == POINTER_MEDIA_TYPE for layer in merged_layers):
+    # Type by the newest chunked layout present. A v2 pointer wins (v2 readers
+    # read v1 too); a manifest may mix v1 and v2 files across revisions, and the
+    # layout annotation gates the whole manifest, so the annotation must name a
+    # layout that can read every file in it — v2.
+    if any(layer.get("mediaType") == POINTER_MEDIA_TYPE_V2 for layer in merged_layers):
+        manifest["artifactType"] = ARTIFACT_TYPE_CHUNKED_V2
+        annotations[LAYOUT_ANNOTATION_KEY] = CHUNKED_LAYOUT_V2
+    elif any(layer.get("mediaType") == POINTER_MEDIA_TYPE for layer in merged_layers):
         manifest["artifactType"] = ARTIFACT_TYPE_CHUNKED
         annotations[LAYOUT_ANNOTATION_KEY] = CHUNKED_LAYOUT
     _guard_manifest_size(manifest)
@@ -629,13 +772,24 @@ def upload_file(
     registry = resolve_registry(endpoint)
     oci_token = _oci_bearer(oci_repo, token, push=True, endpoint=endpoint)
 
+    # Fetch the prior manifest BEFORE uploading: chunked-v2 needs it to build the
+    # dedup index (which chunks already exist, so only new chunks are packed). The
+    # same digest guards the PUT via If-Match, so moving the fetch earlier does not
+    # widen the concurrency window.
+    existing = fetch_manifest(registry, oci_repo, revision, oci_token, missing_ok=True)
+    dedup_index: Dict[str, tuple] = {}
+    pack_sizes: Dict[str, int] = {}
+    if resolve_chunked_write_enabled() and resolve_chunked_layout() == CHUNKED_LAYOUT_V2:
+        dedup_index, pack_sizes = _build_dedup_index(existing, registry, oci_repo, oci_token)
+
     file_path, cleanup = _normalize_path_or_fileobj(path_or_fileobj)
     try:
-        new_layers = _upload_file_layers(file_path, path_in_repo, registry, oci_repo, oci_token)
+        new_layers = _upload_file_layers(
+            file_path, path_in_repo, registry, oci_repo, oci_token, dedup_index, pack_sizes
+        )
     finally:
         cleanup()
 
-    existing = fetch_manifest(registry, oci_repo, revision, oci_token, missing_ok=True)
     existing_layers = existing.manifest.get("layers", []) if existing else []
     prev_digest = _prev_digest_or_warn(existing, repo_id, revision)
     merged_layers = _merge_layers(existing_layers, new_layers)

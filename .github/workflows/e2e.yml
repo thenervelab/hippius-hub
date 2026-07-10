@@ -154,6 +154,21 @@ jobs:
           HIPPIUS_TEST_TOKEN: ${{ secrets.HIPPIUS_TEST_TOKEN }}
         run: .venv/bin/pytest -v tests/test_live_chunked_roundtrip.py
 
+      # Chunked-v2 (pack layout) e2e — STAGING ONLY. Opts into v2 via
+      # HIPPIUS_CHUNKED_LAYOUT=v2 (which also un-skips the gated live test) to
+      # exercise the native pack upload/download + re-upload dedup against the
+      # test/e2e-client namespace. v2 is a new layout value, so a reader that
+      # predates it refuses it loudly — never on main.
+      - name: Chunked-v2 pack-layout e2e (staging only, test namespace)
+        if: github.ref == 'refs/heads/staging'
+        env:
+          HIPPIUS_CHUNKED_WRITE: '1'
+          HIPPIUS_CHUNKED_LAYOUT: v2
+          HIPPIUS_TEST_USER: ${{ secrets.HIPPIUS_TEST_USER }}
+          HIPPIUS_TEST_PASS: ${{ secrets.HIPPIUS_TEST_PASS }}
+          HIPPIUS_TEST_TOKEN: ${{ secrets.HIPPIUS_TEST_TOKEN }}
+        run: .venv/bin/pytest -v tests/test_live_chunked_v2_roundtrip.py
+
       # Expensive suite: on-chain subscribe/cancel, robot rotation,
       # publicity toggle (quota resize). Only runs on release events,
       # manual dispatch, or tag pushes. `-m expensive` overrides the

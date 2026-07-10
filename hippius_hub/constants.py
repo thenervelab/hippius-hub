@@ -59,6 +59,26 @@ FILE_SIZE_KEY = "com.hippius.file.size"
 FILE_DIGEST_KEY = "com.hippius.file.digest"
 CHUNK_COUNT_KEY = "com.hippius.chunk.count"
 
+# ----- chunked-v2 pack layout (docs/plans/2026-07-10-chunked-v2-pack-layout.md) -----
+# Same 4 MiB CDC dedup chunks as v1, but transferred in ~64 MiB *pack* blobs: the
+# pointer BLOB (fetched on download, not just annotations) maps each chunk to
+# (pack digest, offset, size). This cuts per-file upload round-trips ~15x. The pack
+# blob is opaque bytes (its format never changes); only the *pointer* schema
+# versions, so pack layers stay `pack.v1` even as the pointer goes v2+. A file's
+# manifest lists its pointer layer plus the union of pack blobs it references (new
+# packs AND packs reused-by-range from prior revisions) so every referenced pack
+# stays GC-safe and pullable.
+CHUNKED_LAYOUT_V2 = "chunked-v2"
+ARTIFACT_TYPE_CHUNKED_V2 = "application/vnd.hippius.chunked.v2"
+POINTER_MEDIA_TYPE_V2 = "application/vnd.hippius.pointer.v2"
+PACK_MEDIA_TYPE = "application/vnd.hippius.pack.v1"
+# Target pack size. New chunks are concatenated in file order into a pack, closing
+# it once it reaches this; a pack may overshoot by at most one chunk (<= fastcdc
+# MAXIMUM_MAX = 16 MiB) and has no minimum (a 1-chunk edit yields one small pack).
+# 64 MiB = HF-Xet's block/xorb size (~16 chunks/pack) — the transfer unit we could
+# not use in v1 because fastcdc caps a single CHUNK at 4 MiB; packing lifts that.
+DEFAULT_PACK_SIZE = 64 * 1024 * 1024
+
 # CNCF Distribution hard-caps a manifest PUT body at 4 MiB (maxManifestBodySize).
 # Past it the registry returns an opaque 400 — AFTER every blob is already
 # uploaded. We check the serialized manifest before the PUT and raise a clear
@@ -74,7 +94,7 @@ MAX_MANIFEST_BYTES = 4 * 1024 * 1024
 # chunked artifact. That backward gap is why chunked WRITES are opt-in for this
 # release (resolve_chunked_write_enabled defaults off): readers upgrade first,
 # writers flip the default on in a later release.
-KNOWN_LAYOUTS: frozenset = frozenset({CHUNKED_LAYOUT})
+KNOWN_LAYOUTS: frozenset = frozenset({CHUNKED_LAYOUT, CHUNKED_LAYOUT_V2})
 
 
 # ----- transfer tuning knobs -----
@@ -112,6 +132,27 @@ def resolve_chunk_threshold() -> int:
 def resolve_cdc_avg_size() -> int:
     """FastCDC average chunk size (bytes). Pinned; overridable only for testing."""
     return _resolve_positive_int("HIPPIUS_CDC_AVG_SIZE", DEFAULT_CDC_AVG_SIZE)
+
+
+def resolve_pack_size() -> int:
+    """Target pack size (bytes) for the chunked-v2 layout. Overridable for testing."""
+    return _resolve_positive_int("HIPPIUS_PACK_SIZE", DEFAULT_PACK_SIZE)
+
+
+def resolve_chunked_layout() -> str:
+    """Which chunked layout new large-file uploads emit: 'chunked-v1' (default) or
+    'chunked-v2' (Xet-style packs). Opt-in for v2 the same way writes are opt-in:
+    v2 is a NEW layout value, so a reader that predates v2 refuses it loudly rather
+    than misreading — flip the default to v2 only once the v2-capable reader is the
+    deployed floor. `HIPPIUS_CHUNKED_LAYOUT=v2` opts a producer in now (staging)."""
+    raw = (os.environ.get("HIPPIUS_CHUNKED_LAYOUT") or "").strip().lower()
+    if raw in ("v2", "chunked-v2", "2"):
+        return CHUNKED_LAYOUT_V2
+    if raw in ("", "v1", "chunked-v1", "1"):
+        return CHUNKED_LAYOUT
+    raise ValueError(
+        f"HIPPIUS_CHUNKED_LAYOUT must be 'v1' or 'v2', got {raw!r}"
+    )
 
 
 def resolve_chunked_write_enabled() -> bool:

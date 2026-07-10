@@ -4,6 +4,7 @@ Centralizes manifest fetch, layer iteration, and the OCI v2 accept header
 so the same plumbing isn't reimplemented in each module that touches the
 registry.
 """
+import json
 from dataclasses import dataclass
 from typing import List, Optional, Tuple
 
@@ -12,6 +13,8 @@ import httpx
 from .constants import (
     CHUNK_COUNT_KEY,
     CHUNK_MEDIA_TYPE,
+    CHUNKED_LAYOUT,
+    CHUNKED_LAYOUT_V2,
     DEFAULT_HTTP_TIMEOUT,
     FILE_DIGEST_KEY,
     FILE_SIZE_KEY,
@@ -20,6 +23,7 @@ from .constants import (
     LAYOUT_ANNOTATION_KEY,
     OCI_MANIFEST_ACCEPT,
     POINTER_MEDIA_TYPE,
+    POINTER_MEDIA_TYPE_V2,
 )
 from .errors import (
     MalformedManifestError,
@@ -133,7 +137,7 @@ def layer_title(layer: dict) -> Optional[str]:
 
 @dataclass(frozen=True)
 class ChunkRef:
-    """One content-defined chunk blob of a chunked file, in file order.
+    """One content-defined chunk blob of a chunked-v1 file, in file order.
 
     `digest` builds the blob URL and verifies the pulled bytes; `size` gives the
     write offset (sum of preceding chunk sizes) for a parallel, in-place assemble.
@@ -144,24 +148,49 @@ class ChunkRef:
 
 
 @dataclass(frozen=True)
+class PackChunkRef:
+    """One chunk of a chunked-v2 file, located inside a pack blob, in file order.
+
+    `chunk_digest`/`size` verify the chunk's bytes and give its whole-file write
+    offset (sum of preceding sizes). `pack_digest`+`pack_offset` say which pack
+    blob holds the bytes and where — so the downloader fetches packs (whole or
+    ranged) and slices each chunk out. Unlike v1, the chunk is NOT its own layer;
+    many chunks share a pack, and a re-upload references old packs by range.
+    """
+
+    chunk_digest: str
+    size: int
+    pack_digest: str
+    pack_offset: int
+
+
+@dataclass(frozen=True)
 class FileGroup:
     """One logical file in a manifest, independent of its physical layout.
 
-    A plain (pre-chunking / small) file has `chunks == ()` and carries its own
-    blob `digest`/`size`. A chunked file has K `chunks` and carries the
-    *whole-file* `digest`/`size` (from the pointer layer's annotations, not the
-    pointer blob's own tiny digest) — so `siblings`, `list_repo_files`, and the
-    downloader all see the logical file, never the pointer/chunk plumbing.
+    Three layouts, one view: a *plain* file (`layout is None`) carries its own
+    whole-file blob `digest`/`size`; a *chunked-v1* file (`layout == CHUNKED_LAYOUT`)
+    carries K positional `chunks`; a *chunked-v2* file (`layout ==
+    CHUNKED_LAYOUT_V2`) carries `pointer_digest` — the pack→chunk mapping lives in
+    that pointer BLOB, fetched on download, not in the manifest. In every case the
+    whole-file `size`/`digest` come from the annotations (v1/v2) or the layer
+    (plain), so `siblings`/`list_repo_files` stay a pure manifest read — no pointer
+    fetch on the metadata path.
     """
 
     title: str
     size: Optional[int]
     digest: Optional[str]
-    chunks: Tuple[ChunkRef, ...]
+    chunks: Tuple[ChunkRef, ...] = ()
+    layout: Optional[str] = None
+    pointer_digest: Optional[str] = None
 
     @property
     def is_chunked(self) -> bool:
-        return bool(self.chunks)
+        # Chunked if a layout is set (v1/v2) or v1 chunk layers are present. A
+        # v2 group has layout set but empty `chunks` (packs resolved from the
+        # pointer blob), so `bool(chunks)` alone would misclassify it as plain.
+        return self.layout is not None or bool(self.chunks)
 
 
 def _pointer_group(title: str, pointer: dict, following: list) -> Tuple[FileGroup, int]:
@@ -208,7 +237,70 @@ def _pointer_group(title: str, pointer: dict, following: list) -> Tuple[FileGrou
             f"chunked pointer layer {title!r} promises {count} chunk(s) but only "
             f"{len(chunks)} contiguous chunk layer(s) follow it"
         )
-    return FileGroup(title=title, size=file_size, digest=file_digest, chunks=tuple(chunks)), count
+    return FileGroup(
+        title=title, size=file_size, digest=file_digest,
+        chunks=tuple(chunks), layout=CHUNKED_LAYOUT,
+    ), count
+
+
+def _pointer_group_v2(title: str, pointer: dict) -> FileGroup:
+    """Build a chunked-v2 FileGroup from a `pointer.v2` layer alone.
+
+    Unlike v1, the chunk→pack mapping is NOT positional in the manifest — it lives
+    in the pointer BLOB (fetched on download via `pointer_digest`). Here we only
+    read the whole-file annotations (so the metadata path never fetches the blob)
+    and carry the pointer's own digest. The pack layers are untitled and are
+    skipped by `group_files`; they are resolved by the pointer, not by position.
+    """
+    ann = pointer.get("annotations", {})
+    try:
+        count = int(ann[CHUNK_COUNT_KEY])
+        file_size = int(ann[FILE_SIZE_KEY])
+        file_digest = ann[FILE_DIGEST_KEY]
+    except (KeyError, ValueError, TypeError) as exc:
+        raise MalformedManifestError(
+            f"chunked-v2 pointer layer {title!r} is missing or has a non-integer "
+            f"{CHUNK_COUNT_KEY}/{FILE_SIZE_KEY}/{FILE_DIGEST_KEY} annotation"
+        ) from exc
+    if count < 1:
+        raise MalformedManifestError(
+            f"chunked-v2 pointer layer {title!r} declares {CHUNK_COUNT_KEY}={count} "
+            "(must be >= 1)"
+        )
+    return FileGroup(
+        title=title, size=file_size, digest=file_digest,
+        chunks=(), layout=CHUNKED_LAYOUT_V2, pointer_digest=pointer["digest"],
+    )
+
+
+def parse_pointer_v2(blob: bytes) -> Tuple[PackChunkRef, ...]:
+    """Parse a fetched chunked-v2 pointer blob into ordered pack-chunk refs.
+
+    Pure: verifying the blob against its layer digest is the caller's job (done in
+    the downloader). Raises `MalformedManifestError` on any structural violation —
+    reassembling from a malformed pointer would produce a wrong/truncated file.
+    """
+    try:
+        doc = json.loads(blob)
+        if doc.get("version") != CHUNKED_LAYOUT_V2:
+            raise MalformedManifestError(
+                f"pointer blob version is {doc.get('version')!r}, expected "
+                f"{CHUNKED_LAYOUT_V2!r}"
+            )
+        refs = tuple(
+            PackChunkRef(
+                chunk_digest=c["digest"],
+                size=int(c["size"]),
+                pack_digest=c["pack"],
+                pack_offset=int(c["offset"]),
+            )
+            for c in doc["chunks"]
+        )
+    except (json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
+        raise MalformedManifestError(f"malformed chunked-v2 pointer blob: {exc}") from exc
+    if not refs:
+        raise MalformedManifestError("chunked-v2 pointer blob has no chunks")
+    return refs
 
 
 def group_files(manifest: dict) -> List[FileGroup]:
@@ -243,10 +335,17 @@ def group_files(manifest: dict) -> List[FileGroup]:
                 )
             i += 1
             continue
-        if layer.get("mediaType") == POINTER_MEDIA_TYPE:
+        media = layer.get("mediaType")
+        if media == POINTER_MEDIA_TYPE:
             group, consumed = _pointer_group(title, layer, layers[i + 1:])
             groups.append(group)
             i += 1 + consumed
+        elif media == POINTER_MEDIA_TYPE_V2:
+            # v2: pack layers are untitled and non-positional (resolved via the
+            # pointer blob), so this consumes only the pointer layer itself; the
+            # trailing pack.v1 layers are skipped as untitled non-chunk layers.
+            groups.append(_pointer_group_v2(title, layer))
+            i += 1
         else:
             groups.append(
                 FileGroup(title=title, size=layer.get("size"), digest=layer.get("digest"), chunks=())

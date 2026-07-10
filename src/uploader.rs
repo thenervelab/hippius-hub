@@ -343,6 +343,109 @@ async fn try_upload_range_once(
     put_streaming(url, reader, length, &basename_of(path), auth_token).await
 }
 
+/// Read the given file byte-ranges in order into one pack blob and push it via a
+/// fresh OCI upload session (POST init + monolithic PUT-with-digest). Returns the
+/// pack's sha256 hex — the chunked-v2 caller records it in the pointer blob.
+///
+/// A pack holds only NEW chunks (chunks the dedup index had no entry for), so its
+/// content digest is necessarily new and no HEAD is done (it would always 404).
+/// The pack is buffered once (~64 MiB target); at the upload-worker concurrency
+/// that is a bounded peak, and it keeps the retry body cheap to re-send.
+pub async fn pack_upload_async(
+    uploads_url: &str,
+    path: &Path,
+    ranges: &[(u64, u64)],
+    auth_token: Option<&str>,
+) -> Result<String, CoreError> {
+    let buf = read_ranges(path, ranges).await?;
+    let digest_hex = hex::encode(Sha256::digest(&buf));
+    let digest = format!("sha256:{digest_hex}");
+    let mut retries: u32 = 0;
+    loop {
+        match try_pack_upload_once(uploads_url, &buf, &digest, auth_token).await {
+            Ok(()) => return Ok(digest_hex),
+            Err(e) => {
+                retries += 1;
+                if !e.is_retryable() || retries > UPLOAD_MAX_RETRIES {
+                    return Err(e);
+                }
+                tokio::time::sleep(Duration::from_millis(2u64.pow(retries) * 100)).await;
+            }
+        }
+    }
+}
+
+async fn read_ranges(path: &Path, ranges: &[(u64, u64)]) -> Result<Vec<u8>, CoreError> {
+    let mut file = File::open(path).await?;
+    let total: u64 = ranges.iter().map(|(_off, len)| *len).sum();
+    let cap = usize::try_from(total)
+        .map_err(|_| CoreError::Integrity(format!("pack size {total} exceeds usize")))?;
+    let mut buf: Vec<u8> = Vec::with_capacity(cap);
+    for &(offset, len) in ranges {
+        file.seek(SeekFrom::Start(offset)).await?;
+        let before = buf.len();
+        // read_to_end appends; take() bounds it to exactly `len` bytes.
+        (&mut file).take(len).read_to_end(&mut buf).await?;
+        let got = (buf.len() - before) as u64;
+        if got != len {
+            return Err(CoreError::Integrity(format!(
+                "short read packing range at offset {offset}: wanted {len}, got {got}"
+            )));
+        }
+    }
+    Ok(buf)
+}
+
+async fn try_pack_upload_once(
+    uploads_url: &str,
+    buf: &[u8],
+    digest: &str,
+    auth_token: Option<&str>,
+) -> Result<(), CoreError> {
+    let client = upload_client()?;
+    let mut init = client.post(uploads_url).header(header::CONTENT_LENGTH, "0");
+    if let Some(token) = auth_token {
+        init = init.bearer_auth(token);
+    }
+    let init_resp = init.send().await?;
+    if !init_resp.status().is_success() {
+        return Err(CoreError::ServerError(
+            init_resp.status().as_u16(),
+            "pack upload init failed".to_string(),
+        ));
+    }
+    let location = init_resp
+        .headers()
+        .get(header::LOCATION)
+        .and_then(|v| v.to_str().ok())
+        .ok_or_else(|| CoreError::Integrity("registry omitted Location on upload init".to_string()))?;
+    // Resolve a possibly-relative Location against the uploads URL, then append the
+    // digest as a RAW query pair (":" is legal unencoded in a query; percent-
+    // encoding it via query_pairs_mut breaks the registry's digest match).
+    let resolved = reqwest::Url::parse(uploads_url)
+        .and_then(|base| base.join(location))
+        .map_err(|e| CoreError::Integrity(format!("bad upload Location {location:?}: {e}")))?;
+    let mut put_url = resolved.to_string();
+    put_url.push(if put_url.contains('?') { '&' } else { '?' });
+    put_url.push_str("digest=");
+    put_url.push_str(digest);
+    let mut put = client
+        .put(put_url)
+        .header(header::CONTENT_TYPE, "application/octet-stream")
+        .body(buf.to_vec());
+    if let Some(token) = auth_token {
+        put = put.bearer_auth(token);
+    }
+    let put_resp = put.send().await?;
+    if !put_resp.status().is_success() {
+        return Err(CoreError::ServerError(
+            put_resp.status().as_u16(),
+            format!("pack PUT failed: {:?}", put_resp.status()),
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod cdc_tests {
     use super::{CDC_MAX_AVG, CDC_MIN_AVG, chunk_and_hash_reader};
@@ -356,6 +459,32 @@ mod cdc_tests {
             Ok(v) => v,
             Err(_) => unreachable!("chunking valid bytes with a valid avg cannot fail"),
         }
+    }
+
+    #[test]
+    fn read_ranges_concatenates_in_order() {
+        use super::read_ranges;
+        use crate::error::CoreError;
+        use std::io::Write;
+
+        let Ok(rt) = tokio::runtime::Builder::new_current_thread().enable_all().build() else {
+            unreachable!("current-thread runtime builds")
+        };
+        let path = std::env::temp_dir().join(format!("hippius-rr-{}.bin", std::process::id()));
+        match std::fs::File::create(&path).and_then(|mut f| f.write_all(b"0123456789")) {
+            Ok(()) => {}
+            Err(_) => unreachable!("temp file write"),
+        }
+        // Out-of-order, non-contiguous ranges scatter-gather in pack order:
+        // [6,4)+[0,3)+[4,2) over "0123456789" -> "6789"+"012"+"45" = "678901245".
+        match rt.block_on(read_ranges(&path, &[(6, 4), (0, 3), (4, 2)])) {
+            Ok(bytes) => assert_eq!(bytes, b"678901245"),
+            Err(_) => unreachable!("read of valid ranges must succeed"),
+        }
+        // A range past EOF is a short read -> Integrity error, never silent truncation.
+        let bad = rt.block_on(read_ranges(&path, &[(8, 5)]));
+        assert!(matches!(bad, Err(CoreError::Integrity(_))));
+        std::fs::remove_file(&path).unwrap_or(());
     }
 
     #[test]

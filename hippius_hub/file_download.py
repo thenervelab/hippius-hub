@@ -14,10 +14,15 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Optional, Union
 
-from ._oci import fetch_manifest, group_files
+import httpx
+
+from ._oci import fetch_manifest, group_files, parse_pointer_v2
 from .auth import get_oci_bearer_token
 from .constants import (
+    CHUNKED_LAYOUT_V2,
     DEFAULT_CACHE_DIR,
+    DEFAULT_HTTP_TIMEOUT,
+    PACK_MEDIA_TYPE,
     resolve_chunk_size,
     resolve_max_concurrent,
     resolve_registry,
@@ -30,7 +35,11 @@ from .errors import (
 )
 
 try:
-    from .hippius_core import download_chunks_native, download_file_native
+    from .hippius_core import (
+        download_chunks_native,
+        download_file_native,
+        download_packs_native,
+    )
 except ImportError:
     raise ImportError("hippius_core is not installed. Did you run `maturin develop`?")
 
@@ -362,7 +371,7 @@ def hf_hub_download(
     if group.is_chunked:
         if local_dir is not None:
             return _download_chunked_to_local_dir(
-                group, registry, oci_repo, paths.dest_file, oci_token
+                group, registry, oci_repo, paths.dest_file, oci_token, manifest
             )
         return _download_chunked_to_cache(
             group=group,
@@ -372,6 +381,7 @@ def hf_hub_download(
             snapshots_dir=paths.snapshots_dir,
             filename=filename,
             oci_token=oci_token,
+            manifest=manifest,
         )
     blob_url = f"{registry}/v2/{oci_repo}/blobs/{group.digest}"
     if local_dir is not None:
@@ -510,17 +520,71 @@ def _download_to_local_dir(blob_url, dest_file, oci_token):
     return dest_file
 
 
-def _pull_chunks(group, registry, oci_repo, temp_path, oci_token) -> Optional[str]:
-    """Fetch a chunked file's chunk blobs into `temp_path` via the Rust engine.
+def _pull_packs(group, manifest, registry, oci_repo, temp_path, oci_token) -> Optional[str]:
+    """Assemble a chunked-v2 file from its pack blobs.
 
-    Per-chunk digest verification is always on in the native layer. The whole-file
-    digest is ALSO always verified here — unlike the single-blob path's opt-in
-    HIPPIUS_VERIFY_HASH — because per-chunk digests prove each chunk's *bytes* but
-    not its *position*: the whole-file `sha256(concat)` pass is the only check
-    that the K chunks were concatenated in the right order. It is one sequential
-    read, cheap next to the multi-GB download it guards. Returns the computed
-    whole-file hash.
+    Fetches the pointer blob (the pack→chunk map), coalesces the chunks by pack,
+    and hands the plan to the native pack assembler, which fetches each pack once
+    (a full `200`) and slices its chunks to their file offsets. Whole-file digest
+    is always verified — it is the only check that proves cross-pack ordering.
     """
+    blob = _fetch_blob_bytes(registry, oci_repo, group.pointer_digest, oci_token)
+    refs = parse_pointer_v2(blob)
+    pack_layer_sizes = {
+        layer["digest"]: layer["size"]
+        for layer in manifest.get("layers", [])
+        if layer.get("mediaType") == PACK_MEDIA_TYPE
+    }
+    # Group chunks by pack (first-appearance order) and compute file offsets.
+    by_pack: Dict[str, list] = {}
+    file_offset = 0
+    for ref in refs:
+        by_pack.setdefault(ref.pack_digest, []).append(
+            (ref.pack_offset, ref.size, file_offset, _digest_hex(ref.chunk_digest))
+        )
+        file_offset += ref.size
+    total_size = file_offset
+
+    pack_urls, pack_sizes, pack_chunks = [], [], []
+    for pack_digest, targets in by_pack.items():
+        pack_urls.append(f"{registry}/v2/{oci_repo}/blobs/{pack_digest}")
+        pack_sizes.append(pack_layer_sizes[pack_digest])
+        pack_chunks.append(targets)
+    return download_packs_native(
+        pack_urls=pack_urls,
+        pack_sizes=pack_sizes,
+        pack_chunks=pack_chunks,
+        dest_path=temp_path,
+        total_size=total_size,
+        file_digest=_digest_hex(group.digest),
+        auth_token=oci_token,
+        max_concurrent=resolve_max_concurrent(),
+    )
+
+
+def _fetch_blob_bytes(registry, oci_repo, digest, oci_token) -> bytes:
+    """GET a blob's raw bytes (the v2 pointer blob is small and read whole)."""
+    resp = httpx.get(
+        f"{registry}/v2/{oci_repo}/blobs/{digest}",
+        headers={"Authorization": f"Bearer {oci_token}"},
+        timeout=DEFAULT_HTTP_TIMEOUT,
+    )
+    resp.raise_for_status()
+    return resp.content
+
+
+def _pull_chunks(group, registry, oci_repo, temp_path, oci_token, manifest=None) -> Optional[str]:
+    """Fetch a chunked file's blobs into `temp_path` via the Rust engine.
+
+    Dispatches on layout: v2 pulls pack blobs (`_pull_packs`); v1 pulls K
+    content-addressed chunk blobs. Per-chunk digest verification is always on in
+    the native layer; the whole-file digest is ALSO always verified — unlike the
+    single-blob path's opt-in HIPPIUS_VERIFY_HASH — because per-chunk digests prove
+    each chunk's *bytes* but not its *position*, and the whole-file `sha256(concat)`
+    pass is the only check on ordering. Returns the computed whole-file hash.
+    """
+    if group.layout == CHUNKED_LAYOUT_V2:
+        return _pull_packs(group, manifest or {}, registry, oci_repo, temp_path, oci_token)
     urls = [f"{registry}/v2/{oci_repo}/blobs/{c.digest}" for c in group.chunks]
     chunk_digests = [_digest_hex(c.digest) for c in group.chunks]
     chunk_sizes = [c.size for c in group.chunks]
@@ -537,7 +601,7 @@ def _pull_chunks(group, registry, oci_repo, temp_path, oci_token) -> Optional[st
 
 
 def _download_chunked_to_cache(
-    *, group, registry, oci_repo, repo_dir, snapshots_dir, filename, oci_token
+    *, group, registry, oci_repo, repo_dir, snapshots_dir, filename, oci_token, manifest=None
 ):
     """Chunked-file analog of `_download_to_cache`.
 
@@ -555,9 +619,9 @@ def _download_chunked_to_cache(
     fd, temp_path = tempfile.mkstemp(dir=blobs_dir, prefix=f"tmp_{safe_name}_")
     os.close(fd)
 
-    print(f"Downloading {filename} ({len(group.chunks)} chunks, parallel)...")
+    print(f"Downloading {filename} (parallel)...")
     try:
-        computed = _pull_chunks(group, registry, oci_repo, temp_path, oci_token)
+        computed = _pull_chunks(group, registry, oci_repo, temp_path, oci_token, manifest)
     except BaseException:
         # Mirror the single-blob cleanup: drop the partial temp on any failure
         # (including KeyboardInterrupt) so a later cache-hit check can't serve it.
@@ -581,7 +645,7 @@ def _download_chunked_to_cache(
     return file_path
 
 
-def _download_chunked_to_local_dir(group, registry, oci_repo, dest_file, oci_token):
+def _download_chunked_to_local_dir(group, registry, oci_repo, dest_file, oci_token, manifest=None):
     """Chunked-file analog of `_download_to_local_dir`: assemble to a temp
     sibling, then atomically `os.replace` into `dest_file` only on full success,
     so a failed/interrupted assemble never leaves a partial file at the user path.
@@ -589,13 +653,13 @@ def _download_chunked_to_local_dir(group, registry, oci_repo, dest_file, oci_tok
     parent = os.path.dirname(dest_file)
     if parent:
         os.makedirs(parent, exist_ok=True)
-    print(f"Downloading {os.path.basename(dest_file)} ({len(group.chunks)} chunks, parallel)...")
+    print(f"Downloading {os.path.basename(dest_file)} (parallel)...")
     fd, temp_path = tempfile.mkstemp(
         dir=parent or ".", prefix=f".tmp_{os.path.basename(dest_file)}_"
     )
     os.close(fd)
     try:
-        _pull_chunks(group, registry, oci_repo, temp_path, oci_token)
+        _pull_chunks(group, registry, oci_repo, temp_path, oci_token, manifest)
     except BaseException:
         if os.path.exists(temp_path):
             try:
