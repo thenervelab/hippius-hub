@@ -15,8 +15,7 @@ import time
 import warnings
 from typing import Literal, Optional, Union
 
-import httpx
-
+from . import _http
 from .constants import (
     DEFAULT_CACHE_DIR,
     DEFAULT_HTTP_TIMEOUT,
@@ -415,7 +414,7 @@ def get_oci_bearer_token(
             # Backward compatibility
             headers["Authorization"] = f"Bearer {effective_token}"
 
-    resp = httpx.get(auth_url, headers=headers, timeout=DEFAULT_HTTP_TIMEOUT)
+    resp = _http.client().get(auth_url, headers=headers, timeout=DEFAULT_HTTP_TIMEOUT)
     resp.raise_for_status()
     fresh_token = resp.json().get("token")
 

@@ -14,8 +14,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Optional, Union
 
-import httpx
-
+from . import _http
 from ._oci import fetch_manifest, group_files, parse_pointer_v2
 from .auth import get_oci_bearer_token
 from .constants import (
@@ -562,7 +561,7 @@ def _pull_packs(group, manifest, registry, oci_repo, temp_path, oci_token) -> Op
 
 def _fetch_blob_bytes(registry, oci_repo, digest, oci_token) -> bytes:
     """GET a blob's raw bytes (the v2 pointer blob is small and read whole)."""
-    resp = httpx.get(
+    resp = _http.client().get(
         f"{registry}/v2/{oci_repo}/blobs/{digest}",
         headers={"Authorization": f"Bearer {oci_token}"},
         timeout=DEFAULT_HTTP_TIMEOUT,

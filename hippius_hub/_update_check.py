@@ -18,9 +18,7 @@ import sys
 import time
 from typing import Optional
 
-import httpx
-
-from . import __version__
+from . import __version__, _http
 from .constants import DEFAULT_CACHE_DIR
 
 PYPI_PACKAGE = "hippius_hub"
@@ -84,7 +82,7 @@ def _write_cache(data: dict) -> None:
 
 def _fetch_latest_version() -> Optional[str]:
     try:
-        resp = httpx.get(PYPI_URL, timeout=REQUEST_TIMEOUT)
+        resp = _http.client().get(PYPI_URL, timeout=REQUEST_TIMEOUT)
         resp.raise_for_status()
         return resp.json()["info"]["version"]
     except Exception:

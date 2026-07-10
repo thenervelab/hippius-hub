@@ -7,9 +7,9 @@ shape (None/True=saved, False=no auth, str=use literal).
 """
 from typing import List, Optional, Union
 
-import httpx
 from huggingface_hub import GitRefInfo, GitRefs, ModelInfo, RepoUrl
 
+from . import _http
 from ._harbor import (harbor_create_project, harbor_delete_repository,
                       harbor_get_artifact, harbor_get_project, harbor_get_repository,
                       split_repo_id, )
@@ -49,7 +49,7 @@ def _list_tags(registry: str, repo_id: str, oci_token: str) -> Optional[list]:
     seen = set()
     while url and url not in seen:
         seen.add(url)
-        resp = httpx.get(url, headers=headers, timeout=DEFAULT_HTTP_TIMEOUT)
+        resp = _http.client().get(url, headers=headers, timeout=DEFAULT_HTTP_TIMEOUT)
         if resp.status_code == 404:
             return None
         resp.raise_for_status()

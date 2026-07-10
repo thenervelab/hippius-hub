@@ -23,6 +23,7 @@ from huggingface_hub import CommitInfo
 from huggingface_hub.utils import filter_repo_objects
 from tqdm import tqdm
 
+from . import _http
 from ._oci import fetch_manifest, group_files, layer_title, parse_pointer_v2
 from ._packing import plan_packs, pointer_v2_bytes, resolve_pointer_chunks
 from .auth import get_oci_bearer_token
@@ -80,7 +81,7 @@ def _upload_blob_single_put(registry: str, repo_id: str, oci_token: str, file_pa
     large files go through the chunked-v2 path instead (`_upload_file_chunked_v2`)."""
     headers = {"Authorization": f"Bearer {oci_token}"}
     init_headers = {**headers, "Content-Length": "0"}
-    init = httpx.post(f"{registry}/v2/{repo_id}/blobs/uploads/", headers=init_headers, timeout=DEFAULT_HTTP_TIMEOUT)
+    init = _http.client().post(f"{registry}/v2/{repo_id}/blobs/uploads/", headers=init_headers, timeout=DEFAULT_HTTP_TIMEOUT)
     init.raise_for_status()
     location = init.headers.get("Location")
     if not location:
@@ -103,7 +104,7 @@ def _ensure_blob_uploaded(
     was skipped (the dedup HEAD)."""
     digest = f"sha256:{sha256_hash}"
     headers = {"Authorization": f"Bearer {oci_token}"}
-    check = httpx.head(f"{registry}/v2/{repo_id}/blobs/{digest}", headers=headers, timeout=DEFAULT_HTTP_TIMEOUT)
+    check = _http.client().head(f"{registry}/v2/{repo_id}/blobs/{digest}", headers=headers, timeout=DEFAULT_HTTP_TIMEOUT)
     if check.status_code == 200:
         return False
     _upload_blob_single_put(registry, repo_id, oci_token, file_path, digest)
@@ -114,9 +115,9 @@ def _ensure_config_blob_uploaded(registry: str, repo_id: str, oci_token: str) ->
     """Push the empty-object config blob if missing. Returns (digest, size)."""
     data, digest, size = _empty_config_blob_descriptor()
     headers = {"Authorization": f"Bearer {oci_token}"}
-    check = httpx.head(f"{registry}/v2/{repo_id}/blobs/{digest}", headers=headers, timeout=DEFAULT_HTTP_TIMEOUT)
+    check = _http.client().head(f"{registry}/v2/{repo_id}/blobs/{digest}", headers=headers, timeout=DEFAULT_HTTP_TIMEOUT)
     if check.status_code != 200:
-        init = httpx.post(
+        init = _http.client().post(
             f"{registry}/v2/{repo_id}/blobs/uploads/",
             headers={**headers, "Content-Length": "0"},
             timeout=DEFAULT_HTTP_TIMEOUT,
@@ -129,7 +130,7 @@ def _ensure_config_blob_uploaded(registry: str, repo_id: str, oci_token: str) ->
         # Raise on a failed config PUT: otherwise the manifest PUT that follows
         # fails later with an opaque MANIFEST_BLOB_UNKNOWN instead of the real
         # cause (matches _ensure_bytes_blob_uploaded / _upload_blob_single_put).
-        put = httpx.put(
+        put = _http.client().put(
             f"{loc}{sep}digest={digest}",
             headers={**headers, "Content-Type": "application/octet-stream"},
             content=data,
@@ -143,10 +144,10 @@ def _ensure_bytes_blob_uploaded(registry: str, repo_id: str, oci_token: str, dat
     """Push an in-memory blob (the pointer blob) if not already present at its
     digest. HEAD-dedups first, then runs the OCI init + PUT-with-digest dance."""
     headers = {"Authorization": f"Bearer {oci_token}"}
-    check = httpx.head(f"{registry}/v2/{repo_id}/blobs/{digest}", headers=headers, timeout=DEFAULT_HTTP_TIMEOUT)
+    check = _http.client().head(f"{registry}/v2/{repo_id}/blobs/{digest}", headers=headers, timeout=DEFAULT_HTTP_TIMEOUT)
     if check.status_code == 200:
         return
-    init = httpx.post(f"{registry}/v2/{repo_id}/blobs/uploads/", headers={**headers, "Content-Length": "0"}, timeout=DEFAULT_HTTP_TIMEOUT)
+    init = _http.client().post(f"{registry}/v2/{repo_id}/blobs/uploads/", headers={**headers, "Content-Length": "0"}, timeout=DEFAULT_HTTP_TIMEOUT)
     init.raise_for_status()
     location = init.headers.get("Location")
     if not location:
@@ -154,13 +155,13 @@ def _ensure_bytes_blob_uploaded(registry: str, repo_id: str, oci_token: str, dat
     if location.startswith("/"):
         location = f"{registry}{location}"
     sep = "&" if "?" in location else "?"
-    put = httpx.put(f"{location}{sep}digest={digest}", headers={**headers, "Content-Type": "application/octet-stream"}, content=data, timeout=DEFAULT_HTTP_TIMEOUT)
+    put = _http.client().put(f"{location}{sep}digest={digest}", headers={**headers, "Content-Type": "application/octet-stream"}, content=data, timeout=DEFAULT_HTTP_TIMEOUT)
     put.raise_for_status()
 
 
 def _fetch_blob(registry: str, oci_repo: str, digest: str, oci_token: str) -> bytes:
     """GET a blob's raw bytes (used to read prior-revision v2 pointer blobs)."""
-    resp = httpx.get(
+    resp = _http.client().get(
         f"{registry}/v2/{oci_repo}/blobs/{digest}",
         headers={"Authorization": f"Bearer {oci_token}"},
         timeout=DEFAULT_HTTP_TIMEOUT,
@@ -450,7 +451,7 @@ def _put_manifest(
         # and re-raise once the attempts are spent.
         transport_error = None
         try:
-            resp = httpx.put(url, headers=headers, json=manifest, timeout=DEFAULT_HTTP_TIMEOUT * 2)
+            resp = _http.client().put(url, headers=headers, json=manifest, timeout=DEFAULT_HTTP_TIMEOUT * 2)
         except httpx.TransportError as exc:
             transport_error = exc
 
