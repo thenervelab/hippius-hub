@@ -61,7 +61,7 @@ def _point_registry_at_mock(monkeypatch):
 @pytest.fixture
 def stub_blob_download(monkeypatch):
     """Stub the Rust download so the test only exercises Python orchestration."""
-    def fake_download(*, url, dest_path, auth_token, chunk_size, verify_hash):
+    def fake_download(*, url, dest_path, auth_token, chunk_size, verify_hash, content_length=None):
         Path(dest_path).write_bytes(b"x")
         return None
     monkeypatch.setattr("hippius_hub.file_download.download_file_native", fake_download)

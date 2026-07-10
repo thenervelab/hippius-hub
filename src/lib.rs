@@ -88,7 +88,7 @@ fn shared_runtime() -> &'static tokio::runtime::Runtime {
 /// Releases the Python GIL across the blocking I/O via `py.detach`
 /// so other Python threads can make progress during the download.
 #[pyfunction]
-#[pyo3(signature = (url, dest_path, auth_token=None, chunk_size=None, verify_hash=true))]
+#[pyo3(signature = (url, dest_path, auth_token=None, chunk_size=None, verify_hash=true, content_length=None))]
 fn download_file_native(
     py: Python<'_>,
     url: String,
@@ -96,6 +96,7 @@ fn download_file_native(
     auth_token: Option<String>,
     chunk_size: Option<u64>,
     verify_hash: bool,
+    content_length: Option<u64>,
 ) -> PyResult<Option<String>> {
     // Audit L6 (Phase 3.12): `Option<String>` instead of `String` for the
     // hash result. pyo3 0.20's blanket `IntoPy` impl on `Option<T>` maps
@@ -108,15 +109,18 @@ fn download_file_native(
     // sentinel-shaped trap if a future SHA-0-like algorithm ever
     // produced an empty digest).
     let rt = shared_runtime();
-    let downloader =
-        ChunkedDownloader::new(url, auth_token, chunk_size).map_err(|e| core_err_to_py(&e))?;
     let dest = PathBuf::from(dest_path);
 
     // Release the GIL so other Python threads can run during the (long)
     // network/disk I/O. pyo3 acquires the GIL automatically on function
     // entry; detach (the post-0.27 name for allow_threads) explicitly
-    // releases it for the closure body.
+    // releases it for the closure body. Building the downloader — which now
+    // clones the shared download client rather than constructing a fresh one —
+    // happens inside the closure so client access never holds the GIL, matching
+    // download_packs_native (where PackAssembler::new already runs detached).
     py.detach(|| {
+        let downloader = ChunkedDownloader::new(url, auth_token, chunk_size, content_length)
+            .map_err(|e| core_err_to_py(&e))?;
         rt.block_on(async { downloader.download(&dest, verify_hash).await })
             .map_err(|e| core_err_to_py(&e))
     })

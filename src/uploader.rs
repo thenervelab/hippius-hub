@@ -211,7 +211,11 @@ pub(crate) fn upload_client() -> Result<&'static Client, CoreError> {
         .timeout(Duration::from_hours(1)) // 1h timeout for very large uploads
         .http1_only()
         .tcp_keepalive(Duration::from_secs(30))
-        .pool_max_idle_per_host(8)
+        // Generous fixed idle cap (was 8) so raising HIPPIUS_MAX_INFLIGHT_PACKS /
+        // HIPPIUS_UPLOAD_WORKERS above 8 doesn't force connections past the 8th to
+        // re-handshake per pack. The real in-flight bound is the _pack_upload_gate,
+        // not this idle cap; matches the download client's pool_max_idle.
+        .pool_max_idle_per_host(32)
         .build()?;
     Ok(CLIENT.get_or_init(|| built))
 }

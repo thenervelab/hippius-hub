@@ -10,6 +10,7 @@ from typing import List, Optional, Tuple
 
 import httpx
 
+from . import _http
 from .constants import (
     CHUNK_COUNT_KEY,
     CHUNKED_LAYOUT_V2,
@@ -95,7 +96,7 @@ def fetch_manifest(
     the PUT as `If-Match` to get optimistic-concurrency rejection (412) when
     a racing writer has advanced the revision.
     """
-    resp = httpx.get(
+    resp = _http.client().get(
         manifest_url(registry, repo_id, revision),
         headers=oci_headers(oci_token),
         timeout=DEFAULT_HTTP_TIMEOUT,
@@ -120,7 +121,7 @@ def head_manifest(
     oci_token: str,
 ) -> httpx.Response:
     """HEAD the OCI manifest for `repo_id:revision` (used for cheap existence checks)."""
-    return httpx.head(
+    return _http.client().head(
         manifest_url(registry, repo_id, revision),
         headers=oci_headers(oci_token),
         timeout=DEFAULT_HTTP_TIMEOUT,

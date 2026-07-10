@@ -2,6 +2,7 @@ use futures::stream::{FuturesUnordered, StreamExt};
 use reqwest::{header, Client};
 use sha2::{Digest, Sha256};
 use std::path::Path;
+use std::sync::Arc;
 use std::time::Duration;
 use indicatif::{ProgressBar, ProgressStyle};
 use tokio::fs::OpenOptions;
@@ -10,19 +11,22 @@ use tokio::fs::OpenOptions;
 // trait inside `compute_sha256`, so the async-read trait is no longer
 // needed at module scope.
 use tokio::io::{AsyncSeekExt, AsyncWriteExt, SeekFrom, BufWriter};
+use tokio::sync::Semaphore;
 use tokio::task::AbortHandle;
 
 use crate::error::CoreError;
 
 const DEFAULT_CHUNK_SIZE: u64 = 100 * 1024 * 1024; // 100 MB default
-const MAX_CONCURRENT_DOWNLOADS: usize = 32; // default; overridable via HIPPIUS_MAX_CONCURRENT
-const DEFAULT_CONNECT_TIMEOUT_SECS: u64 = 30;
 const MAX_RETRIES: u32 = 3;
+/// In-flight cap for the legacy Range downloader's eager-spawned chunk tasks, so a
+/// small caller-set `HIPPIUS_CHUNK_SIZE` on a huge file can't open O(file/chunk)
+/// connections at once. 32 mirrors the pack path's default concurrency.
+const MAX_INFLIGHT_CHUNKS: usize = 32;
 const VERIFY_READ_BUFFER: usize = 8 * 1024 * 1024; // 8 MB read buffer for SHA256 verification
 
 /// Per-chunk request timeout (audit D6).
 ///
-/// The `Client::builder().connect_timeout(30s)` on line 64 covers the
+/// The shared `chunk_fetcher::download_client`'s `connect_timeout(30s)` covers the
 /// TCP handshake; this constant is the FULL-REQUEST budget applied
 /// per chunk GET via `.timeout(...)`. A slow-loris server that
 /// completes the handshake then dribbles bytes can hold a connection
@@ -80,27 +84,30 @@ pub struct ChunkedDownloader {
     url: String,
     auth_token: Option<String>,
     chunk_size: u64,
+    // Pre-known whole-file size from the OCI manifest layer descriptor
+    // (byte-accurate == the blob's Content-Length), threaded from Python so the
+    // plain-blob path can skip the HEAD it otherwise issues to learn the size.
+    // `None` -> HEAD for Content-Length as before.
+    content_length: Option<u64>,
 }
 
 impl ChunkedDownloader {
     /// Construct a new concurrent downloader.
-    pub fn new(url: String, auth_token: Option<String>, chunk_size_bytes: Option<u64>) -> Result<Self, CoreError> {
-        // Force HTTP/1.1: with h2 reqwest multiplexes all chunks on a single TCP,
-        // which caps aggregate throughput at the per-connection BBR ceiling (~150 MB/s
-        // even on a fast edge). Forcing h1 makes each parallel chunk get its own TCP,
-        // letting the kernel/qdisc fan out across the available bandwidth.
-        let client = Client::builder()
-            .connect_timeout(Duration::from_secs(DEFAULT_CONNECT_TIMEOUT_SECS))
-            .http1_only()
-            .pool_max_idle_per_host(MAX_CONCURRENT_DOWNLOADS)
-            .tcp_keepalive(Duration::from_secs(30))
-            .build()?;
-
+    pub fn new(url: String, auth_token: Option<String>, chunk_size_bytes: Option<u64>, content_length: Option<u64>) -> Result<Self, CoreError> {
+        // Clone the process-global download client (shared with the pack path)
+        // rather than building a fresh client + empty pool per file, so connections
+        // stay warm across back-to-back downloads. It is HTTP/1-only for the same
+        // reason as before: with h2 reqwest multiplexes all chunks on a single TCP
+        // and caps aggregate throughput at the per-connection ceiling, whereas h1
+        // lets each parallel chunk get its own TCP and fan out across the available
+        // bandwidth. See `chunk_fetcher::download_client`.
+        let client = crate::chunk_fetcher::download_client()?.clone();
         Ok(Self {
             client,
             url,
             auth_token,
             chunk_size: chunk_size_bytes.unwrap_or(DEFAULT_CHUNK_SIZE),
+            content_length,
         })
     }
 
@@ -118,8 +125,14 @@ impl ChunkedDownloader {
     /// branch still returns `Some(sha256_of_empty_bytes)` because the
     /// file exists and has a defined (non-skipped) digest.
     pub async fn download(&self, dest_path: &Path, verify_hash: bool) -> Result<Option<String>, CoreError> {
-        // 1. Fetch the total blob size
-        let content_length = self.get_content_length().await?;
+        // 1. Total blob size: use the manifest-supplied size when Python passed it
+        //    (the common path), else HEAD for Content-Length. Skipping the HEAD
+        //    removes one control-plane RTT per plain-file download — meaningful for
+        //    the many small files in a snapshot.
+        let content_length = match self.content_length {
+            Some(n) => n,
+            None => self.get_content_length().await?,
+        };
 
         // Handle the empty-file case. `create_empty_file` keeps its
         // `Result<String, _>` shape because an empty file has a defined
@@ -164,7 +177,7 @@ impl ChunkedDownloader {
         // 3. Launch concurrent downloads — each streams directly to its
         //    correct offset in the final file.
         //
-        // Audit D4: previously this used `buffer_unordered(MAX_CONCURRENT_DOWNLOADS)`
+        // Audit D4: previously this used `buffer_unordered(32)`
         // and early-returned on the first error, but dropping the `Buffered` stream
         // does NOT cancel the `tokio::spawn`'d tasks behind it — `JoinHandle::drop`
         // detaches a tokio task, leaving it running in the background where it
@@ -172,15 +185,19 @@ impl ChunkedDownloader {
         // bubbled an error up. We now collect the spawn-side `AbortHandle`s eagerly
         // and call `.abort()` on every survivor before propagating the error, so
         // the survivors stop at their next await point instead of racing the next
-        // download. The chunk-level HTTP concurrency bound that
-        // `buffer_unordered(MAX_CONCURRENT_DOWNLOADS)` used to enforce is now
-        // carried by `pool_max_idle_per_host(MAX_CONCURRENT_DOWNLOADS)` on the
-        // reqwest client (line 98) — beyond pool capacity, reqwest queues HTTP
-        // requests on the existing connections, so eager spawn does not multiply
-        // network concurrency.
+        // download. NOTE: this legacy path has no `Semaphore`, so it eager-spawns
+        // one task per chunk and the actual concurrent-connection count IS
+        // `num_chunks` — `pool_max_idle_per_host` on the shared `download_client`
+        // caps only IDLE (retained) connections, NOT in-flight requests (reqwest/
+        // hyper open a new connection rather than queueing an h1 request). At the
+        // 100 MiB default chunk size that is a handful of tasks, but a small
+        // caller-set `HIPPIUS_CHUNK_SIZE` on a huge file would open O(file/chunk)
+        // connections — so the `permits` Semaphore below caps in-flight chunk GETs
+        // at MAX_INFLIGHT_CHUNKS, matching the pack path's per-file bound.
         let mut joins: FuturesUnordered<tokio::task::JoinHandle<(usize, Result<(), CoreError>)>> =
             FuturesUnordered::new();
         let mut abort_handles: Vec<AbortHandle> = Vec::with_capacity(num_chunks);
+        let permits = Arc::new(Semaphore::new(MAX_INFLIGHT_CHUNKS));
 
         for i in 0..num_chunks {
             let (start, end) = chunk_bounds(content_length, self.chunk_size, i);
@@ -190,8 +207,14 @@ impl ChunkedDownloader {
             let token = self.auth_token.clone();
             let chunk_pb = pb.clone();
             let path = dest_path_buf.clone();
+            let permits = Arc::clone(&permits);
 
             let handle = tokio::spawn(async move {
+                // Bound concurrent connections; RAII-released on completion or abort.
+                let _permit = match permits.acquire_owned().await {
+                    Ok(p) => p,
+                    Err(e) => return (i, Err(CoreError::Io(std::io::Error::other(e)))),
+                };
                 let res = download_chunk_with_retry(client, url, token, start, end, i, path, chunk_pb).await;
                 (i, res)
             });
@@ -443,8 +466,9 @@ async fn try_download_chunk_to_offset(
     dest_path: &Path,
     pb: &ProgressBar,
 ) -> Result<(), CoreError> {
-    // Audit D6: per-request timeout on the chunk GET. The `Client` (line 97)
-    // sets `connect_timeout(30s)` but no full-request timeout, so a slow-loris
+    // Audit D6: per-request timeout on the chunk GET. The shared
+    // `chunk_fetcher::download_client` sets `connect_timeout(30s)` but no
+    // full-request timeout, so a slow-loris
     // server could hold a TCP open and dribble bytes indefinitely without ever
     // tripping the connect phase. 5 minutes per chunk is generous given the
     // 100 MB `DEFAULT_CHUNK_SIZE` (≈ 333 KB/s floor before timing out) — enough

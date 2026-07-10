@@ -210,3 +210,49 @@ def test_v2_pack_uploads_respect_inflight_cap(monkeypatch, tmp_path):
     # Two packs were produced (so concurrency was possible) but never overlapped.
     assert len(captured["manifest"]["layers"]) >= 3  # pointer + 2 packs
     assert state["max"] == 1, "cap=1 must serialize pack uploads despite a 4-wide pool"
+
+
+@respx.mock
+def test_v2_folder_reupload_dedups_unchanged_chunk(monkeypatch, tmp_path):
+    # #7: upload_folder must build the dedup index from the prior revision too
+    # (upload_file already did; folders silently didn't). A folder re-upload should
+    # reference chunk "a" by range and pack only the new chunk "b" -- the same
+    # "upload only missing bytes" win, previously disabled for the folder path.
+    from hippius_hub.file_upload import upload_folder
+
+    p0 = "sha256:" + _pack_digest([(0, 40)])
+    prior_pointer = json.dumps({
+        "version": "chunked-v2",
+        "file": {"size": 40, "digest": "sha256:" + "d" * 64},
+        "chunks": [{"digest": "sha256:" + "a" * 64, "size": 40, "pack": p0, "offset": 0}],
+    }).encode()
+    prior_ptr_digest = "sha256:" + hashlib.sha256(prior_pointer).hexdigest()
+    existing = {
+        "schemaVersion": 2,
+        "layers": [
+            {"mediaType": POINTER_MEDIA_TYPE_V2, "digest": prior_ptr_digest, "size": len(prior_pointer),
+             "annotations": {"org.opencontainers.image.title": "big.bin",
+                             "com.hippius.file.size": "40", "com.hippius.file.digest": "sha256:" + "d" * 64,
+                             "com.hippius.chunk.count": "1"}},
+            {"mediaType": PACK_MEDIA_TYPE, "digest": p0, "size": 40},
+        ],
+        "annotations": {LAYOUT_ANNOTATION_KEY: CHUNKED_LAYOUT_V2},
+    }
+
+    monkeypatch.setenv("HIPPIUS_CHUNK_THRESHOLD", "1")
+    monkeypatch.setenv("HIPPIUS_CHUNKED_WRITE", "1")
+    monkeypatch.setenv("HIPPIUS_CHUNKED_LAYOUT", "v2")
+    monkeypatch.setenv("HIPPIUS_PACK_SIZE", "1000")
+    captured = {}
+    packs_seen, _put_bodies = _wire_registry(monkeypatch, captured, existing_manifest=existing)
+    respx.get(f"{MOCK_REGISTRY}/v2/{REPO}/blobs/{prior_ptr_digest}").mock(
+        return_value=httpx.Response(200, content=prior_pointer)
+    )
+
+    folder = tmp_path / "src"
+    folder.mkdir()
+    (folder / "big.bin").write_bytes(b"x" * 100)
+    upload_folder(repo_id=REPO, folder_path=str(folder), token="tok")
+
+    # Only the NEW chunk "b" (40, 60) was packed; chunk "a" was reused by range.
+    assert packs_seen == [[(40, 60)]]

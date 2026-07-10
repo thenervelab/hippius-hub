@@ -23,6 +23,7 @@ from huggingface_hub import CommitInfo
 from huggingface_hub.utils import filter_repo_objects
 from tqdm import tqdm
 
+from . import _http
 from ._oci import fetch_manifest, group_files, layer_title, parse_pointer_v2
 from ._packing import plan_packs, pointer_v2_bytes, resolve_pointer_chunks
 from .auth import get_oci_bearer_token
@@ -80,7 +81,7 @@ def _upload_blob_single_put(registry: str, repo_id: str, oci_token: str, file_pa
     large files go through the chunked-v2 path instead (`_upload_file_chunked_v2`)."""
     headers = {"Authorization": f"Bearer {oci_token}"}
     init_headers = {**headers, "Content-Length": "0"}
-    init = httpx.post(f"{registry}/v2/{repo_id}/blobs/uploads/", headers=init_headers, timeout=DEFAULT_HTTP_TIMEOUT)
+    init = _http.client().post(f"{registry}/v2/{repo_id}/blobs/uploads/", headers=init_headers, timeout=DEFAULT_HTTP_TIMEOUT)
     init.raise_for_status()
     location = init.headers.get("Location")
     if not location:
@@ -103,20 +104,50 @@ def _ensure_blob_uploaded(
     was skipped (the dedup HEAD)."""
     digest = f"sha256:{sha256_hash}"
     headers = {"Authorization": f"Bearer {oci_token}"}
-    check = httpx.head(f"{registry}/v2/{repo_id}/blobs/{digest}", headers=headers, timeout=DEFAULT_HTTP_TIMEOUT)
+    check = _http.client().head(f"{registry}/v2/{repo_id}/blobs/{digest}", headers=headers, timeout=DEFAULT_HTTP_TIMEOUT)
     if check.status_code == 200:
         return False
     _upload_blob_single_put(registry, repo_id, oci_token, file_path, digest)
     return True
 
 
+# Process-wide record of (registry, oci_repo) whose empty-config blob we've
+# confirmed present (a 200 HEAD, or our own successful PUT). The empty `{}` config
+# is the SAME 2-byte blob for every manifest and stays referenced -- so never
+# GC-eligible -- while any tag exists, so re-HEADing it before every upload to a
+# repo we've already confirmed is a pure wasted round-trip. Keyed per (registry,
+# repo): a blob in repo A implies nothing about repo B, and the registry is part of
+# the key so a custom endpoint is never assumed from the default.
+_config_blob_present: set = set()
+_config_blob_lock = threading.Lock()
+
+
+def clear_config_blob_cache() -> None:
+    """Drop the confirmed-config-blob cache. For tests reusing a (registry, repo)
+    key across cases -- the process-wide cache would otherwise skip a HEAD the test
+    set a respx route up for."""
+    with _config_blob_lock:
+        _config_blob_present.clear()
+
+
 def _ensure_config_blob_uploaded(registry: str, repo_id: str, oci_token: str) -> tuple:
-    """Push the empty-object config blob if missing. Returns (digest, size)."""
+    """Push the empty-object config blob if missing. Returns (digest, size).
+
+    Skips the HEAD once this (registry, repo) is confirmed (see
+    `_config_blob_present`). Edge: if every tag in the repo were deleted mid-process
+    and Harbor GC then reaped the `{}` config, the skip means the following manifest
+    PUT sees a 400 MANIFEST_BLOB_UNKNOWN. `_put_manifest` evicts this cache entry on
+    a persistent BLOB_UNKNOWN, so re-running the upload re-HEADs/re-PUTs the config
+    rather than skipping and failing the same way again."""
     data, digest, size = _empty_config_blob_descriptor()
+    cache_key = (registry, repo_id)
+    with _config_blob_lock:
+        if cache_key in _config_blob_present:
+            return digest, size
     headers = {"Authorization": f"Bearer {oci_token}"}
-    check = httpx.head(f"{registry}/v2/{repo_id}/blobs/{digest}", headers=headers, timeout=DEFAULT_HTTP_TIMEOUT)
+    check = _http.client().head(f"{registry}/v2/{repo_id}/blobs/{digest}", headers=headers, timeout=DEFAULT_HTTP_TIMEOUT)
     if check.status_code != 200:
-        init = httpx.post(
+        init = _http.client().post(
             f"{registry}/v2/{repo_id}/blobs/uploads/",
             headers={**headers, "Content-Length": "0"},
             timeout=DEFAULT_HTTP_TIMEOUT,
@@ -129,13 +160,17 @@ def _ensure_config_blob_uploaded(registry: str, repo_id: str, oci_token: str) ->
         # Raise on a failed config PUT: otherwise the manifest PUT that follows
         # fails later with an opaque MANIFEST_BLOB_UNKNOWN instead of the real
         # cause (matches _ensure_bytes_blob_uploaded / _upload_blob_single_put).
-        put = httpx.put(
+        put = _http.client().put(
             f"{loc}{sep}digest={digest}",
             headers={**headers, "Content-Type": "application/octet-stream"},
             content=data,
             timeout=DEFAULT_HTTP_TIMEOUT,
         )
         put.raise_for_status()
+    # Confirmed present now (the HEAD hit, or we just PUT it) -- skip the HEAD on
+    # later uploads to this repo in this process.
+    with _config_blob_lock:
+        _config_blob_present.add(cache_key)
     return digest, size
 
 
@@ -143,10 +178,10 @@ def _ensure_bytes_blob_uploaded(registry: str, repo_id: str, oci_token: str, dat
     """Push an in-memory blob (the pointer blob) if not already present at its
     digest. HEAD-dedups first, then runs the OCI init + PUT-with-digest dance."""
     headers = {"Authorization": f"Bearer {oci_token}"}
-    check = httpx.head(f"{registry}/v2/{repo_id}/blobs/{digest}", headers=headers, timeout=DEFAULT_HTTP_TIMEOUT)
+    check = _http.client().head(f"{registry}/v2/{repo_id}/blobs/{digest}", headers=headers, timeout=DEFAULT_HTTP_TIMEOUT)
     if check.status_code == 200:
         return
-    init = httpx.post(f"{registry}/v2/{repo_id}/blobs/uploads/", headers={**headers, "Content-Length": "0"}, timeout=DEFAULT_HTTP_TIMEOUT)
+    init = _http.client().post(f"{registry}/v2/{repo_id}/blobs/uploads/", headers={**headers, "Content-Length": "0"}, timeout=DEFAULT_HTTP_TIMEOUT)
     init.raise_for_status()
     location = init.headers.get("Location")
     if not location:
@@ -154,13 +189,13 @@ def _ensure_bytes_blob_uploaded(registry: str, repo_id: str, oci_token: str, dat
     if location.startswith("/"):
         location = f"{registry}{location}"
     sep = "&" if "?" in location else "?"
-    put = httpx.put(f"{location}{sep}digest={digest}", headers={**headers, "Content-Type": "application/octet-stream"}, content=data, timeout=DEFAULT_HTTP_TIMEOUT)
+    put = _http.client().put(f"{location}{sep}digest={digest}", headers={**headers, "Content-Type": "application/octet-stream"}, content=data, timeout=DEFAULT_HTTP_TIMEOUT)
     put.raise_for_status()
 
 
 def _fetch_blob(registry: str, oci_repo: str, digest: str, oci_token: str) -> bytes:
     """GET a blob's raw bytes (used to read prior-revision v2 pointer blobs)."""
-    resp = httpx.get(
+    resp = _http.client().get(
         f"{registry}/v2/{oci_repo}/blobs/{digest}",
         headers={"Authorization": f"Bearer {oci_token}"},
         timeout=DEFAULT_HTTP_TIMEOUT,
@@ -187,12 +222,25 @@ def _build_dedup_index(existing, registry: str, oci_repo: str, oci_token: str) -
     for layer in manifest.get("layers", []):
         if layer.get("mediaType") == PACK_MEDIA_TYPE:
             pack_sizes[layer["digest"]] = layer["size"]
-    for group in group_files(manifest):
-        if group.layout != CHUNKED_LAYOUT_V2 or group.pointer_digest is None:
-            continue
-        blob = _fetch_blob(registry, oci_repo, group.pointer_digest, oci_token)
-        for ref in parse_pointer_v2(blob):
-            chunk_index.setdefault(ref.chunk_digest, (ref.pack_digest, ref.pack_offset))
+    # Fetch every prior chunked file's pointer blob CONCURRENTLY (independent,
+    # small, read-only GETs) before the first new byte leaves the machine, then
+    # merge in group order so the index stays deterministic (setdefault = first
+    # wins). Uses the shared pooled httpx client, so the fan-out reuses warm
+    # connections instead of re-handshaking per pointer.
+    pointer_digests = [
+        g.pointer_digest
+        for g in group_files(manifest)
+        if g.layout == CHUNKED_LAYOUT_V2 and g.pointer_digest is not None
+    ]
+    if pointer_digests:
+        with ThreadPoolExecutor(max_workers=resolve_upload_workers()) as executor:
+            blobs = list(executor.map(
+                lambda pd: _fetch_blob(registry, oci_repo, pd, oci_token),
+                pointer_digests,
+            ))
+        for blob in blobs:
+            for ref in parse_pointer_v2(blob):
+                chunk_index.setdefault(ref.chunk_digest, (ref.pack_digest, ref.pack_offset))
     return chunk_index, pack_sizes
 
 
@@ -450,7 +498,7 @@ def _put_manifest(
         # and re-raise once the attempts are spent.
         transport_error = None
         try:
-            resp = httpx.put(url, headers=headers, json=manifest, timeout=DEFAULT_HTTP_TIMEOUT * 2)
+            resp = _http.client().put(url, headers=headers, json=manifest, timeout=DEFAULT_HTTP_TIMEOUT * 2)
         except httpx.TransportError as exc:
             transport_error = exc
 
@@ -485,6 +533,12 @@ def _put_manifest(
         )
         time.sleep(delay)
 
+    # A BLOB_UNKNOWN that outlived the retry budget may be a blob we cache-skip (the
+    # empty `{}` config), GC'd since we last confirmed it — not the transient
+    # commit-visibility race the retries assume. Evict the config-blob cache entry so
+    # a re-run re-confirms/re-PUTs it instead of skipping and failing identically.
+    if resp is not None and _is_blob_commit_race(resp):
+        _config_blob_present.discard((registry, repo_id))
     raise httpx.HTTPStatusError(
         f"manifest PUT for {repo_id}:{revision} failed with {resp.status_code} "
         f"after {attempt + 1} attempt(s): {_manifest_error_detail(resp)}",
@@ -685,17 +739,25 @@ def _upload_one_file(
     registry: str,
     oci_repo: str,
     oci_token: str,
+    dedup_index: Optional[Dict[str, tuple]] = None,
+    pack_sizes: Optional[Dict[str, int]] = None,
 ) -> List[dict]:
     """Upload one file from a folder and return its manifest layer(s).
 
     Returns a LIST because a chunked file contributes a pointer layer plus K
     chunk layers (a plain file contributes one). Extracted from the per-file
     closure in `upload_folder` so the thread-pool body is testable in isolation.
+
+    `dedup_index`/`pack_sizes` come from the prior revision (built once by
+    `upload_folder`) so a chunked file references already-stored chunks by range
+    instead of re-uploading them; empty/None for plain uploads.
     """
     abs_path = os.path.join(base_dir, rel_path)
     repo_title = f"{path_in_repo}/{rel_path}" if path_in_repo else rel_path
     tqdm.write(f"🚀 Uploading: {repo_title} ({os.path.getsize(abs_path)} bytes)...")
-    layers = _upload_file_layers(abs_path, repo_title, registry, oci_repo, oci_token)
+    layers = _upload_file_layers(
+        abs_path, repo_title, registry, oci_repo, oci_token, dedup_index, pack_sizes
+    )
     tqdm.write(f"✅ Uploaded: {repo_title}")
     return layers
 
@@ -901,6 +963,18 @@ def upload_folder(
     registry = resolve_registry(endpoint)
     oci_token = _oci_bearer(oci_repo, token, push=True, endpoint=endpoint)
 
+    # Build the chunked-v2 dedup index ONCE from the prior revision (as upload_file
+    # does) so every large file in the folder references chunks already stored
+    # instead of re-packing and re-uploading them. Read-only and taken before the
+    # fan-out; _finalize_upload_manifest re-fetches for the merge + If-Match, so
+    # this does not widen that write's read-modify-write window. Only built under
+    # HIPPIUS_CHUNKED_WRITE — plain uploads dedup per-blob via HEAD.
+    dedup_index: Dict[str, tuple] = {}
+    pack_sizes: Dict[str, int] = {}
+    if resolve_chunked_write_enabled():
+        prior = fetch_manifest(registry, oci_repo, revision, oci_token, missing_ok=True)
+        dedup_index, pack_sizes = _build_dedup_index(prior, registry, oci_repo, oci_token)
+
     new_layers = []
     if filtered:
         print(f"📦 Preparing to upload {len(filtered)} file(s) to {repo_id}:{revision}...")
@@ -914,6 +988,8 @@ def upload_folder(
                     registry=registry,
                     oci_repo=oci_repo,
                     oci_token=oci_token,
+                    dedup_index=dedup_index,
+                    pack_sizes=pack_sizes,
                 )
                 for rel in filtered
             ]

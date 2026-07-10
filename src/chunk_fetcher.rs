@@ -15,7 +15,7 @@ use indicatif::{ProgressBar, ProgressStyle};
 use reqwest::Client;
 use sha2::{Digest, Sha256};
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use tokio::fs::OpenOptions;
 use tokio::io::{AsyncSeekExt, AsyncWriteExt, SeekFrom};
@@ -37,6 +37,61 @@ const VERIFY_READ_BUFFER: usize = 8 * 1024 * 1024;
 /// regression test can pin the value and clippy's dead-code lint enforces its
 /// call site.
 const CHUNK_REQUEST_TIMEOUT: Duration = Duration::from_mins(5);
+
+/// Idle-connection cap for the shared download client. Bounds only *idle*
+/// (kept-alive) connections, not in-flight requests — the per-file `Semaphore`
+/// (`PackAssembler`) and spawn count (`ChunkedDownloader`) are the real concurrency
+/// bounds, so a fixed value is safe regardless of a caller's `max_concurrent`. 32
+/// matches the default `max_concurrent`. This does change the pack path's idle-pool
+/// sizing (previously `pool_max_idle_per_host(max_concurrent)`) to a fixed cap; a
+/// caller running `HIPPIUS_MAX_CONCURRENT` above 32 keeps up to 32 warm idle
+/// connections rather than `max_concurrent`, which only affects idle reuse, not the
+/// real (semaphore-bounded) concurrency.
+const DOWNLOAD_POOL_MAX_IDLE: usize = 32;
+
+/// Process-global HTTP/1 client shared by both download paths (pack assembly here
+/// and the legacy Range downloader). Mirrors `uploader::upload_client`: building a
+/// `Client` per native call starts with an empty pool and forces a fresh
+/// DNS+TCP+TLS handshake to the registry host on every file; the `OnceLock` hoists
+/// construction out of the per-file path so warm connections survive across files
+/// (the win for many-small-file snapshots). Auth is applied per request, so the
+/// shared client carries no per-file credential across origins.
+///
+/// HTTP/1-only for the same reason the per-call clients were: h2 would multiplex
+/// every parallel chunk onto one TCP and cap aggregate throughput at the
+/// per-connection ceiling; h1 lets each chunk claim its own connection.
+///
+/// Construction is fallible (the TLS backend may fail to init), so this returns
+/// `Result` rather than `expect`-ing inside a `get_or_init` closure — the crate
+/// denies `panic`/`unwrap`. On an init race the loser's freshly built client is
+/// dropped unused (RAII); `OnceLock` is valid in statics and never poisoned.
+pub(crate) fn download_client() -> Result<&'static Client, CoreError> {
+    static CLIENT: OnceLock<Client> = OnceLock::new();
+    if let Some(client) = CLIENT.get() {
+        return Ok(client);
+    }
+    let built = Client::builder()
+        .connect_timeout(Duration::from_secs(CONNECT_TIMEOUT_SECS))
+        .http1_only()
+        .pool_max_idle_per_host(DOWNLOAD_POOL_MAX_IDLE)
+        .tcp_keepalive(Duration::from_secs(30))
+        .build()?;
+    Ok(CLIENT.get_or_init(|| built))
+}
+
+/// Process-global cap on packs in flight across ALL concurrent downloads (every
+/// file in a snapshot), so the nested snapshot-workers × per-file-concurrency
+/// parallelism cannot multiply resident 64 MiB pack buffers into an OOM
+/// (8 workers × 32 × 64 MiB ≈ 16 GB worst case). Sized from the FIRST call's
+/// `max_concurrent` (first-caller-wins, like `download_client`): in a uniform
+/// snapshot every file passes the same value, so the total in-flight budget equals
+/// one file's concurrency — a single large file is never throttled, and N files
+/// SHARE that budget rather than each getting the full amount. Mirrors the upload
+/// path's `_pack_upload_gate`.
+fn global_pack_gate(max_concurrent: usize) -> Arc<Semaphore> {
+    static GATE: OnceLock<Arc<Semaphore>> = OnceLock::new();
+    Arc::clone(GATE.get_or_init(|| Arc::new(Semaphore::new(max_concurrent))))
+}
 
 /// One chunk to carve out of a fetched pack: where it sits in the pack, its size,
 /// where it lands in the assembled file, and its content digest (hex, no prefix).
@@ -68,15 +123,14 @@ pub struct PackAssembler {
 }
 
 impl PackAssembler {
-    /// HTTP/1 client with an idle pool sized to `max_concurrent`; the semaphore in
-    /// `assemble` — not the pool — is the real concurrency bound. Only fallible step.
+    /// Clones the shared process-global `download_client` (warm pool across files);
+    /// the semaphore in `assemble` — not the client's fixed idle pool — is the real
+    /// concurrency bound. Fallible only on the client's first-time build.
     pub fn new(auth_token: Option<String>, max_concurrent: usize) -> Result<Self, CoreError> {
-        let client = Client::builder()
-            .connect_timeout(Duration::from_secs(CONNECT_TIMEOUT_SECS))
-            .http1_only()
-            .pool_max_idle_per_host(max_concurrent)
-            .tcp_keepalive(Duration::from_secs(30))
-            .build()?;
+        // Clone the process-global client (an Arc-backed handle sharing one pool)
+        // instead of building a fresh client + empty pool per file. `max_concurrent`
+        // still bounds real concurrency via the `Semaphore` in `assemble`.
+        let client = download_client()?.clone();
         Ok(Self { client, auth_token, max_concurrent: max_concurrent.max(1) })
     }
 
@@ -117,6 +171,7 @@ impl PackAssembler {
             FuturesUnordered::new();
         let mut abort_handles: Vec<AbortHandle> = Vec::with_capacity(packs.len());
         let permits = Arc::new(Semaphore::new(self.max_concurrent));
+        let global = global_pack_gate(self.max_concurrent);
 
         for (i, plan) in packs.iter().enumerate() {
             let client = self.client.clone();
@@ -131,9 +186,17 @@ impl PackAssembler {
             let path = dest.to_path_buf();
             let pack_pb = pb.clone();
             let permits = Arc::clone(&permits);
+            let global = Arc::clone(&global);
 
             let handle = tokio::spawn(async move {
+                // Per-file permit bounds THIS file's concurrency; the global permit
+                // bounds TOTAL packs in flight across every concurrent file (the
+                // snapshot memory ceiling). Held for the whole fetch, released on drop.
                 let _permit = match permits.acquire_owned().await {
+                    Ok(p) => p,
+                    Err(e) => return (i, Err(CoreError::Io(std::io::Error::other(e)))),
+                };
+                let _global_permit = match global.acquire_owned().await {
                     Ok(p) => p,
                     Err(e) => return (i, Err(CoreError::Io(std::io::Error::other(e)))),
                 };

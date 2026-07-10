@@ -7,8 +7,7 @@ credential resolution (saved token, env var, fresh login, etc.).
 import base64
 from typing import Optional
 
-import httpx
-
+from . import _http
 from .constants import DEFAULT_HTTP_TIMEOUT, resolve_registry
 from .errors import LocalTokenNotFoundError
 
@@ -53,7 +52,7 @@ def harbor_whoami(auth_header: str, endpoint: Optional[str] = None) -> dict:
             "orgs": [],
         }
 
-    resp = httpx.get(
+    resp = _http.client().get(
         f"{_base(endpoint)}/api/v2.0/users/current",
         headers=_headers(auth_header),
     )
@@ -87,7 +86,7 @@ def harbor_create_project(
 
     Raises httpx.HTTPStatusError on failure. 409 means the project already exists.
     """
-    resp = httpx.post(
+    resp = _http.client().post(
         f"{_base(endpoint)}/api/v2.0/projects",
         headers=_headers(auth_header, json=True),
         json={"project_name": project_name, "public": public},
@@ -115,7 +114,7 @@ def harbor_get_project(
     flag on ModelInfo) should treat FORBIDDEN as "unknown" rather than
     inferring private/public from absent data.
     """
-    resp = httpx.get(
+    resp = _http.client().get(
         f"{_base(endpoint)}/api/v2.0/projects/{project_name}",
         headers=_headers(auth_header),
         timeout=DEFAULT_HTTP_TIMEOUT,
@@ -136,7 +135,7 @@ def harbor_delete_project(
     missing_ok: bool = False,
 ) -> None:
     """Delete a Harbor project; with `missing_ok=True`, 404 is swallowed."""
-    resp = httpx.delete(
+    resp = _http.client().delete(
         f"{_base(endpoint)}/api/v2.0/projects/{project_name}",
         headers=_headers(auth_header),
     )
@@ -158,7 +157,7 @@ def harbor_get_repository(
     Harbor encodes those as `%2F` in the URL.
     """
     encoded = repo_name.replace("/", "%2F")
-    resp = httpx.get(
+    resp = _http.client().get(
         f"{_base(endpoint)}/api/v2.0/projects/{project_name}/repositories/{encoded}",
         headers=_headers(auth_header),
         timeout=DEFAULT_HTTP_TIMEOUT,
@@ -181,7 +180,7 @@ def harbor_delete_repository(
 ) -> None:
     """Delete a Harbor repository under `project_name`; with `missing_ok=True`, 404 is swallowed."""
     encoded = repo_name.replace("/", "%2F")
-    resp = httpx.delete(
+    resp = _http.client().delete(
         f"{_base(endpoint)}/api/v2.0/projects/{project_name}/repositories/{encoded}",
         headers=_headers(auth_header),
     )
@@ -206,7 +205,7 @@ def harbor_get_artifact(
         "with_label": str(with_label).lower(),
         "with_tag": str(with_tag).lower(),
     }
-    resp = httpx.get(
+    resp = _http.client().get(
         f"{_base(endpoint)}/api/v2.0/projects/{project_name}/repositories/{encoded}/artifacts/{reference}",
         headers=_headers(auth_header),
         params=params,
