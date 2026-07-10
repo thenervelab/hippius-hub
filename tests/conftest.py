@@ -18,18 +18,24 @@ pytest_plugins = ["tests.respx_fixtures"]
 
 @pytest.fixture(autouse=True)
 def _clear_oci_token_cache():
-    """Prevent cross-test contamination of the global OCI bearer-token cache.
+    """Prevent cross-test contamination of module-level process caches.
 
-    `auth._OCI_TOKEN_CACHE` is module-level and survives across tests. Some
-    tests monkeypatch `auth.TOKEN_PATH` per-test — the cache key includes the
-    auth-input string so divergent saved tokens get separate entries, but
-    clearing between tests is defense in depth against future regressions.
+    Two survive across tests: `auth._OCI_TOKEN_CACHE` (bearer JWTs) and
+    `file_upload._config_blob_present` (repos whose empty-config blob is
+    confirmed). The token cache key includes the auth-input string so divergent
+    saved tokens get separate entries, but clearing both between tests is defense
+    in depth — the config-blob cache in particular is keyed only on
+    (registry, repo), so without this a test that confirms the blob would make a
+    later same-repo test skip the HEAD its respx routes expect.
     """
     from hippius_hub.auth import clear_oci_token_cache
+    from hippius_hub.file_upload import clear_config_blob_cache
 
     clear_oci_token_cache()
+    clear_config_blob_cache()
     yield
     clear_oci_token_cache()
+    clear_config_blob_cache()
 
 
 def _have_creds():

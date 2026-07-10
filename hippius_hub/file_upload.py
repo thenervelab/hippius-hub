@@ -111,9 +111,38 @@ def _ensure_blob_uploaded(
     return True
 
 
+# Process-wide record of (registry, oci_repo) whose empty-config blob we've
+# confirmed present (a 200 HEAD, or our own successful PUT). The empty `{}` config
+# is the SAME 2-byte blob for every manifest and stays referenced -- so never
+# GC-eligible -- while any tag exists, so re-HEADing it before every upload to a
+# repo we've already confirmed is a pure wasted round-trip. Keyed per (registry,
+# repo): a blob in repo A implies nothing about repo B, and the registry is part of
+# the key so a custom endpoint is never assumed from the default.
+_config_blob_present: set = set()
+_config_blob_lock = threading.Lock()
+
+
+def clear_config_blob_cache() -> None:
+    """Drop the confirmed-config-blob cache. For tests reusing a (registry, repo)
+    key across cases -- the process-wide cache would otherwise skip a HEAD the test
+    set a respx route up for."""
+    with _config_blob_lock:
+        _config_blob_present.clear()
+
+
 def _ensure_config_blob_uploaded(registry: str, repo_id: str, oci_token: str) -> tuple:
-    """Push the empty-object config blob if missing. Returns (digest, size)."""
+    """Push the empty-object config blob if missing. Returns (digest, size).
+
+    Skips the HEAD once this (registry, repo) is confirmed (see
+    `_config_blob_present`). Edge: if every tag in the repo were deleted
+    mid-process the blob could be GC'd and the following manifest PUT would fail
+    loudly -- an acceptable trade for a within-process cache; a fresh process
+    re-confirms on its first upload."""
     data, digest, size = _empty_config_blob_descriptor()
+    cache_key = (registry, repo_id)
+    with _config_blob_lock:
+        if cache_key in _config_blob_present:
+            return digest, size
     headers = {"Authorization": f"Bearer {oci_token}"}
     check = _http.client().head(f"{registry}/v2/{repo_id}/blobs/{digest}", headers=headers, timeout=DEFAULT_HTTP_TIMEOUT)
     if check.status_code != 200:
@@ -137,6 +166,10 @@ def _ensure_config_blob_uploaded(registry: str, repo_id: str, oci_token: str) ->
             timeout=DEFAULT_HTTP_TIMEOUT,
         )
         put.raise_for_status()
+    # Confirmed present now (the HEAD hit, or we just PUT it) -- skip the HEAD on
+    # later uploads to this repo in this process.
+    with _config_blob_lock:
+        _config_blob_present.add(cache_key)
     return digest, size
 
 
