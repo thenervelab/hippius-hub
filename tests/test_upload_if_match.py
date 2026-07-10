@@ -288,22 +288,40 @@ def test_warns_when_prior_manifest_lacks_docker_content_digest(tmp_path):
     )
 
 
-# --- Manifest-PUT retry on the Harbor blob-commit visibility race -------------
+# --- Manifest-PUT retry on transient conditions -------------------------------
 #
 # Harbor accepts a blob (201) seconds before it is visible to manifest
 # validation (a measured ~3.4s "Move" window). A fast client PUTs the manifest
-# inside that window and gets a transient 400 MANIFEST_BLOB_UNKNOWN. Since the
-# manifest is deterministic and the write is idempotent, _put_manifest retries
-# transient 4xx/5xx with backoff. These tests pin that behavior offline.
+# inside that window and gets a 400 MANIFEST_BLOB_UNKNOWN. Since the manifest is
+# deterministic and the write is idempotent, _put_manifest retries — with the
+# same transient set the Rust uploader retries (connection errors + 408/429/5xx)
+# plus that one Harbor-specific BLOB_UNKNOWN 400 — and fails fast on any other
+# status. These tests pin that classification offline.
 
 _BLOB_UNKNOWN_BODY = {
     "errors": [{"code": "MANIFEST_BLOB_UNKNOWN", "message": "blob unknown to registry",
                 "detail": "sha256:" + "e" * 64}]
 }
+_MANIFEST_INVALID_BODY = {
+    "errors": [{"code": "MANIFEST_INVALID", "message": "manifest invalid"}]
+}
+
+
+def _no_backoff(monkeypatch) -> list:
+    """Silence real backoff and pin jitter deterministic; return the sleep log.
+
+    random() -> 1.0 makes the jittered delay equal the raw backoff, so a sleep
+    assertion reads the intended schedule (0.5, 1, 2, ...) rather than a random
+    fraction of it.
+    """
+    sleeps: list[float] = []
+    monkeypatch.setattr("hippius_hub.file_upload.time.sleep", lambda s: sleeps.append(s))
+    monkeypatch.setattr("hippius_hub.file_upload.random.random", lambda: 1.0)
+    return sleeps
 
 
 @respx.mock
-def test_manifest_put_retries_transient_400_then_succeeds(tmp_path, monkeypatch):
+def test_manifest_put_retries_blob_unknown_400_then_succeeds(tmp_path, monkeypatch):
     """A 400 MANIFEST_BLOB_UNKNOWN then a 201: the upload retries and succeeds.
 
     This is the exact staging-CI failure — a just-committed pack not yet visible
@@ -312,9 +330,7 @@ def test_manifest_put_retries_transient_400_then_succeeds(tmp_path, monkeypatch)
     """
     from hippius_hub.file_upload import upload_file
 
-    sleeps: list[float] = []
-    monkeypatch.setattr("hippius_hub.file_upload.time.sleep", lambda s: sleeps.append(s))
-
+    sleeps = _no_backoff(monkeypatch)
     payload, sha_hex, _size = _write_payload(tmp_path)
     _stub_auth_and_blob(respx.mock, sha_hex)
     respx.mock.get(
@@ -340,17 +356,116 @@ def test_manifest_put_retries_transient_400_then_succeeds(tmp_path, monkeypatch)
 
 
 @respx.mock
+def test_manifest_put_retries_5xx_then_succeeds(tmp_path, monkeypatch):
+    """A 503 (registry redeploy/overload) is transient and retried, like in Rust."""
+    from hippius_hub.file_upload import upload_file
+
+    sleeps = _no_backoff(monkeypatch)
+    payload, sha_hex, _size = _write_payload(tmp_path)
+    _stub_auth_and_blob(respx.mock, sha_hex)
+    respx.mock.get(
+        f"{REGISTRY}/v2/{REPO_ID}/manifests/{REVISION}"
+    ).mock(return_value=httpx.Response(404))
+    put_route = respx.mock.put(
+        f"{REGISTRY}/v2/{REPO_ID}/manifests/{REVISION}"
+    ).mock(side_effect=[
+        httpx.Response(503, text="service unavailable"),
+        httpx.Response(201, headers={"Docker-Content-Digest": "sha256:" + "a" * 64}),
+    ])
+
+    upload_file(
+        path_or_fileobj=str(payload),
+        path_in_repo="hello.txt",
+        repo_id=REPO_ID,
+        token="literal-token-value",
+        revision=REVISION,
+    )
+
+    assert put_route.call_count == 2
+    assert sleeps == [0.5]
+
+
+@respx.mock
+def test_manifest_put_retries_transport_error_then_succeeds(tmp_path, monkeypatch):
+    """A connection reset mid-PUT (an exception, not a status) is retried too.
+
+    Rust's is_retryable covers timeouts/connection errors; the Python loop must
+    match — a Harbor redeploy that drops the socket is at least as transient as a
+    503, and used to fail the whole upload on the first blip.
+    """
+    from hippius_hub.file_upload import upload_file
+
+    sleeps = _no_backoff(monkeypatch)
+    payload, sha_hex, _size = _write_payload(tmp_path)
+    _stub_auth_and_blob(respx.mock, sha_hex)
+    respx.mock.get(
+        f"{REGISTRY}/v2/{REPO_ID}/manifests/{REVISION}"
+    ).mock(return_value=httpx.Response(404))
+    put_route = respx.mock.put(
+        f"{REGISTRY}/v2/{REPO_ID}/manifests/{REVISION}"
+    ).mock(side_effect=[
+        httpx.ConnectError("connection reset by peer"),
+        httpx.Response(201, headers={"Docker-Content-Digest": "sha256:" + "b" * 64}),
+    ])
+
+    upload_file(
+        path_or_fileobj=str(payload),
+        path_in_repo="hello.txt",
+        repo_id=REPO_ID,
+        token="literal-token-value",
+        revision=REVISION,
+    )
+
+    assert put_route.call_count == 2, "the transport error must be retried, not fatal"
+    assert sleeps == [0.5]
+
+
+@respx.mock
+def test_manifest_put_does_not_retry_malformed_400(tmp_path, monkeypatch):
+    """A 400 that is NOT the blob-commit race (MANIFEST_INVALID) fails fast.
+
+    This is the load-bearing narrowing: a genuinely-bad manifest must surface
+    immediately with its real code, not burn 6 PUTs / ~15s mislabelled as a
+    transient registry race.
+    """
+    from hippius_hub.file_upload import upload_file
+
+    sleeps = _no_backoff(monkeypatch)
+    payload, sha_hex, _size = _write_payload(tmp_path)
+    _stub_auth_and_blob(respx.mock, sha_hex)
+    respx.mock.get(
+        f"{REGISTRY}/v2/{REPO_ID}/manifests/{REVISION}"
+    ).mock(return_value=httpx.Response(404))
+    put_route = respx.mock.put(
+        f"{REGISTRY}/v2/{REPO_ID}/manifests/{REVISION}"
+    ).mock(return_value=httpx.Response(400, json=_MANIFEST_INVALID_BODY))
+
+    with pytest.raises(httpx.HTTPStatusError) as exc_info:
+        upload_file(
+            path_or_fileobj=str(payload),
+            path_in_repo="hello.txt",
+            repo_id=REPO_ID,
+            token="literal-token-value",
+            revision=REVISION,
+        )
+
+    assert put_route.call_count == 1, "a non-race 400 must not be retried"
+    assert sleeps == [], "no backoff for a permanent 400"
+    assert "MANIFEST_INVALID" in str(exc_info.value), "the real error code must be surfaced"
+
+
+@respx.mock
 def test_manifest_put_exhausts_retries_and_surfaces_error_body(tmp_path, monkeypatch):
-    """A persistent 400 exhausts the bounded retries and raises with the OCI body.
+    """A persistent BLOB_UNKNOWN 400 exhausts the bounded retries and raises with
+    the OCI body.
 
     `raise_for_status` used to hide Harbor's error code; the raised message must
-    now carry MANIFEST_BLOB_UNKNOWN (and repo:revision) so a real, non-transient
-    manifest rejection is diagnosable instead of an opaque `400 Bad Request`.
+    now carry MANIFEST_BLOB_UNKNOWN (and repo:revision) so the terminal outcome is
+    diagnosable instead of an opaque `400 Bad Request`.
     """
     from hippius_hub.file_upload import MANIFEST_PUT_MAX_RETRIES, upload_file
 
-    monkeypatch.setattr("hippius_hub.file_upload.time.sleep", lambda s: None)
-
+    _no_backoff(monkeypatch)
     payload, sha_hex, _size = _write_payload(tmp_path)
     _stub_auth_and_blob(respx.mock, sha_hex)
     respx.mock.get(
@@ -380,13 +495,11 @@ def test_manifest_put_does_not_retry_non_transient_403(tmp_path, monkeypatch):
     """A 403 is a permanent rejection (auth/quota), not the commit race: fail fast.
 
     Retrying a genuinely-rejected PUT would just burn the backoff budget before
-    surfacing the same error, so only the transient status set is retried.
+    surfacing the same error, so only the transient set is retried.
     """
     from hippius_hub.file_upload import upload_file
 
-    sleeps: list[float] = []
-    monkeypatch.setattr("hippius_hub.file_upload.time.sleep", lambda s: sleeps.append(s))
-
+    sleeps = _no_backoff(monkeypatch)
     payload, sha_hex, _size = _write_payload(tmp_path)
     _stub_auth_and_blob(respx.mock, sha_hex)
     respx.mock.get(
