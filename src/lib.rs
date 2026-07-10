@@ -12,7 +12,7 @@ mod chunked_downloader;
 mod diagnostics;
 mod uploader;
 
-use chunk_fetcher::{ChunkAssembler, ChunkPlan};
+use chunk_fetcher::{ChunkAssembler, ChunkPlan, PackAssembler, PackChunkTarget, PackPlanEntry};
 use chunked_downloader::ChunkedDownloader;
 
 /// Render a `CoreError` (plus its full `source()` chain) as a single
@@ -402,6 +402,119 @@ fn diagnose_blob_native(
     })
 }
 
+/// Pack a file's new-chunk byte ranges into one blob and upload it (chunked-v2).
+///
+/// # Arguments
+/// - `uploads_url`: the repo's `.../blobs/uploads/` endpoint; this call does the
+///   POST-init + monolithic PUT itself (a new pack is never dedup-HEADed — its
+///   content is new by construction).
+/// - `path`: local source file.
+/// - `ranges`: `(offset, length)` byte ranges to concatenate, in pack order.
+/// - `auth_token`: optional bearer token.
+///
+/// # Returns
+/// The pack blob's lowercase-hex sha256 (no prefix) — recorded in the v2 pointer.
+///
+/// # GIL
+/// Releases the GIL across the blocking read+upload via `py.detach`.
+#[pyfunction]
+#[pyo3(signature = (uploads_url, path, ranges, auth_token=None))]
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "pyo3 #[pyfunction] requires owned values to extract from Python args"
+)]
+fn pack_upload_native(
+    py: Python<'_>,
+    uploads_url: String,
+    path: String,
+    ranges: Vec<(u64, u64)>,
+    auth_token: Option<String>,
+) -> PyResult<String> {
+    let rt = shared_runtime();
+    let dest = PathBuf::from(path);
+    py.detach(|| {
+        rt.block_on(async {
+            uploader::pack_upload_async(&uploads_url, &dest, &ranges, auth_token.as_deref()).await
+        })
+        .map_err(|e| core_err_to_py(&e))
+    })
+}
+
+/// Assemble a chunked-v2 file by pulling its pack blobs in parallel and slicing
+/// each chunk to its file offset (the download companion to `pack_upload_native`).
+///
+/// # Arguments
+/// - `pack_urls` / `pack_sizes`: per-pack blob URL and byte length (equal length).
+/// - `pack_chunks`: per pack, a list of `(offset_in_pack, size, file_offset,
+///   chunk_sha256_hex)` targets to carve and verify.
+/// - `dest_path`: destination, pre-allocated to `total_size`.
+/// - `total_size`: whole-file byte length (from the pointer's `file.size`).
+/// - `file_digest`: optional whole-file sha256 (hex, no prefix) — always passed
+///   for chunked files; proves chunk ordering across packs.
+///
+/// # Returns
+/// The verified whole-file sha256 hex when `file_digest` is given, else `None`.
+///
+/// # GIL
+/// Releases the GIL across the blocking transfer via `py.detach`.
+#[pyfunction]
+#[pyo3(signature = (pack_urls, pack_sizes, pack_chunks, dest_path, total_size, file_digest=None, auth_token=None, max_concurrent=None))]
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "pyo3 #[pyfunction] requires owned values to extract from Python args"
+)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "each parameter is a distinct Python-supplied download argument; bundling into a #[pyclass] would add a wrapper type for no call-site clarity"
+)]
+fn download_packs_native(
+    py: Python<'_>,
+    pack_urls: Vec<String>,
+    pack_sizes: Vec<u64>,
+    pack_chunks: Vec<Vec<(u64, u64, u64, String)>>,
+    dest_path: String,
+    total_size: u64,
+    file_digest: Option<String>,
+    auth_token: Option<String>,
+    max_concurrent: Option<usize>,
+) -> PyResult<Option<String>> {
+    if pack_urls.len() != pack_sizes.len() || pack_urls.len() != pack_chunks.len() {
+        return Err(PyValueError::new_err(format!(
+            "pack_urls ({}), pack_sizes ({}), pack_chunks ({}) must have equal length",
+            pack_urls.len(),
+            pack_sizes.len(),
+            pack_chunks.len()
+        )));
+    }
+    let mut packs: Vec<PackPlanEntry> = Vec::with_capacity(pack_urls.len());
+    for ((url, size), chunks) in pack_urls.into_iter().zip(pack_sizes).zip(pack_chunks) {
+        let targets = chunks
+            .into_iter()
+            .map(|(offset_in_pack, csize, file_offset, expected_sha256)| PackChunkTarget {
+                offset_in_pack,
+                size: csize,
+                file_offset,
+                expected_sha256,
+            })
+            .collect();
+        packs.push(PackPlanEntry { url, size, chunks: targets });
+    }
+
+    let rt = shared_runtime();
+    let dest = PathBuf::from(dest_path);
+    let concurrency = max_concurrent.unwrap_or(32).max(1);
+
+    py.detach(|| {
+        let assembler = PackAssembler::new(auth_token, concurrency).map_err(|e| core_err_to_py(&e))?;
+        rt.block_on(async {
+            assembler
+                .assemble(&dest, &packs, file_digest.as_deref(), total_size)
+                .await
+        })
+        .map_err(|e| core_err_to_py(&e))
+    })
+}
+
 /// A Python module implemented in Rust.
 ///
 /// The `#[pymodule]` signature takes `&Bound<'_, PyModule>` (the pyo3 0.21+
@@ -420,6 +533,8 @@ fn hippius_core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(chunk_and_hash_native, m)?)?;
     m.add_function(wrap_pyfunction!(upload_blob_range_native, m)?)?;
     m.add_function(wrap_pyfunction!(upload_blob_native, m)?)?;
+    m.add_function(wrap_pyfunction!(pack_upload_native, m)?)?;
+    m.add_function(wrap_pyfunction!(download_packs_native, m)?)?;
     m.add_function(wrap_pyfunction!(diagnose_blob_native, m)?)?;
     Ok(())
 }
