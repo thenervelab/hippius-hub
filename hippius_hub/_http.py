@@ -15,22 +15,42 @@ share across threads for concurrent synchronous requests (httpcore's sync pool
 serializes its own bookkeeping), so the folder/snapshot upload/download
 ThreadPoolExecutors and the metadata fan-outs all share this single instance.
 
-Contract: this module owns ONLY the transport pool. Every call site still passes
-its own ``headers=``/``timeout=``/``params=`` exactly as before. Two deliberate,
-benign differences from the old throwaway-per-call clients: a process-wide cookie
-jar now persists ``Set-Cookie`` across same-origin control-plane calls (httpx
-scopes cookies by domain, so nothing crosses origins -- a sticky-session LB
-benefits), and idle connections are reused between calls. No auth is ever baked
-into the client -- credentials are per-request headers -- so it can never forward
-one origin's credential to another.
+Contract: this module owns ONLY the transport pool and stays as stateless per
+request as the old throwaway-per-call clients. Every call site still passes its own
+``headers=``/``timeout=``/``params=`` exactly as before, and the one behavioral
+difference a shared client would introduce -- a persistent cookie jar -- is
+deliberately neutralized by a reject-all cookie policy (see ``_NoCookies``): no
+``Set-Cookie`` is ever stored or replayed. That is load-bearing against Harbor,
+which exempts token-authenticated requests from CSRF only while no session cookie
+is present; a *persisted* Harbor session cookie flips it into browser-session mode
+and it then rejects a state-changing request (manifest PUT) with 403 "CSRF token
+not found in request." The old per-call clients never persisted cookies, so they
+stayed CSRF-exempt; this matches that exactly. No auth is baked into the client
+either -- credentials are per-request headers -- so it can never forward one
+origin's credential to another.
 """
 from __future__ import annotations
 
 import atexit
+import http.cookiejar
 import threading
 from typing import Optional
 
 import httpx
+
+
+class _NoCookies(http.cookiejar.DefaultCookiePolicy):
+    """Cookie policy that rejects every ``Set-Cookie`` (see the module docstring).
+
+    Returning ``False`` from ``set_ok`` for every cookie means the shared client
+    stores nothing and therefore sends nothing -- each request is as stateless as a
+    fresh throwaway client, so a Harbor session/CSRF cookie is never replayed onto a
+    later state-changing request.
+    """
+
+    def set_ok(self, cookie, request):
+        return False
+
 
 _CLIENT: Optional[httpx.Client] = None
 _CLIENT_LOCK = threading.Lock()
@@ -69,6 +89,11 @@ def client() -> httpx.Client:
                     # Client default, which is httpx's Timeout(5.0) -- identical to
                     # the pre-pooling module-level httpx.get default.
                 )
+                # Reject all cookies so a Harbor session/CSRF cookie can never be
+                # persisted and replayed on a later state-changing request (which
+                # would 403 with "CSRF token not found") -- keep the shared client as
+                # stateless as the old per-call clients. See _NoCookies.
+                _CLIENT.cookies.jar.set_policy(_NoCookies())
                 atexit.register(_close)
     return _CLIENT
 
