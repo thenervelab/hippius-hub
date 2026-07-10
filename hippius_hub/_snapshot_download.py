@@ -13,7 +13,7 @@ from typing import Dict, List, Optional, Union
 
 from huggingface_hub.utils import filter_repo_objects
 
-from ._oci import fetch_manifest, layer_titles
+from ._oci import fetch_manifest, group_files
 from .auth import get_oci_bearer_token
 from .constants import DEFAULT_CACHE_DIR, resolve_registry, resolve_snapshot_workers
 from .errors import LocalEntryNotFoundError
@@ -155,11 +155,14 @@ def snapshot_download(
     # pass the bare manifest body through to each worker via _resolved_manifest
     # (which is typed as a dict — see `hf_hub_download`).
     manifest = fetch_manifest(registry, oci_repo, revision, oci_token).manifest
-    filenames = layer_titles(manifest)
+    # Parse the manifest into file-groups ONCE and thread each file's group into
+    # its worker, so the fan-out doesn't re-run group_files (an O(layers) parse)
+    # per file under the GIL. Ordered dict preserves the manifest's layer order.
+    groups = {g.title: g for g in group_files(manifest)}
 
     filtered = list(
         filter_repo_objects(
-            items=filenames,
+            items=list(groups),
             allow_patterns=allow_patterns,
             ignore_patterns=ignore_patterns,
         )
@@ -181,6 +184,7 @@ def snapshot_download(
             endpoint=endpoint,
             _resolved_manifest=manifest,
             _oci_token=oci_token,
+            _resolved_group=groups[filename],
         )
 
     # max_workers defaults to None (HF passes int 8); resolve to the env-tunable

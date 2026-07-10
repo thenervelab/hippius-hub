@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Dict, Optional, Union
 
 from . import _http
-from ._oci import fetch_manifest, group_files, parse_pointer_v2
+from ._oci import FileGroup, fetch_manifest, group_files, parse_pointer_v2
 from .auth import get_oci_bearer_token
 from .constants import (
     DEFAULT_CACHE_DIR,
@@ -295,6 +295,7 @@ def hf_hub_download(
     dry_run: bool = False,
     _resolved_manifest: Optional[Dict] = None,
     _oci_token: Optional[str] = None,
+    _resolved_group: Optional[FileGroup] = None,
 ) -> str:
     """Drop-in replacement for huggingface_hub.hf_hub_download against an
     OCI-backed Hippius registry.
@@ -361,7 +362,14 @@ def hf_hub_download(
         oci_token=oci_token,
         cached=_resolved_manifest,
     )
-    group = _resolve_file_group(manifest, filename, repo_id, revision)
+    # snapshot_download resolves every file's group once from the shared manifest
+    # and threads it here, so a snapshot doesn't re-run group_files (an O(layers)
+    # parse) per file under the GIL. A direct caller passes nothing and resolves it.
+    group = (
+        _resolved_group
+        if _resolved_group is not None
+        else _resolve_file_group(manifest, filename, repo_id, revision)
+    )
     # Chunked files pull K content-addressed chunk blobs in parallel and assemble
     # them; plain files keep the single-blob Range-parallel path unchanged, so
     # every pre-chunking artifact downloads exactly as before.
