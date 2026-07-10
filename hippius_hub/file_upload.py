@@ -9,8 +9,10 @@ import datetime
 import hashlib
 import json
 import os
+import random
 import tempfile
 import threading
+import time
 import warnings
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
@@ -354,6 +356,61 @@ def _prev_digest_or_warn(existing, repo_id: str, revision: str) -> Optional[str]
     return existing.digest
 
 
+# Manifest-PUT resilience. Every blob a manifest references — packs, the pointer,
+# the empty config — is uploaded (its PUT returned 2xx, all content-addressed)
+# before we PUT the manifest listing them. But Harbor's S3-backed blob commit
+# (the "Move" from the upload session into the blob store) has a measured
+# multi-second window between accepting a blob (201) and making it visible to
+# manifest validation: a just-PUT 8 MiB blob HEADs 404 for ~3.4s here. A fast
+# client (a low-latency CI runner) can PUT the manifest inside that window and
+# get an opaque 400 MANIFEST_BLOB_UNKNOWN; a slow (WAN) client never sees it,
+# which is why this only ever reproduced on staging CI, never locally.
+#
+# The manifest bytes are deterministic and the revision-tag write is idempotent
+# (content-addressed), so we retry, with bounded exponential backoff + jitter,
+# the SAME set of transient conditions the Rust uploader retries (see
+# `CoreError::is_retryable` in src/error.rs: connection/timeout errors + 408/429/
+# 5xx — a plain 4xx is permanent, pinned by `upload_retry_skips_4xx`), PLUS one
+# Harbor-manifest-specific case: a 400 whose OCI error code is (MANIFEST_)
+# BLOB_UNKNOWN, i.e. the commit-visibility race above. Any OTHER 400 (a malformed
+# or oversized manifest, MANIFEST_INVALID, a bad path/scope) is a real client
+# error and fails fast — retrying it would only waste the backoff budget and
+# mislabel the cause.
+#
+# Known edge (narrow, intentionally not handled here): on an *update* (a prior
+# manifest exists, so If-Match is sent), if the registry commits our write but
+# the response is lost to a retryable 5xx, the retry re-sends the now-stale
+# If-Match and gets 412 → ConcurrentManifestUpdateError. The write in fact
+# succeeded; re-running the upload (which re-fetches the digest and re-PUTs the
+# identical, content-addressed manifest) resolves it. The blob-commit race — the
+# case this fix targets — happens BEFORE the manifest is accepted, so If-Match is
+# still valid on its retries.
+MANIFEST_PUT_MAX_RETRIES = 5
+_MANIFEST_PUT_BACKOFF_BASE_SECS = 0.5
+_MANIFEST_PUT_BACKOFF_CAP_SECS = 8.0
+# Transient statuses, matching the Rust uploader's is_retryable (408/429/5xx).
+# 400 is handled separately (only the BLOB_UNKNOWN commit-race variant); 412 is a
+# real concurrent-write conflict, surfaced typed and never retried.
+_RETRYABLE_MANIFEST_STATUS = frozenset({408, 429, 500, 502, 503, 504})
+
+
+def _manifest_error_detail(resp: httpx.Response) -> str:
+    """Raw (truncated) response body from a failed manifest PUT, so the raised
+    error carries Harbor's OCI error code (e.g. MANIFEST_BLOB_UNKNOWN) instead of
+    an opaque status line. `raise_for_status` hides the body; this doesn't."""
+    body = (resp.text or "").strip()
+    return body[:500] if body else "(empty response body)"
+
+
+def _is_blob_commit_race(resp: httpx.Response) -> bool:
+    """True when a 400 carries Harbor's (MANIFEST_)BLOB_UNKNOWN OCI error code —
+    the blob commit→visibility race (see the module note), the one 400 worth
+    retrying. Substring-matches the raw body (no JSON parse, no try/except): the
+    OCI error document is `{"errors":[{"code":"MANIFEST_BLOB_UNKNOWN",...}]}` and
+    every such code contains `BLOB_UNKNOWN`."""
+    return resp.status_code == 400 and "BLOB_UNKNOWN" in (resp.text or "")
+
+
 def _put_manifest(
     registry: str,
     repo_id: str,
@@ -371,6 +428,10 @@ def _put_manifest(
     the revision in between — we surface that as ConcurrentManifestUpdateError
     so callers can choose to retry or serialize externally rather than silently
     overwriting the other writer's layer.
+
+    Transient conditions — a connection/timeout error, a 408/429/5xx, or the
+    Harbor blob-commit-visibility 400 (see the module note) — are retried with
+    bounded exponential backoff + jitter. Any other status fails fast.
     """
     url = f"{registry}/v2/{repo_id}/manifests/{revision}"
     headers = {
@@ -379,14 +440,57 @@ def _put_manifest(
     }
     if if_match:
         headers["If-Match"] = if_match
-    resp = httpx.put(url, headers=headers, json=manifest, timeout=DEFAULT_HTTP_TIMEOUT * 2)
-    if resp.status_code == 412:
-        raise ConcurrentManifestUpdateError(
-            f"manifest at {repo_id}:{revision} changed between read and write",
-            response=resp,
+
+    resp = None
+    for attempt in range(MANIFEST_PUT_MAX_RETRIES + 1):
+        # A connection reset / timeout / protocol error mid-PUT (e.g. a Harbor
+        # redeploy) is a transient transport failure — the same class the Rust
+        # uploader retries. httpx raises it rather than returning a response, so
+        # this narrow catch is load-bearing: retry it like a retryable status,
+        # and re-raise once the attempts are spent.
+        transport_error = None
+        try:
+            resp = httpx.put(url, headers=headers, json=manifest, timeout=DEFAULT_HTTP_TIMEOUT * 2)
+        except httpx.TransportError as exc:
+            transport_error = exc
+
+        if transport_error is None:
+            if resp.status_code == 412:
+                raise ConcurrentManifestUpdateError(
+                    f"manifest at {repo_id}:{revision} changed between read and write",
+                    response=resp,
+                )
+            if resp.is_success:
+                return resp
+            if (resp.status_code not in _RETRYABLE_MANIFEST_STATUS
+                    and not _is_blob_commit_race(resp)):
+                break
+            if attempt == MANIFEST_PUT_MAX_RETRIES:
+                break
+            reason = ("blob-commit visibility lag" if _is_blob_commit_race(resp)
+                      else f"transient {resp.status_code}")
+        else:
+            if attempt == MANIFEST_PUT_MAX_RETRIES:
+                raise transport_error
+            reason = f"transient network error ({type(transport_error).__name__})"
+
+        backoff = min(_MANIFEST_PUT_BACKOFF_BASE_SECS * (2 ** attempt), _MANIFEST_PUT_BACKOFF_CAP_SECS)
+        # Full jitter (50–100% of the computed delay) so independent uploaders
+        # riding out the same registry blip don't retry in lockstep and re-storm
+        # a recovering registry.
+        delay = backoff * (0.5 + random.random() * 0.5)
+        tqdm.write(
+            f"⏳ Manifest PUT for {revision} — {reason}; retrying in {delay:.1f}s "
+            f"[attempt {attempt + 1}/{MANIFEST_PUT_MAX_RETRIES + 1}]"
         )
-    resp.raise_for_status()
-    return resp
+        time.sleep(delay)
+
+    raise httpx.HTTPStatusError(
+        f"manifest PUT for {repo_id}:{revision} failed with {resp.status_code} "
+        f"after {attempt + 1} attempt(s): {_manifest_error_detail(resp)}",
+        request=resp.request,
+        response=resp,
+    )
 
 
 def _normalize_path_or_fileobj(path_or_fileobj) -> tuple:
