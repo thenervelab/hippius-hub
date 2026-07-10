@@ -85,3 +85,40 @@ def test_chunked_v2_live_roundtrip(tmp_path, cache_dir, logged_in, test_repo, re
     os.makedirs(cache2, exist_ok=True)
     out2 = hf_hub_download(repo_id=test_repo, filename="big.bin", revision=revision, cache_dir=cache2)
     assert sha256_of_file(out2) == expected2
+
+
+def test_chunked_v2_many_packs_ordering(tmp_path, cache_dir, logged_in, test_repo, revision, monkeypatch):
+    """Cross-pack ordering + PackAssembler under real fanout, at ~8 MiB of movement.
+
+    The 4 MiB round-trip above proves 2 packs; production files fan out to dozens
+    (a 3 GiB shard at 64 MiB packs is ~48). Bugs in pack scheduling, the download
+    semaphore, or scatter-to-offset reassembly only surface with many packs — but
+    that's a property of the pack *count*, not the byte volume, so we force a high
+    pack count with small pack/CDC sizes and keep the transfer cheap. The whole-file
+    digest on download is the only check that catches a mis-ordered many-pack
+    reassembly.
+    """
+    if resolve_chunked_layout() != CHUNKED_LAYOUT_V2:
+        pytest.skip("HIPPIUS_CHUNKED_LAYOUT != v2; the pack layout is opt-in")
+
+    monkeypatch.setenv("HIPPIUS_CHUNK_THRESHOLD", str(1 * 1024 * 1024))
+    monkeypatch.setenv("HIPPIUS_CDC_AVG_SIZE", str(256 * 1024))  # max chunk = avg*4 = 1 MiB
+    monkeypatch.setenv("HIPPIUS_PACK_SIZE", str(512 * 1024))     # ~16 packs from an 8 MiB file
+
+    size = 8 * 1024 * 1024
+    src = tmp_path / "many.bin"
+    expected = write_test_file(src, size, seed=b"v2-many-packs")
+
+    hippius_hub_upload(repo_id=test_repo, local_path=str(src), revision=revision)
+
+    oci_repo = _oci_repo_path(test_repo, None)
+    registry = resolve_registry(None)
+    token = get_oci_bearer_token(oci_repo)
+    result = fetch_manifest(registry, oci_repo, revision, token)
+    (group,) = [g for g in group_files(result.manifest) if g.title == "many.bin"]
+    assert group.layout == CHUNKED_LAYOUT_V2
+    assert _pack_layer_count(registry, oci_repo, revision, token) >= 8, "small packs must fan out to many pack layers"
+
+    out = hf_hub_download(repo_id=test_repo, filename="many.bin", revision=revision, cache_dir=cache_dir)
+    assert sha256_of_file(out) == expected
+    assert os.path.getsize(out) == size
