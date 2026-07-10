@@ -11,6 +11,7 @@ import json
 import os
 import tempfile
 import threading
+import time
 import warnings
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
@@ -354,6 +355,37 @@ def _prev_digest_or_warn(existing, repo_id: str, revision: str) -> Optional[str]
     return existing.digest
 
 
+# Manifest-PUT resilience. Every blob a manifest references — packs, the pointer,
+# the empty config — is uploaded (its PUT returned 2xx, all content-addressed)
+# before we PUT the manifest listing them. But Harbor's S3-backed blob commit
+# (the "Move" from the upload session into the blob store) has a measured
+# multi-second window between accepting a blob (201) and making it visible to
+# manifest validation: a just-PUT 8 MiB blob HEADs 404 for ~3.4s here. A fast
+# client (a low-latency CI runner) can PUT the manifest inside that window and
+# get an opaque 400 MANIFEST_BLOB_UNKNOWN; a slow (WAN) client never sees it,
+# which is why this only ever reproduced on staging CI, never locally. The
+# manifest bytes are deterministic and the write is idempotent (a content-
+# addressed revision-tag write), so a 4xx/5xx here is a transient registry-side
+# condition, not bad client content — retry with bounded exponential backoff to
+# let the commit settle. Mirrors the Rust uploader's UPLOAD_MAX_RETRIES loop
+# (src/uploader.rs).
+MANIFEST_PUT_MAX_RETRIES = 5
+_MANIFEST_PUT_BACKOFF_BASE_SECS = 0.5
+_MANIFEST_PUT_BACKOFF_CAP_SECS = 8.0
+# Transient registry-side statuses worth retrying on the manifest PUT. 400 is
+# included deliberately: Harbor answers the blob-visibility race with a 400. 412
+# is intentionally absent — it is a real concurrent-write conflict, not transient.
+_RETRYABLE_MANIFEST_STATUS = frozenset({400, 404, 408, 429, 500, 502, 503, 504})
+
+
+def _manifest_error_detail(resp: httpx.Response) -> str:
+    """Raw (truncated) response body from a failed manifest PUT, so the raised
+    error carries Harbor's OCI error code (e.g. MANIFEST_BLOB_UNKNOWN) instead of
+    an opaque status line. `raise_for_status` hides the body; this doesn't."""
+    body = (resp.text or "").strip()
+    return body[:500] if body else "(empty response body)"
+
+
 def _put_manifest(
     registry: str,
     repo_id: str,
@@ -371,6 +403,11 @@ def _put_manifest(
     the revision in between — we surface that as ConcurrentManifestUpdateError
     so callers can choose to retry or serialize externally rather than silently
     overwriting the other writer's layer.
+
+    A transient 4xx/5xx (see `_RETRYABLE_MANIFEST_STATUS`) is retried with bounded
+    exponential backoff: it means a just-committed blob the manifest references is
+    not yet visible to Harbor's manifest validation (see the module note above),
+    which clears once the commit settles.
     """
     url = f"{registry}/v2/{repo_id}/manifests/{revision}"
     headers = {
@@ -379,14 +416,33 @@ def _put_manifest(
     }
     if if_match:
         headers["If-Match"] = if_match
-    resp = httpx.put(url, headers=headers, json=manifest, timeout=DEFAULT_HTTP_TIMEOUT * 2)
-    if resp.status_code == 412:
-        raise ConcurrentManifestUpdateError(
-            f"manifest at {repo_id}:{revision} changed between read and write",
-            response=resp,
+
+    resp = None
+    for attempt in range(MANIFEST_PUT_MAX_RETRIES + 1):
+        resp = httpx.put(url, headers=headers, json=manifest, timeout=DEFAULT_HTTP_TIMEOUT * 2)
+        if resp.status_code == 412:
+            raise ConcurrentManifestUpdateError(
+                f"manifest at {repo_id}:{revision} changed between read and write",
+                response=resp,
+            )
+        if resp.is_success:
+            return resp
+        if resp.status_code not in _RETRYABLE_MANIFEST_STATUS or attempt == MANIFEST_PUT_MAX_RETRIES:
+            break
+        backoff = min(_MANIFEST_PUT_BACKOFF_BASE_SECS * (2 ** attempt), _MANIFEST_PUT_BACKOFF_CAP_SECS)
+        print(
+            f"⏳ Manifest PUT for {revision} returned {resp.status_code} "
+            f"(transient registry blob-commit race); retrying in {backoff:.1f}s "
+            f"[attempt {attempt + 1}/{MANIFEST_PUT_MAX_RETRIES + 1}]"
         )
-    resp.raise_for_status()
-    return resp
+        time.sleep(backoff)
+
+    raise httpx.HTTPStatusError(
+        f"manifest PUT for {repo_id}:{revision} failed with {resp.status_code} "
+        f"after {attempt + 1} attempt(s): {_manifest_error_detail(resp)}",
+        request=resp.request,
+        response=resp,
+    )
 
 
 def _normalize_path_or_fileobj(path_or_fileobj) -> tuple:

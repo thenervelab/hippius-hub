@@ -286,3 +286,124 @@ def test_warns_when_prior_manifest_lacks_docker_content_digest(tmp_path):
         f"PUT must not carry If-Match when prior digest is unknown, "
         f"got If-Match={sent_headers.get('If-Match')!r}"
     )
+
+
+# --- Manifest-PUT retry on the Harbor blob-commit visibility race -------------
+#
+# Harbor accepts a blob (201) seconds before it is visible to manifest
+# validation (a measured ~3.4s "Move" window). A fast client PUTs the manifest
+# inside that window and gets a transient 400 MANIFEST_BLOB_UNKNOWN. Since the
+# manifest is deterministic and the write is idempotent, _put_manifest retries
+# transient 4xx/5xx with backoff. These tests pin that behavior offline.
+
+_BLOB_UNKNOWN_BODY = {
+    "errors": [{"code": "MANIFEST_BLOB_UNKNOWN", "message": "blob unknown to registry",
+                "detail": "sha256:" + "e" * 64}]
+}
+
+
+@respx.mock
+def test_manifest_put_retries_transient_400_then_succeeds(tmp_path, monkeypatch):
+    """A 400 MANIFEST_BLOB_UNKNOWN then a 201: the upload retries and succeeds.
+
+    This is the exact staging-CI failure — a just-committed pack not yet visible
+    to manifest validation. The second PUT (after backoff) lands once Harbor has
+    finished the blob commit.
+    """
+    from hippius_hub.file_upload import upload_file
+
+    sleeps: list[float] = []
+    monkeypatch.setattr("hippius_hub.file_upload.time.sleep", lambda s: sleeps.append(s))
+
+    payload, sha_hex, _size = _write_payload(tmp_path)
+    _stub_auth_and_blob(respx.mock, sha_hex)
+    respx.mock.get(
+        f"{REGISTRY}/v2/{REPO_ID}/manifests/{REVISION}"
+    ).mock(return_value=httpx.Response(404))
+    put_route = respx.mock.put(
+        f"{REGISTRY}/v2/{REPO_ID}/manifests/{REVISION}"
+    ).mock(side_effect=[
+        httpx.Response(400, json=_BLOB_UNKNOWN_BODY),
+        httpx.Response(201, headers={"Docker-Content-Digest": "sha256:" + "f" * 64}),
+    ])
+
+    upload_file(
+        path_or_fileobj=str(payload),
+        path_in_repo="hello.txt",
+        repo_id=REPO_ID,
+        token="literal-token-value",
+        revision=REVISION,
+    )
+
+    assert put_route.call_count == 2, "PUT must be retried exactly once after the 400"
+    assert sleeps == [0.5], "one bounded backoff sleep between the two attempts"
+
+
+@respx.mock
+def test_manifest_put_exhausts_retries_and_surfaces_error_body(tmp_path, monkeypatch):
+    """A persistent 400 exhausts the bounded retries and raises with the OCI body.
+
+    `raise_for_status` used to hide Harbor's error code; the raised message must
+    now carry MANIFEST_BLOB_UNKNOWN (and repo:revision) so a real, non-transient
+    manifest rejection is diagnosable instead of an opaque `400 Bad Request`.
+    """
+    from hippius_hub.file_upload import MANIFEST_PUT_MAX_RETRIES, upload_file
+
+    monkeypatch.setattr("hippius_hub.file_upload.time.sleep", lambda s: None)
+
+    payload, sha_hex, _size = _write_payload(tmp_path)
+    _stub_auth_and_blob(respx.mock, sha_hex)
+    respx.mock.get(
+        f"{REGISTRY}/v2/{REPO_ID}/manifests/{REVISION}"
+    ).mock(return_value=httpx.Response(404))
+    put_route = respx.mock.put(
+        f"{REGISTRY}/v2/{REPO_ID}/manifests/{REVISION}"
+    ).mock(return_value=httpx.Response(400, json=_BLOB_UNKNOWN_BODY))
+
+    with pytest.raises(httpx.HTTPStatusError) as exc_info:
+        upload_file(
+            path_or_fileobj=str(payload),
+            path_in_repo="hello.txt",
+            repo_id=REPO_ID,
+            token="literal-token-value",
+            revision=REVISION,
+        )
+
+    assert put_route.call_count == MANIFEST_PUT_MAX_RETRIES + 1
+    msg = str(exc_info.value)
+    assert "MANIFEST_BLOB_UNKNOWN" in msg, "Harbor's error body must be surfaced"
+    assert REPO_ID in msg and REVISION in msg
+
+
+@respx.mock
+def test_manifest_put_does_not_retry_non_transient_403(tmp_path, monkeypatch):
+    """A 403 is a permanent rejection (auth/quota), not the commit race: fail fast.
+
+    Retrying a genuinely-rejected PUT would just burn the backoff budget before
+    surfacing the same error, so only the transient status set is retried.
+    """
+    from hippius_hub.file_upload import upload_file
+
+    sleeps: list[float] = []
+    monkeypatch.setattr("hippius_hub.file_upload.time.sleep", lambda s: sleeps.append(s))
+
+    payload, sha_hex, _size = _write_payload(tmp_path)
+    _stub_auth_and_blob(respx.mock, sha_hex)
+    respx.mock.get(
+        f"{REGISTRY}/v2/{REPO_ID}/manifests/{REVISION}"
+    ).mock(return_value=httpx.Response(404))
+    put_route = respx.mock.put(
+        f"{REGISTRY}/v2/{REPO_ID}/manifests/{REVISION}"
+    ).mock(return_value=httpx.Response(403, text="denied"))
+
+    with pytest.raises(httpx.HTTPStatusError):
+        upload_file(
+            path_or_fileobj=str(payload),
+            path_in_repo="hello.txt",
+            repo_id=REPO_ID,
+            token="literal-token-value",
+            revision=REVISION,
+        )
+
+    assert put_route.call_count == 1, "non-transient status must not be retried"
+    assert sleeps == [], "no backoff for a permanent rejection"
