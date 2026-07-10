@@ -59,7 +59,7 @@ import httpx
 from hippius_hub import auth, hf_hub_download, hippius_hub_upload, upload_folder
 from hippius_hub._oci import fetch_manifest, group_files
 from hippius_hub.auth import get_oci_bearer_token
-from hippius_hub.constants import resolve_registry
+from hippius_hub.constants import resolve_max_inflight_packs, resolve_registry
 from hippius_hub.file_download import _oci_repo_path
 
 _MIB = 1024 * 1024
@@ -159,6 +159,11 @@ class _PeakRSS:
 
 def _fmt_mib(mib) -> str:
     return f"{mib:.0f} MiB" if mib is not None else "n/a"
+
+
+def _current_rss_mib():
+    kib = _read_vmrss_kib()
+    return kib / 1024 if kib is not None else None
 
 
 def _fill_random(path: str, size: int) -> None:
@@ -425,27 +430,36 @@ def _packs_per_shard(shard: int, pack_size: int) -> int:
     return max(1, math.ceil(shard / pack_size))
 
 
-def _inflight_ceiling(file_workers, shards, pack_workers, packs_per_shard, pack_size) -> int:
-    """Bytes resident when every busy worker holds one full pack.
+def _inflight_ceiling(cap, file_workers, shards, pack_workers, packs_per_shard, pack_size) -> int:
+    """Bytes of pack buffers resident when every admitted worker holds one full pack.
 
     A folder upload runs `file_workers` files at once, each running `pack_workers`
-    packs at once, and each in-flight pack is exactly `pack_size` bytes buffered by
-    `read_ranges`. The worker pools — not the file count — cap concurrency, so the
-    ceiling is the product of the *effective* (pool-capped) parallelism.
+    packs at once, but the shared in-flight cap (`resolve_max_inflight_packs`) bounds
+    the cross-file total — so effective concurrency is `min(cap, nested)`, and each
+    admitted pack is one `pack_size` buffer. The cap is what stops the nested product
+    (~64 at the defaults) from multiplying resident memory.
     """
-    return min(file_workers, shards) * min(pack_workers, packs_per_shard) * pack_size
+    nested = min(file_workers, shards) * min(pack_workers, packs_per_shard)
+    return min(cap, nested) * pack_size
 
 
-def _folder_rows(work, repo, tag, shards, shard, cdc_avg, pack_size, file_workers, pack_workers) -> list:
+def _mult_str(multiplier) -> str:
+    return f"{multiplier:.1f}" if multiplier is not None else "n/a"
+
+
+def _folder_rows(work, repo, tag, shards, shard, cdc_avg, pack_size, file_workers, pack_workers, baseline) -> list:
     """Upload a folder of shards (the 80 GB-model shape) and measure peak memory.
 
     The run is deliberately small so a hosted runner survives it, but it saturates
-    the SAME worker pools as production, so the measured peak RSS validates the
-    `_inflight_ceiling` model. We then project that model to the production config
-    (~30 × 3 GiB shards, 8×8 workers, 64 MiB packs) — the ceiling a client actually
-    hits, which no hosted-runner run can move directly.
+    the SAME worker pools and shares the SAME in-flight cap as production, so the
+    measured peak RSS validates `_inflight_ceiling`. The per-pack RSS multiplier
+    (real resident bytes exceed one `pack_size` per pack — disk read buffer + HTTP
+    body + per-thread overhead) is derived from THIS run's measured peak rather than
+    hardcoded, so the production projection tracks reality and auto-corrects when an
+    allocation is removed (e.g. the Bytes-body fix) instead of going stale.
     """
     _set_mode("v2", cdc_avg, pack_size, pack_workers)
+    cap = resolve_max_inflight_packs()  # reads HIPPIUS_UPLOAD_WORKERS that _set_mode just set
     src_dir = os.path.join(work, "folder-src")
     os.makedirs(src_dir, exist_ok=True)
     for i in range(shards):
@@ -464,22 +478,31 @@ def _folder_rows(work, repo, tag, shards, shard, cdc_avg, pack_size, file_worker
     shutil.rmtree(cache, ignore_errors=True)
 
     pps = _packs_per_shard(shard, pack_size)
-    measured_ceiling = _inflight_ceiling(file_workers, shards, pack_workers, pps, pack_size)
+    ceil_mib = _inflight_ceiling(cap, file_workers, shards, pack_workers, pps, pack_size) / _MIB
     prod_pps = _packs_per_shard(_PROD_SHARD_BYTES, pack_size)
-    prod_ceiling = _inflight_ceiling(_PROD_FILE_WORKERS, _PROD_SHARDS, _PROD_PACK_WORKERS, prod_pps, pack_size)
+    prod_ceil_mib = _inflight_ceiling(cap, _PROD_FILE_WORKERS, _PROD_SHARDS, _PROD_PACK_WORKERS,
+                                      prod_pps, pack_size) / _MIB
+    # Observed resident cost per unit of pack buffer, isolated from the baseline.
+    delta = max(0.0, peak - baseline) if (peak is not None and baseline is not None) else None
+    multiplier = (delta / ceil_mib) if (delta is not None and ceil_mib > 0) else None
+    if multiplier is not None:
+        projected = baseline + prod_ceil_mib * multiplier
+        projected_str = (f"~{_fmt_mib(projected)}** (baseline {_fmt_mib(baseline)} + "
+                         f"{_fmt_mib(prod_ceil_mib)} pack buffers × {_mult_str(multiplier)} observed/pack")
+    else:
+        projected_str = (f"~{_fmt_mib(prod_ceil_mib)}** of concurrent pack buffers "
+                         "(per-pack RSS multiplier unmeasured off-Linux")
     total_mib = shards * shard // _MIB
     return [
         "### Folder tier (multi-file — the 80 GB-model shape)",
-        f"- uploaded **{shards} shard(s) × {shard // _MIB} MiB = {total_mib} MiB** "
-        f"via `upload_folder` ({file_workers} files × {pack_workers} packs concurrent, "
-        f"{pack_size // _MIB} MiB packs)",
+        f"- uploaded **{shards} shard(s) × {shard // _MIB} MiB = {total_mib} MiB** via `upload_folder` "
+        f"({file_workers} files × {pack_workers} packs, cap {cap} in-flight, {pack_size // _MIB} MiB packs)",
         f"- upload wall-clock: **{up:.1f}s**; one-shard round-trip: **{'OK' if ok else 'MISMATCH'}**",
-        f"- measured peak RSS: **{_fmt_mib(peak)}** "
-        f"(model ceiling for this config: {_fmt_mib(measured_ceiling / _MIB)} of in-flight pack buffers)",
+        f"- measured peak RSS: **{_fmt_mib(peak)}** (baseline {_fmt_mib(baseline)}; config ceiling "
+        f"{_fmt_mib(ceil_mib)} of pack buffers → observed **×{_mult_str(multiplier)}** resident per pack)",
         f"- **projected peak at production** (~{_PROD_SHARDS} × {_PROD_SHARD_BYTES // _MIB} MiB shards, "
-        f"{_PROD_FILE_WORKERS}×{_PROD_PACK_WORKERS} workers, {pack_size // _MIB} MiB packs): "
-        f"**~{_fmt_mib(prod_ceiling / _MIB)}** of concurrent pack buffers — "
-        "cap `HIPPIUS_UPLOAD_WORKERS` / `max_workers` to bound it",
+        f"{_PROD_FILE_WORKERS}×{_PROD_PACK_WORKERS} workers, cap {cap}, {pack_size // _MIB} MiB packs): "
+        f"**{projected_str}) — bounded by the in-flight cap, not the file×pack product",
     ]
 
 
@@ -510,6 +533,9 @@ def main() -> None:
     # Warm the connection/token path with a tiny blob so run 1 isn't cold-skewed.
     with httpx.Client(timeout=_UPLOAD_TIMEOUT) as client:
         _put_blob(client, registry, oci_repo, token, os.urandom(8 * _MIB))
+    # Baseline RSS AFTER warm-up (interpreter + libs + connection loaded), so the
+    # folder tier's per-pack multiplier isolates pack-buffer growth from fixed cost.
+    baseline = _current_rss_mib()
 
     out = [f"## Chunked-layout benchmark ({size // _MIB} MiB file, "
            f"{cdc_avg // _MIB} MiB CDC avg, {pack_size // _MIB} MiB packs)", ""]
@@ -519,7 +545,7 @@ def main() -> None:
                                  size, patch, cdc_avg, pack_size, upload_workers) + [""]
     if "folder" in tiers:
         out += _folder_rows(work, repo, tag, shards, shard, cdc_avg,
-                            pack_size, file_workers, upload_workers) + [""]
+                            pack_size, file_workers, upload_workers, baseline) + [""]
     if do_probe:
         out += _harbor_probe(registry, oci_repo, token, probe)
     _emit(out)

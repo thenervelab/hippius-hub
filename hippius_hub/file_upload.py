@@ -10,6 +10,7 @@ import hashlib
 import json
 import os
 import tempfile
+import threading
 import warnings
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
@@ -43,6 +44,7 @@ from .constants import (
     resolve_chunk_threshold,
     resolve_chunked_layout,
     resolve_chunked_write_enabled,
+    resolve_max_inflight_packs,
     resolve_pack_size,
     resolve_registry,
     resolve_upload_workers,
@@ -283,6 +285,24 @@ def _build_dedup_index(existing, registry: str, oci_repo: str, oci_token: str) -
     return chunk_index, pack_sizes
 
 
+# Process-wide bound on concurrent pack uploads. Shared across every file in a
+# folder upload so the nested file×pack parallelism cannot multiply resident pack
+# buffers past one ceiling. Rebuilt only when the configured cap changes (between
+# top-level uploads), so a test can retune it via HIPPIUS_MAX_INFLIGHT_PACKS.
+_pack_gate_lock = threading.Lock()
+_pack_gate_state: Dict[str, object] = {"cap": None, "sem": None}
+
+
+def _pack_upload_gate() -> threading.BoundedSemaphore:
+    """Return the shared semaphore capping concurrent pack uploads (memory ceiling)."""
+    cap = resolve_max_inflight_packs()
+    with _pack_gate_lock:
+        if _pack_gate_state["cap"] != cap:
+            _pack_gate_state["cap"] = cap
+            _pack_gate_state["sem"] = threading.BoundedSemaphore(cap)
+        return _pack_gate_state["sem"]
+
+
 def _upload_file_chunked_v2(
     abs_path: str,
     repo_title: str,
@@ -305,18 +325,25 @@ def _upload_file_chunked_v2(
     plan = plan_packs(chunks, dedup_index, resolve_pack_size())
     uploads_url = f"{registry}/v2/{oci_repo}/blobs/uploads/"
 
+    # Shared across all files: a thread blocks here BEFORE the native call
+    # allocates the pack, so at most `resolve_max_inflight_packs()` packs are
+    # resident at once regardless of how many files upload concurrently.
+    gate = _pack_upload_gate()
+
     def _upload_pack(new_pack) -> str:
-        hex_digest = pack_upload_native(
-            uploads_url=uploads_url,
-            path=abs_path,
-            ranges=list(new_pack.ranges),
-            auth_token=oci_token,
-        )
+        with gate:
+            hex_digest = pack_upload_native(
+                uploads_url=uploads_url,
+                path=abs_path,
+                ranges=list(new_pack.ranges),
+                auth_token=oci_token,
+            )
         return f"sha256:{hex_digest}"
 
     # Packs are independent blobs → upload in parallel (the round-trip win: ~K/16
     # pack PUTs instead of K chunk PUTs). Order is preserved so digests line up
-    # with plan.new_packs for resolve_pointer_chunks.
+    # with plan.new_packs for resolve_pointer_chunks. The gate above caps the
+    # cross-file total even though this pool is per-file.
     with ThreadPoolExecutor(max_workers=resolve_upload_workers()) as executor:
         new_pack_digests = list(executor.map(_upload_pack, plan.new_packs))
 

@@ -1,3 +1,4 @@
+use bytes::Bytes;
 use fastcdc::v2020::StreamCDC;
 use futures::stream::StreamExt;
 use indicatif::{ProgressBar, ProgressStyle};
@@ -357,12 +358,18 @@ pub async fn pack_upload_async(
     ranges: &[(u64, u64)],
     auth_token: Option<&str>,
 ) -> Result<String, CoreError> {
-    let buf = read_ranges(path, ranges).await?;
-    let digest_hex = hex::encode(Sha256::digest(&buf));
+    // Own the pack bytes once as `Bytes`: the hash pass and every retry share a
+    // single allocation (a `Bytes` clone is a refcount bump, not a copy), so an
+    // in-flight pack costs one pack_size instead of two — `read_ranges`' `Vec`
+    // converts in without reallocating. The prior `.body(buf.to_vec())` re-copied
+    // the whole pack on each attempt, which the staging peak-RSS benchmark showed
+    // roughly doubled resident memory per concurrent upload.
+    let body = Bytes::from(read_ranges(path, ranges).await?);
+    let digest_hex = hex::encode(Sha256::digest(&body));
     let digest = format!("sha256:{digest_hex}");
     let mut retries: u32 = 0;
     loop {
-        match try_pack_upload_once(uploads_url, &buf, &digest, auth_token).await {
+        match try_pack_upload_once(uploads_url, &body, &digest, auth_token).await {
             Ok(()) => return Ok(digest_hex),
             Err(e) => {
                 retries += 1;
@@ -398,7 +405,7 @@ async fn read_ranges(path: &Path, ranges: &[(u64, u64)]) -> Result<Vec<u8>, Core
 
 async fn try_pack_upload_once(
     uploads_url: &str,
-    buf: &[u8],
+    body: &Bytes,
     digest: &str,
     auth_token: Option<&str>,
 ) -> Result<(), CoreError> {
@@ -432,7 +439,7 @@ async fn try_pack_upload_once(
     let mut put = client
         .put(put_url)
         .header(header::CONTENT_TYPE, "application/octet-stream")
-        .body(buf.to_vec());
+        .body(body.clone());
     if let Some(token) = auth_token {
         put = put.bearer_auth(token);
     }
