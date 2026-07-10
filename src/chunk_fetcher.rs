@@ -79,6 +79,20 @@ pub(crate) fn download_client() -> Result<&'static Client, CoreError> {
     Ok(CLIENT.get_or_init(|| built))
 }
 
+/// Process-global cap on packs in flight across ALL concurrent downloads (every
+/// file in a snapshot), so the nested snapshot-workers × per-file-concurrency
+/// parallelism cannot multiply resident 64 MiB pack buffers into an OOM
+/// (8 workers × 32 × 64 MiB ≈ 16 GB worst case). Sized from the FIRST call's
+/// `max_concurrent` (first-caller-wins, like `download_client`): in a uniform
+/// snapshot every file passes the same value, so the total in-flight budget equals
+/// one file's concurrency — a single large file is never throttled, and N files
+/// SHARE that budget rather than each getting the full amount. Mirrors the upload
+/// path's `_pack_upload_gate`.
+fn global_pack_gate(max_concurrent: usize) -> Arc<Semaphore> {
+    static GATE: OnceLock<Arc<Semaphore>> = OnceLock::new();
+    Arc::clone(GATE.get_or_init(|| Arc::new(Semaphore::new(max_concurrent))))
+}
+
 /// One chunk to carve out of a fetched pack: where it sits in the pack, its size,
 /// where it lands in the assembled file, and its content digest (hex, no prefix).
 pub struct PackChunkTarget {
@@ -157,6 +171,7 @@ impl PackAssembler {
             FuturesUnordered::new();
         let mut abort_handles: Vec<AbortHandle> = Vec::with_capacity(packs.len());
         let permits = Arc::new(Semaphore::new(self.max_concurrent));
+        let global = global_pack_gate(self.max_concurrent);
 
         for (i, plan) in packs.iter().enumerate() {
             let client = self.client.clone();
@@ -171,9 +186,17 @@ impl PackAssembler {
             let path = dest.to_path_buf();
             let pack_pb = pb.clone();
             let permits = Arc::clone(&permits);
+            let global = Arc::clone(&global);
 
             let handle = tokio::spawn(async move {
+                // Per-file permit bounds THIS file's concurrency; the global permit
+                // bounds TOTAL packs in flight across every concurrent file (the
+                // snapshot memory ceiling). Held for the whole fetch, released on drop.
                 let _permit = match permits.acquire_owned().await {
+                    Ok(p) => p,
+                    Err(e) => return (i, Err(CoreError::Io(std::io::Error::other(e)))),
+                };
+                let _global_permit = match global.acquire_owned().await {
                     Ok(p) => p,
                     Err(e) => return (i, Err(CoreError::Io(std::io::Error::other(e)))),
                 };

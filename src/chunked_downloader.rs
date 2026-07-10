@@ -78,11 +78,16 @@ pub struct ChunkedDownloader {
     url: String,
     auth_token: Option<String>,
     chunk_size: u64,
+    // Pre-known whole-file size from the OCI manifest layer descriptor
+    // (byte-accurate == the blob's Content-Length), threaded from Python so the
+    // plain-blob path can skip the HEAD it otherwise issues to learn the size.
+    // `None` -> HEAD for Content-Length as before.
+    content_length: Option<u64>,
 }
 
 impl ChunkedDownloader {
     /// Construct a new concurrent downloader.
-    pub fn new(url: String, auth_token: Option<String>, chunk_size_bytes: Option<u64>) -> Result<Self, CoreError> {
+    pub fn new(url: String, auth_token: Option<String>, chunk_size_bytes: Option<u64>, content_length: Option<u64>) -> Result<Self, CoreError> {
         // Clone the process-global download client (shared with the pack path)
         // rather than building a fresh client + empty pool per file, so connections
         // stay warm across back-to-back downloads. It is HTTP/1-only for the same
@@ -96,6 +101,7 @@ impl ChunkedDownloader {
             url,
             auth_token,
             chunk_size: chunk_size_bytes.unwrap_or(DEFAULT_CHUNK_SIZE),
+            content_length,
         })
     }
 
@@ -113,8 +119,14 @@ impl ChunkedDownloader {
     /// branch still returns `Some(sha256_of_empty_bytes)` because the
     /// file exists and has a defined (non-skipped) digest.
     pub async fn download(&self, dest_path: &Path, verify_hash: bool) -> Result<Option<String>, CoreError> {
-        // 1. Fetch the total blob size
-        let content_length = self.get_content_length().await?;
+        // 1. Total blob size: use the manifest-supplied size when Python passed it
+        //    (the common path), else HEAD for Content-Length. Skipping the HEAD
+        //    removes one control-plane RTT per plain-file download — meaningful for
+        //    the many small files in a snapshot.
+        let content_length = match self.content_length {
+            Some(n) => n,
+            None => self.get_content_length().await?,
+        };
 
         // Handle the empty-file case. `create_empty_file` keeps its
         // `Result<String, _>` shape because an empty file has a defined

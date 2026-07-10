@@ -398,8 +398,11 @@ def hf_hub_download(
             manifest=manifest,
         )
     blob_url = f"{registry}/v2/{oci_repo}/blobs/{group.digest}"
+    # group.size is the manifest layer size (byte-accurate == the blob's
+    # Content-Length), so the Rust downloader can pre-allocate + range without a
+    # HEAD. None only for a malformed layer, where the native side HEADs as before.
     if local_dir is not None:
-        return _download_to_local_dir(blob_url, paths.dest_file, oci_token)
+        return _download_to_local_dir(blob_url, paths.dest_file, oci_token, group.size)
     return _download_to_cache(
         blob_url=blob_url,
         repo_dir=paths.repo_dir,
@@ -407,11 +410,12 @@ def hf_hub_download(
         filename=filename,
         oci_token=oci_token,
         target_digest=group.digest,
+        content_length=group.size,
     )
 
 
 def _download_to_cache(
-    blob_url, repo_dir, snapshots_dir, filename, oci_token, target_digest
+    blob_url, repo_dir, snapshots_dir, filename, oci_token, target_digest, content_length=None
 ):
     """Cache-structured download mirroring huggingface_hub's layout."""
     # Cache layout modeled on huggingface_hub
@@ -450,6 +454,7 @@ def _download_to_cache(
             auth_token=oci_token,
             chunk_size=resolve_chunk_size(),
             verify_hash=verify_hash,
+            content_length=content_length,
         )
     except Exception:
         # Clean up the mkstemp file before bubbling up. The inner OSError
@@ -483,7 +488,7 @@ def _download_to_cache(
     return file_path
 
 
-def _download_to_local_dir(blob_url, dest_file, oci_token):
+def _download_to_local_dir(blob_url, dest_file, oci_token, content_length=None):
     """Direct download to a user-chosen directory — bypasses the cache layout.
 
     Downloads to a per-call temp sibling and atomically `os.replace`s it into
@@ -519,6 +524,7 @@ def _download_to_local_dir(blob_url, dest_file, oci_token):
             auth_token=oci_token,
             chunk_size=resolve_chunk_size(),
             verify_hash=resolve_verify_hash(),
+            content_length=content_length,
         )
     except BaseException:
         # Remove the partial temp file before propagating. The inner OSError
