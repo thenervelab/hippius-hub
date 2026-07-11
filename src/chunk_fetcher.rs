@@ -40,6 +40,16 @@ const VERIFY_READ_BUFFER: usize = 8 * 1024 * 1024;
 /// call site.
 const CHUNK_REQUEST_TIMEOUT: Duration = Duration::from_mins(5);
 
+/// Default per-chunk-read idle timeout for downloads (audit M4). Bounds a peer that
+/// completes the handshake then dribbles or stops mid-body: reset on each successful
+/// read, so it fires only on genuine no-progress (a 30s gap with zero bytes), never
+/// on a slow-but-steady transfer. Default-ON — unlike the opt-in client
+/// `read_timeout` — and overridden by `HIPPIUS_READ_TIMEOUT` when set. Scoped per
+/// chunk read (an app-level `tokio::time::timeout`), not a global client setting, so
+/// it fixes the slow-loris the 5-minute total timeout would otherwise leave open for
+/// minutes.
+const DOWNLOAD_READ_IDLE: Duration = Duration::from_secs(30);
+
 /// Idle-connection cap for the shared download client. Bounds only *idle*
 /// (kept-alive) connections, not in-flight requests — the per-file `Semaphore`
 /// (`PackAssembler`) and spawn count (`ChunkedDownloader`) are the real concurrency
@@ -73,15 +83,14 @@ const DOWNLOAD_POOL_MAX_IDLE: usize = 32;
 /// transfers, not only `hippius-hub diagnose` (audit L9). `connect` bounds the
 /// handshake; `read` is a *stalled-read* bound (reset on each successful read).
 ///
-/// `read` is `Option` and defaults to `None` (no client-level read timeout) on
-/// purpose: with `None` the shared download client is byte-for-byte the
-/// pre-audit client, so plumbing the env knobs (L9) changes no default behavior.
-/// A client-level `.read_timeout()` is a *global* setting on the one process-wide
-/// download client shared by every concurrent chunk, so we make it opt-in
-/// (`HIPPIUS_READ_TIMEOUT`) rather than flip it on for all transfers here. The
-/// default-on download stall guard (audit M4) is deferred to an app-level
-/// idle-timeout on the chunk body stream — scoped per chunk, not a global client
-/// setting — see the audit remediation plan.
+/// `read` is `Option`: `None` leaves the shared client's *opt-in* `.read_timeout()`
+/// off, so the client is byte-for-byte the pre-audit one. The DEFAULT-ON download
+/// stall guard (audit M4) lives at the app level instead — [`read_chunk_bounded`]
+/// bounds each `res.chunk()` read by [`download_read_idle`] (30s, or
+/// `HIPPIUS_READ_TIMEOUT` when set), scoped per chunk rather than as a global client
+/// setting. So a slow-loris is cut by default; setting `HIPPIUS_READ_TIMEOUT`
+/// additionally arms the client's per-request `.read_timeout()` and lowers the
+/// app-level window to the same value.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct TransportTimeouts {
     pub connect: Duration,
@@ -130,6 +139,35 @@ fn build_download_client(timeouts: TransportTimeouts) -> Result<Client, CoreErro
     Ok(builder.build()?)
 }
 
+/// The resolved per-chunk-read idle timeout (audit M4), fixed by the first
+/// `download_client` caller (first-caller-wins, like the client itself): every file
+/// in a snapshot passes the same env-derived value. `HIPPIUS_READ_TIMEOUT` overrides
+/// the `DOWNLOAD_READ_IDLE` default. Read via [`download_read_idle`].
+static READ_IDLE: OnceLock<Duration> = OnceLock::new();
+
+/// The default-on download read-idle timeout (audit M4). Falls back to
+/// `DOWNLOAD_READ_IDLE` if no download has started yet; in practice the read loops
+/// only run after `download_client` has fixed it, so the fallback is belt-and-braces.
+pub(crate) fn download_read_idle() -> Duration {
+    READ_IDLE.get().copied().unwrap_or(DOWNLOAD_READ_IDLE)
+}
+
+/// One response-body read bounded by `idle` (audit M4): a `res.chunk()` yielding no
+/// data within `idle` is a retryable [`CoreError::ReadStall`], so a peer that stops
+/// mid-body is cut promptly instead of running out the per-chunk 5-minute total
+/// timeout. `idle` applies per call (per successful read resets it), so a slow-but-
+/// steady transfer is never tripped. Shared by both download read loops. `idle` is a
+/// parameter (not read from the global) so tests can drive a short window.
+pub(crate) async fn read_chunk_bounded(
+    res: &mut reqwest::Response,
+    idle: Duration,
+) -> Result<Option<bytes::Bytes>, CoreError> {
+    match tokio::time::timeout(idle, res.chunk()).await {
+        Ok(chunk) => Ok(chunk?),
+        Err(_elapsed) => Err(CoreError::ReadStall(idle)),
+    }
+}
+
 pub(crate) fn download_client(timeouts: TransportTimeouts) -> Result<&'static Client, CoreError> {
     static CLIENT: OnceLock<Client> = OnceLock::new();
     if let Some(client) = CLIENT.get() {
@@ -141,7 +179,11 @@ pub(crate) fn download_client(timeouts: TransportTimeouts) -> Result<&'static Cl
     // a later differing value is ignored — the documented tradeoff of one shared
     // pool. The loser of an init race drops its freshly built client (RAII).
     let built = build_download_client(timeouts)?;
-    Ok(CLIENT.get_or_init(|| built))
+    let client = CLIENT.get_or_init(|| built);
+    // Fix the default-on read-idle window (audit M4) alongside the client, same
+    // first-caller-wins discipline; HIPPIUS_READ_TIMEOUT overrides the default.
+    let _ = READ_IDLE.get_or_init(|| timeouts.read.unwrap_or(DOWNLOAD_READ_IDLE));
+    Ok(client)
 }
 
 /// Process-global cap on packs in flight across ALL concurrent downloads (every
@@ -473,7 +515,10 @@ async fn fetch_pack(
     let cap = usize::try_from(pack_size).unwrap_or(usize::MAX);
     let mut bytes: Vec<u8> = Vec::with_capacity(cap);
     let mut received: u64 = 0;
-    while let Some(chunk) = res.chunk().await? {
+    // Each body read is bounded by the default-on read-idle window (audit M4): a
+    // registry that stops streaming mid-pack is cut as a retryable ReadStall instead
+    // of holding the connection until the 5-minute total timeout.
+    while let Some(chunk) = read_chunk_bounded(&mut res, download_read_idle()).await? {
         received = received.saturating_add(chunk.len() as u64);
         if received > pack_size {
             return Err(CoreError::Integrity(format!(
@@ -686,6 +731,50 @@ mod tests {
             Err(CoreError::Integrity(_))
         ));
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn read_chunk_bounded_trips_readstall_on_a_stalled_body() {
+        // Audit M4: a peer that sends the head + a few body bytes then stalls (no
+        // more data, socket held open) must be cut by the app-level per-read idle
+        // window as a retryable ReadStall — not left until the 5-minute total
+        // timeout. The client here has NO client read_timeout (default), so the
+        // app-level ReadStall is the sole guard, proving it is default-on.
+        let Ok(listener) = tokio::net::TcpListener::bind("127.0.0.1:0").await else { return };
+        let Ok(addr) = listener.local_addr() else { return };
+        let server = tokio::spawn(async move {
+            if let Ok((mut sock, _)) = listener.accept().await {
+                let mut buf = [0u8; 1024];
+                let _ = sock.read(&mut buf).await;
+                // Advertise 1000 bytes, send 8, then stall (hold the socket open).
+                let _ = sock
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 1000\r\n\r\nABCDEFGH")
+                    .await;
+                tokio::time::sleep(Duration::from_secs(30)).await;
+            }
+        });
+
+        let url = format!("http://{addr}/blob");
+        let Ok(client) = build_download_client(TransportTimeouts::default()) else {
+            unreachable!("client builds")
+        };
+        let Ok(mut res) = client.get(&url).send().await else { unreachable!("GET connects") };
+        let idle = Duration::from_millis(200);
+        let outcome = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match read_chunk_bounded(&mut res, idle).await {
+                    Ok(Some(_)) => {}
+                    Ok(None) => return Ok(()),
+                    Err(e) => return Err(e),
+                }
+            }
+        })
+        .await;
+        server.abort();
+        assert!(
+            matches!(outcome, Ok(Err(CoreError::ReadStall(_)))),
+            "a stalled body read must abort as a retryable ReadStall, got {outcome:?}"
+        );
     }
 
     // An oversized/short/mis-hashed chunk must surface as the permanent

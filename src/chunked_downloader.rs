@@ -575,8 +575,11 @@ async fn try_download_chunk_to_offset(
     let expected = end - start + 1;
     let mut written: u64 = 0;
     let mut over_range = false;
+    // Each body read is bounded by the default-on read-idle window (audit M4): a peer
+    // that dribbles the head then stalls mid-body is cut as a retryable ReadStall,
+    // rather than held open until the per-chunk 5-minute total timeout.
     loop {
-        match res.chunk().await {
+        match crate::chunk_fetcher::read_chunk_bounded(&mut res, crate::chunk_fetcher::download_read_idle()).await {
             Ok(Some(buf)) => {
                 // Bound each write to the bytes still owed for this range (audit
                 // M-SHORT206 follow-up): a 206 whose body RUNS PAST the requested
@@ -600,7 +603,7 @@ async fn try_download_chunk_to_offset(
                 }
             }
             Ok(None) => break,
-            Err(e) => return Err(e.into()),
+            Err(e) => return Err(e),
         }
     }
 

@@ -140,6 +140,17 @@ pub enum CoreError {
     /// or a dead backend behind a live load balancer) is expected to succeed.
     #[error("upload write stalled: no progress for {0:?}")]
     Stall(std::time::Duration),
+
+    /// A chunk-body READ stalled: no data arrived within the download idle-timeout
+    /// window (audit M4). The download counterpart to [`CoreError::Stall`]: a peer
+    /// that completed the handshake then dribbled or stopped mid-body, which
+    /// `connect_timeout`/`tcp_keepalive` cannot see and reqwest's opt-in client
+    /// `read_timeout` only catches when enabled. Default-on and reset on each
+    /// successful read, so it bounds a slow-loris without capping an honest
+    /// slow-but-steady transfer. The `Duration` is the idle window that elapsed.
+    /// Retryable — a fresh attempt to a healthy replica should succeed.
+    #[error("download read stalled: no data for {0:?}")]
+    ReadStall(std::time::Duration),
 }
 
 impl CoreError {
@@ -186,7 +197,7 @@ impl CoreError {
             // Network/transport errors are retryable, and so is an upload
             // write-stall (audit H1) — the watchdog aborts a socket the peer
             // stopped draining; a fresh attempt to a healthy replica succeeds.
-            CoreError::Reqwest(_) | CoreError::Io(_) | CoreError::Stall(_) => true,
+            CoreError::Reqwest(_) | CoreError::Io(_) | CoreError::Stall(_) | CoreError::ReadStall(_) => true,
             // 5xx server errors are retryable, plus the two retryable 4xx
             // (408 Request Timeout, 429 Too Many Requests). Everything else
             // 4xx is permanent. `(500..600).contains(status)` operates on
@@ -290,6 +301,14 @@ mod tests {
     #[test]
     fn stall_is_retryable() {
         assert!(CoreError::Stall(std::time::Duration::from_secs(30)).is_retryable());
+    }
+
+    // A download read-stall (audit M4) must also classify retryable so the per-chunk
+    // retry loop re-fetches from a healthy replica instead of surfacing the idle-cut
+    // as terminal — the download counterpart of the upload write-stall above.
+    #[test]
+    fn read_stall_is_retryable() {
+        assert!(CoreError::ReadStall(std::time::Duration::from_secs(30)).is_retryable());
     }
 
     #[test]
