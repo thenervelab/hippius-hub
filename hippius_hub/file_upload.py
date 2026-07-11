@@ -76,20 +76,15 @@ def _empty_config_blob_descriptor() -> tuple:
 
 
 def _upload_blob_single_put(registry: str, repo_id: str, oci_token: str, file_path: str, digest: str) -> None:
-    """OCI blob-upload init against the registry, then one streaming PUT-with-digest
-    straight to it. This is the path for a plain (sub-threshold) whole-file blob;
-    large files go through the chunked-v2 path instead (`_upload_file_chunked_v2`)."""
-    headers = {"Authorization": f"Bearer {oci_token}"}
-    init_headers = {**headers, "Content-Length": "0"}
-    init = _http.client().post(f"{registry}/v2/{repo_id}/blobs/uploads/", headers=init_headers, timeout=DEFAULT_HTTP_TIMEOUT)
-    init.raise_for_status()
-    location = init.headers.get("Location")
-    if not location:
-        raise ValueError("Registry did not return a Location header for upload initiation")
-    if location.startswith("/"):
-        location = f"{registry}{location}"
-    sep = "&" if "?" in location else "?"
-    upload_blob_native(f"{location}{sep}digest={digest}", file_path, oci_token)
+    """One plain (sub-threshold) whole-file blob upload; large files take the
+    chunked-v2 path instead (`_upload_file_chunked_v2`).
+
+    Rust owns the POST-init + streaming PUT-with-digest and re-inits the OCI upload
+    session on every retry attempt (audit L2), so a transient failure re-POSTs a
+    fresh session rather than re-PUTting the one a prior attempt already consumed.
+    We therefore hand it the `/blobs/uploads/` endpoint and the digest, not a
+    pre-initiated PUT URL."""
+    upload_blob_native(f"{registry}/v2/{repo_id}/blobs/uploads/", file_path, digest, oci_token)
 
 
 def _ensure_blob_uploaded(

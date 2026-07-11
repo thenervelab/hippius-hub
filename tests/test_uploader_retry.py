@@ -1,20 +1,24 @@
-"""End-to-end test for audit U3: uploader retries transient 5xx via Rust.
+"""End-to-end test for audit U3 + L2: the plain uploader retries transient 5xx,
+re-initiating a fresh OCI upload session per attempt, all in Rust.
 
 `uploader.rs:upload_blob_async` wraps `try_upload_blob_once` in an
-exponential-backoff retry loop. The classifier (`CoreError::is_retryable`)
-decides whether a failed PUT is permanent (4xx) or transient (5xx).
+exponential-backoff retry loop. Since audit L2 each attempt does its OWN
+POST-init + streaming PUT-with-digest (symmetry with the pack path), so a retry
+never re-PUTs a session a failed attempt already consumed — the classifier
+(`CoreError::is_retryable`) decides whether a failed PUT is permanent (4xx) or
+transient (5xx).
 
-Rust unit tests cover `is_retryable` in isolation. This file is the
-integration counterpart: a real localhost HTTP server that responds
-503 on the first PUT and 201 on the second, then `upload_blob_native`
-called through the real pyo3 extension. The behavioral pins are:
+Rust unit tests cover `is_retryable` in isolation. This file is the integration
+counterpart: a real localhost HTTP server that answers the init POST (202 +
+Location) and then 503 on the first PUT / 201 on the second, driven through the
+real pyo3 extension. The behavioral pins are:
 
   - upload_blob_native returns successfully (no Python-side exception)
-  - The server saw exactly 2 PUT requests (one retry happened)
+  - The server saw exactly 2 PUT attempts (one retry happened), each preceded by
+    its own init POST (re-init per retry — audit L2)
 
-respx isn't a fit — it patches httpx, not the Rust reqwest client. A
-real socket-bound HTTP server is what puts 5xx bytes on the wire that
-Rust will read.
+respx isn't a fit — it patches httpx, not the Rust reqwest client. A real
+socket-bound HTTP server is what puts 5xx bytes on the wire that Rust will read.
 """
 from __future__ import annotations
 
@@ -34,39 +38,42 @@ except ImportError:
 
 
 PAYLOAD = b"upload-me-please\n"
+DIGEST = "sha256:fake"
 
 
 class _RetryHandler(BaseHTTPRequestHandler):
-    """Replies 503 then 201 to PUT — simulates a Harbor restart mid-upload.
+    """Answers the init POST (202 + Location), then 503 then 201 to PUT —
+    simulates a Harbor restart mid-upload. The retry does its own POST-init, so a
+    fresh session is minted each attempt.
 
-    The class attribute `attempt_count` is mutated by every request; the
-    fixture resets it to 0 before each test. Using a class attribute (not
-    instance) because HTTPServer creates a new handler per request.
+    The class attributes are mutated by every request; the fixture resets them to
+    0 before each test. Class (not instance) attributes because HTTPServer creates
+    a new handler per request.
     """
-    attempt_count = 0
+    post_count = 0
+    put_count = 0
+
+    def do_POST(self):
+        cls = type(self)
+        cls.post_count += 1
+        # OCI blob-upload init: hand back a session Location the client PUTs to.
+        self.send_response(202)
+        self.send_header("Location", "/v2/foo/bar/blobs/uploads/session")
+        self.send_header("Content-Length", "0")
+        self.end_headers()
 
     def do_PUT(self):
         cls = type(self)
-        cls.attempt_count += 1
-        # Drain the body so the Rust client sees a clean response cycle
-        # — a 503 with an unread body can confuse some clients into
-        # double-counting the request.
+        cls.put_count += 1
+        # Drain the body so the Rust client sees a clean response cycle — a 503
+        # with an unread body can confuse some clients into double-counting.
         length = int(self.headers.get("Content-Length", "0") or "0")
         if length:
             self.rfile.read(length)
-        if cls.attempt_count == 1:
-            # First attempt: transient server error. Rust's
-            # is_retryable() classifies any 5xx as retryable.
-            self.send_response(503)
-            self.send_header("Content-Length", "0")
-            self.end_headers()
-        else:
-            # Retry: success. Harbor returns 201 with a digest header on
-            # blob PUT; we only need the status code for is_retryable
-            # accounting.
-            self.send_response(201)
-            self.send_header("Content-Length", "0")
-            self.end_headers()
+        # First PUT: transient server error (any 5xx is retryable). Retry: 201.
+        self.send_response(503 if cls.put_count == 1 else 201)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
 
     def log_message(self, *_args, **_kwargs):
         pass  # silence per-request stderr noise
@@ -80,14 +87,15 @@ def _free_port() -> int:
 
 @pytest.fixture
 def retry_server():
-    """Spin a server that 503s once then 201s for the duration of one test."""
-    _RetryHandler.attempt_count = 0
+    """Spin a server that 503s once then 201s (per-attempt init POST) for one test."""
+    _RetryHandler.post_count = 0
+    _RetryHandler.put_count = 0
     port = _free_port()
     server = HTTPServer(("127.0.0.1", port), _RetryHandler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     try:
-        yield f"http://127.0.0.1:{port}/v2/foo/bar/blobs/uploads/abc?digest=sha256:fake"
+        yield f"http://127.0.0.1:{port}/v2/foo/bar/blobs/uploads/"
     finally:
         server.shutdown()
         thread.join(timeout=5)
@@ -96,19 +104,23 @@ def retry_server():
 def test_503_then_201_succeeds_after_retry(retry_server, tmp_path):
     """upload_blob_native must transparently retry on 5xx and return Ok.
 
-    A regression that disabled the retry (or mis-classified 5xx as
-    permanent) would surface the first 503 as a terminal exception in
-    Python — that's what this test pins.
+    A regression that disabled the retry (or mis-classified 5xx as permanent)
+    would surface the first 503 as a terminal exception in Python. A regression
+    that re-PUT the consumed session instead of re-initiating (undoing L2) would
+    show fewer POSTs than PUTs.
     """
     payload_path = tmp_path / "blob.bin"
     payload_path.write_bytes(PAYLOAD)
 
     # Must not raise.
-    upload_blob_native(url=retry_server, path=str(payload_path), auth_token=None)
+    upload_blob_native(uploads_url=retry_server, path=str(payload_path), digest=DIGEST, auth_token=None)
 
-    assert _RetryHandler.attempt_count == 2, (
-        f"expected exactly 2 PUT attempts (1 503 + 1 retry), "
-        f"got {_RetryHandler.attempt_count}"
+    assert _RetryHandler.put_count == 2, (
+        f"expected exactly 2 PUT attempts (1 503 + 1 retry), got {_RetryHandler.put_count}"
+    )
+    assert _RetryHandler.post_count == 2, (
+        f"audit L2: each attempt must re-init its own session, so 2 POSTs expected, "
+        f"got {_RetryHandler.post_count}"
     )
 
 
@@ -116,14 +128,23 @@ def test_503_then_201_succeeds_after_retry(retry_server, tmp_path):
 
 
 class _Permanent4xxHandler(BaseHTTPRequestHandler):
-    """Always responds 403. Rust's classifier says 4xx is permanent → no
-    retry → exactly one PUT, then a terminal exception in Python.
+    """Answers the init POST, then always 403 on PUT. Rust's classifier says 4xx
+    is permanent → no retry → exactly one PUT, then a terminal exception in Python.
     """
-    attempt_count = 0
+    post_count = 0
+    put_count = 0
+
+    def do_POST(self):
+        cls = type(self)
+        cls.post_count += 1
+        self.send_response(202)
+        self.send_header("Location", "/v2/foo/bar/blobs/uploads/session")
+        self.send_header("Content-Length", "0")
+        self.end_headers()
 
     def do_PUT(self):
         cls = type(self)
-        cls.attempt_count += 1
+        cls.put_count += 1
         length = int(self.headers.get("Content-Length", "0") or "0")
         if length:
             self.rfile.read(length)
@@ -137,13 +158,14 @@ class _Permanent4xxHandler(BaseHTTPRequestHandler):
 
 @pytest.fixture
 def permanent_4xx_server():
-    _Permanent4xxHandler.attempt_count = 0
+    _Permanent4xxHandler.post_count = 0
+    _Permanent4xxHandler.put_count = 0
     port = _free_port()
     server = HTTPServer(("127.0.0.1", port), _Permanent4xxHandler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     try:
-        yield f"http://127.0.0.1:{port}/v2/foo/bar/blobs/uploads/xyz"
+        yield f"http://127.0.0.1:{port}/v2/foo/bar/blobs/uploads/"
     finally:
         server.shutdown()
         thread.join(timeout=5)
@@ -152,23 +174,22 @@ def permanent_4xx_server():
 def test_403_does_not_retry(permanent_4xx_server, tmp_path):
     """A 4xx is permanent — the retry budget MUST NOT be consumed.
 
-    Without this pin, a regression that broadened `is_retryable` to "any
-    non-2xx" would silently turn every 403 into a 4-attempt loop (1.4s of
-    wasted backoff before a misleading "we tried hard" error). Rust unit
-    tests cover the classifier; this test pins the END-TO-END behavior:
-    exactly one PUT lands on the server, then Python sees an exception.
+    Without this pin, a regression that broadened `is_retryable` to "any non-2xx"
+    would silently turn every 403 into a 4-attempt loop. Rust unit tests cover the
+    classifier; this test pins the END-TO-END behavior: exactly one PUT lands on
+    the server, then Python sees an exception.
     """
     payload_path = tmp_path / "blob.bin"
     payload_path.write_bytes(PAYLOAD)
 
     with pytest.raises(Exception):
         upload_blob_native(
-            url=permanent_4xx_server,
+            uploads_url=permanent_4xx_server,
             path=str(payload_path),
+            digest=DIGEST,
             auth_token=None,
         )
 
-    assert _Permanent4xxHandler.attempt_count == 1, (
-        f"4xx must not provoke retries; saw "
-        f"{_Permanent4xxHandler.attempt_count} PUT attempts"
+    assert _Permanent4xxHandler.put_count == 1, (
+        f"4xx must not provoke retries; saw {_Permanent4xxHandler.put_count} PUT attempts"
     )

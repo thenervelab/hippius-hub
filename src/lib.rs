@@ -229,23 +229,26 @@ fn chunk_and_hash_native(
 /// `py.detach` so other Python threads can make progress while
 /// the file is being streamed.
 #[pyfunction]
-#[pyo3(signature = (url, path, auth_token=None))]
+#[pyo3(signature = (uploads_url, path, digest, auth_token=None))]
 #[expect(
     clippy::needless_pass_by_value,
     reason = "pyo3 #[pyfunction] requires owned values to extract from Python args"
 )]
 fn upload_blob_native(
     py: Python<'_>,
-    url: String,
+    uploads_url: String,
     path: String,
+    digest: String,
     auth_token: Option<String>,
 ) -> PyResult<()> {
     let rt = shared_runtime();
     let dest = PathBuf::from(path);
 
-    // Release the GIL across the blocking upload; see `download_file_native`.
+    // Release the GIL across the blocking upload; see `download_file_native`. Rust
+    // owns the POST-init + PUT and re-inits the session per retry (audit L2), so the
+    // Python caller passes the `/blobs/uploads/` endpoint + digest, not a pre-PUT URL.
     py.detach(|| {
-        rt.block_on(async { uploader::upload_blob_async(&url, &dest, auth_token.as_deref()).await })
+        rt.block_on(async { uploader::upload_blob_async(&uploads_url, &dest, &digest, auth_token.as_deref()).await })
             .map_err(|e| core_err_to_py(&e))
     })
 }
