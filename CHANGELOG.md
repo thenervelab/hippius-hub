@@ -72,6 +72,9 @@ the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html
   - A `206`'s `Content-Range` is validated to cover exactly the requested bytes,
     so a range-aliasing proxy can no longer silently write mis-placed bytes into
     a file cached under the correct-looking digest.
+  - A whole-file `200 OK` to a single-chunk small-file download (the range covers
+    the entire object) is now accepted as RFC-legal instead of rejected; a
+    multi-chunk range-ignored `200` is still refused.
   - Transient control-plane failures (manifest fetch, token fetch — `408`/`429`/
     `5xx` and connection blips) are retried with jittered backoff like the data
     plane, instead of aborting the whole operation on one registry hiccup.
