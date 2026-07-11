@@ -208,3 +208,46 @@ def test_download_forwards_resolved_timeouts_to_native(monkeypatched_registry, m
     )
     assert captured.get("connect_timeout_secs") == 7
     assert captured.get("read_timeout_secs") == 11
+
+
+@respx.mock
+def test_plain_download_forwards_resolved_timeouts_to_native(monkeypatched_registry, monkeypatch, tmp_path):
+    # Audit L9 (plain path): the single-blob download — the more commonly exercised
+    # path — must ALSO forward HIPPIUS_CONNECT_TIMEOUT/HIPPIUS_READ_TIMEOUT into
+    # download_file_native. The pack path is covered above; the plain-path stubs in
+    # other test files swallow these kwargs via `**_`, so without this assertion a
+    # dropped forward at the `_download_to_cache`/`_download_to_local_dir` call sites
+    # would leave the whole suite green (the L9 regression this fix targets).
+    payload = b"Z" * 42
+    plain = {
+        "schemaVersion": 2,
+        "layers": [
+            {
+                "mediaType": "application/octet-stream",
+                "size": len(payload),
+                "digest": f"sha256:{_sha(payload)}",
+                "annotations": {LAYER_TITLE_KEY: "file.txt"},
+            }
+        ],
+    }
+    token_route(respx.mock)
+    respx.get(f"{MOCK_REGISTRY}/v2/{REPO}/manifests/main").mock(
+        return_value=httpx.Response(200, json=plain, headers={"Docker-Content-Digest": "sha256:" + "d" * 64})
+    )
+    monkeypatch.setenv("HIPPIUS_CONNECT_TIMEOUT", "7")
+    monkeypatch.setenv("HIPPIUS_READ_TIMEOUT", "11")
+    captured = {}
+
+    def fake_native(*, dest_path, **kw):
+        captured.update(kw)
+        with open(dest_path, "wb") as f:
+            f.write(payload)
+        return None
+
+    monkeypatch.setattr(file_download, "download_file_native", fake_native)
+    hf_hub_download(
+        repo_id=REPO, filename="file.txt", revision="main",
+        cache_dir=str(tmp_path), token="tok",
+    )
+    assert captured.get("connect_timeout_secs") == 7
+    assert captured.get("read_timeout_secs") == 11

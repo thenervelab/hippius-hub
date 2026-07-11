@@ -8,8 +8,11 @@ unit tests instant.
 from __future__ import annotations
 
 import httpx
+import respx
 
 from hippius_hub import _http
+from hippius_hub._oci import fetch_manifest
+from tests.respx_fixtures import MOCK_REGISTRY
 
 
 def test_retries_5xx_then_succeeds():
@@ -71,3 +74,26 @@ def test_transport_error_exhausts_and_raises():
     except httpx.ConnectError:
         return
     raise AssertionError("a persistent transport error must propagate after retries")
+
+
+@respx.mock
+def test_fetch_manifest_wires_through_retry_on_transient_5xx():
+    # L3 WIRING (not just the helper in isolation): fetch_manifest runs before every
+    # upload/download, so it must route its GET through request_with_retry. A 503
+    # then 200 must yield the manifest after exactly one retry — inlining the GET
+    # back to a bare `client().get()` (undoing L3) makes route.call_count == 1 and
+    # fails this test.
+    repo = "acme/model"
+    route = respx.get(f"{MOCK_REGISTRY}/v2/{repo}/manifests/main").mock(
+        side_effect=[
+            httpx.Response(503),
+            httpx.Response(
+                200,
+                json={"schemaVersion": 2, "layers": []},
+                headers={"Docker-Content-Digest": "sha256:" + "d" * 64},
+            ),
+        ]
+    )
+    result = fetch_manifest(MOCK_REGISTRY, repo, "main", "tok")
+    assert result is not None and result.manifest["schemaVersion"] == 2
+    assert route.call_count == 2, "fetch_manifest must retry the 503 through request_with_retry"
