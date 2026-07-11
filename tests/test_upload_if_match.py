@@ -356,6 +356,44 @@ def test_manifest_put_retries_blob_unknown_400_then_succeeds(tmp_path, monkeypat
 
 
 @respx.mock
+def test_manifest_put_rides_out_a_lag_longer_than_the_old_budget(tmp_path, monkeypatch):
+    """The commit-visibility lag has grown under sustained JuiceFS backpressure past
+    the original ~13s / 5-retry window (a fast CI runner outruns it). The widened
+    budget must ride out a run of BLOB_UNKNOWN 400s LONGER than the old 6-attempt
+    window and still land the manifest — this is the pre-widening staging failure.
+    """
+    from hippius_hub.file_upload import MANIFEST_PUT_MAX_RETRIES, upload_file
+
+    _no_backoff(monkeypatch)
+    payload, sha_hex, _size = _write_payload(tmp_path)
+    _stub_auth_and_blob(respx.mock, sha_hex)
+    respx.mock.get(
+        f"{REGISTRY}/v2/{REPO_ID}/manifests/{REVISION}"
+    ).mock(return_value=httpx.Response(404))
+    # 8 consecutive BLOB_UNKNOWN 400s — beyond the OLD 6-attempt budget — then a 201.
+    lag = 8
+    assert MANIFEST_PUT_MAX_RETRIES + 1 > lag, "the widened budget must exceed the simulated lag"
+    put_route = respx.mock.put(
+        f"{REGISTRY}/v2/{REPO_ID}/manifests/{REVISION}"
+    ).mock(side_effect=(
+        [httpx.Response(400, json=_BLOB_UNKNOWN_BODY)] * lag
+        + [httpx.Response(201, headers={"Docker-Content-Digest": "sha256:" + "b" * 64})]
+    ))
+
+    upload_file(
+        path_or_fileobj=str(payload),
+        path_in_repo="hello.txt",
+        repo_id=REPO_ID,
+        token="literal-token-value",
+        revision=REVISION,
+    )
+
+    assert put_route.call_count == lag + 1, (
+        "the manifest PUT must keep retrying past the old budget until the blob is visible"
+    )
+
+
+@respx.mock
 def test_manifest_put_retries_5xx_then_succeeds(tmp_path, monkeypatch):
     """A 503 (registry redeploy/overload) is transient and retried, like in Rust."""
     from hippius_hub.file_upload import upload_file
