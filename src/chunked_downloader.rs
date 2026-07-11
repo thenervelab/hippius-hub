@@ -533,13 +533,30 @@ async fn try_download_chunk_to_offset(
     // No temp file, no assembly phase.
     let expected = end - start + 1;
     let mut written: u64 = 0;
+    let mut over_range = false;
     loop {
         match res.chunk().await {
             Ok(Some(buf)) => {
-                let len = buf.len();
-                buf_writer.write_all(&buf).await?;
-                written += len as u64;
-                pb.inc(len as u64);
+                // Bound each write to the bytes still owed for this range (audit
+                // M-SHORT206 follow-up): a 206 whose body RUNS PAST the requested
+                // range would otherwise spill its surplus into the adjacent chunk's
+                // region — the concurrent tasks write disjoint ranges of one shared
+                // pre-allocated file. Write at most the remaining bytes and flag the
+                // over-send; the surplus is dropped, never written.
+                let remaining = expected - written;
+                // `remaining` (u64) may exceed usize on a 32-bit target; when it
+                // does, `buf.len()` is certainly the smaller bound, so fall back to
+                // it — no truncating cast either way.
+                let take = usize::try_from(remaining).map_or(buf.len(), |r| buf.len().min(r));
+                if take > 0 {
+                    buf_writer.write_all(&buf[..take]).await?;
+                    written += take as u64;
+                    pb.inc(take as u64);
+                }
+                if buf.len() as u64 > remaining {
+                    over_range = true;
+                    break;
+                }
             }
             Ok(None) => break,
             Err(e) => return Err(e.into()),
@@ -552,12 +569,19 @@ async fn try_download_chunk_to_offset(
     // internally-consistent short sub-range: matching Content-Length + a sub-range
     // Content-Range, as a proxy/CDN can emit) reaches a clean EOF here — `chunk()`
     // returns `Ok(None)` and hyper raises no incomplete-body error because the body
-    // matched its own advertised length. Without this guard the chunk's tail stays
-    // as the file's pre-allocated `set_len` zeros: a silently truncated file cached
-    // forever under the trusted content digest. Surface it as UnexpectedEof →
-    // `CoreError::Io` (retryable) so a transient short read re-fetches before the
-    // failure becomes terminal. `require_partial_content` already rejects the
-    // 200-instead-of-206 case; this closes the short-206 case it cannot see.
+    // matched its own advertised length. Without a length check the chunk's tail
+    // stays as the file's pre-allocated `set_len` zeros: a silently truncated file
+    // cached forever under the trusted content digest. An OVER-length body (bounded
+    // above) is likewise anomalous. Both surface as a retryable `CoreError::Io` so a
+    // transient anomaly re-fetches before failing hard. `require_partial_content`
+    // already rejects the 200-instead-of-206 case; these close the short/long-206
+    // cases it cannot see.
+    if over_range {
+        return Err(CoreError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("chunk bytes={start}-{end}: server sent more than the {expected}-byte range"),
+        )));
+    }
     if written != expected {
         return Err(CoreError::Io(std::io::Error::new(
             std::io::ErrorKind::UnexpectedEof,
@@ -932,6 +956,24 @@ mod short_206_tests {
         let res = try_download_chunk_to_offset(client, &format!("{base}/blob"), None, 0, 99, &dest, &pb).await;
         let _ = std::fs::remove_file(&dest);
         assert!(res.is_ok(), "full-length 206 must be accepted, got {res:?}");
+    }
+
+    #[tokio::test]
+    async fn over_length_206_is_rejected_without_clobbering() {
+        // Server sends 150 bytes for a 100-byte range. The write must be bounded to
+        // 100 bytes — bytes [100, 200) of the shared file (the next chunk's region)
+        // must stay the pre-allocated zeros, not the surplus — and the over-send must
+        // surface as an error rather than a silent cross-chunk corruption.
+        let Some(base) = serve_short_206(100, 150).await.ok() else { return };
+        let Ok(client) = crate::chunk_fetcher::download_client() else { return };
+        let Some(dest) = prealloc(200).await else { return };
+        let pb = ProgressBar::hidden();
+        let res = try_download_chunk_to_offset(client, &format!("{base}/blob"), None, 0, 99, &dest, &pb).await;
+        let tail_is_zero = std::fs::read(&dest)
+            .is_ok_and(|b| b.len() == 200 && b[100..].iter().all(|&x| x == 0));
+        let _ = std::fs::remove_file(&dest);
+        assert!(matches!(res, Err(CoreError::Io(_))), "over-length 206 must error, got {res:?}");
+        assert!(tail_is_zero, "surplus bytes must not clobber the neighbouring chunk region");
     }
 }
 

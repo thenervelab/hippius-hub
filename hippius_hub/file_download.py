@@ -428,7 +428,10 @@ def _assert_download_matches_digest(calculated_hash, target_digest, filename) ->
     whole-file digest mismatch, and huggingface_hub, which raises on the same case.
     Raising `OSError` matches huggingface_hub's integrity-failure type.
     """
-    if calculated_hash is None:
+    # `calculated_hash is None` → verification skipped. `not target_digest` guards a
+    # (currently upstream-prevented) missing expected digest so the helper can never
+    # `AttributeError` on `None.replace(...)`; there is nothing to compare against.
+    if calculated_hash is None or not target_digest:
         return
     expected = target_digest.replace("sha256:", "")
     if calculated_hash != expected:
