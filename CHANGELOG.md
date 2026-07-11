@@ -67,8 +67,10 @@ the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html
   - Uploads now abort a stalled body write: a peer that completes TCP+TLS then
     stops draining the socket (invisible to the connect timeout and TCP
     keep-alive) is cut by an idle-progress watchdog and retried, instead of
-    hanging forever and wedging a whole folder upload. The pack upload-init POST
-    is bounded too.
+    hanging forever and wedging a whole folder upload. The watchdog covers both
+    the whole-file PUT and the chunked-write pack PUT, keys "body fully sent" off
+    the stream reaching end-of-input (so a file rewritten mid-upload can't
+    false-trip it), and the pack upload-init POST is bounded too.
   - A `206`'s `Content-Range` is validated to cover exactly the requested bytes,
     so a range-aliasing proxy can no longer silently write mis-placed bytes into
     a file cached under the correct-looking digest.
