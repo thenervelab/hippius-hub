@@ -33,8 +33,10 @@ from __future__ import annotations
 
 import atexit
 import http.cookiejar
+import random
 import threading
-from typing import Optional
+import time
+from typing import Callable, Optional
 
 import httpx
 
@@ -104,3 +106,46 @@ def _close() -> None:
     existing, _CLIENT = _CLIENT, None
     if existing is not None:
         existing.close()
+
+
+# ----- transient-failure retry for control-plane requests (audit L3) -----
+
+_RETRYABLE_STATUS = frozenset({408, 429})
+
+
+def _is_retryable_status(code: int) -> bool:
+    """Mirror the Rust data plane's ``CoreError::is_retryable``: 408/429 + any 5xx."""
+    return code in _RETRYABLE_STATUS or 500 <= code < 600
+
+
+def request_with_retry(
+    send: Callable[[], httpx.Response],
+    *,
+    attempts: int = 4,
+    base_delay: float = 0.2,
+) -> httpx.Response:
+    """Call ``send()`` (returning an ``httpx.Response``), retrying transient failures.
+
+    Retries httpx transport errors (connect/read/write/pool) and 408/429/5xx
+    responses with full-jitter exponential backoff, mirroring the Rust data plane's
+    ``CoreError::is_retryable`` — so a transient Harbor blip during a rolling
+    redeploy doesn't abort a control-plane call (manifest fetch, token fetch) whose
+    data-plane siblings would have retried (audit L3). The response is returned
+    as-is for the caller's own status handling (404 branches, ``raise_for_status``);
+    only transient failures are retried, and the last attempt's response or
+    exception is surfaced once the budget is spent.
+    """
+    for attempt in range(attempts):
+        last = attempt == attempts - 1
+        try:
+            resp = send()
+        except httpx.TransportError:
+            if last:
+                raise
+        else:
+            if last or not _is_retryable_status(resp.status_code):
+                return resp
+        # Full-jitter backoff in [0, base_delay * 2**attempt].
+        time.sleep(random.uniform(0, base_delay * (2**attempt)))
+    # Unreachable: the final iteration always returns or raises.
+    raise RuntimeError("request_with_retry exhausted without a result")  # pragma: no cover

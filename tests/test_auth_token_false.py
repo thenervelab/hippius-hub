@@ -13,6 +13,8 @@ def test_explicit_no_auth_skips_docker_fallback(mock_client, mock_docker):
     mock_docker.return_value = "stolen-base64-auth"
     # The token GET now goes through the shared pooled client; intercept its .get.
     mock_get = mock_client.return_value.get
+    # status_code is inspected by the L3 retry wrapper (200 = success, not retried).
+    mock_get.return_value.status_code = 200
     mock_get.return_value.json.return_value = {"token": "anon-token"}
     mock_get.return_value.raise_for_status.return_value = None
 

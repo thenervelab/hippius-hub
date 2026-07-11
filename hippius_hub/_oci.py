@@ -96,11 +96,15 @@ def fetch_manifest(
     the PUT as `If-Match` to get optimistic-concurrency rejection (412) when
     a racing writer has advanced the revision.
     """
-    resp = _http.client().get(
+    # Retry transient blips (audit L3): fetch_manifest runs before every upload and
+    # download, so a 503/429 during a Harbor rolling redeploy would otherwise abort
+    # the whole operation — while the same status on any data-plane blob request is
+    # retried. 404 (missing revision) is not retried; it is handled below.
+    resp = _http.request_with_retry(lambda: _http.client().get(
         manifest_url(registry, repo_id, revision),
         headers=oci_headers(oci_token),
         timeout=DEFAULT_HTTP_TIMEOUT,
-    )
+    ))
     if resp.status_code == 404:
         if missing_ok:
             return None
