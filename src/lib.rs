@@ -10,6 +10,7 @@ pub use error::{CoreError, Result};
 mod chunk_fetcher;
 mod chunked_downloader;
 mod diagnostics;
+mod retry;
 mod uploader;
 
 use chunk_fetcher::{PackAssembler, PackChunkTarget, PackPlanEntry};
@@ -243,7 +244,7 @@ fn upload_blob_native(
 /// so the wire contract is intentionally a string — every new field added to
 /// `DiagnosticReport` flows through without changing the pyo3 signature.
 #[pyfunction]
-#[pyo3(signature = (blob_url, auth_token=None, probe_bytes=33_554_432, max_concurrent=None, connect_timeout_secs=None))]
+#[pyo3(signature = (blob_url, auth_token=None, probe_bytes=33_554_432, max_concurrent=None, connect_timeout_secs=None, read_timeout_secs=None))]
 #[expect(
     clippy::needless_pass_by_value,
     reason = "pyo3 #[pyfunction] requires owned values to extract from Python args"
@@ -255,6 +256,7 @@ fn diagnose_blob_native(
     probe_bytes: u64,
     max_concurrent: Option<usize>,
     connect_timeout_secs: Option<u64>,
+    read_timeout_secs: Option<u64>,
 ) -> PyResult<String> {
     let rt = shared_runtime();
     py.detach(|| {
@@ -266,6 +268,7 @@ fn diagnose_blob_native(
                     probe_bytes,
                     max_concurrent,
                     connect_timeout_secs,
+                    read_timeout_secs,
                 )
                 .await
             })

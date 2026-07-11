@@ -364,7 +364,10 @@ async fn fetch_pack_with_retry(
                 if !e.is_retryable() || retries > MAX_RETRIES {
                     return Err(e);
                 }
-                tokio::time::sleep(Duration::from_millis(2u64.pow(retries) * 100)).await;
+                // Full-jitter backoff (audit L-JITTER): decorrelates the up-to-32
+                // concurrent pack fetches so a registry 429/503 does not make them
+                // retry in lockstep. Shared helper across the four transport loops.
+                tokio::time::sleep(crate::retry::backoff_delay(retries)).await;
             }
         }
     }

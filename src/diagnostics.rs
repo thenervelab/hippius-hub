@@ -192,9 +192,18 @@ pub async fn probe_blob(
     probe_bytes: u64,
     max_concurrent: Option<usize>,
     connect_timeout_secs: Option<u64>,
+    read_timeout_secs: Option<u64>,
 ) -> Result<DiagnosticReport, DiagError> {
     let n = max_concurrent.unwrap_or(32);
     let connect_timeout = Duration::from_secs(connect_timeout_secs.unwrap_or(30));
+    // Idle/read timeout (audit M-DIAG-TIMEOUT): reqwest's `.timeout()` is a TOTAL
+    // deadline that would abort exactly the slow-but-working links this probe
+    // exists to measure; `.read_timeout()` instead fires only when a read STALLS
+    // (no byte within the window, reset on each successful read), so a stalled or
+    // dribbling server ends the probe with a recorded error instead of hanging
+    // forever. `.max(1)` floors a truncated sub-second knob so it can never become
+    // a 0s (instant-fail) timeout.
+    let read_timeout = Duration::from_secs(read_timeout_secs.unwrap_or(30).max(1));
     let mut errors: Vec<String> = Vec::new();
     let mut request_ids: BTreeMap<String, String> = BTreeMap::new();
 
@@ -217,7 +226,19 @@ pub async fn probe_blob(
     // --- TCP connect (doubles as the RTT estimate) ---
     let addr = first_addr.ok_or_else(|| DiagError::Url("DNS returned no addresses".to_string()))?;
     let tcp_start = Instant::now();
-    let tcp = TcpStream::connect(addr).await?;
+    // Bound the raw connect (audit M-DIAG-TIMEOUT): the reqwest clients'
+    // `connect_timeout` does not cover this bare tokio socket, so a black-holed
+    // host (SYN sent, never answered) would otherwise hang the probe here forever.
+    let tcp = match tokio::time::timeout(connect_timeout, TcpStream::connect(addr)).await {
+        Ok(Ok(s)) => s,
+        Ok(Err(e)) => return Err(DiagError::Io(e)),
+        Err(_) => {
+            return Err(DiagError::Io(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!("TCP connect to {addr} timed out after {connect_timeout:?}"),
+            )))
+        }
+    };
     let tcp_connect_ms = tcp_start.elapsed().as_millis() as u64;
 
     // TLS handshake sub-probe was removed because the only ecosystem option
@@ -235,6 +256,7 @@ pub async fn probe_blob(
     // --- HEAD with redirects disabled, to reveal a redirect to a download host ---
     let probe_client = Client::builder()
         .connect_timeout(connect_timeout)
+        .read_timeout(read_timeout)
         .redirect(reqwest::redirect::Policy::none())
         .build()?;
     let mut head_req = probe_client.head(blob_url);
@@ -271,6 +293,7 @@ pub async fn probe_blob(
     // --- Transfer client: follows redirects, HTTP/1.1 only, matching production ---
     let transfer_client = Client::builder()
         .connect_timeout(connect_timeout)
+        .read_timeout(read_timeout)
         .http1_only()
         .pool_max_idle_per_host(n)
         .tcp_keepalive(Duration::from_secs(30))
@@ -326,14 +349,24 @@ pub async fn probe_blob(
 
         let mut total_bytes = 0u64;
         for r in results {
-            let (index, bytes, elapsed) = r?;
-            total_bytes += bytes;
-            parallel_chunks.push(ChunkTiming {
-                index,
-                bytes,
-                ms: elapsed.as_millis() as u64,
-                mbps: mbps(bytes, elapsed),
-            });
+            // Audit M-DIAG-ABORT: a single failed parallel range (429/503/416, or a
+            // reset on one stream) must NOT discard the whole report — DNS, TCP,
+            // HEAD and the single-stream result are already collected, and the
+            // rate-limit verdict reads `parallel_chunks`. Record the failure and
+            // compute throughput over the survivors so a partial report still returns
+            // on exactly the lossy/rate-limited paths this probe targets.
+            match r {
+                Ok((index, bytes, elapsed)) => {
+                    total_bytes += bytes;
+                    parallel_chunks.push(ChunkTiming {
+                        index,
+                        bytes,
+                        ms: elapsed.as_millis() as u64,
+                        mbps: mbps(bytes, elapsed),
+                    });
+                }
+                Err(e) => errors.push(format!("parallel chunk failed: {e:?}")),
+            }
         }
         parallel_chunks.sort_by_key(|c| c.index);
         parallel_ms = Some(par_elapsed.as_millis() as u64);
