@@ -917,10 +917,16 @@ mod short_206_tests {
     }
 
     async fn prealloc(size: u64) -> Option<std::path::PathBuf> {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        // A DISTINCT path per call, keyed on a monotonic counter — not the size —
+        // so two tests that pre-allocate the same size never share a temp file. The
+        // per-size path raced under the parallel test runner (one test's final
+        // remove_file unlinked the other's dest mid-download): a CI flake this fixes.
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let seq = SEQ.fetch_add(1, Ordering::Relaxed);
         let path = std::env::temp_dir().join(format!(
-            "hippius_short206_{}_{}.bin",
+            "hippius_short206_{}_{seq}.bin",
             std::process::id(),
-            size
         ));
         let f = OpenOptions::new().create(true).write(true).truncate(true).open(&path).await.ok()?;
         f.set_len(size).await.ok()?;
