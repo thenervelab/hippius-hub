@@ -983,8 +983,14 @@ def upload_folder(
     dedup_index: Dict[str, tuple] = {}
     pack_sizes: Dict[str, int] = {}
     if resolve_chunked_write_enabled():
-        prior = fetch_manifest(registry, oci_repo, revision, oci_token, missing_ok=True)
-        dedup_index, pack_sizes = _build_dedup_index(prior, registry, oci_repo, oci_token)
+        # Only build the dedup index (a manifest GET + N pointer-blob GETs) when at
+        # least one file will actually be chunked (audit L10) — otherwise a folder
+        # of only-small files pays ~2N+1 wasted round-trips before the first byte,
+        # for a plain-path upload that never consults the index. Mirrors upload_file.
+        threshold = resolve_chunk_threshold()
+        if any(os.path.getsize(os.path.join(base_dir, rel)) >= threshold for rel in filtered):
+            prior = fetch_manifest(registry, oci_repo, revision, oci_token, missing_ok=True)
+            dedup_index, pack_sizes = _build_dedup_index(prior, registry, oci_repo, oci_token)
 
     new_layers = []
     if filtered:
@@ -1004,8 +1010,17 @@ def upload_folder(
                 )
                 for rel in filtered
             ]
-            for fut in tqdm(as_completed(futures), total=len(filtered), desc="Uploading", unit="file"):
-                new_layers.extend(fut.result())
+            try:
+                for fut in tqdm(as_completed(futures), total=len(filtered), desc="Uploading", unit="file"):
+                    new_layers.extend(fut.result())
+            except BaseException:
+                # Fail-fast (audit M3): mirror _snapshot_download — drop queued
+                # uploads on the first failure / Ctrl-C. Blob PUTs are idempotent
+                # and the manifest PUT is deferred to after all files succeed, so a
+                # partial run leaves only orphan content-addressed blobs a GC
+                # reclaims — never a bad manifest.
+                executor.shutdown(wait=False, cancel_futures=True)
+                raise
 
     commit_info = _finalize_upload_manifest(
         registry=registry,
