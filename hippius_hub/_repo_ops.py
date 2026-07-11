@@ -15,7 +15,7 @@ from ._harbor import (harbor_create_project, harbor_delete_repository,
                       harbor_get_artifact, harbor_get_project, harbor_get_repository,
                       split_repo_id, )
 from ._oci import fetch_manifest, group_files, head_manifest, layer_titles
-from .auth import get_oci_bearer_token, resolve_auth_header, resolve_token_value
+from .auth import get_oci_bearer_token, resolve_auth_header
 from .constants import DEFAULT_HTTP_TIMEOUT, resolve_registry
 from .errors import (LocalTokenNotFoundError, RepositoryNotFoundError, )
 from .file_download import _oci_repo_path, _validate_repo_type
@@ -79,38 +79,14 @@ def _next_link(link_header: Optional[str], registry: str) -> Optional[str]:
     return None
 
 
-def _manifest_digest(registry: str, repo_id: str, revision: str, oci_token: str) -> Optional[str]:
-    """Return the content digest of a revision's manifest, or None if unreachable.
-
-    Used as the commit-like identifier for a revision. A cheap HEAD suffices —
-    the digest comes back in the Docker-Content-Digest response header.
-    """
-    head = head_manifest(registry, repo_id, revision, oci_token)
-    if head.status_code != 200:
-        return None
-    return head.headers.get("Docker-Content-Digest")
-
-
-def _revision_created(registry: str, repo_id: str, revision: str, oci_token: str) -> Optional[str]:
-    """Return a revision's upload timestamp (ISO8601), or None if absent.
-
-    Read from the manifest's org.opencontainers.image.created annotation, which
-    uploads via this tool stamp. Revisions pushed by other tooling may lack it.
-    """
-    result = fetch_manifest(registry, repo_id, revision, oci_token, missing_ok=True)
-    if result is None:
-        return None
-    return result.manifest.get("annotations", {}).get("org.opencontainers.image.created")
-
-
 def _revision_digest_and_created(registry: str, repo_id: str, revision: str, oci_token: str) -> tuple:
     """Return (manifest digest, upload timestamp) for a revision in ONE GET.
 
     fetch_manifest already returns both the manifest body — carrying the
     org.opencontainers.image.created annotation — AND the Docker-Content-Digest
-    response header, so the separate HEAD `_manifest_digest` did per revision is
-    redundant. `cmd_revisions` uses this to fetch each revision once (N GETs) rather
-    than 2N (HEAD + GET). Returns (None, None) when the revision is gone (404).
+    response header, so a separate digest-only HEAD per revision is redundant.
+    `cmd_revisions` uses this to fetch each revision once (N GETs) rather than 2N
+    (HEAD + GET). Returns (None, None) when the revision is gone (404).
     """
     result = fetch_manifest(registry, repo_id, revision, oci_token, missing_ok=True)
     if result is None:
@@ -321,7 +297,7 @@ def list_repo_refs(repo_id: str, *, repo_type: Optional[str] = None,
     _validate_repo_type(repo_type)
     oci_repo = _oci_repo_path(repo_id, repo_type)
     registry = resolve_registry(endpoint)
-    oci_token = get_oci_bearer_token(oci_repo, resolve_token_value(token), push=False)
+    oci_token = get_oci_bearer_token(oci_repo, token, push=False, endpoint=endpoint)
     tags = _list_tags(registry, oci_repo, oci_token)
     if tags is None:
         # RepositoryNotFoundError (an HfHubHTTPError) requires a response object;

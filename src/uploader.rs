@@ -14,6 +14,12 @@ use tokio_util::codec::{BytesCodec, FramedRead};
 
 use crate::error::CoreError;
 
+/// TCP/TLS handshake budget for `upload_client`, matching
+/// `chunk_fetcher::CONNECT_TIMEOUT_SECS` on the download side (audit
+/// M-UPLOAD-CONNECT). Kept local rather than re-exported so the two clients stay
+/// independently tunable.
+const CONNECT_TIMEOUT_SECS: u64 = 30;
+
 /// Per-chunk `(sha256_hex, offset, length)` in file order — the plan a chunked
 /// upload works from (offset re-reads the range; digest dedups and addresses).
 pub type ChunkList = Vec<(String, u64, u64)>;
@@ -165,12 +171,12 @@ pub async fn upload_blob_async(
                 if !e.is_retryable() || retries > UPLOAD_MAX_RETRIES {
                     return Err(e);
                 }
-                // `2u64.pow(retries) * 100` reproduces the downloader's
-                // 200/400/800/1600 ms schedule. `retries` is `u32` to
-                // match `UPLOAD_MAX_RETRIES`; `pow` widens to `u64` so
-                // the multiplication cannot overflow at this budget.
-                let wait_time = 2u64.pow(retries) * 100;
-                tokio::time::sleep(Duration::from_millis(wait_time)).await;
+                // Full-jitter backoff (audit L-JITTER): a jittered draw within the
+                // same 200/400/800/1600 ms cap schedule the deterministic sleep
+                // used, so concurrent uploads that hit a registry 429/503 together
+                // do not re-collide in lockstep. Shared helper across all four
+                // transport retry loops.
+                tokio::time::sleep(crate::retry::backoff_delay(retries)).await;
             }
         }
     }
@@ -207,8 +213,19 @@ pub(crate) fn upload_client() -> Result<&'static Client, CoreError> {
     // Force HTTP/1.1 for the same reason as the downloader: avoids h2 single-TCP
     // multiplexing, lets uploads spread across multiple connections if the caller
     // parallelizes.
+    //
+    // No flat whole-request timeout (audit H-UPLOAD-TIMEOUT): reqwest's client
+    // `.timeout()` is a wall-clock deadline over the ENTIRE request including the
+    // streamed body, so a 1h cap silently bounded total *transfer* time — a
+    // legitimately slow large upload (multi-GB model on a slow uplink, the default
+    // non-chunked path) would trip it, and because a reqwest timeout is
+    // `is_retryable()`, `upload_blob_async` then re-streamed the whole file from
+    // byte 0 up to the retry budget (~4× the wall). A dead or stalled peer is
+    // instead detected by `connect_timeout` (handshake) + `tcp_keepalive` (an
+    // idle/half-open connection) without ever capping an honest transfer — the
+    // exact policy `download_client` uses.
     let built = Client::builder()
-        .timeout(Duration::from_hours(1)) // 1h timeout for very large uploads
+        .connect_timeout(Duration::from_secs(CONNECT_TIMEOUT_SECS))
         .http1_only()
         .tcp_keepalive(Duration::from_secs(30))
         // Generous fixed idle cap (was 8) so raising HIPPIUS_MAX_INFLIGHT_PACKS /
@@ -334,7 +351,8 @@ pub async fn pack_upload_async(
                 if !e.is_retryable() || retries > UPLOAD_MAX_RETRIES {
                     return Err(e);
                 }
-                tokio::time::sleep(Duration::from_millis(2u64.pow(retries) * 100)).await;
+                // Full-jitter backoff — see `upload_blob_async` (audit L-JITTER).
+                tokio::time::sleep(crate::retry::backoff_delay(retries)).await;
             }
         }
     }

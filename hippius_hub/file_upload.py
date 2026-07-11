@@ -154,7 +154,12 @@ def _ensure_config_blob_uploaded(registry: str, repo_id: str, oci_token: str) ->
         )
         init.raise_for_status()
         loc = init.headers.get("Location")
-        if loc and loc.startswith("/"):
+        # Guard a missing Location (audit L-LOCATION-GUARD): a 2xx init without the
+        # header would make `"?" in loc` raise an opaque TypeError on None. Match the
+        # clear error the sibling helpers (`_ensure_bytes_blob_uploaded`) raise.
+        if not loc:
+            raise ValueError("Registry did not return a Location header for upload initiation")
+        if loc.startswith("/"):
             loc = f"{registry}{loc}"
         sep = "&" if "?" in loc else "?"
         # Raise on a failed config PUT: otherwise the manifest PUT that follows
@@ -872,13 +877,19 @@ def upload_file(
     # same digest guards the PUT via If-Match, so moving the fetch earlier does not
     # widen the concurrency window.
     existing = fetch_manifest(registry, oci_repo, revision, oci_token, missing_ok=True)
-    dedup_index: Dict[str, tuple] = {}
-    pack_sizes: Dict[str, int] = {}
-    if resolve_chunked_write_enabled():
-        dedup_index, pack_sizes = _build_dedup_index(existing, registry, oci_repo, oci_token)
 
     file_path, cleanup = _normalize_path_or_fileobj(path_or_fileobj)
     try:
+        dedup_index: Dict[str, tuple] = {}
+        pack_sizes: Dict[str, int] = {}
+        # Only build the dedup index (a pointer-blob GET fan-out over the prior
+        # revision) when THIS file is large enough to take the chunked-v2 path
+        # (audit L-DEDUP-EARLY). A sub-threshold file uploads as one plain blob and
+        # never reads the index, so building it would be pure wasted round-trips.
+        if resolve_chunked_write_enabled() and (
+            os.path.getsize(file_path) >= resolve_chunk_threshold()
+        ):
+            dedup_index, pack_sizes = _build_dedup_index(existing, registry, oci_repo, oci_token)
         new_layers = _upload_file_layers(
             file_path, path_in_repo, registry, oci_repo, oci_token, dedup_index, pack_sizes
         )

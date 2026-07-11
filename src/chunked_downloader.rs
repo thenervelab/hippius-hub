@@ -2,7 +2,7 @@ use futures::stream::{FuturesUnordered, StreamExt};
 use reqwest::{header, Client};
 use sha2::{Digest, Sha256};
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use indicatif::{ProgressBar, ProgressStyle};
 use tokio::fs::OpenOptions;
@@ -42,6 +42,27 @@ const VERIFY_READ_BUFFER: usize = 8 * 1024 * 1024; // 8 MB read buffer for SHA25
 /// `cargo clippy -- -D warnings` already promotes to a CI failure.
 /// Three-layer defense without self-reference.
 const CHUNK_REQUEST_TIMEOUT: Duration = Duration::from_mins(5);
+
+/// Read/total request budget for the size-probe HEAD (audit L-HEAD-TIMEOUT). The
+/// shared `download_client` sets only `connect_timeout(30s)`, which covers the
+/// handshake but not a peer that completes it then never sends response headers —
+/// `req.send().await` on the HEAD would otherwise hang indefinitely. A HEAD has no
+/// body, so a tight bound is safe.
+const HEAD_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Process-global cap on Range GETs in flight across ALL concurrent legacy
+/// downloads (audit M-RANGE-GATE). The per-file `permits` semaphore below bounds
+/// ONE file's chunks; without a global gate a snapshot `ThreadPoolExecutor`
+/// running N files each opens up to `MAX_INFLIGHT_CHUNKS` connections, so
+/// `N * 32` GETs hit the registry at once — FD/ephemeral-port pressure and per-IP
+/// 429 storms — while `pool_max_idle_per_host(32)` retains only 32 for reuse.
+/// First-caller-wins fixed sizing mirrors `chunk_fetcher::global_pack_gate`: a
+/// single large file still gets the full 32; N files SHARE that budget instead of
+/// multiplying it.
+fn global_range_gate() -> Arc<Semaphore> {
+    static GATE: OnceLock<Arc<Semaphore>> = OnceLock::new();
+    Arc::clone(GATE.get_or_init(|| Arc::new(Semaphore::new(MAX_INFLIGHT_CHUNKS))))
+}
 
 /// Number of HTTP Range requests needed to cover `content_length` bytes when
 /// each chunk is `chunk_size` bytes. Returns 0 for empty files (caller is
@@ -210,8 +231,16 @@ impl ChunkedDownloader {
             let permits = Arc::clone(&permits);
 
             let handle = tokio::spawn(async move {
-                // Bound concurrent connections; RAII-released on completion or abort.
+                // Per-file permit bounds THIS file's in-flight chunks; the global
+                // permit (audit M-RANGE-GATE) bounds TOTAL Range GETs across every
+                // concurrent legacy download so a snapshot fan-out cannot open
+                // workers × 32 connections. Both RAII-released on completion or abort.
+                // Acquired per-file-then-global consistently, so no lock-order cycle.
                 let _permit = match permits.acquire_owned().await {
+                    Ok(p) => p,
+                    Err(e) => return (i, Err(CoreError::Io(std::io::Error::other(e)))),
+                };
+                let _global_permit = match global_range_gate().acquire_owned().await {
                     Ok(p) => p,
                     Err(e) => return (i, Err(CoreError::Io(std::io::Error::other(e)))),
                 };
@@ -290,7 +319,7 @@ impl ChunkedDownloader {
 
     /// Issue a HEAD request to obtain Content-Length
     async fn get_content_length(&self) -> Result<u64, CoreError> {
-        let mut req = self.client.head(&self.url);
+        let mut req = self.client.head(&self.url).timeout(HEAD_REQUEST_TIMEOUT);
         if let Some(ref token) = self.auth_token {
             req = req.bearer_auth(token);
         }
@@ -414,8 +443,10 @@ async fn download_chunk_with_retry(
                 if !e.is_retryable() || retries > MAX_RETRIES {
                     return Err(e);
                 }
-                let wait_time = 2u64.pow(retries) * 100;
-                tokio::time::sleep(Duration::from_millis(wait_time)).await;
+                // Full-jitter backoff (audit L-JITTER): decorrelates the concurrent
+                // chunk retries so a registry 429/503 does not trigger a lockstep
+                // storm. Shared helper across the four transport retry loops.
+                tokio::time::sleep(crate::retry::backoff_delay(retries)).await;
             }
         }
     }
@@ -500,12 +531,32 @@ async fn try_download_chunk_to_offset(
 
     // Stream HTTP body chunks directly to disk at our position.
     // No temp file, no assembly phase.
+    let expected = end - start + 1;
+    let mut written: u64 = 0;
+    let mut over_range = false;
     loop {
         match res.chunk().await {
             Ok(Some(buf)) => {
-                let len = buf.len();
-                buf_writer.write_all(&buf).await?;
-                pb.inc(len as u64);
+                // Bound each write to the bytes still owed for this range (audit
+                // M-SHORT206 follow-up): a 206 whose body RUNS PAST the requested
+                // range would otherwise spill its surplus into the adjacent chunk's
+                // region — the concurrent tasks write disjoint ranges of one shared
+                // pre-allocated file. Write at most the remaining bytes and flag the
+                // over-send; the surplus is dropped, never written.
+                let remaining = expected - written;
+                // `remaining` (u64) may exceed usize on a 32-bit target; when it
+                // does, `buf.len()` is certainly the smaller bound, so fall back to
+                // it — no truncating cast either way.
+                let take = usize::try_from(remaining).map_or(buf.len(), |r| buf.len().min(r));
+                if take > 0 {
+                    buf_writer.write_all(&buf[..take]).await?;
+                    written += take as u64;
+                    pb.inc(take as u64);
+                }
+                if buf.len() as u64 > remaining {
+                    over_range = true;
+                    break;
+                }
             }
             Ok(None) => break,
             Err(e) => return Err(e.into()),
@@ -513,6 +564,30 @@ async fn try_download_chunk_to_offset(
     }
 
     buf_writer.flush().await?;
+
+    // Audit M-SHORT206: a 206 whose body is SHORTER than the requested range (an
+    // internally-consistent short sub-range: matching Content-Length + a sub-range
+    // Content-Range, as a proxy/CDN can emit) reaches a clean EOF here — `chunk()`
+    // returns `Ok(None)` and hyper raises no incomplete-body error because the body
+    // matched its own advertised length. Without a length check the chunk's tail
+    // stays as the file's pre-allocated `set_len` zeros: a silently truncated file
+    // cached forever under the trusted content digest. An OVER-length body (bounded
+    // above) is likewise anomalous. Both surface as a retryable `CoreError::Io` so a
+    // transient anomaly re-fetches before failing hard. `require_partial_content`
+    // already rejects the 200-instead-of-206 case; these close the short/long-206
+    // cases it cannot see.
+    if over_range {
+        return Err(CoreError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("chunk bytes={start}-{end}: server sent more than the {expected}-byte range"),
+        )));
+    }
+    if written != expected {
+        return Err(CoreError::Io(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            format!("chunk bytes={start}-{end}: received {written} bytes, expected {expected}"),
+        )));
+    }
     Ok(())
 }
 
@@ -797,6 +872,114 @@ mod partial_content_tests {
     fn rejects_other_4xx_5xx() {
         assert!(require_partial_content(StatusCode::NOT_FOUND, 0, 99).is_err());
         assert!(require_partial_content(StatusCode::INTERNAL_SERVER_ERROR, 0, 99).is_err());
+    }
+}
+
+// Audit M-SHORT206: a 206 whose body is shorter than the requested range must be
+// rejected (retryable), never written as a zero-padded truncation. Kept in its own
+// module — it drives a real HTTP/1 socket, distinct from the pure status/arith tests.
+#[cfg(test)]
+mod short_206_tests {
+    use super::*;
+    // `AsyncWriteExt` is already in scope via `super::*`; only the read half is new.
+    use tokio::io::AsyncReadExt as _;
+
+    /// Serve exactly one `206 Partial Content` whose Content-Length (and body) is
+    /// `body_len`, while the Content-Range claims the full `range_len`-byte range —
+    /// the internally-consistent short sub-range a misbehaving proxy/CDN can emit.
+    /// `connection: close` so there is no keep-alive framing to parse.
+    async fn serve_short_206(range_len: u64, body_len: usize) -> std::io::Result<String> {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let addr = listener.local_addr()?;
+        tokio::spawn(async move {
+            if let Ok((mut sock, _)) = listener.accept().await {
+                let mut req = Vec::new();
+                let mut tmp = [0u8; 1024];
+                while !req.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match sock.read(&mut tmp).await {
+                        Ok(0) | Err(_) => return,
+                        Ok(n) => req.extend_from_slice(&tmp[..n]),
+                    }
+                }
+                let body = vec![7u8; body_len];
+                let resp = format!(
+                    "HTTP/1.1 206 Partial Content\r\ncontent-length: {}\r\ncontent-range: bytes 0-{}/{}\r\nconnection: close\r\n\r\n",
+                    body_len,
+                    range_len.saturating_sub(1),
+                    range_len
+                );
+                let _ = sock.write_all(resp.as_bytes()).await;
+                let _ = sock.write_all(&body).await;
+                let _ = sock.shutdown().await;
+            }
+        });
+        Ok(format!("http://{addr}"))
+    }
+
+    async fn prealloc(size: u64) -> Option<std::path::PathBuf> {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        // A DISTINCT path per call, keyed on a monotonic counter — not the size —
+        // so two tests that pre-allocate the same size never share a temp file. The
+        // per-size path raced under the parallel test runner (one test's final
+        // remove_file unlinked the other's dest mid-download): a CI flake this fixes.
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "hippius_short206_{}_{seq}.bin",
+            std::process::id(),
+        ));
+        let f = OpenOptions::new().create(true).write(true).truncate(true).open(&path).await.ok()?;
+        f.set_len(size).await.ok()?;
+        Some(path)
+    }
+
+    #[tokio::test]
+    async fn short_206_is_rejected_not_silently_truncated() {
+        // Request 100 bytes; the server sends a consistent 50-byte 206 (matching
+        // Content-Length, so hyper sees a clean EOF and raises nothing). The
+        // byte-count guard must surface a retryable Io error instead of leaving the
+        // chunk's tail as pre-allocated zeros.
+        let Some(base) = serve_short_206(100, 50).await.ok() else { return };
+        let Ok(client) = crate::chunk_fetcher::download_client() else { return };
+        let Some(dest) = prealloc(100).await else { return };
+        let pb = ProgressBar::hidden();
+        let res = try_download_chunk_to_offset(client, &format!("{base}/blob"), None, 0, 99, &dest, &pb).await;
+        let _ = std::fs::remove_file(&dest);
+        assert!(
+            matches!(res, Err(CoreError::Io(_))),
+            "short 206 must be a retryable Io error (silent truncation guard), got {res:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn full_length_206_is_accepted() {
+        // Control: a 206 whose body fills the requested range must succeed, so the
+        // guard rejects only genuine short reads.
+        let Some(base) = serve_short_206(100, 100).await.ok() else { return };
+        let Ok(client) = crate::chunk_fetcher::download_client() else { return };
+        let Some(dest) = prealloc(100).await else { return };
+        let pb = ProgressBar::hidden();
+        let res = try_download_chunk_to_offset(client, &format!("{base}/blob"), None, 0, 99, &dest, &pb).await;
+        let _ = std::fs::remove_file(&dest);
+        assert!(res.is_ok(), "full-length 206 must be accepted, got {res:?}");
+    }
+
+    #[tokio::test]
+    async fn over_length_206_is_rejected_without_clobbering() {
+        // Server sends 150 bytes for a 100-byte range. The write must be bounded to
+        // 100 bytes — bytes [100, 200) of the shared file (the next chunk's region)
+        // must stay the pre-allocated zeros, not the surplus — and the over-send must
+        // surface as an error rather than a silent cross-chunk corruption.
+        let Some(base) = serve_short_206(100, 150).await.ok() else { return };
+        let Ok(client) = crate::chunk_fetcher::download_client() else { return };
+        let Some(dest) = prealloc(200).await else { return };
+        let pb = ProgressBar::hidden();
+        let res = try_download_chunk_to_offset(client, &format!("{base}/blob"), None, 0, 99, &dest, &pb).await;
+        let tail_is_zero = std::fs::read(&dest)
+            .is_ok_and(|b| b.len() == 200 && b[100..].iter().all(|&x| x == 0));
+        let _ = std::fs::remove_file(&dest);
+        assert!(matches!(res, Err(CoreError::Io(_))), "over-length 206 must error, got {res:?}");
+        assert!(tail_is_zero, "surplus bytes must not clobber the neighbouring chunk region");
     }
 }
 
