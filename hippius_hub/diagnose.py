@@ -124,6 +124,10 @@ def run_diagnose(
         probe_bytes=probe_bytes,
         max_concurrent=resolve_max_concurrent(),
         connect_timeout_secs=resolve_connect_timeout(),
+        # Wire the read/idle timeout into the probe (audit M-DIAG-TIMEOUT): it now
+        # bounds a stalled read so `diagnose` cannot hang forever, and makes
+        # HIPPIUS_READ_TIMEOUT a real knob for the probe instead of dead config.
+        read_timeout_secs=int(resolve_read_timeout()),
     )
     report["blob"] = json.loads(raw)
     report["verdict"] = _verdict(report)

@@ -29,6 +29,7 @@ from .constants import (
 from .errors import (
     EntryNotFoundError,
     LocalEntryNotFoundError,
+    MalformedManifestError,
     RevisionNotFoundError,
 )
 
@@ -402,7 +403,9 @@ def hf_hub_download(
     # Content-Length), so the Rust downloader can pre-allocate + range without a
     # HEAD. None only for a malformed layer, where the native side HEADs as before.
     if local_dir is not None:
-        return _download_to_local_dir(blob_url, paths.dest_file, oci_token, group.size)
+        return _download_to_local_dir(
+            blob_url, paths.dest_file, oci_token, group.digest, group.size
+        )
     return _download_to_cache(
         blob_url=blob_url,
         repo_dir=paths.repo_dir,
@@ -412,6 +415,27 @@ def hf_hub_download(
         target_digest=group.digest,
         content_length=group.size,
     )
+
+
+def _assert_download_matches_digest(calculated_hash, target_digest, filename) -> None:
+    """Raise when a verify-on download's SHA-256 disagrees with the manifest digest.
+
+    `calculated_hash` is None when HIPPIUS_VERIFY_HASH is off (verification skipped)
+    — there is nothing to check. When present it MUST equal the manifest's bare-hex
+    digest; a mismatch means the registry/CDN served wrong bytes (or a truncated 206
+    slipped through), which must fail loudly rather than be cached under the trusted
+    digest. Mirrors the chunked-v2 path, whose native assembler already errors on a
+    whole-file digest mismatch, and huggingface_hub, which raises on the same case.
+    Raising `OSError` matches huggingface_hub's integrity-failure type.
+    """
+    if calculated_hash is None:
+        return
+    expected = target_digest.replace("sha256:", "")
+    if calculated_hash != expected:
+        raise OSError(
+            f"Integrity check failed for {filename!r}: downloaded content sha256 "
+            f"{calculated_hash} does not match the manifest digest {expected}"
+        )
 
 
 def _download_to_cache(
@@ -456,10 +480,17 @@ def _download_to_cache(
             verify_hash=verify_hash,
             content_length=content_length,
         )
-    except Exception:
-        # Clean up the mkstemp file before bubbling up. The inner OSError
-        # swallow is intentional: a cleanup failure (file already gone,
-        # permissions) must not shadow the original download exception.
+        # Audit M-VERIFY-PLAIN: when verify is on, the computed digest MUST equal
+        # the manifest digest, else we would cache wrong/truncated bytes under the
+        # trusted `sha256:` name and serve them forever. No-op when verify is off.
+        # Inside the try so the cleanup below removes the temp blob on a mismatch.
+        _assert_download_matches_digest(calculated_hash, target_digest, filename)
+    except BaseException:
+        # Clean up the mkstemp file before bubbling up. Catches BaseException (not
+        # Exception) so a KeyboardInterrupt/SystemExit at the native-call boundary
+        # also removes the temp blob (audit L-TEMP-LEAK) — matches the sibling
+        # helpers. The inner OSError swallow is intentional: a cleanup failure must
+        # not shadow the original download/verify exception.
         if os.path.exists(temp_path):
             try:
                 os.remove(temp_path)
@@ -488,7 +519,7 @@ def _download_to_cache(
     return file_path
 
 
-def _download_to_local_dir(blob_url, dest_file, oci_token, content_length=None):
+def _download_to_local_dir(blob_url, dest_file, oci_token, target_digest, content_length=None):
     """Direct download to a user-chosen directory — bypasses the cache layout.
 
     Downloads to a per-call temp sibling and atomically `os.replace`s it into
@@ -515,16 +546,21 @@ def _download_to_local_dir(blob_url, dest_file, oci_token, content_length=None):
     )
     os.close(fd)
     try:
-        # local_dir mode writes to the user-chosen path and does not assemble a
-        # content-addressed blob layout, so the calculated hash (Optional[str]
-        # post Phase 3.12) is intentionally unused — the path is the identity.
-        download_file_native(
+        # local_dir mode writes to the user-chosen path (the path is the identity,
+        # not a content-addressed blob name), but a verify-on download must still
+        # confirm the bytes match the manifest digest (audit M-VERIFY-PLAIN) — the
+        # digest is no longer discarded. Inside the try so the cleanup below removes
+        # the temp file on a mismatch.
+        calculated_hash = download_file_native(
             url=blob_url,
             dest_path=temp_path,
             auth_token=oci_token,
             chunk_size=resolve_chunk_size(),
             verify_hash=resolve_verify_hash(),
             content_length=content_length,
+        )
+        _assert_download_matches_digest(
+            calculated_hash, target_digest, os.path.basename(dest_file)
         )
     except BaseException:
         # Remove the partial temp file before propagating. The inner OSError
@@ -568,7 +604,16 @@ def _pull_packs(group, manifest, registry, oci_repo, temp_path, oci_token) -> Op
     pack_urls, pack_sizes, pack_chunks = [], [], []
     for pack_digest, targets in by_pack.items():
         pack_urls.append(f"{registry}/v2/{oci_repo}/blobs/{pack_digest}")
-        pack_sizes.append(pack_layer_sizes[pack_digest])
+        # A pointer that references a pack whose manifest layer was stripped/dropped
+        # is a malformed chunked-v2 artifact, not a KeyError bug — surface the typed
+        # error the symmetric upload path raises (audit L-PACK-KEYERROR) so callers
+        # see a clear cause, not an opaque traceback.
+        try:
+            pack_sizes.append(pack_layer_sizes[pack_digest])
+        except KeyError as exc:
+            raise MalformedManifestError(
+                f"pointer references pack {pack_digest} absent from the manifest layers"
+            ) from exc
         pack_chunks.append(targets)
     return download_packs_native(
         pack_urls=pack_urls,

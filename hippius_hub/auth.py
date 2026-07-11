@@ -119,7 +119,19 @@ def _jwt_expiration(jwt_str: str):
             stacklevel=2,
         )
         return None
-    return payload.get("exp")
+    exp = payload.get("exp")
+    # RFC 7519 §4.1.4: `exp` is a NumericDate (a number). A non-conformant issuer
+    # sending a string/list/dict would be cached, then poison the read path
+    # (`cached_exp - leeway > now` raises TypeError for the process lifetime). `bool`
+    # is an int subclass but never a valid timestamp, so exclude it explicitly.
+    if exp is not None and (isinstance(exp, bool) or not isinstance(exp, (int, float))):
+        warnings.warn(
+            f"JWT 'exp' claim is not numeric ({type(exp).__name__}); token will not be cached",
+            UserWarning,
+            stacklevel=2,
+        )
+        return None
+    return exp
 
 
 def _atomic_write_secret(path: str, content: str) -> None:
