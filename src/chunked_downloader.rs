@@ -1,4 +1,3 @@
-use futures::stream::{FuturesUnordered, StreamExt};
 use reqwest::{header, Client};
 use sha2::{Digest, Sha256};
 use std::path::Path;
@@ -12,7 +11,6 @@ use tokio::fs::OpenOptions;
 // needed at module scope.
 use tokio::io::{AsyncSeekExt, AsyncWriteExt, SeekFrom, BufWriter};
 use tokio::sync::Semaphore;
-use tokio::task::AbortHandle;
 
 use crate::error::CoreError;
 
@@ -207,48 +205,34 @@ impl ChunkedDownloader {
         // 3. Launch concurrent downloads — each streams directly to its
         //    correct offset in the final file.
         //
-        // Audit D4: previously this used `buffer_unordered(32)`
-        // and early-returned on the first error, but dropping the `Buffered` stream
-        // does NOT cancel the `tokio::spawn`'d tasks behind it — `JoinHandle::drop`
-        // detaches a tokio task, leaving it running in the background where it
-        // continues writing to `dest_path` and holding sockets after we've already
-        // bubbled an error up. We now collect the spawn-side `AbortHandle`s eagerly
-        // and call `.abort()` on every survivor before propagating the error, so
-        // the survivors stop at their next await point instead of racing the next
-        // download. NOTE: this legacy path has no `Semaphore`, so it eager-spawns
-        // one task per chunk and the actual concurrent-connection count IS
-        // `num_chunks` — `pool_max_idle_per_host` on the shared `download_client`
-        // caps only IDLE (retained) connections, NOT in-flight requests (reqwest/
-        // hyper open a new connection rather than queueing an h1 request). At the
-        // 100 MiB default chunk size that is a handful of tasks, but a small
-        // caller-set `HIPPIUS_CHUNK_SIZE` on a huge file would open O(file/chunk)
-        // connections — so the `permits` Semaphore below caps in-flight chunk GETs
-        // at MAX_INFLIGHT_CHUNKS, matching the pack path's per-file bound.
-        let mut joins: FuturesUnordered<tokio::task::JoinHandle<(usize, Result<(), CoreError>)>> =
-            FuturesUnordered::new();
-        let mut abort_handles: Vec<AbortHandle> = Vec::with_capacity(num_chunks);
-        let permits = Arc::new(Semaphore::new(MAX_INFLIGHT_CHUNKS));
-
-        for i in 0..num_chunks {
-            let (start, end) = chunk_bounds(content_length, self.chunk_size, i);
-
-            let client = self.client.clone();
-            let url = self.url.clone();
-            let token = self.auth_token.clone();
-            let chunk_pb = pb.clone();
+        // Bounded-spawn window (audit L13): keep at most MAX_INFLIGHT_CHUNKS tasks
+        // live and spawn the next only as one lands, instead of eager-spawning one
+        // task per chunk (which, for a huge file under a small HIPPIUS_CHUNK_SIZE,
+        // meant O(file/chunk) live tasks plus an O(num_chunks) abort-handle Vec —
+        // `pool_max_idle_per_host` caps only IDLE connections, not in-flight GETs).
+        // A `JoinSet` owns the live tasks; dropping it on an early error return
+        // ABORTS every survivor (audit D4 — a detached `tokio::spawn` would keep
+        // writing to `dest_path` and holding sockets after we bubbled the error up),
+        // so no manual `AbortHandle` bookkeeping is needed. The window is this file's
+        // in-flight cap; `global_range_gate` (audit M-RANGE-GATE) still bounds TOTAL
+        // Range GETs across every concurrent legacy download.
+        let base_client = self.client.clone();
+        let base_url = self.url.clone();
+        let base_token = self.auth_token.clone();
+        let chunk_size = self.chunk_size;
+        let spawn_pb = pb.clone();
+        let mut set: tokio::task::JoinSet<(usize, Result<(), CoreError>)> = tokio::task::JoinSet::new();
+        let spawn_chunk = |set: &mut tokio::task::JoinSet<(usize, Result<(), CoreError>)>, i: usize| {
+            let (start, end) = chunk_bounds(content_length, chunk_size, i);
+            let client = base_client.clone();
+            let url = base_url.clone();
+            let token = base_token.clone();
+            let chunk_pb = spawn_pb.clone();
             let path = dest_path_buf.clone();
-            let permits = Arc::clone(&permits);
-
-            let handle = tokio::spawn(async move {
-                // Per-file permit bounds THIS file's in-flight chunks; the global
-                // permit (audit M-RANGE-GATE) bounds TOTAL Range GETs across every
-                // concurrent legacy download so a snapshot fan-out cannot open
-                // workers × 32 connections. Both RAII-released on completion or abort.
-                // Acquired per-file-then-global consistently, so no lock-order cycle.
-                let _permit = match permits.acquire_owned().await {
-                    Ok(p) => p,
-                    Err(e) => return (i, Err(CoreError::Io(std::io::Error::other(e)))),
-                };
+            set.spawn(async move {
+                // Global permit (RAII-released on completion or abort) bounds TOTAL
+                // in-flight Range GETs across every concurrent legacy download so a
+                // snapshot fan-out cannot open workers × MAX_INFLIGHT_CHUNKS at once.
                 let _global_permit = match global_range_gate().acquire_owned().await {
                     Ok(p) => p,
                     Err(e) => return (i, Err(CoreError::Io(std::io::Error::other(e)))),
@@ -256,49 +240,38 @@ impl ChunkedDownloader {
                 let res = download_chunk_with_retry(client, url, token, start, end, content_length, i, path, chunk_pb).await;
                 (i, res)
             });
-            // `abort_handle()` clones the cooperative-cancel signal; the original
-            // `JoinHandle` is what `FuturesUnordered` polls for completion.
-            abort_handles.push(handle.abort_handle());
-            joins.push(handle);
+        };
+
+        // Prime the window; the drain loop below refills it one-for-one.
+        let mut next = 0usize;
+        while next < num_chunks && set.len() < MAX_INFLIGHT_CHUNKS {
+            spawn_chunk(&mut set, next);
+            next += 1;
         }
 
-        // Drain the `FuturesUnordered` of `JoinHandle`s. Exhaustive match preserves
-        // both the spawn-side (`JoinError`) and the download-layer cause: previously
-        // both collapsed into a bare `ChunkFailed(usize)`, hiding which chunk failed
-        // AND why. Phase 3.8 replaced the `usize::MAX` sentinel with
-        // `JoinFailed.index: Option<usize>` — `None` here because the chunk index
-        // lives inside the future's return tuple, and a `JoinError` that escapes
-        // before the tuple is constructed has lost that identity. The thiserror
-        // `Display` renders `None` as `<unknown>`.
+        // Drain the JoinSet, refilling the window as each chunk lands. Exhaustive
+        // match preserves both the spawn-side (`JoinError`) and the download-layer
+        // cause: previously both collapsed into a bare `ChunkFailed(usize)`, hiding
+        // which chunk failed AND why. `JoinFailed.index` is `None` because the chunk
+        // index lives inside the future's return tuple, and a `JoinError` escaping
+        // before the tuple is built has lost that identity (`Display` → `<unknown>`).
         //
-        // On any error we abort every collected handle before returning. Aborting
-        // an already-completed handle is a documented no-op (tokio), so iterating
-        // the full `abort_handles` vector is correct even though some tasks have
-        // finished. We do not drain the remaining `joins` after firing the aborts:
-        // tokio cancellation is cooperative — the spawned futures will return
-        // `JoinError::is_cancelled()` at their next await and shut down on their
-        // own; awaiting them here would only delay the user-visible failure.
-        while let Some(res) = joins.next().await {
-            match res {
+        // On any error we return immediately; dropping `set` aborts every still-
+        // running task (audit D4) so no survivor keeps writing to `dest_path`.
+        while let Some(joined) = set.join_next().await {
+            match joined {
                 Err(join_err) => {
-                    for a in &abort_handles {
-                        a.abort();
-                    }
-                    return Err(CoreError::JoinFailed {
-                        index: None,
-                        source: join_err,
-                    });
+                    return Err(CoreError::JoinFailed { index: None, source: join_err });
                 }
                 Ok((i, Err(chunk_err))) => {
-                    for a in &abort_handles {
-                        a.abort();
-                    }
-                    return Err(CoreError::ChunkFailed {
-                        index: i,
-                        source: Box::new(chunk_err),
-                    });
+                    return Err(CoreError::ChunkFailed { index: i, source: Box::new(chunk_err) });
                 }
-                Ok((_, Ok(()))) => {}
+                Ok((_, Ok(()))) => {
+                    if next < num_chunks {
+                        spawn_chunk(&mut set, next);
+                        next += 1;
+                    }
+                }
             }
         }
 
@@ -602,8 +575,11 @@ async fn try_download_chunk_to_offset(
     let expected = end - start + 1;
     let mut written: u64 = 0;
     let mut over_range = false;
+    // Each body read is bounded by the default-on read-idle window (audit M4): a peer
+    // that dribbles the head then stalls mid-body is cut as a retryable ReadStall,
+    // rather than held open until the per-chunk 5-minute total timeout.
     loop {
-        match res.chunk().await {
+        match crate::chunk_fetcher::read_chunk_bounded(&mut res, crate::chunk_fetcher::download_read_idle()).await {
             Ok(Some(buf)) => {
                 // Bound each write to the bytes still owed for this range (audit
                 // M-SHORT206 follow-up): a 206 whose body RUNS PAST the requested
@@ -627,7 +603,7 @@ async fn try_download_chunk_to_offset(
                 }
             }
             Ok(None) => break,
-            Err(e) => return Err(e.into()),
+            Err(e) => return Err(e),
         }
     }
 
@@ -1295,5 +1271,86 @@ mod retry_classification_tests {
             err_some.to_string().contains("chunk task 7 failed"),
             "Display for Some(7) must contain 'chunk task 7 failed', got: {err_some}",
         );
+    }
+
+    #[tokio::test]
+    async fn download_refills_window_beyond_max_inflight_chunks() {
+        // Audit L13: a file with MORE than MAX_INFLIGHT_CHUNKS chunks must download
+        // completely — the bounded-spawn window has to refill as chunks land, not
+        // stop after the first MAX_INFLIGHT_CHUNKS. A broken refill would leave the
+        // tail chunks never spawned (hang / short file); this asserts every byte
+        // lands by driving 52 four-byte chunks (> the 32 window) through a real 206
+        // Range server.
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let total: usize = (MAX_INFLIGHT_CHUNKS + 20) * 4; // 52 chunks of 4 bytes
+        let body: Vec<u8> = (0..total).map(|i| u8::try_from(i % 251).unwrap_or(0)).collect();
+
+        let Ok(listener) = TcpListener::bind("127.0.0.1:0").await else { return };
+        let Ok(addr) = listener.local_addr() else { return };
+        let body_srv = body.clone();
+        let server = tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else { return };
+                let body = body_srv.clone();
+                tokio::spawn(async move {
+                    // Read until the end of the request head (hyper may split it across
+                    // segments). Match the Range header case-insensitively: hyper writes
+                    // HTTP/1 header names lowercase (`range:`), not `Range:`.
+                    let mut acc: Vec<u8> = Vec::new();
+                    let mut buf = [0u8; 1024];
+                    loop {
+                        let Ok(n) = sock.read(&mut buf).await else { return };
+                        if n == 0 {
+                            break;
+                        }
+                        acc.extend_from_slice(&buf[..n]);
+                        if acc.windows(4).any(|w| w == b"\r\n\r\n") {
+                            break;
+                        }
+                    }
+                    let req = String::from_utf8_lossy(&acc).to_ascii_lowercase();
+                    // Echo exactly the requested inclusive byte range as a 206.
+                    let Some(rng) = req.lines().find_map(|l| l.strip_prefix("range: bytes=")) else {
+                        return;
+                    };
+                    let Some((s, e)) = rng.trim().split_once('-') else { return };
+                    let (Ok(start), Ok(end)) = (s.parse::<usize>(), e.parse::<usize>()) else {
+                        return;
+                    };
+                    let end = end.min(body.len().saturating_sub(1));
+                    if start > end {
+                        return;
+                    }
+                    let slice = &body[start..=end];
+                    let head = format!(
+                        "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes {}-{}/{}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        start, end, body.len(), slice.len()
+                    );
+                    let _ = sock.write_all(head.as_bytes()).await;
+                    let _ = sock.write_all(slice).await;
+                    let _ = sock.shutdown().await;
+                });
+            }
+        });
+
+        let url = format!("http://{addr}/blob");
+        let Ok(dl) = ChunkedDownloader::new(
+            url,
+            None,
+            Some(4),
+            Some(total as u64),
+            crate::chunk_fetcher::TransportTimeouts::default(),
+        ) else {
+            unreachable!("downloader builds")
+        };
+        let dest = std::env::temp_dir().join(format!("hippius-l13-{}.bin", std::process::id()));
+        let out = tokio::time::timeout(Duration::from_secs(20), dl.download(&dest, false)).await;
+        server.abort();
+        let Ok(Ok(_)) = out else { unreachable!("52-chunk download must complete, got {out:?}") };
+        let Ok(got) = tokio::fs::read(&dest).await else { unreachable!("read dest") };
+        assert_eq!(got, body, "every chunk past the window must have been refilled and written");
+        let _ = std::fs::remove_file(&dest);
     }
 }

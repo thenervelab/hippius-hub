@@ -27,6 +27,7 @@ from types import SimpleNamespace
 import pytest
 
 from hippius_hub import _snapshot_download as sd
+from hippius_hub import auth
 from hippius_hub import file_upload as fu
 
 # Enough files that, with max_workers=2, the vast majority are queued (never
@@ -80,7 +81,7 @@ def test_upload_folder_fail_fast_cancels_queued(monkeypatch, tmp_path):
     folder = tmp_path / "repo"
     _write_files(folder, FAN)
 
-    monkeypatch.setattr(fu, "_oci_bearer", lambda *a, **k: "tok")
+    monkeypatch.setattr(auth, "get_oci_bearer_token", lambda *a, **k: "tok")
 
     def no_finalize(**_):
         raise AssertionError("manifest must NOT be finalized on a failed folder upload")
@@ -110,13 +111,40 @@ def test_upload_folder_fail_fast_cancels_queued(monkeypatch, tmp_path):
     assert len(started) < FAN, f"queued uploads must be cancelled; {len(started)}/{FAN} started"
 
 
+def test_upload_folder_refreshes_token_on_worker_401(monkeypatch, tmp_path):
+    # Audit M2 (folder path): a worker 401 — a token that expired mid folder upload —
+    # must refresh the token and retry the whole fan-out once, mirroring upload_file.
+    # First attempt's workers all 401; the retry uses a fresh token and succeeds.
+    monkeypatch.setenv("HIPPIUS_CHUNKED_WRITE", "0")
+    folder = tmp_path / "repo"
+    _write_files(folder, 3)
+    auth.clear_oci_token_cache()
+
+    tokens = iter(["tok1", "tok2"])
+    monkeypatch.setattr(auth, "get_oci_bearer_token", lambda *a, **k: next(tokens))
+    monkeypatch.setattr(fu, "_finalize_upload_manifest", lambda **k: "commit-ok")
+
+    def fake_one(**kw):
+        if kw["oci_token"] == "tok1":
+            raise RuntimeError("server returned 401 (Unauthorized)")
+        return []
+
+    monkeypatch.setattr(fu, "_upload_one_file", fake_one)
+
+    result = fu.upload_folder(
+        repo_id="acme/model", folder_path=str(folder), repo_type="model", max_workers=WORKERS
+    )
+    assert result == "commit-ok", "the fan-out must re-run with a fresh token and commit"
+    assert next(tokens, "exhausted") == "exhausted", "exactly two mints: initial + one refresh"
+
+
 def test_l10_dedup_index_skipped_for_small_only_folder(monkeypatch, tmp_path):
     monkeypatch.setenv("HIPPIUS_CHUNKED_WRITE", "1")
     monkeypatch.setenv("HIPPIUS_CHUNK_THRESHOLD", "1024")
     folder = tmp_path / "small"
     _write_files(folder, 3, size=8)  # all well under the 1024-byte threshold
 
-    monkeypatch.setattr(fu, "_oci_bearer", lambda *a, **k: "tok")
+    monkeypatch.setattr(auth, "get_oci_bearer_token", lambda *a, **k: "tok")
     calls = {"manifest": 0, "dedup": 0}
 
     def spy_manifest(*a, **k):
@@ -144,7 +172,7 @@ def test_l10_dedup_index_built_when_a_file_chunks(monkeypatch, tmp_path):
     _write_files(folder, 2, size=8)
     (folder / "big.bin").write_bytes(b"x" * 2048)  # >= threshold → takes the chunked path
 
-    monkeypatch.setattr(fu, "_oci_bearer", lambda *a, **k: "tok")
+    monkeypatch.setattr(auth, "get_oci_bearer_token", lambda *a, **k: "tok")
     calls = {"manifest": 0, "dedup": 0}
 
     def spy_manifest(*a, **k):

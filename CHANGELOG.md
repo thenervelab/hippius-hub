@@ -97,6 +97,22 @@ the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html
   - The pack fetch is bounded against an over-sending server; the upload hash
     uses an 8 MiB read buffer (~128× fewer read syscalls); a dead per-download
     `fsync` of the pre-allocation was removed.
+- **Connection & transport hardening — follow-up.** The deferred cluster from the
+  same audit:
+  - Native downloads and uploads are now interruptible by Ctrl-C: a `SIGINT`
+    during a long transfer is checked ~10×/s and cancels the in-flight work
+    instead of hanging until the transfer finishes.
+  - A bearer token that expires mid-operation on a long transfer is refreshed and
+    the upload/download retried once, instead of failing on the `401`.
+  - Each download body read has a default-on 30s idle timeout (overridable by
+    `HIPPIUS_READ_TIMEOUT`), so a peer that dribbles then stalls mid-body is cut
+    promptly rather than only after the 5-minute per-chunk total timeout.
+  - The plain blob upload re-initiates its OCI upload session on every retry, so a
+    transient failure no longer re-PUTs a session the failed attempt consumed.
+  - The legacy Range downloader bounds its live chunk tasks to a spawn window
+    (drain-as-they-land) instead of eager-spawning one task per chunk; the pack
+    verify/scatter and pack-body hashing moved off the async runtime onto the
+    blocking pool.
 - A `206 Partial Content` whose body is shorter — or longer — than the requested
   byte range is now rejected and retried instead of being written as a
   truncated/mis-sized chunk and cached under the correct-looking digest. An

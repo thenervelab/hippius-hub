@@ -185,20 +185,21 @@ const PUT_FRAME_BYTES: usize = 1024 * 1024;
 ///
 /// Audit U3 (Phase 3.11): wraps [`try_upload_blob_once`] in an
 /// exponential-backoff retry loop with the same shape as
-/// [`crate::chunked_downloader::download_chunk_with_retry`]. Each
-/// attempt re-opens the file inside `try_upload_blob_once` (the
-/// previous `FramedRead` stream has been consumed), so the retry sees a
-/// fresh handle. Backoff schedule: 200, 400, 800, 1600 ms — four
-/// attempts total, ~3 s of backoff before surfacing a transient 5xx as
-/// terminal. A 4xx never burns backoff.
+/// [`crate::chunked_downloader::download_chunk_with_retry`]. Each attempt re-inits
+/// a fresh OCI upload session AND re-opens the file inside `try_upload_blob_once`
+/// (the previous session is consumed and the previous `FramedRead` stream is spent),
+/// so a retry never re-PUTs a dead session (audit L2). Backoff schedule: 200, 400,
+/// 800, 1600 ms — four attempts total, ~3 s of backoff before surfacing a transient
+/// 5xx as terminal. A 4xx never burns backoff.
 pub async fn upload_blob_async(
-    url: &str,
+    uploads_url: &str,
     path: &Path,
+    digest: &str,
     auth_token: Option<&str>,
 ) -> Result<(), CoreError> {
     let mut retries: u32 = 0;
     loop {
-        match try_upload_blob_once(url, path, auth_token).await {
+        match try_upload_blob_once(uploads_url, path, digest, auth_token).await {
             Ok(()) => return Ok(()),
             Err(e) => {
                 retries += 1;
@@ -468,15 +469,65 @@ fn basename_of(path: &Path) -> String {
 }
 
 async fn try_upload_blob_once(
-    url: &str,
+    uploads_url: &str,
     path: &Path,
+    digest: &str,
     auth_token: Option<&str>,
 ) -> Result<(), CoreError> {
+    // Re-init a fresh OCI upload session on every attempt (audit L2): a PUT to a
+    // session a prior failed attempt already consumed fails, so init must live inside
+    // the retried unit (symmetry with `try_pack_upload_once`), not once on the Python
+    // side re-PUTting the same dead session.
+    let put_url = init_upload_session(uploads_url, digest, auth_token).await?;
     let file = File::open(path).await?;
     // Size is for the progress bar only — see put_streaming on why it is not a
     // Content-Length.
     let file_size = file.metadata().await?.len();
-    put_streaming(url, file, file_size, &basename_of(path), auth_token, WRITE_STALL_TIMEOUT).await
+    put_streaming(&put_url, file, file_size, &basename_of(path), auth_token, WRITE_STALL_TIMEOUT).await
+}
+
+/// POST-init a fresh OCI blob-upload session at `uploads_url`, resolve the returned
+/// `Location`, and append `?digest={digest}` — the URL a monolithic PUT-with-digest
+/// targets. Shared by the plain ([`try_upload_blob_once`]) and pack
+/// ([`try_pack_upload_once`]) paths so BOTH re-init per retry attempt (audit L2).
+async fn init_upload_session(
+    uploads_url: &str,
+    digest: &str,
+    auth_token: Option<&str>,
+) -> Result<String, CoreError> {
+    let client = upload_client()?;
+    let mut init = client
+        .post(uploads_url)
+        .header(header::CONTENT_LENGTH, "0")
+        // Bound the zero-body init POST (audit H1): a hung registry here would
+        // otherwise block the upload forever and drain the shared gate.
+        .timeout(INIT_POST_TIMEOUT);
+    if let Some(token) = auth_token {
+        init = init.bearer_auth(token);
+    }
+    let init_resp = init.send().await?;
+    if !init_resp.status().is_success() {
+        return Err(CoreError::ServerError(
+            init_resp.status().as_u16(),
+            "blob upload init failed".to_string(),
+        ));
+    }
+    let location = init_resp
+        .headers()
+        .get(header::LOCATION)
+        .and_then(|v| v.to_str().ok())
+        .ok_or_else(|| CoreError::Integrity("registry omitted Location on upload init".to_string()))?;
+    // Resolve a possibly-relative Location against the uploads URL, then append the
+    // digest as a RAW query pair (":" is legal unencoded in a query; percent-encoding
+    // it via query_pairs_mut breaks the registry's digest match).
+    let resolved = reqwest::Url::parse(uploads_url)
+        .and_then(|base| base.join(location))
+        .map_err(|e| CoreError::Integrity(format!("bad upload Location {location:?}: {e}")))?;
+    let mut put_url = resolved.to_string();
+    put_url.push(if put_url.contains('?') { '&' } else { '?' });
+    put_url.push_str("digest=");
+    put_url.push_str(digest);
+    Ok(put_url)
 }
 
 /// Read the given file byte-ranges in order into one pack blob and push it via a
@@ -500,7 +551,14 @@ pub async fn pack_upload_async(
     // the whole pack on each attempt, which the staging peak-RSS benchmark showed
     // roughly doubled resident memory per concurrent upload.
     let body = Bytes::from(read_ranges(path, ranges).await?);
-    let digest_hex = hex::encode(Sha256::digest(&body));
+    // Hash the ~64 MiB pack on the blocking pool (audit L14): the digest is
+    // CPU-bound and would otherwise stall the runtime's other in-flight pack
+    // uploads for the duration. The `Bytes` clone into the closure is a refcount
+    // bump, not a copy, so the pack is still buffered exactly once.
+    let body_for_hash = body.clone();
+    let digest_hex = tokio::task::spawn_blocking(move || hex::encode(Sha256::digest(&body_for_hash)))
+        .await
+        .map_err(|join_err| CoreError::Io(std::io::Error::other(join_err)))?;
     let digest = format!("sha256:{digest_hex}");
     let mut retries: u32 = 0;
     loop {
@@ -545,38 +603,8 @@ async fn try_pack_upload_once(
     digest: &str,
     auth_token: Option<&str>,
 ) -> Result<(), CoreError> {
-    let client = upload_client()?;
-    let mut init = client
-        .post(uploads_url)
-        .header(header::CONTENT_LENGTH, "0")
-        // Bound the zero-body init POST (audit H1): a hung registry here would
-        // otherwise block this pack upload forever and drain the shared gate.
-        .timeout(INIT_POST_TIMEOUT);
-    if let Some(token) = auth_token {
-        init = init.bearer_auth(token);
-    }
-    let init_resp = init.send().await?;
-    if !init_resp.status().is_success() {
-        return Err(CoreError::ServerError(
-            init_resp.status().as_u16(),
-            "pack upload init failed".to_string(),
-        ));
-    }
-    let location = init_resp
-        .headers()
-        .get(header::LOCATION)
-        .and_then(|v| v.to_str().ok())
-        .ok_or_else(|| CoreError::Integrity("registry omitted Location on upload init".to_string()))?;
-    // Resolve a possibly-relative Location against the uploads URL, then append the
-    // digest as a RAW query pair (":" is legal unencoded in a query; percent-
-    // encoding it via query_pairs_mut breaks the registry's digest match).
-    let resolved = reqwest::Url::parse(uploads_url)
-        .and_then(|base| base.join(location))
-        .map_err(|e| CoreError::Integrity(format!("bad upload Location {location:?}: {e}")))?;
-    let mut put_url = resolved.to_string();
-    put_url.push(if put_url.contains('?') { '&' } else { '?' });
-    put_url.push_str("digest=");
-    put_url.push_str(digest);
+    // Re-init a fresh session per attempt (audit L2/H1) — shared with the plain path.
+    let put_url = init_upload_session(uploads_url, digest, auth_token).await?;
     // Route the pack PUT through the same write-stall watchdog as the whole-file
     // path (audit H1). The bare `put.send().await` here previously left the pack
     // PUT — the wedge point behind the shared `_pack_upload_gate` — unprotected

@@ -20,7 +20,7 @@ use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use tokio::fs::OpenOptions;
-use tokio::io::{AsyncSeekExt, AsyncWriteExt, SeekFrom};
+use tokio::io::SeekFrom;
 use tokio::sync::Semaphore;
 use tokio::task::AbortHandle;
 
@@ -39,6 +39,16 @@ const VERIFY_READ_BUFFER: usize = 8 * 1024 * 1024;
 /// regression test can pin the value and clippy's dead-code lint enforces its
 /// call site.
 const CHUNK_REQUEST_TIMEOUT: Duration = Duration::from_mins(5);
+
+/// Default per-chunk-read idle timeout for downloads (audit M4). Bounds a peer that
+/// completes the handshake then dribbles or stops mid-body: reset on each successful
+/// read, so it fires only on genuine no-progress (a 30s gap with zero bytes), never
+/// on a slow-but-steady transfer. Default-ON — unlike the opt-in client
+/// `read_timeout` — and overridden by `HIPPIUS_READ_TIMEOUT` when set. Scoped per
+/// chunk read (an app-level `tokio::time::timeout`), not a global client setting, so
+/// it fixes the slow-loris the 5-minute total timeout would otherwise leave open for
+/// minutes.
+const DOWNLOAD_READ_IDLE: Duration = Duration::from_secs(30);
 
 /// Idle-connection cap for the shared download client. Bounds only *idle*
 /// (kept-alive) connections, not in-flight requests — the per-file `Semaphore`
@@ -73,15 +83,14 @@ const DOWNLOAD_POOL_MAX_IDLE: usize = 32;
 /// transfers, not only `hippius-hub diagnose` (audit L9). `connect` bounds the
 /// handshake; `read` is a *stalled-read* bound (reset on each successful read).
 ///
-/// `read` is `Option` and defaults to `None` (no client-level read timeout) on
-/// purpose: with `None` the shared download client is byte-for-byte the
-/// pre-audit client, so plumbing the env knobs (L9) changes no default behavior.
-/// A client-level `.read_timeout()` is a *global* setting on the one process-wide
-/// download client shared by every concurrent chunk, so we make it opt-in
-/// (`HIPPIUS_READ_TIMEOUT`) rather than flip it on for all transfers here. The
-/// default-on download stall guard (audit M4) is deferred to an app-level
-/// idle-timeout on the chunk body stream — scoped per chunk, not a global client
-/// setting — see the audit remediation plan.
+/// `read` is `Option`: `None` leaves the shared client's *opt-in* `.read_timeout()`
+/// off, so the client is byte-for-byte the pre-audit one. The DEFAULT-ON download
+/// stall guard (audit M4) lives at the app level instead — [`read_chunk_bounded`]
+/// bounds each `res.chunk()` read by [`download_read_idle`] (30s, or
+/// `HIPPIUS_READ_TIMEOUT` when set), scoped per chunk rather than as a global client
+/// setting. So a slow-loris is cut by default; setting `HIPPIUS_READ_TIMEOUT`
+/// additionally arms the client's per-request `.read_timeout()` and lowers the
+/// app-level window to the same value.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct TransportTimeouts {
     pub connect: Duration,
@@ -130,6 +139,35 @@ fn build_download_client(timeouts: TransportTimeouts) -> Result<Client, CoreErro
     Ok(builder.build()?)
 }
 
+/// The resolved per-chunk-read idle timeout (audit M4), fixed by the first
+/// `download_client` caller (first-caller-wins, like the client itself): every file
+/// in a snapshot passes the same env-derived value. `HIPPIUS_READ_TIMEOUT` overrides
+/// the `DOWNLOAD_READ_IDLE` default. Read via [`download_read_idle`].
+static READ_IDLE: OnceLock<Duration> = OnceLock::new();
+
+/// The default-on download read-idle timeout (audit M4). Falls back to
+/// `DOWNLOAD_READ_IDLE` if no download has started yet; in practice the read loops
+/// only run after `download_client` has fixed it, so the fallback is belt-and-braces.
+pub(crate) fn download_read_idle() -> Duration {
+    READ_IDLE.get().copied().unwrap_or(DOWNLOAD_READ_IDLE)
+}
+
+/// One response-body read bounded by `idle` (audit M4): a `res.chunk()` yielding no
+/// data within `idle` is a retryable [`CoreError::ReadStall`], so a peer that stops
+/// mid-body is cut promptly instead of running out the per-chunk 5-minute total
+/// timeout. `idle` applies per call (per successful read resets it), so a slow-but-
+/// steady transfer is never tripped. Shared by both download read loops. `idle` is a
+/// parameter (not read from the global) so tests can drive a short window.
+pub(crate) async fn read_chunk_bounded(
+    res: &mut reqwest::Response,
+    idle: Duration,
+) -> Result<Option<bytes::Bytes>, CoreError> {
+    match tokio::time::timeout(idle, res.chunk()).await {
+        Ok(chunk) => Ok(chunk?),
+        Err(_elapsed) => Err(CoreError::ReadStall(idle)),
+    }
+}
+
 pub(crate) fn download_client(timeouts: TransportTimeouts) -> Result<&'static Client, CoreError> {
     static CLIENT: OnceLock<Client> = OnceLock::new();
     if let Some(client) = CLIENT.get() {
@@ -141,7 +179,11 @@ pub(crate) fn download_client(timeouts: TransportTimeouts) -> Result<&'static Cl
     // a later differing value is ignored — the documented tradeoff of one shared
     // pool. The loser of an init race drops its freshly built client (RAII).
     let built = build_download_client(timeouts)?;
-    Ok(CLIENT.get_or_init(|| built))
+    let client = CLIENT.get_or_init(|| built);
+    // Fix the default-on read-idle window (audit M4) alongside the client, same
+    // first-caller-wins discipline; HIPPIUS_READ_TIMEOUT overrides the default.
+    let _ = READ_IDLE.get_or_init(|| timeouts.read.unwrap_or(DOWNLOAD_READ_IDLE));
+    Ok(client)
 }
 
 /// Process-global cap on packs in flight across ALL concurrent downloads (every
@@ -172,6 +214,23 @@ type HasherTask = tokio::task::JoinHandle<Option<String>>;
 /// completion on and the task handle to await, or `(None, None)` when the caller
 /// requested no whole-file digest.
 type IncrementalHash = (Option<Sender<HashSignal>>, Option<HasherTask>);
+
+/// Aborts every held task handle when dropped. Fires on BOTH `assemble`'s
+/// early-return error path AND on cancellation (the whole `assemble` future dropped
+/// when Ctrl-C interrupts the native call — audit M1). Without it, dropping the
+/// `FuturesUnordered`/`Vec<AbortHandle>` would DETACH the spawned pack tasks (a
+/// `JoinHandle` drop detaches, not aborts), leaving them writing to `dest` and
+/// holding the pack gate after the caller moved on — the exact hazard the download
+/// path's `JoinSet` avoids structurally (audit D4/L13).
+struct AbortOnDrop(Vec<AbortHandle>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        for handle in &self.0 {
+            handle.abort();
+        }
+    }
+}
 
 /// One chunk to carve out of a fetched pack: where it sits in the pack, its size,
 /// where it lands in the assembled file, and its content digest (hex, no prefix).
@@ -317,25 +376,27 @@ impl PackAssembler {
             abort_handles.push(handle.abort_handle());
             joins.push(handle);
         }
+        // Abort every pack task when this scope unwinds — on the early-return error
+        // path below AND on cancellation (audit M1): a `_`-prefixed binding keeps the
+        // guard alive to scope end (a bare `_` would drop it immediately). It is
+        // declared after `joins`, so on unwind it drops FIRST and aborts the tasks
+        // before `joins` detaches them.
+        let _abort_guard = AbortOnDrop(abort_handles);
+
         // Drop the original sender so the channel closes once every pack task has
         // finished (each task holds its own clone); that unblocks the hasher task's
-        // final `recv` and lets it finalize (or fall back).
+        // final `recv` and lets it finalize (or fall back). On cancellation the
+        // aborted pack tasks drop their sender clones too, so the channel closes and
+        // the hasher exits rather than leaking.
         drop(hash_tx);
 
         while let Some(res) = joins.next().await {
             match res {
-                Err(join_err) => {
-                    for a in &abort_handles {
-                        a.abort();
-                    }
-                    return Err(CoreError::JoinFailed { index: None, source: join_err });
-                }
-                Ok((i, Err(pack_err))) => {
-                    for a in &abort_handles {
-                        a.abort();
-                    }
-                    return Err(CoreError::ChunkFailed { index: i, source: Box::new(pack_err) });
-                }
+                // On any error we return; `_abort_guard` drops and aborts every
+                // still-running pack task (the old explicit abort loop, now unified
+                // with the cancellation path).
+                Err(join_err) => return Err(CoreError::JoinFailed { index: None, source: join_err }),
+                Ok((i, Err(pack_err))) => return Err(CoreError::ChunkFailed { index: i, source: Box::new(pack_err) }),
                 Ok((_, Ok(()))) => {}
             }
         }
@@ -473,7 +534,10 @@ async fn fetch_pack(
     let cap = usize::try_from(pack_size).unwrap_or(usize::MAX);
     let mut bytes: Vec<u8> = Vec::with_capacity(cap);
     let mut received: u64 = 0;
-    while let Some(chunk) = res.chunk().await? {
+    // Each body read is bounded by the default-on read-idle window (audit M4): a
+    // registry that stops streaming mid-pack is cut as a retryable ReadStall instead
+    // of holding the connection until the 5-minute total timeout.
+    while let Some(chunk) = read_chunk_bounded(&mut res, download_read_idle()).await? {
         received = received.saturating_add(chunk.len() as u64);
         if received > pack_size {
             return Err(CoreError::Integrity(format!(
@@ -488,7 +552,34 @@ async fn fetch_pack(
             bytes.len()
         )));
     }
-    let mut file = OpenOptions::new().write(true).open(dest_path).await?;
+    // Verify + scatter on the blocking pool (audit L14). The per-chunk sha256 is
+    // CPU-bound and the scatter writes are local disk — neither is async work, so
+    // running them inline on the runtime starves the other up-to-32 concurrent pack
+    // fetches. `bytes` (the received pack) moves in; the metadata clones are cheap.
+    let targets_owned = targets.to_vec();
+    let dest = dest_path.to_path_buf();
+    let url_owned = url.to_string();
+    let pb_owned = pb.clone();
+    tokio::task::spawn_blocking(move || verify_and_scatter(&url_owned, &bytes, &targets_owned, &dest, &pb_owned))
+        .await
+        .map_err(|join_err| CoreError::Io(std::io::Error::other(join_err)))?
+}
+
+/// Verify each carved chunk's sha256 against `bytes` and scatter its slice to the
+/// file offset. Runs on the blocking pool (audit L14): hashing is CPU-bound and the
+/// writes are local disk, so this does no async work and must not sit on the async
+/// runtime. A digest mismatch or out-of-range chunk is a retryable `Integrity`
+/// error (a corrupt/mis-placed pack must never be written past its bounds).
+fn verify_and_scatter(
+    url: &str,
+    bytes: &[u8],
+    targets: &[(u64, u64, u64, String)],
+    dest_path: &Path,
+    pb: &ProgressBar,
+) -> Result<(), CoreError> {
+    use std::io::{Seek, Write};
+
+    let mut file = std::fs::OpenOptions::new().write(true).open(dest_path)?;
     for (offset_in_pack, size, file_offset, expected) in targets {
         let start = usize::try_from(*offset_in_pack)
             .map_err(|_| CoreError::Integrity(format!("pack offset {offset_in_pack} exceeds usize")))?;
@@ -510,11 +601,11 @@ async fn fetch_pack(
                 "chunk at pack offset {offset_in_pack}: expected sha256 {expected}, got {got}"
             )));
         }
-        file.seek(SeekFrom::Start(*file_offset)).await?;
-        file.write_all(slice).await?;
+        file.seek(SeekFrom::Start(*file_offset))?;
+        file.write_all(slice)?;
         pb.inc(*size);
     }
-    file.flush().await?;
+    file.flush()?;
     Ok(())
 }
 
@@ -614,6 +705,7 @@ fn incremental_hash(rx: &Receiver<HashSignal>, path: &Path, total_size: u64) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     // Pin the per-chunk request timeout value (same guard shape as the legacy
     // path): clippy's dead-code lint enforces the const is USED at the call
@@ -621,6 +713,113 @@ mod tests {
     #[test]
     fn chunk_request_timeout_is_five_minutes() {
         assert_eq!(CHUNK_REQUEST_TIMEOUT, Duration::from_mins(5));
+    }
+
+    #[test]
+    fn verify_and_scatter_writes_chunks_and_rejects_bad_digest() {
+        // L14: the verify+scatter loop (moved onto the blocking pool) must place
+        // each chunk at its file offset only after its sha256 matches the expected
+        // digest, and reject a mismatched chunk as a (retryable) Integrity error.
+        use std::io::Read;
+        let pb = ProgressBar::hidden();
+        let (a, b) = (b"AAAA".as_slice(), b"BB".as_slice()); // 4 + 2 bytes
+        let pack: Vec<u8> = [a, b].concat();
+        let ha = hex::encode(Sha256::digest(a));
+        let hb = hex::encode(Sha256::digest(b));
+        // (offset_in_pack, size, file_offset, expected_hex): scatter A→0, B→4.
+        let good = vec![(0u64, 4u64, 0u64, ha), (4u64, 2u64, 4u64, hb.clone())];
+
+        let path = std::env::temp_dir().join(format!("hippius-vs-{}.bin", std::process::id()));
+        let Ok(()) = std::fs::File::create(&path).and_then(|f| f.set_len(6)) else {
+            unreachable!("temp file create")
+        };
+        let Ok(()) = verify_and_scatter("u", &pack, &good, &path, &pb) else {
+            unreachable!("valid chunks must scatter")
+        };
+        let mut got = Vec::new();
+        let Ok(_) = std::fs::File::open(&path).and_then(|mut f| f.read_to_end(&mut got)) else {
+            unreachable!("read back")
+        };
+        assert_eq!(got, b"AAAABB");
+
+        // A wrong expected digest (hb over the "AAAA" slice) is a permanent Integrity
+        // error, so a corrupt/mis-placed pack is never accepted.
+        let bad = vec![(0u64, 4u64, 0u64, hb)];
+        assert!(matches!(
+            verify_and_scatter("u", &pack, &bad, &path, &pb),
+            Err(CoreError::Integrity(_))
+        ));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn read_chunk_bounded_trips_readstall_on_a_stalled_body() {
+        // Audit M4: a peer that sends the head + a few body bytes then stalls (no
+        // more data, socket held open) must be cut by the app-level per-read idle
+        // window as a retryable ReadStall — not left until the 5-minute total
+        // timeout. The client here has NO client read_timeout (default), so the
+        // app-level ReadStall is the sole guard, proving it is default-on.
+        let Ok(listener) = tokio::net::TcpListener::bind("127.0.0.1:0").await else { return };
+        let Ok(addr) = listener.local_addr() else { return };
+        let server = tokio::spawn(async move {
+            if let Ok((mut sock, _)) = listener.accept().await {
+                let mut buf = [0u8; 1024];
+                let _ = sock.read(&mut buf).await;
+                // Advertise 1000 bytes, send 8, then stall (hold the socket open).
+                let _ = sock
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 1000\r\n\r\nABCDEFGH")
+                    .await;
+                tokio::time::sleep(Duration::from_secs(30)).await;
+            }
+        });
+
+        let url = format!("http://{addr}/blob");
+        let Ok(client) = build_download_client(TransportTimeouts::default()) else {
+            unreachable!("client builds")
+        };
+        let Ok(mut res) = client.get(&url).send().await else { unreachable!("GET connects") };
+        let idle = Duration::from_millis(200);
+        let outcome = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match read_chunk_bounded(&mut res, idle).await {
+                    Ok(Some(_)) => {}
+                    Ok(None) => return Ok(()),
+                    Err(e) => return Err(e),
+                }
+            }
+        })
+        .await;
+        server.abort();
+        assert!(
+            matches!(outcome, Ok(Err(CoreError::ReadStall(_)))),
+            "a stalled body read must abort as a retryable ReadStall, got {outcome:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn abort_on_drop_aborts_held_tasks() {
+        // Audit M1: dropping the guard must abort every held pack task, so a cancelled
+        // (Ctrl-C'd) assemble never leaves a task writing to `dest` after the caller
+        // moved on. Spawn long-lived tasks, wrap their abort handles in AbortOnDrop,
+        // drop it, then confirm each task was cancelled (never ran to completion).
+        let mut joins = Vec::new();
+        let mut aborts = Vec::new();
+        for _ in 0..3 {
+            let h = tokio::spawn(async {
+                tokio::time::sleep(Duration::from_secs(30)).await;
+            });
+            aborts.push(h.abort_handle());
+            joins.push(h);
+        }
+
+        drop(AbortOnDrop(aborts));
+
+        for h in joins {
+            match h.await {
+                Ok(()) => unreachable!("the task must be aborted, not run to completion"),
+                Err(e) => assert!(e.is_cancelled(), "AbortOnDrop must cancel the task, got {e:?}"),
+            }
+        }
     }
 
     // An oversized/short/mis-hashed chunk must surface as the permanent
@@ -647,7 +846,6 @@ mod tests {
         // `connect_timeout`/`tcp_keepalive` cannot see) must be cut by the client's
         // `read_timeout`. Without it the body read hangs until the caller's 5-min
         // total timeout; the download plane's whole point is to fail fast and retry.
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
         use tokio::net::TcpListener;
         let Ok(listener) = TcpListener::bind("127.0.0.1:0").await else { return };
         let Ok(addr) = listener.local_addr() else { return };
@@ -966,7 +1164,6 @@ mod tests {
     /// there is no keep-alive framing to parse). Returns the base URL; the accept loop
     /// lives in a spawned task the test's runtime cancels on completion.
     async fn serve_packs(routes: HashMap<String, Vec<u8>>) -> std::io::Result<String> {
-        use tokio::io::AsyncReadExt as _;
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
         let addr = listener.local_addr()?;
         tokio::spawn(async move {
