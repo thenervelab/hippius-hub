@@ -39,6 +39,52 @@ the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html
   probe). Chunking pushes chunk blobs straight to Harbor, so the receiver is
   superseded. The download `diagnose` command and its probe are unchanged.
 
+### Changed
+
+- **Uploads no longer carry a fixed 1-hour total-request timeout.** A large
+  upload on a slow link was aborted at the 1h mark and — because a timeout is
+  retryable — re-streamed from the start up to the retry budget (~4h of dead
+  transfer). A dead or stalled peer is now detected by connect-timeout + TCP
+  keepalive instead, without ever capping an honest transfer.
+- **`HIPPIUS_VERIFY_HASH=1` now raises on a mismatched plain (non-chunked)
+  download** (`OSError`, matching huggingface_hub) instead of silently caching
+  the content. Previously the computed digest was only used to name the cache
+  blob and was never compared to the manifest digest, so the check was a no-op
+  on the primary (non-chunked) workload.
+- The legacy Range download shares a process-global in-flight cap, so a snapshot
+  of many large files opens at most ~32 concurrent registry connections rather
+  than `snapshot_workers × 32`.
+- `HIPPIUS_READ_TIMEOUT` is now applied to the `diagnose` transfer probe (it was
+  accepted and displayed but never enforced).
+- Transport retry backoff is now jittered (was a deterministic `2^n · 100ms`), so
+  concurrent chunk/pack/upload retries under a registry `429`/`503` no longer
+  collide in lockstep.
+
+### Fixed
+
+- A `206 Partial Content` whose body is shorter — or longer — than the requested
+  byte range is now rejected and retried instead of being written as a
+  truncated/mis-sized chunk and cached under the correct-looking digest. An
+  over-length body is bounded so its surplus cannot corrupt the adjacent chunk.
+- `list_repo_refs` (and `HfApi(endpoint=...).list_repo_refs`) minted its auth
+  token against the default registry, returning `401` on every custom endpoint;
+  it now honors `endpoint=`.
+- The upload client now sets a connect-timeout (a stalled handshake was
+  previously unbounded).
+- `diagnose` no longer hangs indefinitely on a stalled server (read-timeout plus
+  a bounded raw connect), and one failed parallel range no longer discards the
+  whole report. The size-probe HEAD also gained a request timeout.
+- A missing upload-init `Location` header now raises a clear error instead of a
+  `TypeError`.
+- A non-numeric JWT `exp` claim is rejected instead of poisoning the OCI token
+  cache with a persistent `TypeError`.
+- `HippiusApi` no longer drops the constructor token when a call passes
+  `token=None` explicitly.
+- An interrupted cache download (`KeyboardInterrupt`/`SystemExit`) no longer
+  leaves a temp blob behind.
+- A pointer referencing a pack absent from the manifest raises
+  `MalformedManifestError` instead of a bare `KeyError`.
+
 ## [0.5.0] — 2026-05-27
 
 A consolidation release that lands the 45-finding security/correctness audit
