@@ -197,7 +197,17 @@ def snapshot_download(
     if filtered:
         with ThreadPoolExecutor(max_workers=workers) as executor:
             futures = [executor.submit(_download_one, name) for name in filtered]
-            for fut in as_completed(futures):
-                fut.result()
+            try:
+                for fut in as_completed(futures):
+                    fut.result()
+            except BaseException:
+                # Fail-fast (audit M3): on the first failure (or Ctrl-C), drop the
+                # queued-but-not-started downloads instead of letting the executor
+                # drain the whole repo before the error surfaces. Already-running
+                # GIL-released native downloads can't be interrupted (that needs
+                # M1), but cancelling the queue restores prompt failure on a large
+                # repo. BaseException so KeyboardInterrupt/SystemExit also cancel.
+                executor.shutdown(wait=False, cancel_futures=True)
+                raise
 
     return snapshot_dir

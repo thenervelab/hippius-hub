@@ -215,31 +215,65 @@ pub async fn probe_blob(
         .to_string();
     let port = url.port_or_known_default().unwrap_or(443);
 
-    // --- DNS ---
-    // Take only the first address and let the resolver iterator drop right away,
-    // so its borrow of `host` doesn't outlive into the report-construction move.
+    // --- DNS (bounded — audit L7) ---
+    // Bound resolution by the same connect budget: `connect_timeout` covers the
+    // reqwest clients and the raw socket below, but NOT this lookup, so a
+    // black-holed resolver would otherwise hang the probe for the OS resolver's
+    // full retry duration. Collect into an owned Vec so the `host` borrow drops
+    // before report construction.
     let dns_start = Instant::now();
-    let first_addr = tokio::net::lookup_host((host.as_str(), port)).await?.next();
-    let dns_ms = dns_start.elapsed().as_millis() as u64;
-    let resolved_ip = first_addr.map(|a| a.ip().to_string());
-
-    // --- TCP connect (doubles as the RTT estimate) ---
-    let addr = first_addr.ok_or_else(|| DiagError::Url("DNS returned no addresses".to_string()))?;
-    let tcp_start = Instant::now();
-    // Bound the raw connect (audit M-DIAG-TIMEOUT): the reqwest clients'
-    // `connect_timeout` does not cover this bare tokio socket, so a black-holed
-    // host (SYN sent, never answered) would otherwise hang the probe here forever.
-    let tcp = match tokio::time::timeout(connect_timeout, TcpStream::connect(addr)).await {
-        Ok(Ok(s)) => s,
+    let addrs: Vec<std::net::SocketAddr> = match tokio::time::timeout(
+        connect_timeout,
+        tokio::net::lookup_host((host.as_str(), port)),
+    )
+    .await
+    {
+        Ok(Ok(iter)) => iter.collect(),
         Ok(Err(e)) => return Err(DiagError::Io(e)),
         Err(_) => {
             return Err(DiagError::Io(std::io::Error::new(
                 std::io::ErrorKind::TimedOut,
-                format!("TCP connect to {addr} timed out after {connect_timeout:?}"),
+                format!("DNS resolution of {host} timed out after {connect_timeout:?}"),
             )))
         }
     };
+    let dns_ms = dns_start.elapsed().as_millis() as u64;
+    if addrs.is_empty() {
+        return Err(DiagError::Url("DNS returned no addresses".to_string()));
+    }
+
+    // --- TCP connect (doubles as the RTT estimate) ---
+    // Try every resolved address in order (audit L7 / happy-eyeballs-lite): a
+    // dual-stack host whose first record is an unreachable IPv6 would otherwise
+    // make the probe report a connect failure while production (reqwest/hyper tries
+    // multiple addresses) transfers fine. `connect_timeout` bounds each attempt so
+    // a black-holed host cannot hang. Record the address that actually connected.
+    let tcp_start = Instant::now();
+    let mut last_err: Option<std::io::Error> = None;
+    let mut connected: Option<(TcpStream, std::net::SocketAddr)> = None;
+    for addr in &addrs {
+        match tokio::time::timeout(connect_timeout, TcpStream::connect(addr)).await {
+            Ok(Ok(s)) => {
+                connected = Some((s, *addr));
+                break;
+            }
+            Ok(Err(e)) => last_err = Some(e),
+            Err(_) => {
+                last_err = Some(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    format!("TCP connect to {addr} timed out after {connect_timeout:?}"),
+                ));
+            }
+        }
+    }
+    let Some((tcp, addr)) = connected else {
+        return Err(DiagError::Io(last_err.unwrap_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::AddrNotAvailable, "no resolved address was reachable")
+        })));
+    };
     let tcp_connect_ms = tcp_start.elapsed().as_millis() as u64;
+    // The IP that actually connected — more useful than the first DNS record.
+    let resolved_ip = Some(addr.ip().to_string());
 
     // TLS handshake sub-probe was removed because the only ecosystem option
     // for a raw timed handshake on an already-open socket (tokio-rustls 0.24 +

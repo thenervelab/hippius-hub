@@ -426,7 +426,12 @@ def get_oci_bearer_token(
             # Backward compatibility
             headers["Authorization"] = f"Bearer {effective_token}"
 
-    resp = _http.client().get(auth_url, headers=headers, timeout=DEFAULT_HTTP_TIMEOUT)
+    # Retry transient blips (audit L3): the token endpoint is hit up front for every
+    # operation, so a 503/429 here aborts even operations whose data plane would
+    # have retried. Auth is idempotent, so retrying is safe.
+    resp = _http.request_with_retry(
+        lambda: _http.client().get(auth_url, headers=headers, timeout=DEFAULT_HTTP_TIMEOUT)
+    )
     resp.raise_for_status()
     fresh_token = resp.json().get("token")
 

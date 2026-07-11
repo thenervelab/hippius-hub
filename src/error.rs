@@ -128,6 +128,18 @@ pub enum CoreError {
     /// diagnosable message.
     #[error("integrity check failed: {0}")]
     Integrity(String),
+
+    /// The request-body write stalled: reqwest stopped pulling body bytes for
+    /// longer than the upload write-stall window while the body was not yet fully
+    /// sent. This is an application-level watchdog on the *upload* write path
+    /// (audit H1) covering a gap reqwest cannot: the peer completed TCP+TLS (so
+    /// `connect_timeout` passed) and keeps the connection alive at the TCP layer
+    /// (so `tcp_keepalive` never fires) but stopped draining the socket, for which
+    /// reqwest has no per-operation timeout. The `Duration` is the observed idle
+    /// gap. Retryable — a fresh attempt to a healthy replica (a rolling redeploy
+    /// or a dead backend behind a live load balancer) is expected to succeed.
+    #[error("upload write stalled: no progress for {0:?}")]
+    Stall(std::time::Duration),
 }
 
 impl CoreError {
@@ -171,8 +183,10 @@ impl CoreError {
     #[must_use]
     pub fn is_retryable(&self) -> bool {
         match self {
-            // Network/transport errors are retryable.
-            CoreError::Reqwest(_) | CoreError::Io(_) => true,
+            // Network/transport errors are retryable, and so is an upload
+            // write-stall (audit H1) — the watchdog aborts a socket the peer
+            // stopped draining; a fresh attempt to a healthy replica succeeds.
+            CoreError::Reqwest(_) | CoreError::Io(_) | CoreError::Stall(_) => true,
             // 5xx server errors are retryable, plus the two retryable 4xx
             // (408 Request Timeout, 429 Too Many Requests). Everything else
             // 4xx is permanent. `(500..600).contains(status)` operates on
@@ -270,6 +284,14 @@ mod tests {
     // The `#[from] io::Error` derive provides this conversion; the
     // test pins the wiring so a refactor that swapped the variant
     // for a manual `From` impl with the wrong arm would fail loudly.
+    // An upload write-stall (audit H1) must classify retryable so the upload
+    // retry loop re-attempts against a healthy replica rather than surfacing the
+    // watchdog abort as terminal.
+    #[test]
+    fn stall_is_retryable() {
+        assert!(CoreError::Stall(std::time::Duration::from_secs(30)).is_retryable());
+    }
+
     #[test]
     fn from_io_error_routes_to_io_variant() {
         let io_err = std::io::Error::other("test");

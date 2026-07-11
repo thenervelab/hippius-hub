@@ -13,7 +13,7 @@ mod diagnostics;
 mod retry;
 mod uploader;
 
-use chunk_fetcher::{PackAssembler, PackChunkTarget, PackPlanEntry};
+use chunk_fetcher::{PackAssembler, PackChunkTarget, PackPlanEntry, TransportTimeouts};
 use chunked_downloader::ChunkedDownloader;
 
 /// Render a `CoreError` (plus its full `source()` chain) as a single
@@ -89,7 +89,11 @@ fn shared_runtime() -> &'static tokio::runtime::Runtime {
 /// Releases the Python GIL across the blocking I/O via `py.detach`
 /// so other Python threads can make progress during the download.
 #[pyfunction]
-#[pyo3(signature = (url, dest_path, auth_token=None, chunk_size=None, verify_hash=true, content_length=None))]
+#[pyo3(signature = (url, dest_path, auth_token=None, chunk_size=None, verify_hash=true, content_length=None, connect_timeout_secs=None, read_timeout_secs=None))]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "each parameter is a distinct Python-supplied download argument; the two timeouts are resolved in constants.py and threaded here (audit L9) — bundling would add a wrapper type for no call-site clarity"
+)]
 fn download_file_native(
     py: Python<'_>,
     url: String,
@@ -98,6 +102,8 @@ fn download_file_native(
     chunk_size: Option<u64>,
     verify_hash: bool,
     content_length: Option<u64>,
+    connect_timeout_secs: Option<u64>,
+    read_timeout_secs: Option<u64>,
 ) -> PyResult<Option<String>> {
     // Audit L6 (Phase 3.12): `Option<String>` instead of `String` for the
     // hash result. pyo3 0.20's blanket `IntoPy` impl on `Option<T>` maps
@@ -119,8 +125,14 @@ fn download_file_native(
     // clones the shared download client rather than constructing a fresh one —
     // happens inside the closure so client access never holds the GIL, matching
     // download_packs_native (where PackAssembler::new already runs detached).
+    // Timeouts resolved in Python (constants.resolve_connect_timeout /
+    // resolve_read_timeout) so `HIPPIUS_CONNECT_TIMEOUT` / `HIPPIUS_READ_TIMEOUT`
+    // reach real transfers, not just the diagnose probe (audit L9). `None` keeps
+    // the crate default (30s each). `TransportTimeouts` is `Copy`.
+    let timeouts = TransportTimeouts::from_secs(connect_timeout_secs, read_timeout_secs);
+
     py.detach(|| {
-        let downloader = ChunkedDownloader::new(url, auth_token, chunk_size, content_length)
+        let downloader = ChunkedDownloader::new(url, auth_token, chunk_size, content_length, timeouts)
             .map_err(|e| core_err_to_py(&e))?;
         rt.block_on(async { downloader.download(&dest, verify_hash).await })
             .map_err(|e| core_err_to_py(&e))
@@ -334,7 +346,7 @@ fn pack_upload_native(
 /// # GIL
 /// Releases the GIL across the blocking transfer via `py.detach`.
 #[pyfunction]
-#[pyo3(signature = (pack_urls, pack_sizes, pack_chunks, dest_path, total_size, file_digest=None, auth_token=None, max_concurrent=None))]
+#[pyo3(signature = (pack_urls, pack_sizes, pack_chunks, dest_path, total_size, file_digest=None, auth_token=None, max_concurrent=None, connect_timeout_secs=None, read_timeout_secs=None))]
 #[expect(
     clippy::needless_pass_by_value,
     reason = "pyo3 #[pyfunction] requires owned values to extract from Python args"
@@ -353,6 +365,8 @@ fn download_packs_native(
     file_digest: Option<String>,
     auth_token: Option<String>,
     max_concurrent: Option<usize>,
+    connect_timeout_secs: Option<u64>,
+    read_timeout_secs: Option<u64>,
 ) -> PyResult<Option<String>> {
     if pack_urls.len() != pack_sizes.len() || pack_urls.len() != pack_chunks.len() {
         return Err(PyValueError::new_err(format!(
@@ -379,9 +393,12 @@ fn download_packs_native(
     let rt = shared_runtime();
     let dest = PathBuf::from(dest_path);
     let concurrency = max_concurrent.unwrap_or(32).max(1);
+    // See `download_file_native`: env-resolved timeouts threaded to the shared
+    // download client (audit L9); `None` keeps the 30s crate defaults.
+    let timeouts = TransportTimeouts::from_secs(connect_timeout_secs, read_timeout_secs);
 
     py.detach(|| {
-        let assembler = PackAssembler::new(auth_token, concurrency).map_err(|e| core_err_to_py(&e))?;
+        let assembler = PackAssembler::new(auth_token, concurrency, timeouts).map_err(|e| core_err_to_py(&e))?;
         rt.block_on(async {
             assembler
                 .assemble(&dest, &packs, file_digest.as_deref(), total_size)

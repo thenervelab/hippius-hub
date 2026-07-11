@@ -1,13 +1,16 @@
 use bytes::Bytes;
 use fastcdc::v2020::StreamCDC;
-use futures::stream::StreamExt;
+use futures::stream::{Stream, StreamExt};
 use indicatif::{ProgressBar, ProgressStyle};
 use reqwest::{Client, header};
 use sha2::{Digest, Sha256};
 use std::io::SeekFrom;
 use std::path::Path;
-use std::sync::OnceLock;
-use std::time::Duration;
+use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
+use std::task::{Context, Poll};
+use std::time::{Duration, Instant};
 use tokio::fs::File;
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use tokio_util::codec::{BytesCodec, FramedRead};
@@ -19,6 +22,12 @@ use crate::error::CoreError;
 /// M-UPLOAD-CONNECT). Kept local rather than re-exported so the two clients stay
 /// independently tunable.
 const CONNECT_TIMEOUT_SECS: u64 = 30;
+
+/// Read-buffer size for `hash_file_async` (audit L16). Matches
+/// `chunk_fetcher`/`chunked_downloader`'s `VERIFY_READ_BUFFER` (8 MiB): the
+/// previous 64 KiB buffer did ~128x more `read(2)` syscalls (~82k vs ~640 for a
+/// 5 GiB blob) for no benefit — the hash is bandwidth-bound, not latency-bound.
+const HASH_READ_BUFFER: usize = 8 * 1024 * 1024;
 
 /// Per-chunk `(sha256_hex, offset, length)` in file order — the plan a chunked
 /// upload works from (offset re-reads the range; digest dedups and addresses).
@@ -116,7 +125,7 @@ pub async fn hash_file_async(path: &Path) -> Result<(String, u64), CoreError> {
     tokio::task::spawn_blocking(move || -> Result<(String, u64), CoreError> {
         let mut file = std::fs::File::open(&path)?;
         let mut hasher = Sha256::new();
-        let mut buffer = vec![0u8; 64 * 1024]; // 64 KB chunks
+        let mut buffer = vec![0u8; HASH_READ_BUFFER];
         let mut total_size = 0u64;
 
         loop {
@@ -141,6 +150,35 @@ pub async fn hash_file_async(path: &Path) -> Result<(String, u64), CoreError> {
 /// and the same [`CoreError::is_retryable`] classifier — see
 /// `try_upload_blob_once` for the per-attempt body.
 const UPLOAD_MAX_RETRIES: u32 = 3;
+
+/// Upload write-stall watchdog window (audit H1). If reqwest stops pulling body
+/// bytes for this long while the body is NOT yet fully sent, the send is aborted
+/// with a retryable [`CoreError::Stall`]. Gating on "body not yet fully sent"
+/// means a legitimately slow blob-commit RESPONSE (`JuiceFS` backpressure can make
+/// a commit take many seconds) never trips it — the watchdog guards only the
+/// write phase, which reqwest itself offers no per-operation timeout for.
+const WRITE_STALL_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Poll cadence for the write-stall watchdog. One second keeps the abort latency
+/// bounded without measurable overhead against a multi-GB streamed body.
+const WRITE_STALL_CHECK: Duration = Duration::from_secs(1);
+
+/// Total budget for the zero-body pack upload-init POST (audit H1). Init only
+/// allocates an upload session and returns a `Location`; it has no legitimate
+/// slow path, so a tight total timeout turns a hung/black-holed registry into a
+/// retryable error instead of blocking `try_pack_upload_once` forever — which
+/// (via the shared `_pack_upload_gate`) would otherwise wedge the whole folder
+/// upload. Unlike the streamed PUT body, a `.timeout()` here can't clip an honest
+/// transfer because there is no body to stream.
+const INIT_POST_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Frame size the in-memory pack PUT body is sliced into before streaming (audit
+/// H1). The write-stall watchdog re-stamps its progress clock only when reqwest
+/// pulls the next body frame, so a single 64 `MiB` frame would read as idle for the
+/// whole write and false-trip `Stall` against a slow-but-progressing peer. 1 `MiB`
+/// frames re-stamp often enough that only a genuinely stalled socket trips the
+/// watchdog, and the slices are cheap `Bytes` views (a refcount bump, not a copy).
+const PUT_FRAME_BYTES: usize = 1024 * 1024;
 
 /// Stream-upload a file to the OCI URL returned by /blobs/uploads/ (the PUT-with-digest finalises the blob).
 /// Shows a per-call progress bar — useful for large blobs (multi-GB).
@@ -237,6 +275,124 @@ pub(crate) fn upload_client() -> Result<&'static Client, CoreError> {
     Ok(CLIENT.get_or_init(|| built))
 }
 
+/// Milliseconds since `base`, saturating a u128→u64 cast that only overflows
+/// after ~584 million years of uptime — keeps clippy's truncation lint satisfied
+/// without an `unwrap`.
+fn elapsed_ms(base: Instant) -> u64 {
+    u64::try_from(base.elapsed().as_millis()).unwrap_or(u64::MAX)
+}
+
+/// Stream adapter that flips `done` to `true` the instant the inner stream is
+/// exhausted (`poll_next` → `Ready(None)`).
+///
+/// This is the "body fully sent" signal for the write-stall watchdog. reqwest
+/// polls the body to EOF exactly when it has taken every byte, so EOF is the only
+/// reliable end-of-write marker — a pre-stream `metadata().len()` can diverge from
+/// the streamed length (the TOCTOU the U2 chunked-encoding design deliberately
+/// tolerates: the file may be rewritten between stat and stream). Keying `done`
+/// off a byte count against that stat either false-tripped a `Stall` on a
+/// fully-sent shorter body or disarmed the watchdog early on a longer one.
+///
+/// The inner stream is boxed-pinned so the adapter is `Unpin` regardless of the
+/// inner stream's pinning, letting `poll_next` project without `unsafe`.
+struct DoneOnEof<S> {
+    inner: Pin<Box<S>>,
+    done: Arc<AtomicBool>,
+}
+
+impl<S> DoneOnEof<S> {
+    fn new(inner: S, done: Arc<AtomicBool>) -> Self {
+        Self { inner: Box::pin(inner), done }
+    }
+}
+
+impl<S: Stream> Stream for DoneOnEof<S> {
+    type Item = S::Item;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<S::Item>> {
+        // `Self: Unpin` (boxed inner + `Arc`), so `get_mut` is safe.
+        let this = self.get_mut();
+        let polled = this.inner.as_mut().poll_next(cx);
+        if let Poll::Ready(None) = &polled {
+            this.done.store(true, Ordering::Relaxed);
+        }
+        polled
+    }
+}
+
+/// Send a chunked-encoded PUT of `body_stream`, aborting with a retryable
+/// [`CoreError::Stall`] if reqwest stops pulling body frames for `write_stall` —
+/// i.e. a peer that completed the handshake then stopped draining the socket, the
+/// H1 wedge that `connect_timeout`/`tcp_keepalive` cannot see and reqwest offers
+/// no per-operation write timeout for.
+///
+/// Shared by the whole-file ([`put_streaming`]) and pack ([`try_pack_upload_once`])
+/// PUT paths so both get the same protection. `done` is driven off the body stream
+/// reaching end-of-input (see [`DoneOnEof`]), so the write phase is guarded while a
+/// legitimately slow blob-commit RESPONSE (`JuiceFS` backpressure) never trips it,
+/// correct even when the streamed length diverges from any earlier stat.
+///
+/// Atomics (not a lock) so the body-stamping closure never holds a guard across
+/// reqwest's `.await` and the watchdog's reads are wait-free; `Relaxed` is enough
+/// because the watchdog only needs to eventually observe the latest stamp, not a
+/// happens-before edge (no data is published through the flags).
+async fn send_put_watchdogged<S>(
+    url: &str,
+    body_stream: S,
+    auth_token: Option<&str>,
+    write_stall: Duration,
+) -> Result<reqwest::Response, CoreError>
+where
+    S: Stream<Item = Result<Bytes, std::io::Error>> + Send + 'static,
+{
+    let client = upload_client()?;
+
+    let base = Instant::now();
+    let last_ms = Arc::new(AtomicU64::new(elapsed_ms(base)));
+    let done = Arc::new(AtomicBool::new(false));
+
+    // Stamp the progress clock every time reqwest pulls a frame (= the socket
+    // accepted the prior bytes); `DoneOnEof` sets `done` when the body is drained.
+    let lm = Arc::clone(&last_ms);
+    let stamped = body_stream.map(move |frame| {
+        if frame.is_ok() {
+            lm.store(elapsed_ms(base), Ordering::Relaxed);
+        }
+        frame
+    });
+    let body = reqwest::Body::wrap_stream(DoneOnEof::new(stamped, Arc::clone(&done)));
+
+    let mut req = client
+        .put(url)
+        .header(header::CONTENT_TYPE, "application/octet-stream")
+        .body(body);
+    if let Some(token) = auth_token {
+        req = req.bearer_auth(token);
+    }
+
+    // Drive the send, aborting if the body WRITE stalls (audit H1). Dropping the
+    // send future on a stall (the `return` below) cancels the reqwest request and
+    // severs the socket the peer stopped draining. select! polls the pinned send
+    // future and re-arms a 1s timer each round; the timer branch checks idle time
+    // only while `done` is false, so the response-wait phase is never tripped.
+    let send_fut = req.send();
+    tokio::pin!(send_fut);
+    let stall_ms = u64::try_from(write_stall.as_millis()).unwrap_or(u64::MAX);
+    loop {
+        tokio::select! {
+            r = &mut send_fut => return Ok(r?),
+            () = tokio::time::sleep(WRITE_STALL_CHECK) => {
+                if !done.load(Ordering::Relaxed) {
+                    let idle = elapsed_ms(base).saturating_sub(last_ms.load(Ordering::Relaxed));
+                    if idle >= stall_ms {
+                        return Err(CoreError::Stall(Duration::from_millis(idle)));
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// Stream `reader` to `url` as a chunked-encoded PUT body, ticking a progress
 /// bar sized `pb_total`. Shared by the whole-file and byte-range upload paths.
 ///
@@ -244,19 +400,20 @@ pub(crate) fn upload_client() -> Result<&'static Client, CoreError> {
 /// for a `wrap_stream` body, so the wire length matches whatever the reader
 /// actually yields — the TOCTOU-safe behaviour audit U2 established for the
 /// whole-file path. For a range upload the reader is a `Take` bounded to the
-/// chunk length, so the body is exactly that range regardless.
+/// chunk length, so the body is exactly that range regardless. `pb_total` sizes
+/// the progress bar only; it is deliberately NOT used as a "fully sent" signal
+/// (see [`DoneOnEof`]).
 async fn put_streaming<R>(
     url: &str,
     reader: R,
     pb_total: u64,
     basename: &str,
     auth_token: Option<&str>,
+    write_stall: Duration,
 ) -> Result<(), CoreError>
 where
     R: tokio::io::AsyncRead + Send + 'static,
 {
-    let client = upload_client()?;
-
     let pb = ProgressBar::new(pb_total);
     // The template string is a compile-time literal; `indicatif` only errors on
     // malformed format directives, which we control at the call site.
@@ -271,26 +428,29 @@ where
     );
     pb.set_message(format!("📤 {basename}"));
 
-    // Wrap the stream so we tick the progress bar on every body chunk emitted
-    // to reqwest. ProgressBar is Arc-internally → cloning is cheap.
+    // Tick the progress bar on every body frame; the watchdog's write-progress
+    // stamping lives in `send_put_watchdogged`. `freeze()` hands reqwest an
+    // immutable `Bytes` (a move of the `BytesMut` buffer, not a copy). ProgressBar
+    // is Arc-internally → cloning is cheap.
     let pb_stream = pb.clone();
-    let stream = FramedRead::new(reader, BytesCodec::new()).map(move |chunk_result| {
-        if let Ok(ref bytes) = chunk_result {
+    let stream = FramedRead::new(reader, BytesCodec::new()).map(move |frame| {
+        frame.map(|bytes| {
             pb_stream.inc(bytes.len() as u64);
-        }
-        chunk_result
+            bytes.freeze()
+        })
     });
-    let body = reqwest::Body::wrap_stream(stream);
 
-    let mut req = client
-        .put(url)
-        .header(header::CONTENT_TYPE, "application/octet-stream")
-        .body(body);
-    if let Some(token) = auth_token {
-        req = req.bearer_auth(token);
-    }
-
-    let res = req.send().await?;
+    let res = match send_put_watchdogged(url, stream, auth_token, write_stall).await {
+        Ok(res) => res,
+        Err(e) => {
+            let msg = match &e {
+                CoreError::Stall(_) => format!("❌ {basename} stalled"),
+                _ => format!("❌ {basename} failed"),
+            };
+            pb.finish_with_message(msg);
+            return Err(e);
+        }
+    };
     if !res.status().is_success() {
         pb.finish_with_message(format!("❌ {basename} failed"));
         return Err(CoreError::ServerError(
@@ -316,7 +476,7 @@ async fn try_upload_blob_once(
     // Size is for the progress bar only — see put_streaming on why it is not a
     // Content-Length.
     let file_size = file.metadata().await?.len();
-    put_streaming(url, file, file_size, &basename_of(path), auth_token).await
+    put_streaming(url, file, file_size, &basename_of(path), auth_token, WRITE_STALL_TIMEOUT).await
 }
 
 /// Read the given file byte-ranges in order into one pack blob and push it via a
@@ -386,7 +546,12 @@ async fn try_pack_upload_once(
     auth_token: Option<&str>,
 ) -> Result<(), CoreError> {
     let client = upload_client()?;
-    let mut init = client.post(uploads_url).header(header::CONTENT_LENGTH, "0");
+    let mut init = client
+        .post(uploads_url)
+        .header(header::CONTENT_LENGTH, "0")
+        // Bound the zero-body init POST (audit H1): a hung registry here would
+        // otherwise block this pack upload forever and drain the shared gate.
+        .timeout(INIT_POST_TIMEOUT);
     if let Some(token) = auth_token {
         init = init.bearer_auth(token);
     }
@@ -412,14 +577,15 @@ async fn try_pack_upload_once(
     put_url.push(if put_url.contains('?') { '&' } else { '?' });
     put_url.push_str("digest=");
     put_url.push_str(digest);
-    let mut put = client
-        .put(put_url)
-        .header(header::CONTENT_TYPE, "application/octet-stream")
-        .body(body.clone());
-    if let Some(token) = auth_token {
-        put = put.bearer_auth(token);
-    }
-    let put_resp = put.send().await?;
+    // Route the pack PUT through the same write-stall watchdog as the whole-file
+    // path (audit H1). The bare `put.send().await` here previously left the pack
+    // PUT — the wedge point behind the shared `_pack_upload_gate` — unprotected
+    // against a peer that completes the (now bounded) init POST then stops draining
+    // the body mid-write. Framing the in-memory buffer lets the watchdog re-stamp
+    // as the socket accepts each frame (see `PUT_FRAME_BYTES`).
+    let frames = pack_frames(body);
+    let body_stream = futures::stream::iter(frames.into_iter().map(Ok::<Bytes, std::io::Error>));
+    let put_resp = send_put_watchdogged(&put_url, body_stream, auth_token, WRITE_STALL_TIMEOUT).await?;
     if !put_resp.status().is_success() {
         return Err(CoreError::ServerError(
             put_resp.status().as_u16(),
@@ -427,6 +593,30 @@ async fn try_pack_upload_once(
         ));
     }
     Ok(())
+}
+
+/// Slice an in-memory pack into `PUT_FRAME_BYTES`-sized body frames for the
+/// watchdogged PUT. Each frame is a cheap `Bytes` view over the shared buffer (a
+/// refcount bump, not a copy); framing keeps the write-stall watchdog re-stamping
+/// as the peer drains rather than reading a single large frame as idle.
+fn pack_frames(body: &Bytes) -> Vec<Bytes> {
+    frame_bytes(body, PUT_FRAME_BYTES)
+}
+
+/// Partition `body` into `≤frame`-sized cheap `Bytes` views (refcount slices, no
+/// copy). Split out from [`pack_frames`] so the partition invariant (lossless,
+/// bounded frame size) is property-testable with a small frame without allocating
+/// multi-`MiB` fixtures. `frame` is floored at 1 so a `0` never spins the loop.
+fn frame_bytes(body: &Bytes, frame: usize) -> Vec<Bytes> {
+    let frame = frame.max(1);
+    let mut frames = Vec::with_capacity(body.len().div_ceil(frame).max(1));
+    let mut start = 0usize;
+    while start < body.len() {
+        let end = (start + frame).min(body.len());
+        frames.push(body.slice(start..end));
+        start = end;
+    }
+    frames
 }
 
 #[cfg(test)]
@@ -583,6 +773,7 @@ mod cdc_tests {
 #[cfg(test)]
 mod tests {
     use super::CoreError;
+    use bytes::Bytes;
 
     /// Source-grep guard. Setting `Content-Length` on a streaming PUT
     /// re-introduces the TOCTOU race fixed in audit U2: between
@@ -609,6 +800,194 @@ mod tests {
             "uploader.rs must NOT set the Content-Length header on the streaming PUT \
              — that creates a TOCTOU race vs the file's actual size at stream time"
         );
+    }
+
+    #[tokio::test]
+    async fn put_streaming_aborts_on_write_stall() {
+        // Audit H1: a peer that completes TCP+TLS, reads the request head, then
+        // STOPS draining the socket (zero-window) is invisible to `connect_timeout`
+        // and `tcp_keepalive`, and reqwest has no per-op write timeout — so without
+        // the write-stall watchdog the streamed PUT hangs forever (wedging the
+        // folder upload via the shared gate). Serve exactly that stall and assert a
+        // retryable `Stall` returns within the window.
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+        let Ok(listener) = TcpListener::bind("127.0.0.1:0").await else { return };
+        let Ok(addr) = listener.local_addr() else { return };
+        let server = tokio::spawn(async move {
+            if let Ok((mut sock, _)) = listener.accept().await {
+                // Read only the request head + first bytes, then stall: never drain
+                // the rest, so the client's send buffer fills and reqwest stops
+                // pulling the body. Hold the socket open; send no response.
+                let mut buf = [0u8; 4096];
+                let _ = sock.read(&mut buf).await;
+                tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                let _ = sock.shutdown().await;
+            }
+        });
+
+        let url = format!("http://{addr}/blob");
+        // 8 MiB body far exceeds the OS send buffer, so reqwest keeps pulling then
+        // stalls; write_stall = 1s keeps the test fast (trips within ~2 checks).
+        let total: u64 = 8 * 1024 * 1024;
+        let reader = tokio::io::repeat(0u8).take(total);
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(8),
+            super::put_streaming(&url, reader, total, "stalltest", None, std::time::Duration::from_secs(1)),
+        )
+        .await;
+        server.abort();
+        assert!(
+            matches!(outcome, Ok(Err(CoreError::Stall(_)))),
+            "a stalled body write must abort via the watchdog as a retryable Stall, got {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn done_on_eof_flips_on_exhaustion() {
+        // The core of the H1 watchdog fix: `done` must flip on the stream reaching
+        // EOF, NOT on any byte threshold. The old code set `done` from
+        // `sent >= pb_total`, which stayed false forever when the streamed length
+        // undershot a pre-stat total (a truncated file), false-tripping `Stall`.
+        use super::DoneOnEof;
+        use futures::StreamExt;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let Ok(rt) = tokio::runtime::Builder::new_current_thread().enable_all().build() else {
+            unreachable!("current-thread runtime builds")
+        };
+        let done = Arc::new(AtomicBool::new(false));
+        let frames = vec![
+            Ok::<Bytes, std::io::Error>(Bytes::from_static(b"ab")),
+            Ok(Bytes::from_static(b"c")),
+        ];
+        let mut s = DoneOnEof::new(futures::stream::iter(frames), Arc::clone(&done));
+        rt.block_on(async {
+            assert!(!done.load(Ordering::Relaxed), "done must start false");
+            assert!(s.next().await.is_some());
+            assert!(!done.load(Ordering::Relaxed), "done must stay false mid-stream");
+            assert!(s.next().await.is_some());
+            assert!(!done.load(Ordering::Relaxed), "done must stay false until EOF");
+            assert!(s.next().await.is_none(), "stream must exhaust");
+            assert!(done.load(Ordering::Relaxed), "done must flip true on EOF");
+        });
+    }
+
+    #[tokio::test]
+    async fn put_streaming_tolerates_short_body_with_slow_response() {
+        // Audit H1 regression: `done` is driven by the body stream reaching EOF, NOT
+        // by `pb_total`. The reader yields FEWER bytes than `pb_total` (as if the
+        // file were truncated between stat and stream — the U2 TOCTOU), and the
+        // server drains the whole body then delays its response past the write-stall
+        // window. A byte-count `done` would stay false and false-trip `Stall` on a
+        // fully-sent upload; the EOF-driven `done` suppresses it and tolerates the
+        // slow (JuiceFS-backpressure-shaped) commit response.
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+        let Ok(listener) = TcpListener::bind("127.0.0.1:0").await else { return };
+        let Ok(addr) = listener.local_addr() else { return };
+        let server = tokio::spawn(async move {
+            if let Ok((mut sock, _)) = listener.accept().await {
+                // Read until the chunked body terminator (`0\r\n\r\n`), then delay the
+                // response past the 1s write-stall window before a 200. The body is
+                // all 0x00 bytes, so the ASCII '0'+CRLFCRLF terminator can't collide
+                // with body content or a chunk-size line's trailing byte.
+                let mut acc: Vec<u8> = Vec::new();
+                let mut buf = [0u8; 8192];
+                loop {
+                    match sock.read(&mut buf).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => {
+                            acc.extend_from_slice(&buf[..n]);
+                            if acc.windows(5).any(|w| w == b"0\r\n\r\n") {
+                                break;
+                            }
+                        }
+                    }
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                let _ = sock.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n").await;
+                let _ = sock.shutdown().await;
+            }
+        });
+
+        let url = format!("http://{addr}/blob");
+        // Body is 64 KiB but pb_total claims ~10 MiB more — the divergence the fix
+        // must tolerate. write_stall = 1s < the server's 2s response delay.
+        let actual: u64 = 64 * 1024;
+        let pb_total: u64 = actual + 10 * 1024 * 1024;
+        let reader = tokio::io::repeat(0u8).take(actual);
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(8),
+            super::put_streaming(&url, reader, pb_total, "shortbody", None, std::time::Duration::from_secs(1)),
+        )
+        .await;
+        server.abort();
+        assert!(
+            matches!(outcome, Ok(Ok(()))),
+            "a fully-sent body shorter than pb_total, then a slow response, must NOT trip the watchdog; got {outcome:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn pack_put_stall_aborts_via_shared_watchdog() {
+        // Audit H1: the pack PUT now routes through `send_put_watchdogged` (was a
+        // bare `send().await` with no stall protection). Drive that helper with a
+        // framed in-memory body against a peer that reads the head then stops
+        // draining, and assert the shared watchdog aborts with a retryable `Stall` —
+        // the protection the chunked-write pack path previously lacked.
+        use tokio::io::AsyncReadExt;
+        use tokio::net::TcpListener;
+        let Ok(listener) = TcpListener::bind("127.0.0.1:0").await else { return };
+        let Ok(addr) = listener.local_addr() else { return };
+        let server = tokio::spawn(async move {
+            if let Ok((mut sock, _)) = listener.accept().await {
+                let mut buf = [0u8; 4096];
+                let _ = sock.read(&mut buf).await;
+                tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+            }
+        });
+
+        let url = format!("http://{addr}/v2/blobs/uploads/x?digest=sha256:deadbeef");
+        // 8 MiB pack → many 1 MiB frames; far exceeds the OS send buffer so reqwest
+        // stalls mid-write. write_stall = 1s keeps the test fast.
+        let body = Bytes::from(vec![0u8; 8 * 1024 * 1024]);
+        let frames = super::pack_frames(&body);
+        let body_stream = futures::stream::iter(frames.into_iter().map(Ok::<Bytes, std::io::Error>));
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(8),
+            super::send_put_watchdogged(&url, body_stream, None, std::time::Duration::from_secs(1)),
+        )
+        .await;
+        server.abort();
+        assert!(
+            matches!(outcome, Ok(Err(CoreError::Stall(_)))),
+            "a stalled pack PUT must abort via the shared watchdog as a retryable Stall, got {outcome:?}"
+        );
+    }
+
+    proptest::proptest! {
+        // `frame_bytes` must be a lossless partition: concatenating the frames
+        // reproduces the original bytes exactly, and every frame is within the size
+        // bound (so the watchdog re-stamps at least every `frame` bytes). A small
+        // frame over small data exercises the multi-frame path without multi-MiB
+        // fixtures.
+        #[test]
+        fn frame_bytes_partitions_losslessly(
+            data in proptest::collection::vec(proptest::prelude::any::<u8>(), 0..4096usize),
+            frame in 1usize..=64,
+        ) {
+            let body = Bytes::from(data.clone());
+            let frames = super::frame_bytes(&body, frame);
+            let mut rejoined: Vec<u8> = Vec::with_capacity(data.len());
+            for f in &frames {
+                proptest::prop_assert!(f.len() <= frame, "frame {} exceeds bound {}", f.len(), frame);
+                proptest::prop_assert!(!f.is_empty(), "no empty frames");
+                rejoined.extend_from_slice(f);
+            }
+            proptest::prop_assert_eq!(rejoined, data);
+        }
     }
 
     // Audit U3 (Phase 3.11): pin the retry classification at the

@@ -187,10 +187,18 @@ def _maybe_docker_login(host: str, user: str, secret: str, *, auto: bool):
         print("    hippius-hub's own auth is set up; only `docker push`/`pull` will be unavailable.")
         print(f"    Run manually if you install docker later: docker login {host} -u '{user}' -p '...'")
         return
-    p = subprocess.run(
-        ["docker", "login", host, "-u", user, "--password-stdin"],
-        input=secret.encode(), capture_output=True,
-    )
+    try:
+        p = subprocess.run(
+            ["docker", "login", host, "-u", user, "--password-stdin"],
+            input=secret.encode(), capture_output=True,
+            # Bound a wedged docker daemon (audit L8): hippius auth is already saved
+            # above, so a hung `docker login` must not block the CLI indefinitely.
+            timeout=60,
+        )
+    except subprocess.TimeoutExpired:
+        print("⚠️  docker login timed out (docker daemon unresponsive) — hippius auth "
+              "is already saved; run `docker login` manually if you need docker push/pull.")
+        return
     if p.returncode == 0:
         print(f"✅ docker login {host} OK")
     else:
@@ -462,7 +470,7 @@ def cmd_models_list(args):
     print(f"Found {total} model(s):")
     for m in res.get("results", []):
         own = " [mine]" if m.get("is_mine") else (" [public]" if m.get("is_public") else "")
-        print(f"  {m['project']}/{m['repo']:30} {m.get('format'):12} "
+        print(f"  {m['project']}/{m['repo']:30} {(m.get('format') or '—'):12} "
               f"arch={m.get('architecture') or '—':10} params={_fmt_params(m.get('parameter_count')):>7}  "
               f"quant={m.get('quantization') or '—':6}  size={_fmt_bytes(m.get('total_size_bytes')):>9}{own}")
 
@@ -488,7 +496,7 @@ def cmd_models_show(args):
         print(f"  Digest:   {res.get('digest')}")
         print("  Files:")
         for f in res.get("files", []):
-            print(f"    {f['filename']:40} {f['format']:12} {_fmt_bytes(f['size_bytes'])}")
+            print(f"    {f['filename']:40} {(f.get('format') or '—'):12} {_fmt_bytes(f['size_bytes'])}")
         print(f"\n  pull: {res.get('pull_command')}")
     else:
         res = console.model_repo(project, repo)

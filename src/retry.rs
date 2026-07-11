@@ -43,7 +43,15 @@ pub(crate) fn backoff_delay(attempt: u32) -> Duration {
 /// against a zero cap (unreachable for `attempt >= 1`, but defends the primitive).
 fn jittered_backoff(attempt: u32, entropy: u64) -> Duration {
     let cap_ms = BACKOFF_BASE_MS.saturating_mul(2u64.saturating_pow(attempt));
-    Duration::from_millis(entropy % cap_ms.max(1))
+    // Reduce in NANOSECONDS, not milliseconds (audit L4). `entropy` is a
+    // `subsec_nanos()` value, and a clock with >=1us realtime resolution only
+    // ever yields multiples of 1000 ns. `entropy % cap_ms` — with `cap_ms`
+    // always a multiple of 200 — then reduced every attempt-1 draw to 0,
+    // collapsing full jitter into the lockstep retry storm it exists to
+    // prevent. Scaling the cap to nanoseconds keeps the identical [0, cap)
+    // magnitude while restoring per-call spread across the whole range.
+    let cap_ns = cap_ms.saturating_mul(1_000_000);
+    Duration::from_nanos(entropy % cap_ns.max(1))
 }
 
 #[cfg(test)]
@@ -56,8 +64,10 @@ mod tests {
         // The jitter upper bound must equal the old deterministic sleep so the
         // worst-case backoff is unchanged: 200/400/800/1600 ms for attempts 1..=4.
         for (attempt, cap) in [(1u32, 200u64), (2, 400), (3, 800), (4, 1600)] {
-            // entropy == cap-1 yields the largest in-range draw.
-            let d = jittered_backoff(attempt, cap - 1);
+            // entropy == cap_ns-1 yields the largest in-range draw (the reduction
+            // is in nanoseconds — see `jittered_backoff`), and it must stay
+            // strictly below the ms cap.
+            let d = jittered_backoff(attempt, cap * 1_000_000 - 1);
             assert!(d < Duration::from_millis(cap), "attempt {attempt} exceeded cap {cap}");
             assert_eq!(BACKOFF_BASE_MS * 2u64.pow(attempt), cap);
         }
@@ -67,6 +77,29 @@ mod tests {
     fn extreme_attempt_does_not_panic() {
         // A pathological attempt count must saturate, not overflow the shift.
         let _ = jittered_backoff(1000, u64::MAX);
+    }
+
+    #[test]
+    fn jitter_spreads_on_microsecond_resolution_clock() {
+        // Regression (audit L4): the entropy source is `subsec_nanos()`, but a
+        // clock with 1µs realtime resolution (macOS — a shipped/CI target)
+        // always yields a multiple of 1000 ns. The old `entropy % cap_ms` with
+        // cap_ms a multiple of 200 reduced every attempt-1 draw to 0, collapsing
+        // full jitter into the lockstep retry storm it exists to prevent. The
+        // reduction must happen in nanoseconds so a µs-quantized clock still
+        // spreads across the cap.
+        use std::collections::BTreeSet;
+        let delays: BTreeSet<Duration> = (1u64..=1000)
+            .map(|micros| jittered_backoff(1, micros * 1_000)) // µs-quantized nanos
+            .collect();
+        assert!(
+            delays.len() > 1,
+            "attempt-1 jitter collapsed to {} distinct value(s) on a µs-resolution clock",
+            delays.len()
+        );
+        // ...while still never exceeding the attempt's cap (200 ms for attempt 1).
+        let cap = Duration::from_millis(BACKOFF_BASE_MS * 2);
+        assert!(delays.iter().all(|d| *d < cap), "a jittered draw exceeded the cap");
     }
 
     proptest::proptest! {

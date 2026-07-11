@@ -114,7 +114,13 @@ pub struct ChunkedDownloader {
 
 impl ChunkedDownloader {
     /// Construct a new concurrent downloader.
-    pub fn new(url: String, auth_token: Option<String>, chunk_size_bytes: Option<u64>, content_length: Option<u64>) -> Result<Self, CoreError> {
+    pub fn new(
+        url: String,
+        auth_token: Option<String>,
+        chunk_size_bytes: Option<u64>,
+        content_length: Option<u64>,
+        timeouts: crate::chunk_fetcher::TransportTimeouts,
+    ) -> Result<Self, CoreError> {
         // Clone the process-global download client (shared with the pack path)
         // rather than building a fresh client + empty pool per file, so connections
         // stay warm across back-to-back downloads. It is HTTP/1-only for the same
@@ -122,7 +128,7 @@ impl ChunkedDownloader {
         // and caps aggregate throughput at the per-connection ceiling, whereas h1
         // lets each parallel chunk get its own TCP and fan out across the available
         // bandwidth. See `chunk_fetcher::download_client`.
-        let client = crate::chunk_fetcher::download_client()?.clone();
+        let client = crate::chunk_fetcher::download_client(timeouts)?.clone();
         Ok(Self {
             client,
             url,
@@ -190,7 +196,10 @@ impl ChunkedDownloader {
                 .open(dest_path)
                 .await?;
             f.set_len(content_length).await?;
-            f.sync_all().await?; // Ensure the size is persisted before parallel writes
+            // No `sync_all` (audit L15): the parallel chunk writers see the
+            // `set_len` size through the page cache without forcing metadata to
+            // disk. It only bought crash durability of the pre-allocation, which is
+            // discarded anyway — a crash re-downloads (the dest opens `truncate`).
         }
 
         let dest_path_buf = dest_path.to_path_buf();
@@ -244,7 +253,7 @@ impl ChunkedDownloader {
                     Ok(p) => p,
                     Err(e) => return (i, Err(CoreError::Io(std::io::Error::other(e)))),
                 };
-                let res = download_chunk_with_retry(client, url, token, start, end, i, path, chunk_pb).await;
+                let res = download_chunk_with_retry(client, url, token, start, end, content_length, i, path, chunk_pb).await;
                 (i, res)
             });
             // `abort_handle()` clones the cooperative-cancel signal; the original
@@ -425,6 +434,7 @@ async fn download_chunk_with_retry(
     token: Option<String>,
     start: u64,
     end: u64,
+    content_length: u64,
     _chunk_index: usize,
     dest_path: std::path::PathBuf,
     pb: ProgressBar,
@@ -432,7 +442,7 @@ async fn download_chunk_with_retry(
     let mut retries = 0;
 
     loop {
-        match try_download_chunk_to_offset(&client, &url, token.as_deref(), start, end, &dest_path, &pb).await {
+        match try_download_chunk_to_offset(&client, &url, token.as_deref(), start, end, content_length, &dest_path, &pb).await {
             Ok(()) => return Ok(()),
             Err(e) => {
                 retries += 1;
@@ -452,24 +462,69 @@ async fn download_chunk_with_retry(
     }
 }
 
+/// Parse a `Content-Range: bytes START-END/TOTAL` (or `.../*`) value into its
+/// `(start, end)` byte bounds. Returns `None` for anything that is not a
+/// well-formed byte range — wrong unit, missing `-` or `/`, or non-numeric
+/// bounds. The TOTAL is intentionally not validated (a proxy may legitimately
+/// send `*`); only the offsets matter for the alignment check below.
+fn parse_content_range(value: &str) -> Option<(u64, u64)> {
+    let range = value.trim().strip_prefix("bytes ")?.split('/').next()?;
+    let (start, end) = range.split_once('-')?;
+    Some((start.trim().parse().ok()?, end.trim().parse().ok()?))
+}
+
+/// Reject a 206 whose `Content-Range` does not cover exactly `bytes={start}-{end}`
+/// (audit L1). A range-aliasing edge/proxy can return a length-correct 206 for the
+/// WRONG offset; the chunk write then `seek(start)`s and lands the misplaced bytes,
+/// and with hash verification off (the default) the corrupt file is cached forever
+/// under the trusted content digest. A 206 MUST carry a matching `Content-Range`
+/// (RFC 9110 §15.3.7), so an absent, unparsable, or mismatched header is treated as
+/// a retryable anomaly (`Io`) that re-fetches rather than a silent write.
+fn require_content_range_matches(
+    headers: &reqwest::header::HeaderMap,
+    start: u64,
+    end: u64,
+) -> Result<(), CoreError> {
+    let raw = headers
+        .get(reqwest::header::CONTENT_RANGE)
+        .and_then(|v| v.to_str().ok());
+    if raw.and_then(parse_content_range) == Some((start, end)) {
+        return Ok(());
+    }
+    Err(CoreError::Io(std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        format!(
+            "chunk bytes={start}-{end}: 206 Content-Range {} does not cover the requested range",
+            raw.unwrap_or("<absent>")
+        ),
+    )))
+}
+
 /// Verify that a chunk GET produced exactly HTTP 206 Partial Content.
 ///
-/// Audit D2: previously `try_download_chunk_to_offset` accepted any 2xx
-/// status. A server that ignored the `Range` header would respond with
-/// 200 OK and the FULL body; we would then `seek(start)` and stream that
-/// full body starting at the chunk's offset, overwriting everything past
-/// `end + 1` and producing a silently corrupt file. The diagnostic on
-/// the 200 branch names the ignored range explicitly so the failure mode
-/// is unambiguous in logs — distinct from a "server returned the wrong
-/// bytes" error a caller might otherwise assume.
-fn require_partial_content(
+/// Audit D2: a server that ignores `Range` and returns 200 + the FULL body would,
+/// if `seek(start)`-written, overwrite everything past `end + 1` and corrupt the
+/// file — so a 200 is rejected, its diagnostic naming the ignored range (distinct
+/// from a "wrong bytes" error). This rejects a 200 even for a single-chunk
+/// whole-file request.
+///
+/// Audit L5: the one accepted 200 is a single-chunk small-file download whose
+/// range covers the WHOLE object (`start == 0 && end == content_length - 1`) — a
+/// `200 OK` with the full body is then RFC 9110 §15.3.7-legal and correct (the
+/// over-length write guard already bounds a stray full body). A multi-chunk
+/// download that got a range-ignored 200 still fails loudly, because its range is
+/// not the whole object. A 200 carries no `Content-Range`, so the caller runs
+/// [`require_content_range_matches`] only for a 206.
+fn require_acceptable_status(
     status: reqwest::StatusCode,
     start: u64,
     end: u64,
+    content_length: u64,
 ) -> Result<(), CoreError> {
     use reqwest::StatusCode;
     match status {
         StatusCode::PARTIAL_CONTENT => Ok(()),
+        StatusCode::OK if start == 0 && content_length > 0 && end == content_length - 1 => Ok(()),
         StatusCode::OK => Err(CoreError::ServerError(
             status.as_u16(),
             format!(
@@ -488,12 +543,17 @@ fn require_partial_content(
 /// (already pre-allocated). Each task opens its own file handle, seeks to its
 /// offset, and writes bytes as they arrive from the HTTP stream.
 /// Parallel writes to disjoint ranges are safe.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "each argument is a distinct per-chunk download input; content_length is needed for the whole-file-200 check (audit L5), matching download_chunk_with_retry's own expect"
+)]
 async fn try_download_chunk_to_offset(
     client: &Client,
     url: &str,
     token: Option<&str>,
     start: u64,
     end: u64,
+    content_length: u64,
     dest_path: &Path,
     pb: &ProgressBar,
 ) -> Result<(), CoreError> {
@@ -517,7 +577,15 @@ async fn try_download_chunk_to_offset(
 
     let mut res = req.send().await?;
 
-    require_partial_content(res.status(), start, end)?;
+    let status = res.status();
+    require_acceptable_status(status, start, end, content_length)?;
+    // Audit L1: a 206 must cover exactly the requested range — a range-aliasing
+    // proxy can return a length-correct 206 for the WRONG offset, silently
+    // corrupting the file. A whole-file 200 (audit L5) carries no Content-Range,
+    // so validate it only for a 206.
+    if status == reqwest::StatusCode::PARTIAL_CONTENT {
+        require_content_range_matches(res.headers(), start, end)?;
+    }
 
     // Open this task's own handle on the pre-allocated final file, seek to start.
     let mut file = OpenOptions::new()
@@ -573,8 +641,8 @@ async fn try_download_chunk_to_offset(
     // stays as the file's pre-allocated `set_len` zeros: a silently truncated file
     // cached forever under the trusted content digest. An OVER-length body (bounded
     // above) is likewise anomalous. Both surface as a retryable `CoreError::Io` so a
-    // transient anomaly re-fetches before failing hard. `require_partial_content`
-    // already rejects the 200-instead-of-206 case; these close the short/long-206
+    // transient anomaly re-fetches before failing hard. `require_acceptable_status`
+    // already rejects a range-ignored 200; these close the short/long-206
     // cases it cannot see.
     if over_range {
         return Err(CoreError::Io(std::io::Error::new(
@@ -847,19 +915,27 @@ mod partial_content_tests {
 
     #[test]
     fn accepts_206() {
-        assert!(require_partial_content(StatusCode::PARTIAL_CONTENT, 0, 99).is_ok());
+        assert!(require_acceptable_status(StatusCode::PARTIAL_CONTENT, 0, 99, 100).is_ok());
     }
 
-    // The diagnostic on the 200 branch is load-bearing: it is the only signal
-    // distinguishing "server ignored Range" from "server returned wrong bytes".
-    // `let ... else { unreachable!() }` is used instead of `.unwrap_err()` /
-    // `panic!()` because the project denies `unwrap_used` and `panic`
-    // cluster-wide; the test still fails clearly if the helper accepts 200.
+    // Audit L5: a 200 OK is accepted ONLY when the request covers the whole object
+    // (a single-chunk small-file download) — the full body written at offset 0 is
+    // then correct and RFC 9110 §15.3.7-legal.
     #[test]
-    fn rejects_200_with_diagnostic() {
-        let result = require_partial_content(StatusCode::OK, 0, 99);
-        let Err(err) = result else {
-            unreachable!("require_partial_content must reject 200 OK")
+    fn accepts_whole_file_200() {
+        assert!(require_acceptable_status(StatusCode::OK, 0, 99, 100).is_ok());
+    }
+
+    // A range-ignored 200 on a MULTI-chunk download (the range is not the whole
+    // object) still fails loudly, and the diagnostic names the ignored range — the
+    // only signal distinguishing "server ignored Range" from "wrong bytes".
+    // `let ... else { unreachable!() }` instead of `.unwrap_err()`/`panic!()`
+    // because the project denies `unwrap_used` and `panic` cluster-wide.
+    #[test]
+    fn rejects_range_ignored_200_with_diagnostic() {
+        // range 0-99 of a 1000-byte object is NOT the whole file → must reject.
+        let Err(err) = require_acceptable_status(StatusCode::OK, 0, 99, 1000) else {
+            unreachable!("a non-whole-file 200 must be rejected")
         };
         let msg = format!("{err:?}");
         assert!(
@@ -870,8 +946,56 @@ mod partial_content_tests {
 
     #[test]
     fn rejects_other_4xx_5xx() {
-        assert!(require_partial_content(StatusCode::NOT_FOUND, 0, 99).is_err());
-        assert!(require_partial_content(StatusCode::INTERNAL_SERVER_ERROR, 0, 99).is_err());
+        assert!(require_acceptable_status(StatusCode::NOT_FOUND, 0, 99, 100).is_err());
+        assert!(require_acceptable_status(StatusCode::INTERNAL_SERVER_ERROR, 0, 99, 100).is_err());
+    }
+
+    fn cr_headers(value: &str) -> reqwest::header::HeaderMap {
+        let mut h = reqwest::header::HeaderMap::new();
+        // Test values are ASCII, so `from_str` succeeds; `if let` avoids a denied
+        // `unwrap` while leaving the map empty on the (unreachable) error path.
+        if let Ok(v) = reqwest::header::HeaderValue::from_str(value) {
+            h.insert(reqwest::header::CONTENT_RANGE, v);
+        }
+        h
+    }
+
+    // Audit L1: the 206 Content-Range must cover exactly the requested bytes.
+    #[test]
+    fn content_range_matching_is_accepted() {
+        assert!(require_content_range_matches(&cr_headers("bytes 100-199/500"), 100, 199).is_ok());
+    }
+
+    #[test]
+    fn content_range_wrong_offset_is_rejected() {
+        // Length-correct (100 bytes) but offset-wrong (0- not 100-): the exact
+        // silent-corruption case L1 defends against.
+        assert!(require_content_range_matches(&cr_headers("bytes 0-99/500"), 100, 199).is_err());
+    }
+
+    #[test]
+    fn content_range_absent_is_rejected() {
+        assert!(require_content_range_matches(&reqwest::header::HeaderMap::new(), 0, 99).is_err());
+    }
+
+    #[test]
+    fn parse_content_range_reads_bounds() {
+        assert_eq!(parse_content_range("bytes 5-17/42"), Some((5, 17)));
+        assert_eq!(parse_content_range("bytes 0-0/*"), Some((0, 0)));
+        assert_eq!(parse_content_range("bogus"), None);
+        assert_eq!(parse_content_range("bytes 5/42"), None);
+    }
+
+    proptest::proptest! {
+        // Round-trip: any (start, end) formatted as a byte Content-Range parses
+        // back to the same bounds, so the parser agrees with the wire format the
+        // alignment check relies on — for offsets a hand-picked fixture would miss.
+        #[test]
+        fn parse_content_range_round_trips(start in 0u64.., extra in 0u64..) {
+            let end = start.saturating_add(extra);
+            let header = format!("bytes {start}-{end}/{}", end.saturating_add(1));
+            proptest::prop_assert_eq!(parse_content_range(&header), Some((start, end)));
+        }
     }
 }
 
@@ -940,10 +1064,10 @@ mod short_206_tests {
         // byte-count guard must surface a retryable Io error instead of leaving the
         // chunk's tail as pre-allocated zeros.
         let Some(base) = serve_short_206(100, 50).await.ok() else { return };
-        let Ok(client) = crate::chunk_fetcher::download_client() else { return };
+        let Ok(client) = crate::chunk_fetcher::download_client(crate::chunk_fetcher::TransportTimeouts::default()) else { return };
         let Some(dest) = prealloc(100).await else { return };
         let pb = ProgressBar::hidden();
-        let res = try_download_chunk_to_offset(client, &format!("{base}/blob"), None, 0, 99, &dest, &pb).await;
+        let res = try_download_chunk_to_offset(client, &format!("{base}/blob"), None, 0, 99, 100, &dest, &pb).await;
         let _ = std::fs::remove_file(&dest);
         assert!(
             matches!(res, Err(CoreError::Io(_))),
@@ -956,10 +1080,10 @@ mod short_206_tests {
         // Control: a 206 whose body fills the requested range must succeed, so the
         // guard rejects only genuine short reads.
         let Some(base) = serve_short_206(100, 100).await.ok() else { return };
-        let Ok(client) = crate::chunk_fetcher::download_client() else { return };
+        let Ok(client) = crate::chunk_fetcher::download_client(crate::chunk_fetcher::TransportTimeouts::default()) else { return };
         let Some(dest) = prealloc(100).await else { return };
         let pb = ProgressBar::hidden();
-        let res = try_download_chunk_to_offset(client, &format!("{base}/blob"), None, 0, 99, &dest, &pb).await;
+        let res = try_download_chunk_to_offset(client, &format!("{base}/blob"), None, 0, 99, 100, &dest, &pb).await;
         let _ = std::fs::remove_file(&dest);
         assert!(res.is_ok(), "full-length 206 must be accepted, got {res:?}");
     }
@@ -971,10 +1095,10 @@ mod short_206_tests {
         // must stay the pre-allocated zeros, not the surplus — and the over-send must
         // surface as an error rather than a silent cross-chunk corruption.
         let Some(base) = serve_short_206(100, 150).await.ok() else { return };
-        let Ok(client) = crate::chunk_fetcher::download_client() else { return };
+        let Ok(client) = crate::chunk_fetcher::download_client(crate::chunk_fetcher::TransportTimeouts::default()) else { return };
         let Some(dest) = prealloc(200).await else { return };
         let pb = ProgressBar::hidden();
-        let res = try_download_chunk_to_offset(client, &format!("{base}/blob"), None, 0, 99, &dest, &pb).await;
+        let res = try_download_chunk_to_offset(client, &format!("{base}/blob"), None, 0, 99, 100, &dest, &pb).await;
         let tail_is_zero = std::fs::read(&dest)
             .is_ok_and(|b| b.len() == 200 && b[100..].iter().all(|&x| x == 0));
         let _ = std::fs::remove_file(&dest);

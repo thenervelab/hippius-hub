@@ -67,17 +67,80 @@ const DOWNLOAD_POOL_MAX_IDLE: usize = 32;
 /// `Result` rather than `expect`-ing inside a `get_or_init` closure — the crate
 /// denies `panic`/`unwrap`. On an init race the loser's freshly built client is
 /// dropped unused (RAII); `OnceLock` is valid in statics and never poisoned.
-pub(crate) fn download_client() -> Result<&'static Client, CoreError> {
+/// Connect + read timeouts for the shared download client. Resolved in Python
+/// (`constants.resolve_connect_timeout` / `resolve_read_timeout`) and threaded
+/// down so `HIPPIUS_CONNECT_TIMEOUT` / `HIPPIUS_READ_TIMEOUT` reach real
+/// transfers, not only `hippius-hub diagnose` (audit L9). `connect` bounds the
+/// handshake; `read` is a *stalled-read* bound (reset on each successful read).
+///
+/// `read` is `Option` and defaults to `None` (no client-level read timeout) on
+/// purpose: with `None` the shared download client is byte-for-byte the
+/// pre-audit client, so plumbing the env knobs (L9) changes no default behavior.
+/// A client-level `.read_timeout()` is a *global* setting on the one process-wide
+/// download client shared by every concurrent chunk, so we make it opt-in
+/// (`HIPPIUS_READ_TIMEOUT`) rather than flip it on for all transfers here. The
+/// default-on download stall guard (audit M4) is deferred to an app-level
+/// idle-timeout on the chunk body stream — scoped per chunk, not a global client
+/// setting — see the audit remediation plan.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct TransportTimeouts {
+    pub connect: Duration,
+    pub read: Option<Duration>,
+}
+
+impl Default for TransportTimeouts {
+    fn default() -> Self {
+        Self {
+            connect: Duration::from_secs(CONNECT_TIMEOUT_SECS),
+            read: None,
+        }
+    }
+}
+
+impl TransportTimeouts {
+    /// Build from optional per-operation seconds; `None` keeps the field default
+    /// (`connect` -> 30s, `read` -> no client read timeout). Non-positive values
+    /// are unrepresentable — Python's `_resolve_positive_int` rejects them first.
+    pub(crate) fn from_secs(connect: Option<u64>, read: Option<u64>) -> Self {
+        let d = Self::default();
+        Self {
+            connect: connect.map_or(d.connect, Duration::from_secs),
+            read: read.map(Duration::from_secs),
+        }
+    }
+}
+
+/// Pure client builder, split from `download_client` so a test can assert the
+/// read-timeout behavior on a fresh client without racing the process-global
+/// singleton (whose first caller fixes its config for the whole process).
+fn build_download_client(timeouts: TransportTimeouts) -> Result<Client, CoreError> {
+    let mut builder = Client::builder()
+        .connect_timeout(timeouts.connect)
+        .http1_only()
+        .pool_max_idle_per_host(DOWNLOAD_POOL_MAX_IDLE)
+        .tcp_keepalive(Duration::from_secs(30));
+    if let Some(read) = timeouts.read {
+        // Opt-in only (see `TransportTimeouts`): fires on a stalled read (no byte
+        // within the window, reset on each successful read), bounding a peer that
+        // handshakes then dribbles/stops mid-body — which `connect_timeout` and
+        // `tcp_keepalive` cannot see and the per-chunk 5-min total `.timeout()`
+        // only catches after 5 minutes (audit M4).
+        builder = builder.read_timeout(read);
+    }
+    Ok(builder.build()?)
+}
+
+pub(crate) fn download_client(timeouts: TransportTimeouts) -> Result<&'static Client, CoreError> {
     static CLIENT: OnceLock<Client> = OnceLock::new();
     if let Some(client) = CLIENT.get() {
         return Ok(client);
     }
-    let built = Client::builder()
-        .connect_timeout(Duration::from_secs(CONNECT_TIMEOUT_SECS))
-        .http1_only()
-        .pool_max_idle_per_host(DOWNLOAD_POOL_MAX_IDLE)
-        .tcp_keepalive(Duration::from_secs(30))
-        .build()?;
+    // First-caller-wins (like `global_pack_gate`): the process-global client is
+    // built once with the first download's resolved timeouts. Every file in a
+    // snapshot passes the same env-derived values, so the winner is representative;
+    // a later differing value is ignored — the documented tradeoff of one shared
+    // pool. The loser of an init race drops its freshly built client (RAII).
+    let built = build_download_client(timeouts)?;
     Ok(CLIENT.get_or_init(|| built))
 }
 
@@ -143,11 +206,15 @@ impl PackAssembler {
     /// Clones the shared process-global `download_client` (warm pool across files);
     /// the semaphore in `assemble` — not the client's fixed idle pool — is the real
     /// concurrency bound. Fallible only on the client's first-time build.
-    pub fn new(auth_token: Option<String>, max_concurrent: usize) -> Result<Self, CoreError> {
+    pub fn new(
+        auth_token: Option<String>,
+        max_concurrent: usize,
+        timeouts: TransportTimeouts,
+    ) -> Result<Self, CoreError> {
         // Clone the process-global client (an Arc-backed handle sharing one pool)
         // instead of building a fresh client + empty pool per file. `max_concurrent`
         // still bounds real concurrency via the `Semaphore` in `assemble`.
-        let client = download_client()?.clone();
+        let client = download_client(timeouts)?.clone();
         Ok(Self { client, auth_token, max_concurrent: max_concurrent.max(1) })
     }
 
@@ -172,7 +239,11 @@ impl PackAssembler {
                 .open(dest)
                 .await?;
             f.set_len(total_size).await?;
-            f.sync_all().await?;
+            // No `sync_all` (audit L15): the parallel chunk writers and the
+            // incremental hasher see the `set_len` size through the page cache
+            // without forcing metadata to disk. `sync_all` only bought crash
+            // durability of the pre-allocation, which is discarded anyway — a crash
+            // re-downloads the whole file (the dest always opens with `truncate`).
         }
 
         let pb = ProgressBar::new(total_size);
@@ -389,11 +460,28 @@ async fn fetch_pack(
     if let Some(t) = token {
         req = req.bearer_auth(t);
     }
-    let res = req.send().await?;
+    let mut res = req.send().await?;
     if !res.status().is_success() {
         return Err(CoreError::ServerError(res.status().as_u16(), format!("pack GET failed for {url}")));
     }
-    let bytes = res.bytes().await?;
+    // Audit L12: read the body under a running cap instead of `res.bytes()`, which
+    // buffers an unbounded body BEFORE the length check — a chunked (no
+    // Content-Length) response from a misbehaving/compromised registry could
+    // balloon memory well past the intended ~pack_size ceiling (x32 concurrent
+    // packs) before rejection. Abort the moment the accumulated body exceeds
+    // `pack_size`, so peak memory stays bounded to one pack.
+    let cap = usize::try_from(pack_size).unwrap_or(usize::MAX);
+    let mut bytes: Vec<u8> = Vec::with_capacity(cap);
+    let mut received: u64 = 0;
+    while let Some(chunk) = res.chunk().await? {
+        received = received.saturating_add(chunk.len() as u64);
+        if received > pack_size {
+            return Err(CoreError::Integrity(format!(
+                "pack {url}: body exceeds expected {pack_size} bytes (over-send)"
+            )));
+        }
+        bytes.extend_from_slice(&chunk);
+    }
     if bytes.len() as u64 != pack_size {
         return Err(CoreError::Integrity(format!(
             "pack {url}: expected {pack_size} bytes, got {}",
@@ -548,8 +636,55 @@ mod tests {
     // usable client (constructor is the only fallible setup step).
     #[test]
     fn assembler_new_builds() {
-        let a = PackAssembler::new(Some("tok".into()), 16);
+        let a = PackAssembler::new(Some("tok".into()), 16, TransportTimeouts::default());
         assert!(a.is_ok());
+    }
+
+    #[tokio::test]
+    async fn read_timeout_aborts_a_stalled_response_body() {
+        // Audit M4: a peer that completes the handshake, sends response headers +
+        // a few body bytes, then goes silent (an application-layer stall
+        // `connect_timeout`/`tcp_keepalive` cannot see) must be cut by the client's
+        // `read_timeout`. Without it the body read hangs until the caller's 5-min
+        // total timeout; the download plane's whole point is to fail fast and retry.
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+        let Ok(listener) = TcpListener::bind("127.0.0.1:0").await else { return };
+        let Ok(addr) = listener.local_addr() else { return };
+        let server = tokio::spawn(async move {
+            if let Ok((mut sock, _)) = listener.accept().await {
+                let mut buf = [0u8; 1024];
+                let _ = sock.read(&mut buf).await; // consume the request line/headers
+                // Promise 1_000_000 bytes, deliver 8, then stall without closing.
+                let _ = sock
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 1000000\r\n\r\nabcdefgh")
+                    .await;
+                let _ = sock.flush().await;
+                tokio::time::sleep(Duration::from_secs(30)).await;
+            }
+        });
+
+        let Ok(client) = build_download_client(TransportTimeouts {
+            connect: Duration::from_secs(5),
+            read: Some(Duration::from_secs(1)),
+        }) else {
+            server.abort();
+            return;
+        };
+        let url = format!("http://{addr}/blob");
+        // `Ok(Err(_))` = the inner future finished with a reqwest error (read_timeout
+        // fired — correct). `Err(_)` = the test's own 8s bound elapsed, i.e. the read
+        // hung because `read_timeout` was NOT honored (the regression this guards).
+        let outcome = tokio::time::timeout(Duration::from_secs(8), async {
+            let resp = client.get(&url).send().await?;
+            resp.bytes().await
+        })
+        .await;
+        server.abort();
+        assert!(
+            matches!(outcome, Ok(Err(_))),
+            "a stalled body read must abort via read_timeout, got {outcome:?}"
+        );
     }
 
     // --- incremental_hash ---
@@ -885,6 +1020,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn fetch_pack_rejects_over_length_body() {
+        // Audit L12: a body larger than the declared pack_size must be rejected
+        // under a running cap, not buffered whole. Serve 2000 bytes but declare
+        // pack_size=1000 — the over-send guard trips before the carve.
+        let mut routes = HashMap::new();
+        routes.insert("/pack".to_string(), vec![9u8; 2000]);
+        let Some(base) = serve_packs(routes).await.ok() else { return };
+        let Ok(client) = download_client(TransportTimeouts::default()) else { return };
+        let pb = ProgressBar::hidden();
+        let dest = scratch_path("l12_overlen");
+        let _g = TempFileGuard(dest.clone());
+        let res = fetch_pack(client, &format!("{base}/pack"), None, 1000, &[], &dest, &pb).await;
+        assert!(
+            matches!(res, Err(CoreError::Integrity(ref m)) if m.contains("over-send")),
+            "an over-length pack body must be rejected (bounded), got {res:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn assemble_reconstructs_scattered_packs_and_verifies() {
         let content = pattern(3000);
         let pack_a = [&content[0..1000], &content[2000..3000]].concat();
@@ -895,7 +1049,7 @@ mod tests {
         let Some(base) = serve_packs(routes).await.ok() else { return };
         let dest = scratch_path("asm_ok");
         let _g = TempFileGuard(dest.clone());
-        let Some(assembler) = PackAssembler::new(None, 4).ok() else { return };
+        let Some(assembler) = PackAssembler::new(None, 4, TransportTimeouts::default()).ok() else { return };
         let packs = three_pack_plan(&base, &content);
         // Timeout-guarded: a channel-lifecycle regression (e.g. dropping `drop(hash_tx)`)
         // would hang the hasher's recv forever, surfacing here as a failure not a hang.
@@ -919,7 +1073,7 @@ mod tests {
         let Some(base) = serve_packs(routes).await.ok() else { return };
         let dest = scratch_path("asm_bad");
         let _g = TempFileGuard(dest.clone());
-        let Some(assembler) = PackAssembler::new(None, 4).ok() else { return };
+        let Some(assembler) = PackAssembler::new(None, 4, TransportTimeouts::default()).ok() else { return };
         let packs = three_pack_plan(&base, &content);
         // The bytes assemble correctly, but the declared whole-file digest disagrees:
         // the cross-pack ordering check must reject with Integrity.
