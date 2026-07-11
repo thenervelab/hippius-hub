@@ -63,16 +63,14 @@ def _ensure_blob_uploaded(
     if check.status_code == 200:
         return False
 
-    init_headers = {**headers, "Content-Length": "0"}
-    init = httpx.post(f"{registry}/v2/{repo_id}/blobs/uploads/", headers=init_headers, timeout=DEFAULT_HTTP_TIMEOUT)
-    init.raise_for_status()
-    location = init.headers.get("Location")
-    if not location:
-        raise ValueError("Registry did not return a Location header for upload initiation")
-    if location.startswith("/"):
-        location = f"{registry}{location}"
-    sep = "&" if "?" in location else "?"
-    upload_blob_native(f"{location}{sep}digest={digest}", file_path, oci_token)
+    # The session init (POST /blobs/uploads/) + streaming PUT both run in Rust
+    # (`upload_blob_native`) so that each retry attempt starts a FRESH upload
+    # session. Doing the POST once here and only retrying the PUT was the bug
+    # behind production "upload resumed at wrong offset" / blob-upload-invalid
+    # failures: a mid-stream disconnect left the session at a nonzero offset, and
+    # the retry's offset-0 PUT was rejected. Rust re-POSTs per attempt instead.
+    uploads_url = f"{registry}/v2/{repo_id}/blobs/uploads/"
+    upload_blob_native(uploads_url, digest, file_path, oci_token)
     return True
 
 

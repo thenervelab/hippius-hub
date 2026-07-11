@@ -87,16 +87,29 @@ def test_oci_call_with_garbage_token_fails(tmp_path, monkeypatch, test_repo):
     src = tmp_path / "garbage-auth.bin"
     src.write_bytes(b"x")
 
-    with pytest.raises(httpx.HTTPStatusError) as excinfo:
+    # The bogus token is refused at one of two layers, both of which count as
+    # "auth is actually evaluated":
+    #   - the token endpoint refuses push scope -> httpx.HTTPStatusError(401)
+    #     raised by get_oci_bearer_token; or
+    #   - it issues a no-perm token and the registry rejects the blob-upload
+    #     session-init (or PUT), which the native uploader surfaces as a
+    #     RuntimeError carrying the status (401/403). The session-init POST
+    #     lives in Rust now — see `_ensure_blob_uploaded` — so this arm is a
+    #     RuntimeError, not an httpx error.
+    with pytest.raises((httpx.HTTPStatusError, RuntimeError)) as excinfo:
         upload_file(
             path_or_fileobj=str(src),
             path_in_repo="garbage-auth.bin",
             repo_id=test_repo,
             revision=f"garbage-{uuid.uuid4().hex[:8]}",
         )
-    # 401 from the token endpoint (refused push scope) or 403 if the token
-    # service issues a no-perm token and the registry rejects the PUT.
-    assert excinfo.value.response.status_code in (401, 403)
+    exc = excinfo.value
+    if isinstance(exc, httpx.HTTPStatusError):
+        assert exc.response.status_code in (401, 403)
+    else:
+        assert "401" in str(exc) or "403" in str(exc), (
+            f"native uploader must surface the auth status, got: {exc}"
+        )
 
 
 # ---------- role enforcement ----------
