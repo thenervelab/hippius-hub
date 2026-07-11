@@ -26,7 +26,7 @@ from tqdm import tqdm
 from . import _http
 from ._oci import fetch_manifest, group_files, layer_title, parse_pointer_v2
 from ._packing import plan_packs, pointer_v2_bytes, resolve_pointer_chunks
-from .auth import call_with_oci_token_refresh, get_oci_bearer_token
+from .auth import call_with_oci_token_refresh
 from .constants import (
     ARTIFACT_TYPE_CHUNKED_V2,
     CHUNK_COUNT_KEY,
@@ -62,12 +62,6 @@ except ImportError:
 
 
 # ---- helpers ----
-
-def _oci_bearer(repo_id: str, token, push: bool = True, endpoint=None) -> str:
-    # Token resolution + the off-origin credential guard happen inside
-    # get_oci_bearer_token, which mints from `resolve_registry(endpoint)`.
-    return get_oci_bearer_token(repo_id, token, push=push, endpoint=endpoint)
-
 
 def _empty_config_blob_descriptor() -> tuple:
     data = b"{}"
@@ -981,71 +975,82 @@ def upload_folder(
 
     oci_repo = _oci_repo_path(repo_id, repo_type)
     registry = resolve_registry(endpoint)
-    oci_token = _oci_bearer(oci_repo, token, push=True, endpoint=endpoint)
 
-    # Build the chunked-v2 dedup index ONCE from the prior revision (as upload_file
-    # does) so every large file in the folder references chunks already stored
-    # instead of re-packing and re-uploading them. Read-only and taken before the
-    # fan-out; _finalize_upload_manifest re-fetches for the merge + If-Match, so
-    # this does not widen that write's read-modify-write window. Only built under
-    # HIPPIUS_CHUNKED_WRITE — plain uploads dedup per-blob via HEAD.
-    dedup_index: Dict[str, tuple] = {}
-    pack_sizes: Dict[str, int] = {}
-    if resolve_chunked_write_enabled():
-        # Only build the dedup index (a manifest GET + N pointer-blob GETs) when at
-        # least one file will actually be chunked (audit L10) — otherwise a folder
-        # of only-small files pays ~2N+1 wasted round-trips before the first byte,
-        # for a plain-path upload that never consults the index. Mirrors upload_file.
-        threshold = resolve_chunk_threshold()
-        if any(os.path.getsize(os.path.join(base_dir, rel)) >= threshold for rel in filtered):
-            prior = fetch_manifest(registry, oci_repo, revision, oci_token, missing_ok=True)
-            dedup_index, pack_sizes = _build_dedup_index(prior, registry, oci_repo, oci_token)
+    # Refresh the OCI token and retry once on a 401 (audit M2), mirroring upload_file:
+    # one token minted up front is shared across every worker for the whole folder's
+    # wall-clock time, so a large/slow folder can outlive the token's TTL and every
+    # worker then 401s. On a 401 the fan-out re-runs with a fresh token; blob pushes
+    # are idempotent (content-addressed HEAD-dedup skips what already landed) and the
+    # manifest PUT is deferred until all files succeed, so a re-run re-HEADs the
+    # completed blobs and re-commits rather than re-uploading. Folder workers read
+    # files from disk by path, so there is no stream-reconsumption hazard.
+    def _op(oci_token):
+        # Build the chunked-v2 dedup index ONCE from the prior revision (as upload_file
+        # does) so every large file in the folder references chunks already stored
+        # instead of re-packing and re-uploading them. Read-only and taken before the
+        # fan-out; _finalize_upload_manifest re-fetches for the merge + If-Match, so
+        # this does not widen that write's read-modify-write window. Only built under
+        # HIPPIUS_CHUNKED_WRITE — plain uploads dedup per-blob via HEAD.
+        dedup_index: Dict[str, tuple] = {}
+        pack_sizes: Dict[str, int] = {}
+        if resolve_chunked_write_enabled():
+            # Only build the dedup index (a manifest GET + N pointer-blob GETs) when at
+            # least one file will actually be chunked (audit L10) — otherwise a folder
+            # of only-small files pays ~2N+1 wasted round-trips before the first byte,
+            # for a plain-path upload that never consults the index. Mirrors upload_file.
+            threshold = resolve_chunk_threshold()
+            if any(os.path.getsize(os.path.join(base_dir, rel)) >= threshold for rel in filtered):
+                prior = fetch_manifest(registry, oci_repo, revision, oci_token, missing_ok=True)
+                dedup_index, pack_sizes = _build_dedup_index(prior, registry, oci_repo, oci_token)
 
-    new_layers = []
-    if filtered:
-        print(f"📦 Preparing to upload {len(filtered)} file(s) to {repo_id}:{revision}...")
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            futures = [
-                executor.submit(
-                    _upload_one_file,
-                    rel_path=rel,
-                    base_dir=base_dir,
-                    path_in_repo=path_in_repo,
-                    registry=registry,
-                    oci_repo=oci_repo,
-                    oci_token=oci_token,
-                    dedup_index=dedup_index,
-                    pack_sizes=pack_sizes,
-                )
-                for rel in filtered
-            ]
-            try:
-                for fut in tqdm(as_completed(futures), total=len(filtered), desc="Uploading", unit="file"):
-                    new_layers.extend(fut.result())
-            except BaseException:
-                # Fail-fast (audit M3): mirror _snapshot_download — drop queued
-                # uploads on the first failure / Ctrl-C. Blob PUTs are idempotent
-                # and the manifest PUT is deferred to after all files succeed, so a
-                # partial run leaves only orphan content-addressed blobs a GC
-                # reclaims — never a bad manifest.
-                executor.shutdown(wait=False, cancel_futures=True)
-                raise
+        new_layers = []
+        if filtered:
+            print(f"📦 Preparing to upload {len(filtered)} file(s) to {repo_id}:{revision}...")
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                futures = [
+                    executor.submit(
+                        _upload_one_file,
+                        rel_path=rel,
+                        base_dir=base_dir,
+                        path_in_repo=path_in_repo,
+                        registry=registry,
+                        oci_repo=oci_repo,
+                        oci_token=oci_token,
+                        dedup_index=dedup_index,
+                        pack_sizes=pack_sizes,
+                    )
+                    for rel in filtered
+                ]
+                try:
+                    for fut in tqdm(as_completed(futures), total=len(filtered), desc="Uploading", unit="file"):
+                        new_layers.extend(fut.result())
+                except BaseException:
+                    # Fail-fast (audit M3): mirror _snapshot_download — drop queued
+                    # uploads on the first failure / Ctrl-C. Blob PUTs are idempotent
+                    # and the manifest PUT is deferred to after all files succeed, so a
+                    # partial run leaves only orphan content-addressed blobs a GC
+                    # reclaims — never a bad manifest. A 401 re-raised here is caught by
+                    # the token-refresh wrapper, which retries the whole fan-out once.
+                    executor.shutdown(wait=False, cancel_futures=True)
+                    raise
 
-    commit_info = _finalize_upload_manifest(
-        registry=registry,
-        oci_repo=oci_repo,
-        oci_token=oci_token,
-        repo_id=repo_id,
-        revision=revision,
-        new_layers=new_layers,
-        delete_patterns=delete_patterns,
-        commit_message=commit_message,
-        commit_description=commit_description,
-    )
-    # Count logical files uploaded, not manifest layers: a chunked file expands
-    # to a pointer + K chunk layers, so len(new_layers) would overcount.
-    print(f"🎉 Successfully pushed {len(filtered)} file(s) to {repo_id}:{revision}")
-    return commit_info
+        commit_info = _finalize_upload_manifest(
+            registry=registry,
+            oci_repo=oci_repo,
+            oci_token=oci_token,
+            repo_id=repo_id,
+            revision=revision,
+            new_layers=new_layers,
+            delete_patterns=delete_patterns,
+            commit_message=commit_message,
+            commit_description=commit_description,
+        )
+        # Count logical files uploaded, not manifest layers: a chunked file expands
+        # to a pointer + K chunk layers, so len(new_layers) would overcount.
+        print(f"🎉 Successfully pushed {len(filtered)} file(s) to {repo_id}:{revision}")
+        return commit_info
+
+    return call_with_oci_token_refresh(oci_repo, token, push=True, endpoint=endpoint, operation=_op)
 
 
 def hippius_hub_upload(
