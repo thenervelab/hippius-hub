@@ -215,6 +215,23 @@ type HasherTask = tokio::task::JoinHandle<Option<String>>;
 /// requested no whole-file digest.
 type IncrementalHash = (Option<Sender<HashSignal>>, Option<HasherTask>);
 
+/// Aborts every held task handle when dropped. Fires on BOTH `assemble`'s
+/// early-return error path AND on cancellation (the whole `assemble` future dropped
+/// when Ctrl-C interrupts the native call — audit M1). Without it, dropping the
+/// `FuturesUnordered`/`Vec<AbortHandle>` would DETACH the spawned pack tasks (a
+/// `JoinHandle` drop detaches, not aborts), leaving them writing to `dest` and
+/// holding the pack gate after the caller moved on — the exact hazard the download
+/// path's `JoinSet` avoids structurally (audit D4/L13).
+struct AbortOnDrop(Vec<AbortHandle>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        for handle in &self.0 {
+            handle.abort();
+        }
+    }
+}
+
 /// One chunk to carve out of a fetched pack: where it sits in the pack, its size,
 /// where it lands in the assembled file, and its content digest (hex, no prefix).
 pub struct PackChunkTarget {
@@ -359,25 +376,27 @@ impl PackAssembler {
             abort_handles.push(handle.abort_handle());
             joins.push(handle);
         }
+        // Abort every pack task when this scope unwinds — on the early-return error
+        // path below AND on cancellation (audit M1): a `_`-prefixed binding keeps the
+        // guard alive to scope end (a bare `_` would drop it immediately). It is
+        // declared after `joins`, so on unwind it drops FIRST and aborts the tasks
+        // before `joins` detaches them.
+        let _abort_guard = AbortOnDrop(abort_handles);
+
         // Drop the original sender so the channel closes once every pack task has
         // finished (each task holds its own clone); that unblocks the hasher task's
-        // final `recv` and lets it finalize (or fall back).
+        // final `recv` and lets it finalize (or fall back). On cancellation the
+        // aborted pack tasks drop their sender clones too, so the channel closes and
+        // the hasher exits rather than leaking.
         drop(hash_tx);
 
         while let Some(res) = joins.next().await {
             match res {
-                Err(join_err) => {
-                    for a in &abort_handles {
-                        a.abort();
-                    }
-                    return Err(CoreError::JoinFailed { index: None, source: join_err });
-                }
-                Ok((i, Err(pack_err))) => {
-                    for a in &abort_handles {
-                        a.abort();
-                    }
-                    return Err(CoreError::ChunkFailed { index: i, source: Box::new(pack_err) });
-                }
+                // On any error we return; `_abort_guard` drops and aborts every
+                // still-running pack task (the old explicit abort loop, now unified
+                // with the cancellation path).
+                Err(join_err) => return Err(CoreError::JoinFailed { index: None, source: join_err }),
+                Ok((i, Err(pack_err))) => return Err(CoreError::ChunkFailed { index: i, source: Box::new(pack_err) }),
                 Ok((_, Ok(()))) => {}
             }
         }

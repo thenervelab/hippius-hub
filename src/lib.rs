@@ -63,6 +63,59 @@ fn shared_runtime() -> &'static tokio::runtime::Runtime {
     pyo3_async_runtimes::tokio::get_runtime()
 }
 
+/// Poll cadence for the Ctrl-C signal check while a native transfer runs (audit M1).
+/// 100 ms keeps the interrupt latency low without measurable overhead against a
+/// multi-minute transfer.
+const SIGNAL_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// Drive `fut` to completion, polling `poll_interrupt` every `interval`; if it
+/// returns `Some(e)`, stop and return `Err(e)`, DROPPING `fut` — which cancels its
+/// in-flight work. Cancellation is structural: the download `JoinSet` and the pack
+/// `AbortOnDrop` guard abort their spawned tasks on drop, and a directly-awaited
+/// streamed send is cancelled by dropping its future.
+///
+/// This is what makes a native transfer interruptible by Ctrl-C (audit M1). The
+/// entry points run inside `py.detach` (GIL released), so `poll_interrupt` briefly
+/// re-`attach`es and calls `check_signals`, which processes a pending `SIGINT` and
+/// returns the `KeyboardInterrupt`. `check_signals` only acts on the interpreter's
+/// MAIN thread — which is where `block_on` drives this loop for a DIRECT native call
+/// (the case that otherwise hangs on Ctrl-C); a fan-out worker thread no-ops the
+/// check and relies on the main thread's own signal handling plus audit M3.
+///
+/// Returns `Ok(fut_output)` on normal completion (the caller maps its inner
+/// `CoreError`) or `Err(e)` on interrupt. Generic over the interrupt type `E` and
+/// the poll closure so it is unit-testable without a live Python interpreter.
+async fn run_interruptible<T, E, F>(
+    fut: F,
+    interval: std::time::Duration,
+    mut poll_interrupt: impl FnMut() -> Option<E>,
+) -> std::result::Result<T, E>
+where
+    F: std::future::Future<Output = T>,
+{
+    tokio::pin!(fut);
+    loop {
+        tokio::select! {
+            // `biased`: poll the work future first each round so a transfer that
+            // finishes on the same tick as the timer wins over a spurious interrupt.
+            biased;
+            output = &mut fut => return Ok(output),
+            () = tokio::time::sleep(interval) => {
+                if let Some(interrupt) = poll_interrupt() {
+                    return Err(interrupt);
+                }
+            }
+        }
+    }
+}
+
+/// The `run_interruptible` poll for the real entry points: briefly re-acquire the
+/// GIL and check for a pending Ctrl-C, yielding the `KeyboardInterrupt` `PyErr` when
+/// one is raised. See `run_interruptible` for why this only fires on the main thread.
+fn poll_ctrl_c() -> Option<PyErr> {
+    Python::attach(|py| py.check_signals().err())
+}
+
 /// Download a file from `url` to `dest_path` using the shared tokio runtime.
 ///
 /// # Arguments
@@ -134,8 +187,16 @@ fn download_file_native(
     py.detach(|| {
         let downloader = ChunkedDownloader::new(url, auth_token, chunk_size, content_length, timeouts)
             .map_err(|e| core_err_to_py(&e))?;
-        rt.block_on(async { downloader.download(&dest, verify_hash).await })
-            .map_err(|e| core_err_to_py(&e))
+        // Interruptible by Ctrl-C (audit M1): on a pending SIGINT the download future
+        // is dropped, whose JoinSet aborts the in-flight chunk tasks.
+        match rt.block_on(run_interruptible(
+            downloader.download(&dest, verify_hash),
+            SIGNAL_POLL_INTERVAL,
+            poll_ctrl_c,
+        )) {
+            Ok(result) => result.map_err(|e| core_err_to_py(&e)),
+            Err(interrupt) => Err(interrupt),
+        }
     })
 }
 
@@ -248,8 +309,16 @@ fn upload_blob_native(
     // owns the POST-init + PUT and re-inits the session per retry (audit L2), so the
     // Python caller passes the `/blobs/uploads/` endpoint + digest, not a pre-PUT URL.
     py.detach(|| {
-        rt.block_on(async { uploader::upload_blob_async(&uploads_url, &dest, &digest, auth_token.as_deref()).await })
-            .map_err(|e| core_err_to_py(&e))
+        // Interruptible by Ctrl-C (audit M1): dropping the upload future on a pending
+        // SIGINT cancels the in-flight streamed send.
+        match rt.block_on(run_interruptible(
+            uploader::upload_blob_async(&uploads_url, &dest, &digest, auth_token.as_deref()),
+            SIGNAL_POLL_INTERVAL,
+            poll_ctrl_c,
+        )) {
+            Ok(result) => result.map_err(|e| core_err_to_py(&e)),
+            Err(interrupt) => Err(interrupt),
+        }
     })
 }
 
@@ -324,10 +393,16 @@ fn pack_upload_native(
     let rt = shared_runtime();
     let dest = PathBuf::from(path);
     py.detach(|| {
-        rt.block_on(async {
-            uploader::pack_upload_async(&uploads_url, &dest, &ranges, auth_token.as_deref()).await
-        })
-        .map_err(|e| core_err_to_py(&e))
+        // Interruptible by Ctrl-C (audit M1): dropping the pack-upload future on a
+        // pending SIGINT cancels the in-flight streamed pack send.
+        match rt.block_on(run_interruptible(
+            uploader::pack_upload_async(&uploads_url, &dest, &ranges, auth_token.as_deref()),
+            SIGNAL_POLL_INTERVAL,
+            poll_ctrl_c,
+        )) {
+            Ok(result) => result.map_err(|e| core_err_to_py(&e)),
+            Err(interrupt) => Err(interrupt),
+        }
     })
 }
 
@@ -402,12 +477,16 @@ fn download_packs_native(
 
     py.detach(|| {
         let assembler = PackAssembler::new(auth_token, concurrency, timeouts).map_err(|e| core_err_to_py(&e))?;
-        rt.block_on(async {
-            assembler
-                .assemble(&dest, &packs, file_digest.as_deref(), total_size)
-                .await
-        })
-        .map_err(|e| core_err_to_py(&e))
+        // Interruptible by Ctrl-C (audit M1): on a pending SIGINT the assemble future
+        // is dropped, whose AbortOnDrop guard aborts the in-flight pack tasks.
+        match rt.block_on(run_interruptible(
+            assembler.assemble(&dest, &packs, file_digest.as_deref(), total_size),
+            SIGNAL_POLL_INTERVAL,
+            poll_ctrl_c,
+        )) {
+            Ok(result) => result.map_err(|e| core_err_to_py(&e)),
+            Err(interrupt) => Err(interrupt),
+        }
     })
 }
 
@@ -447,5 +526,53 @@ mod runtime_tests {
         let a: &'static _ = super::shared_runtime();
         let b: &'static _ = super::shared_runtime();
         assert!(std::ptr::eq(a, b));
+    }
+
+    #[tokio::test]
+    async fn run_interruptible_surfaces_the_interrupt_and_drops_the_future() {
+        // Audit M1: on an interrupt, run_interruptible must return Err AND drop the
+        // work future — dropping is what cancels its in-flight work (the JoinSet /
+        // AbortOnDrop guard abort their tasks, a streamed send is cut). A guard held
+        // across the never-completing await proves the drop happened.
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        struct Guard(Arc<AtomicBool>);
+        impl Drop for Guard {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+
+        let dropped = Arc::new(AtomicBool::new(false));
+        let guard = Guard(Arc::clone(&dropped));
+        let never = async move {
+            let _held = guard;
+            std::future::pending::<()>().await;
+        };
+
+        // Fire the interrupt on the 2nd poll; a short interval keeps the test fast.
+        let mut polls = 0u32;
+        let outcome: std::result::Result<(), &str> = super::run_interruptible(
+            never,
+            std::time::Duration::from_millis(20),
+            || {
+                polls += 1;
+                (polls >= 2).then_some("interrupted")
+            },
+        )
+        .await;
+
+        assert_eq!(outcome, Err("interrupted"), "the interrupt must be surfaced");
+        assert!(dropped.load(Ordering::SeqCst), "the cancelled work future must be dropped");
+    }
+
+    #[tokio::test]
+    async fn run_interruptible_returns_output_when_the_future_finishes_first() {
+        // No pending signal (poll always None) → the work future's own output wins,
+        // so a normal transfer is untouched by the signal poll.
+        let outcome: std::result::Result<i32, &str> =
+            super::run_interruptible(async { 42 }, std::time::Duration::from_millis(20), || None).await;
+        assert_eq!(outcome, Ok(42));
     }
 }
