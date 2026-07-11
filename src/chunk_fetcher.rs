@@ -239,7 +239,11 @@ impl PackAssembler {
                 .open(dest)
                 .await?;
             f.set_len(total_size).await?;
-            f.sync_all().await?;
+            // No `sync_all` (audit L15): the parallel chunk writers and the
+            // incremental hasher see the `set_len` size through the page cache
+            // without forcing metadata to disk. `sync_all` only bought crash
+            // durability of the pre-allocation, which is discarded anyway — a crash
+            // re-downloads the whole file (the dest always opens with `truncate`).
         }
 
         let pb = ProgressBar::new(total_size);
@@ -456,11 +460,28 @@ async fn fetch_pack(
     if let Some(t) = token {
         req = req.bearer_auth(t);
     }
-    let res = req.send().await?;
+    let mut res = req.send().await?;
     if !res.status().is_success() {
         return Err(CoreError::ServerError(res.status().as_u16(), format!("pack GET failed for {url}")));
     }
-    let bytes = res.bytes().await?;
+    // Audit L12: read the body under a running cap instead of `res.bytes()`, which
+    // buffers an unbounded body BEFORE the length check — a chunked (no
+    // Content-Length) response from a misbehaving/compromised registry could
+    // balloon memory well past the intended ~pack_size ceiling (x32 concurrent
+    // packs) before rejection. Abort the moment the accumulated body exceeds
+    // `pack_size`, so peak memory stays bounded to one pack.
+    let cap = usize::try_from(pack_size).unwrap_or(usize::MAX);
+    let mut bytes: Vec<u8> = Vec::with_capacity(cap);
+    let mut received: u64 = 0;
+    while let Some(chunk) = res.chunk().await? {
+        received = received.saturating_add(chunk.len() as u64);
+        if received > pack_size {
+            return Err(CoreError::Integrity(format!(
+                "pack {url}: body exceeds expected {pack_size} bytes (over-send)"
+            )));
+        }
+        bytes.extend_from_slice(&chunk);
+    }
     if bytes.len() as u64 != pack_size {
         return Err(CoreError::Integrity(format!(
             "pack {url}: expected {pack_size} bytes, got {}",
@@ -996,6 +1017,25 @@ mod tests {
                 chunks: vec![chunk_target(0, 1000, 1000, reference(&content[1000..2000]))],
             },
         ]
+    }
+
+    #[tokio::test]
+    async fn fetch_pack_rejects_over_length_body() {
+        // Audit L12: a body larger than the declared pack_size must be rejected
+        // under a running cap, not buffered whole. Serve 2000 bytes but declare
+        // pack_size=1000 — the over-send guard trips before the carve.
+        let mut routes = HashMap::new();
+        routes.insert("/pack".to_string(), vec![9u8; 2000]);
+        let Some(base) = serve_packs(routes).await.ok() else { return };
+        let Ok(client) = download_client(TransportTimeouts::default()) else { return };
+        let pb = ProgressBar::hidden();
+        let dest = scratch_path("l12_overlen");
+        let _g = TempFileGuard(dest.clone());
+        let res = fetch_pack(client, &format!("{base}/pack"), None, 1000, &[], &dest, &pb).await;
+        assert!(
+            matches!(res, Err(CoreError::Integrity(ref m)) if m.contains("over-send")),
+            "an over-length pack body must be rejected (bounded), got {res:?}"
+        );
     }
 
     #[tokio::test]

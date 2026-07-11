@@ -196,7 +196,10 @@ impl ChunkedDownloader {
                 .open(dest_path)
                 .await?;
             f.set_len(content_length).await?;
-            f.sync_all().await?; // Ensure the size is persisted before parallel writes
+            // No `sync_all` (audit L15): the parallel chunk writers see the
+            // `set_len` size through the page cache without forcing metadata to
+            // disk. It only bought crash durability of the pre-allocation, which is
+            // discarded anyway — a crash re-downloads (the dest opens `truncate`).
         }
 
         let dest_path_buf = dest_path.to_path_buf();
