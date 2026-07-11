@@ -32,6 +32,7 @@ from .constants import (
     CHUNK_COUNT_KEY,
     CHUNKED_LAYOUT_V2,
     DEFAULT_HTTP_TIMEOUT,
+    _resolve_positive_int,
     FILE_DIGEST_KEY,
     FILE_SIZE_KEY,
     LAYER_TITLE_KEY,
@@ -427,9 +428,21 @@ def _prev_digest_or_warn(existing, repo_id: str, revision: str) -> Optional[str]
 # identical, content-addressed manifest) resolves it. The blob-commit race — the
 # case this fix targets — happens BEFORE the manifest is accepted, so If-Match is
 # still valid on its retries.
-MANIFEST_PUT_MAX_RETRIES = 5
+# The commit→visibility window was originally ~3.4s (see the module note above), so
+# 5 retries / ~13s covered it. Under sustained JuiceFS-mount backpressure that window
+# has grown to tens of seconds, and a fast CI runner (which PUTs the manifest sooner
+# than a WAN client) now outruns the old budget and fails with a spurious
+# MANIFEST_BLOB_UNKNOWN even though the blob DOES become visible shortly after (a
+# concurrent slower folder upload to the same registry commits fine). The blob commit
+# is idempotent and the manifest bytes are deterministic, so a longer patient budget
+# only costs latency in the pathological lag case (the common case still succeeds on
+# the first retry); ~2 min of bounded backoff comfortably absorbs the observed lag.
+# Tunable via HIPPIUS_MANIFEST_PUT_RETRIES so ops can widen further without a release
+# if the backend degrades. Same budget applies to a persistent 5xx — rare, and
+# waiting it out before failing a bulk upload is acceptable.
+MANIFEST_PUT_MAX_RETRIES = _resolve_positive_int("HIPPIUS_MANIFEST_PUT_RETRIES", 12)
 _MANIFEST_PUT_BACKOFF_BASE_SECS = 0.5
-_MANIFEST_PUT_BACKOFF_CAP_SECS = 8.0
+_MANIFEST_PUT_BACKOFF_CAP_SECS = 20.0
 # Transient statuses, matching the Rust uploader's is_retryable (408/429/5xx).
 # 400 is handled separately (only the BLOB_UNKNOWN commit-race variant); 412 is a
 # real concurrent-write conflict, surfaced typed and never retried.
