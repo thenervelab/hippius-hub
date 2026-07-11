@@ -16,7 +16,7 @@ from typing import Dict, Optional, Union
 
 from . import _http
 from ._oci import FileGroup, fetch_manifest, group_files, parse_pointer_v2
-from .auth import get_oci_bearer_token
+from .auth import call_with_oci_token_refresh
 from .constants import (
     DEFAULT_CACHE_DIR,
     DEFAULT_HTTP_TIMEOUT,
@@ -354,68 +354,75 @@ def hf_hub_download(
         )
 
     registry = resolve_registry(endpoint)
-    # _oci_token / _resolved_manifest / _resolved_group let snapshot_download skip
-    # per-file token, manifest-fetch, and group-parse work (see each kwarg's note).
-    # Token resolution + the off-origin credential guard happen inside
-    # get_oci_bearer_token, which mints from `registry` (= resolve_registry(endpoint)).
-    oci_token = _oci_token or get_oci_bearer_token(oci_repo, token, endpoint=endpoint)
-    manifest = _resolve_manifest(
-        registry=registry,
-        oci_repo=oci_repo,
-        revision=revision,
-        oci_token=oci_token,
-        cached=_resolved_manifest,
-    )
-    # snapshot_download resolves every file's group once from the shared manifest
-    # and threads it here, so a snapshot doesn't re-run group_files (an O(layers)
-    # parse) per file under the GIL. A direct caller passes nothing and resolves it.
-    group = (
-        _resolved_group
-        if _resolved_group is not None
-        else _resolve_file_group(manifest, filename, repo_id, revision)
-    )
-    # Re-assert _resolve_file_group's guard on the threaded path: a snapshot-supplied
-    # group skips that call, so without this a titled plain layer with a falsy digest
-    # would reach the plain path and build a `.../blobs/None` URL instead of raising
-    # the same EntryNotFoundError a direct hf_hub_download would.
-    if not group.is_chunked and not group.digest:
-        raise EntryNotFoundError(
-            f"File '{filename}' not found in the OCI manifest of '{repo_id}:{revision}'"
-        )
-    # Chunked files pull K content-addressed chunk blobs in parallel and assemble
-    # them; plain files keep the single-blob Range-parallel path unchanged, so
-    # every pre-chunking artifact downloads exactly as before.
-    if group.is_chunked:
-        if local_dir is not None:
-            return _download_chunked_to_local_dir(
-                group, registry, oci_repo, paths.dest_file, oci_token, manifest
-            )
-        return _download_chunked_to_cache(
-            group=group,
+
+    # Refresh the OCI token and retry once on a 401 (audit M2): a token minted here
+    # can expire mid-download on a large multi-GB blob that outlives its TTL. The
+    # manifest fetch + native downloads all use `oci_token`, so the whole token-using
+    # body runs inside the refresh wrapper. `initial=_oci_token` reuses
+    # snapshot_download's per-file shared token on the first attempt (see the kwarg
+    # notes) without re-minting.
+    def _download(oci_token):
+        manifest = _resolve_manifest(
             registry=registry,
             oci_repo=oci_repo,
+            revision=revision,
+            oci_token=oci_token,
+            cached=_resolved_manifest,
+        )
+        # snapshot_download resolves every file's group once from the shared manifest
+        # and threads it here, so a snapshot doesn't re-run group_files (an O(layers)
+        # parse) per file under the GIL. A direct caller passes nothing and resolves it.
+        group = (
+            _resolved_group
+            if _resolved_group is not None
+            else _resolve_file_group(manifest, filename, repo_id, revision)
+        )
+        # Re-assert _resolve_file_group's guard on the threaded path: a snapshot-
+        # supplied group skips that call, so without this a titled plain layer with a
+        # falsy digest would reach the plain path and build a `.../blobs/None` URL
+        # instead of raising the same EntryNotFoundError a direct hf_hub_download would.
+        if not group.is_chunked and not group.digest:
+            raise EntryNotFoundError(
+                f"File '{filename}' not found in the OCI manifest of '{repo_id}:{revision}'"
+            )
+        # Chunked files pull K content-addressed chunk blobs in parallel and assemble
+        # them; plain files keep the single-blob Range-parallel path unchanged, so
+        # every pre-chunking artifact downloads exactly as before.
+        if group.is_chunked:
+            if local_dir is not None:
+                return _download_chunked_to_local_dir(
+                    group, registry, oci_repo, paths.dest_file, oci_token, manifest
+                )
+            return _download_chunked_to_cache(
+                group=group,
+                registry=registry,
+                oci_repo=oci_repo,
+                repo_dir=paths.repo_dir,
+                snapshots_dir=paths.snapshots_dir,
+                filename=filename,
+                oci_token=oci_token,
+                manifest=manifest,
+            )
+        blob_url = f"{registry}/v2/{oci_repo}/blobs/{group.digest}"
+        # group.size is the manifest layer size (byte-accurate == the blob's
+        # Content-Length), so the Rust downloader can pre-allocate + range without a
+        # HEAD. None only for a malformed layer, where the native side HEADs as before.
+        if local_dir is not None:
+            return _download_to_local_dir(
+                blob_url, paths.dest_file, oci_token, group.digest, group.size
+            )
+        return _download_to_cache(
+            blob_url=blob_url,
             repo_dir=paths.repo_dir,
             snapshots_dir=paths.snapshots_dir,
             filename=filename,
             oci_token=oci_token,
-            manifest=manifest,
+            target_digest=group.digest,
+            content_length=group.size,
         )
-    blob_url = f"{registry}/v2/{oci_repo}/blobs/{group.digest}"
-    # group.size is the manifest layer size (byte-accurate == the blob's
-    # Content-Length), so the Rust downloader can pre-allocate + range without a
-    # HEAD. None only for a malformed layer, where the native side HEADs as before.
-    if local_dir is not None:
-        return _download_to_local_dir(
-            blob_url, paths.dest_file, oci_token, group.digest, group.size
-        )
-    return _download_to_cache(
-        blob_url=blob_url,
-        repo_dir=paths.repo_dir,
-        snapshots_dir=paths.snapshots_dir,
-        filename=filename,
-        oci_token=oci_token,
-        target_digest=group.digest,
-        content_length=group.size,
+
+    return call_with_oci_token_refresh(
+        oci_repo, token, push=False, endpoint=endpoint, operation=_download, initial=_oci_token
     )
 
 

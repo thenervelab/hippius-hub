@@ -26,7 +26,7 @@ from tqdm import tqdm
 from . import _http
 from ._oci import fetch_manifest, group_files, layer_title, parse_pointer_v2
 from ._packing import plan_packs, pointer_v2_bytes, resolve_pointer_chunks
-from .auth import get_oci_bearer_token
+from .auth import call_with_oci_token_refresh, get_oci_bearer_token
 from .constants import (
     ARTIFACT_TYPE_CHUNKED_V2,
     CHUNK_COUNT_KEY,
@@ -865,43 +865,51 @@ def upload_file(
 
     oci_repo = _oci_repo_path(repo_id, repo_type)
     registry = resolve_registry(endpoint)
-    oci_token = _oci_bearer(oci_repo, token, push=True, endpoint=endpoint)
 
-    # Fetch the prior manifest BEFORE uploading: chunked-v2 needs it to build the
-    # dedup index (which chunks already exist, so only new chunks are packed). The
-    # same digest guards the PUT via If-Match, so moving the fetch earlier does not
-    # widen the concurrency window.
-    existing = fetch_manifest(registry, oci_repo, revision, oci_token, missing_ok=True)
+    # Refresh the OCI token and retry once on a 401 (audit M2): a token minted here
+    # can expire mid-upload on a large multi-GB blob that outlives its TTL. The
+    # manifest fetch, blob/pack uploads, config blob, and manifest PUT all use
+    # `oci_token`, so the whole token-using body runs inside the refresh wrapper.
+    # Blob pushes are idempotent (content-addressed HEAD-dedup skips what already
+    # landed), so a retry re-HEADs and re-PUTs the manifest rather than re-uploading.
+    def _op(oci_token):
+        # Fetch the prior manifest BEFORE uploading: chunked-v2 needs it to build the
+        # dedup index (which chunks already exist, so only new chunks are packed). The
+        # same digest guards the PUT via If-Match, so moving the fetch earlier does not
+        # widen the concurrency window.
+        existing = fetch_manifest(registry, oci_repo, revision, oci_token, missing_ok=True)
 
-    file_path, cleanup = _normalize_path_or_fileobj(path_or_fileobj)
-    try:
-        dedup_index: Dict[str, tuple] = {}
-        pack_sizes: Dict[str, int] = {}
-        # Only build the dedup index (a pointer-blob GET fan-out over the prior
-        # revision) when THIS file is large enough to take the chunked-v2 path
-        # (audit L-DEDUP-EARLY). A sub-threshold file uploads as one plain blob and
-        # never reads the index, so building it would be pure wasted round-trips.
-        if resolve_chunked_write_enabled() and (
-            os.path.getsize(file_path) >= resolve_chunk_threshold()
-        ):
-            dedup_index, pack_sizes = _build_dedup_index(existing, registry, oci_repo, oci_token)
-        new_layers = _upload_file_layers(
-            file_path, path_in_repo, registry, oci_repo, oci_token, dedup_index, pack_sizes
+        file_path, cleanup = _normalize_path_or_fileobj(path_or_fileobj)
+        try:
+            dedup_index: Dict[str, tuple] = {}
+            pack_sizes: Dict[str, int] = {}
+            # Only build the dedup index (a pointer-blob GET fan-out over the prior
+            # revision) when THIS file is large enough to take the chunked-v2 path
+            # (audit L-DEDUP-EARLY). A sub-threshold file uploads as one plain blob and
+            # never reads the index, so building it would be pure wasted round-trips.
+            if resolve_chunked_write_enabled() and (
+                os.path.getsize(file_path) >= resolve_chunk_threshold()
+            ):
+                dedup_index, pack_sizes = _build_dedup_index(existing, registry, oci_repo, oci_token)
+            new_layers = _upload_file_layers(
+                file_path, path_in_repo, registry, oci_repo, oci_token, dedup_index, pack_sizes
+            )
+        finally:
+            cleanup()
+
+        existing_layers = existing.manifest.get("layers", []) if existing else []
+        prev_digest = _prev_digest_or_warn(existing, repo_id, revision)
+        merged_layers = _merge_layers(existing_layers, new_layers)
+
+        config_digest, config_size = _ensure_config_blob_uploaded(registry, oci_repo, oci_token)
+        manifest = _assemble_manifest(
+            config_digest, config_size, merged_layers, commit_message, commit_description
         )
-    finally:
-        cleanup()
 
-    existing_layers = existing.manifest.get("layers", []) if existing else []
-    prev_digest = _prev_digest_or_warn(existing, repo_id, revision)
-    merged_layers = _merge_layers(existing_layers, new_layers)
+        resp = _put_manifest(registry, oci_repo, revision, oci_token, manifest, if_match=prev_digest)
+        return _build_commit_info(registry, repo_id, revision, resp, commit_message, commit_description)
 
-    config_digest, config_size = _ensure_config_blob_uploaded(registry, oci_repo, oci_token)
-    manifest = _assemble_manifest(
-        config_digest, config_size, merged_layers, commit_message, commit_description
-    )
-
-    resp = _put_manifest(registry, oci_repo, revision, oci_token, manifest, if_match=prev_digest)
-    return _build_commit_info(registry, repo_id, revision, resp, commit_message, commit_description)
+    return call_with_oci_token_refresh(oci_repo, token, push=True, endpoint=endpoint, operation=_op)
 
 
 def upload_folder(
