@@ -114,7 +114,13 @@ pub struct ChunkedDownloader {
 
 impl ChunkedDownloader {
     /// Construct a new concurrent downloader.
-    pub fn new(url: String, auth_token: Option<String>, chunk_size_bytes: Option<u64>, content_length: Option<u64>) -> Result<Self, CoreError> {
+    pub fn new(
+        url: String,
+        auth_token: Option<String>,
+        chunk_size_bytes: Option<u64>,
+        content_length: Option<u64>,
+        timeouts: crate::chunk_fetcher::TransportTimeouts,
+    ) -> Result<Self, CoreError> {
         // Clone the process-global download client (shared with the pack path)
         // rather than building a fresh client + empty pool per file, so connections
         // stay warm across back-to-back downloads. It is HTTP/1-only for the same
@@ -122,7 +128,7 @@ impl ChunkedDownloader {
         // and caps aggregate throughput at the per-connection ceiling, whereas h1
         // lets each parallel chunk get its own TCP and fan out across the available
         // bandwidth. See `chunk_fetcher::download_client`.
-        let client = crate::chunk_fetcher::download_client()?.clone();
+        let client = crate::chunk_fetcher::download_client(timeouts)?.clone();
         Ok(Self {
             client,
             url,
@@ -940,7 +946,7 @@ mod short_206_tests {
         // byte-count guard must surface a retryable Io error instead of leaving the
         // chunk's tail as pre-allocated zeros.
         let Some(base) = serve_short_206(100, 50).await.ok() else { return };
-        let Ok(client) = crate::chunk_fetcher::download_client() else { return };
+        let Ok(client) = crate::chunk_fetcher::download_client(crate::chunk_fetcher::TransportTimeouts::default()) else { return };
         let Some(dest) = prealloc(100).await else { return };
         let pb = ProgressBar::hidden();
         let res = try_download_chunk_to_offset(client, &format!("{base}/blob"), None, 0, 99, &dest, &pb).await;
@@ -956,7 +962,7 @@ mod short_206_tests {
         // Control: a 206 whose body fills the requested range must succeed, so the
         // guard rejects only genuine short reads.
         let Some(base) = serve_short_206(100, 100).await.ok() else { return };
-        let Ok(client) = crate::chunk_fetcher::download_client() else { return };
+        let Ok(client) = crate::chunk_fetcher::download_client(crate::chunk_fetcher::TransportTimeouts::default()) else { return };
         let Some(dest) = prealloc(100).await else { return };
         let pb = ProgressBar::hidden();
         let res = try_download_chunk_to_offset(client, &format!("{base}/blob"), None, 0, 99, &dest, &pb).await;
@@ -971,7 +977,7 @@ mod short_206_tests {
         // must stay the pre-allocated zeros, not the surplus — and the over-send must
         // surface as an error rather than a silent cross-chunk corruption.
         let Some(base) = serve_short_206(100, 150).await.ok() else { return };
-        let Ok(client) = crate::chunk_fetcher::download_client() else { return };
+        let Ok(client) = crate::chunk_fetcher::download_client(crate::chunk_fetcher::TransportTimeouts::default()) else { return };
         let Some(dest) = prealloc(200).await else { return };
         let pb = ProgressBar::hidden();
         let res = try_download_chunk_to_offset(client, &format!("{base}/blob"), None, 0, 99, &dest, &pb).await;

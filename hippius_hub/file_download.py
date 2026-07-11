@@ -22,7 +22,9 @@ from .constants import (
     DEFAULT_HTTP_TIMEOUT,
     PACK_MEDIA_TYPE,
     resolve_chunk_size,
+    resolve_connect_timeout,
     resolve_max_concurrent,
+    resolve_read_timeout,
     resolve_registry,
     resolve_verify_hash,
 )
@@ -482,6 +484,10 @@ def _download_to_cache(
             chunk_size=resolve_chunk_size(),
             verify_hash=verify_hash,
             content_length=content_length,
+            # Env-resolved so HIPPIUS_CONNECT/READ_TIMEOUT reach real transfers,
+            # not just `hippius-hub diagnose` (audit L9).
+            connect_timeout_secs=resolve_connect_timeout(),
+            read_timeout_secs=resolve_read_timeout(),
         )
         # Audit M-VERIFY-PLAIN: when verify is on, the computed digest MUST equal
         # the manifest digest, else we would cache wrong/truncated bytes under the
@@ -561,6 +567,10 @@ def _download_to_local_dir(blob_url, dest_file, oci_token, target_digest, conten
             chunk_size=resolve_chunk_size(),
             verify_hash=resolve_verify_hash(),
             content_length=content_length,
+            # Env-resolved so HIPPIUS_CONNECT/READ_TIMEOUT reach real transfers,
+            # not just `hippius-hub diagnose` (audit L9).
+            connect_timeout_secs=resolve_connect_timeout(),
+            read_timeout_secs=resolve_read_timeout(),
         )
         _assert_download_matches_digest(
             calculated_hash, target_digest, os.path.basename(dest_file)
@@ -627,6 +637,9 @@ def _pull_packs(group, manifest, registry, oci_repo, temp_path, oci_token) -> Op
         file_digest=_digest_hex(group.digest),
         auth_token=oci_token,
         max_concurrent=resolve_max_concurrent(),
+        # See the plain path: env-resolved timeouts reach the pack assembler (L9).
+        connect_timeout_secs=resolve_connect_timeout(),
+        read_timeout_secs=resolve_read_timeout(),
     )
 
 

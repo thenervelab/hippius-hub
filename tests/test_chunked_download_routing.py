@@ -99,7 +99,7 @@ def test_chunked_file_routes_to_native_pack_assembler(monkeypatched_registry, mo
 
     calls = []
 
-    def fake_native(*, pack_urls, pack_sizes, pack_chunks, dest_path, total_size, file_digest, auth_token, max_concurrent):
+    def fake_native(*, pack_urls, pack_sizes, pack_chunks, dest_path, total_size, file_digest, auth_token, max_concurrent, **_):
         calls.append({"pack_urls": pack_urls, "pack_sizes": pack_sizes,
                       "pack_chunks": pack_chunks, "total_size": total_size, "file_digest": file_digest})
         with open(dest_path, "wb") as f:
@@ -183,3 +183,28 @@ def test_plain_file_does_not_touch_pack_assembler(monkeypatched_registry, monkey
         cache_dir=str(tmp_path), token="tok",
     )
     assert open(out, "rb").read() == payload
+
+
+@respx.mock
+def test_download_forwards_resolved_timeouts_to_native(monkeypatched_registry, monkeypatch, tmp_path):
+    # Audit L9: HIPPIUS_CONNECT_TIMEOUT / HIPPIUS_READ_TIMEOUT must reach real
+    # transfers (the native pack assembler), not only `hippius-hub diagnose`. The
+    # resolved values flow through download_packs_native as connect/read secs.
+    _mock_chunked()
+    monkeypatch.setenv("HIPPIUS_CONNECT_TIMEOUT", "7")
+    monkeypatch.setenv("HIPPIUS_READ_TIMEOUT", "11")
+    captured = {}
+
+    def fake_native(*, dest_path, **kw):
+        captured.update(kw)
+        with open(dest_path, "wb") as f:
+            f.write(FILE_BYTES)
+        return None
+
+    monkeypatch.setattr(file_download, "download_packs_native", fake_native)
+    hf_hub_download(
+        repo_id=REPO, filename="big.bin", revision="main",
+        cache_dir=str(tmp_path), token="tok",
+    )
+    assert captured.get("connect_timeout_secs") == 7
+    assert captured.get("read_timeout_secs") == 11

@@ -173,10 +173,21 @@ def resolve_connect_timeout() -> int:
 
 
 def resolve_read_timeout() -> Optional[int]:
-    """Per-chunk total request timeout (seconds), or None to leave it unset.
-    Unset by default: reqwest 0.11 only offers a *total* request timeout, so a
-    value here bounds a single chunk request (each chunk is its own request),
-    not the whole file. Opting in protects against a silently-stalled chunk."""
+    """Per-read stall timeout (seconds) for real transfers, or None to leave it off.
+
+    Threaded into download_file_native / download_packs_native, where the shared
+    reqwest 0.12 client applies it as ``.read_timeout()`` when set — it fires only
+    when a read STALLS (no byte within the window, reset on each successful read),
+    bounding a dribbling/stalled chunk without capping an honest slow transfer.
+    This now reaches real transfers, not only ``hippius-hub diagnose`` (audit L9).
+
+    Opt-in (``None`` by default = no client read timeout): a client-level read
+    timeout is a global setting on the one process-wide download client shared by
+    every concurrent chunk, so it stays off by default (the default client is
+    byte-identical to the pre-audit one) and a user opts in per transfer. The
+    default-on download stall guard (M4) is deferred to a per-chunk app-level
+    idle-timeout. (The prior "reqwest 0.11 only offers a total timeout" note was
+    stale — the crate has been on reqwest 0.12, which diagnostics already used.)"""
     raw = os.environ.get("HIPPIUS_READ_TIMEOUT")
     if not raw:
         return None

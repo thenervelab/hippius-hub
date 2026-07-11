@@ -55,7 +55,7 @@ def stub_blob_download(monkeypatch):
     """
     fills: list[str] = []
 
-    def fake_download(*, url, dest_path, auth_token, chunk_size, verify_hash, content_length=None):
+    def fake_download(*, url, dest_path, auth_token, chunk_size, verify_hash, content_length=None, **_):
         fills.append(dest_path)
         Path(dest_path).write_bytes(b"x")
         return None  # verify_hash=False sentinel
