@@ -97,7 +97,10 @@ def run_diagnose(
     }
 
     logger.debug("requesting auth token for %s", oci_repo)
-    oci_token, token_ms = _timed(get_oci_bearer_token, oci_repo, auth_token)
+    # Thread `endpoint` through (audit critic#3): without it a --endpoint-customized
+    # diagnose mints the bearer token from the DEFAULT registry while the blob probe
+    # targets the custom host — a token/origin mismatch (401 on the probe).
+    oci_token, token_ms = _timed(get_oci_bearer_token, oci_repo, auth_token, endpoint=endpoint)
     report["token"] = {"ms": round(token_ms, 1)}
 
     logger.debug("fetching metadata for %s:%s", oci_repo, revision)
