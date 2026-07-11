@@ -500,7 +500,14 @@ pub async fn pack_upload_async(
     // the whole pack on each attempt, which the staging peak-RSS benchmark showed
     // roughly doubled resident memory per concurrent upload.
     let body = Bytes::from(read_ranges(path, ranges).await?);
-    let digest_hex = hex::encode(Sha256::digest(&body));
+    // Hash the ~64 MiB pack on the blocking pool (audit L14): the digest is
+    // CPU-bound and would otherwise stall the runtime's other in-flight pack
+    // uploads for the duration. The `Bytes` clone into the closure is a refcount
+    // bump, not a copy, so the pack is still buffered exactly once.
+    let body_for_hash = body.clone();
+    let digest_hex = tokio::task::spawn_blocking(move || hex::encode(Sha256::digest(&body_for_hash)))
+        .await
+        .map_err(|join_err| CoreError::Io(std::io::Error::other(join_err)))?;
     let digest = format!("sha256:{digest_hex}");
     let mut retries: u32 = 0;
     loop {

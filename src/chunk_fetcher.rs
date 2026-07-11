@@ -20,7 +20,7 @@ use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use tokio::fs::OpenOptions;
-use tokio::io::{AsyncSeekExt, AsyncWriteExt, SeekFrom};
+use tokio::io::SeekFrom;
 use tokio::sync::Semaphore;
 use tokio::task::AbortHandle;
 
@@ -488,7 +488,34 @@ async fn fetch_pack(
             bytes.len()
         )));
     }
-    let mut file = OpenOptions::new().write(true).open(dest_path).await?;
+    // Verify + scatter on the blocking pool (audit L14). The per-chunk sha256 is
+    // CPU-bound and the scatter writes are local disk — neither is async work, so
+    // running them inline on the runtime starves the other up-to-32 concurrent pack
+    // fetches. `bytes` (the received pack) moves in; the metadata clones are cheap.
+    let targets_owned = targets.to_vec();
+    let dest = dest_path.to_path_buf();
+    let url_owned = url.to_string();
+    let pb_owned = pb.clone();
+    tokio::task::spawn_blocking(move || verify_and_scatter(&url_owned, &bytes, &targets_owned, &dest, &pb_owned))
+        .await
+        .map_err(|join_err| CoreError::Io(std::io::Error::other(join_err)))?
+}
+
+/// Verify each carved chunk's sha256 against `bytes` and scatter its slice to the
+/// file offset. Runs on the blocking pool (audit L14): hashing is CPU-bound and the
+/// writes are local disk, so this does no async work and must not sit on the async
+/// runtime. A digest mismatch or out-of-range chunk is a retryable `Integrity`
+/// error (a corrupt/mis-placed pack must never be written past its bounds).
+fn verify_and_scatter(
+    url: &str,
+    bytes: &[u8],
+    targets: &[(u64, u64, u64, String)],
+    dest_path: &Path,
+    pb: &ProgressBar,
+) -> Result<(), CoreError> {
+    use std::io::{Seek, Write};
+
+    let mut file = std::fs::OpenOptions::new().write(true).open(dest_path)?;
     for (offset_in_pack, size, file_offset, expected) in targets {
         let start = usize::try_from(*offset_in_pack)
             .map_err(|_| CoreError::Integrity(format!("pack offset {offset_in_pack} exceeds usize")))?;
@@ -510,11 +537,11 @@ async fn fetch_pack(
                 "chunk at pack offset {offset_in_pack}: expected sha256 {expected}, got {got}"
             )));
         }
-        file.seek(SeekFrom::Start(*file_offset)).await?;
-        file.write_all(slice).await?;
+        file.seek(SeekFrom::Start(*file_offset))?;
+        file.write_all(slice)?;
         pb.inc(*size);
     }
-    file.flush().await?;
+    file.flush()?;
     Ok(())
 }
 
@@ -614,6 +641,7 @@ fn incremental_hash(rx: &Receiver<HashSignal>, path: &Path, total_size: u64) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     // Pin the per-chunk request timeout value (same guard shape as the legacy
     // path): clippy's dead-code lint enforces the const is USED at the call
@@ -621,6 +649,43 @@ mod tests {
     #[test]
     fn chunk_request_timeout_is_five_minutes() {
         assert_eq!(CHUNK_REQUEST_TIMEOUT, Duration::from_mins(5));
+    }
+
+    #[test]
+    fn verify_and_scatter_writes_chunks_and_rejects_bad_digest() {
+        // L14: the verify+scatter loop (moved onto the blocking pool) must place
+        // each chunk at its file offset only after its sha256 matches the expected
+        // digest, and reject a mismatched chunk as a (retryable) Integrity error.
+        use std::io::Read;
+        let pb = ProgressBar::hidden();
+        let (a, b) = (b"AAAA".as_slice(), b"BB".as_slice()); // 4 + 2 bytes
+        let pack: Vec<u8> = [a, b].concat();
+        let ha = hex::encode(Sha256::digest(a));
+        let hb = hex::encode(Sha256::digest(b));
+        // (offset_in_pack, size, file_offset, expected_hex): scatter A→0, B→4.
+        let good = vec![(0u64, 4u64, 0u64, ha), (4u64, 2u64, 4u64, hb.clone())];
+
+        let path = std::env::temp_dir().join(format!("hippius-vs-{}.bin", std::process::id()));
+        let Ok(()) = std::fs::File::create(&path).and_then(|f| f.set_len(6)) else {
+            unreachable!("temp file create")
+        };
+        let Ok(()) = verify_and_scatter("u", &pack, &good, &path, &pb) else {
+            unreachable!("valid chunks must scatter")
+        };
+        let mut got = Vec::new();
+        let Ok(_) = std::fs::File::open(&path).and_then(|mut f| f.read_to_end(&mut got)) else {
+            unreachable!("read back")
+        };
+        assert_eq!(got, b"AAAABB");
+
+        // A wrong expected digest (hb over the "AAAA" slice) is a permanent Integrity
+        // error, so a corrupt/mis-placed pack is never accepted.
+        let bad = vec![(0u64, 4u64, 0u64, hb)];
+        assert!(matches!(
+            verify_and_scatter("u", &pack, &bad, &path, &pb),
+            Err(CoreError::Integrity(_))
+        ));
+        let _ = std::fs::remove_file(&path);
     }
 
     // An oversized/short/mis-hashed chunk must surface as the permanent
@@ -647,7 +712,6 @@ mod tests {
         // `connect_timeout`/`tcp_keepalive` cannot see) must be cut by the client's
         // `read_timeout`. Without it the body read hangs until the caller's 5-min
         // total timeout; the download plane's whole point is to fail fast and retry.
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
         use tokio::net::TcpListener;
         let Ok(listener) = TcpListener::bind("127.0.0.1:0").await else { return };
         let Ok(addr) = listener.local_addr() else { return };
@@ -966,7 +1030,6 @@ mod tests {
     /// there is no keep-alive framing to parse). Returns the base URL; the accept loop
     /// lives in a spawned task the test's runtime cancels on completion.
     async fn serve_packs(routes: HashMap<String, Vec<u8>>) -> std::io::Result<String> {
-        use tokio::io::AsyncReadExt as _;
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
         let addr = listener.local_addr()?;
         tokio::spawn(async move {
