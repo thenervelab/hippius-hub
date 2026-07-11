@@ -4,8 +4,11 @@ build-backend = "maturin"
 
 [project]
 name = "hippius_hub"
-version = "0.5.1"
+version = "0.5.2"
 description = "Hippius Hub CLI + Python client: manage your registry namespace, search the AI model index, and pull/push models with a Rust-accelerated transport"
+# Rendered as the long description on the PyPI project page (maturin sets
+# Description-Content-Type: text/markdown from the .md extension, per PEP 621).
+readme = "README.md"
 requires-python = ">=3.9"
 dependencies = [
     "httpx",
