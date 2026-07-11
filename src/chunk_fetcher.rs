@@ -796,6 +796,32 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn abort_on_drop_aborts_held_tasks() {
+        // Audit M1: dropping the guard must abort every held pack task, so a cancelled
+        // (Ctrl-C'd) assemble never leaves a task writing to `dest` after the caller
+        // moved on. Spawn long-lived tasks, wrap their abort handles in AbortOnDrop,
+        // drop it, then confirm each task was cancelled (never ran to completion).
+        let mut joins = Vec::new();
+        let mut aborts = Vec::new();
+        for _ in 0..3 {
+            let h = tokio::spawn(async {
+                tokio::time::sleep(Duration::from_secs(30)).await;
+            });
+            aborts.push(h.abort_handle());
+            joins.push(h);
+        }
+
+        drop(AbortOnDrop(aborts));
+
+        for h in joins {
+            match h.await {
+                Ok(()) => unreachable!("the task must be aborted, not run to completion"),
+                Err(e) => assert!(e.is_cancelled(), "AbortOnDrop must cancel the task, got {e:?}"),
+            }
+        }
+    }
+
     // An oversized/short/mis-hashed chunk must surface as the permanent
     // Integrity variant, not a retryable transport error — otherwise a
     // corrupt content-addressed blob would burn the whole retry budget.

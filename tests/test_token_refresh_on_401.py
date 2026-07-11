@@ -12,11 +12,14 @@ so a native 401 is transparently recovered.
 """
 from __future__ import annotations
 
+import io
+from types import SimpleNamespace
+
 import httpx
 import pytest
 import respx
 
-from hippius_hub import auth, file_download
+from hippius_hub import auth, file_download, file_upload
 from hippius_hub.constants import LAYER_TITLE_KEY
 from hippius_hub.file_download import hf_hub_download
 
@@ -159,3 +162,43 @@ def test_hf_hub_download_refreshes_token_on_native_401(monkeypatched_registry, m
     )
     assert open(out, "rb").read() == payload
     assert calls["n"] == 2, "the native 401 must trigger a token refresh + one retry"
+
+
+def test_upload_file_401_retry_reuses_normalized_content_not_empty(monkeypatch):
+    # Audit M2 correctness regression: a file-like input must be normalized ONCE,
+    # OUTSIDE the retry, so a 401 retry re-uploads the SAME content — not an empty
+    # temp file read from the already-exhausted stream. With the pre-fix code the
+    # second attempt saw b"" (silent empty-blob corruption committed as success).
+    auth.clear_oci_token_cache()
+    monkeypatch.setattr(auth, "get_oci_bearer_token", lambda *a, **k: "tok")
+    monkeypatch.setattr(file_upload, "fetch_manifest", lambda *a, **k: None)
+    monkeypatch.setattr(
+        file_upload, "_ensure_config_blob_uploaded", lambda *a, **k: ("sha256:" + "c" * 64, 2)
+    )
+    monkeypatch.setattr(file_upload, "_put_manifest", lambda *a, **k: SimpleNamespace(headers={}))
+    monkeypatch.setattr(file_upload, "_build_commit_info", lambda *a, **k: "commit-ok")
+
+    seen = []
+
+    def fake_layers(file_path, *a, **k):
+        with open(file_path, "rb") as fh:
+            seen.append(fh.read())
+        if len(seen) == 1:
+            # Token expires during the blob PUT — the native 401 surface.
+            raise RuntimeError("server returned 401 (Unauthorized)")
+        return []
+
+    monkeypatch.setattr(file_upload, "_upload_file_layers", fake_layers)
+
+    result = file_upload.upload_file(
+        path_or_fileobj=io.BytesIO(b"real content"),
+        path_in_repo="model.bin",
+        repo_id="acme/model",
+        repo_type="model",
+    )
+
+    assert result == "commit-ok"
+    assert len(seen) == 2, "the 401 must trigger exactly one retry"
+    assert seen == [b"real content", b"real content"], (
+        "the retry must re-upload the SAME normalized content, never the exhausted (empty) stream"
+    )

@@ -866,21 +866,27 @@ def upload_file(
     oci_repo = _oci_repo_path(repo_id, repo_type)
     registry = resolve_registry(endpoint)
 
-    # Refresh the OCI token and retry once on a 401 (audit M2): a token minted here
-    # can expire mid-upload on a large multi-GB blob that outlives its TTL. The
-    # manifest fetch, blob/pack uploads, config blob, and manifest PUT all use
-    # `oci_token`, so the whole token-using body runs inside the refresh wrapper.
-    # Blob pushes are idempotent (content-addressed HEAD-dedup skips what already
-    # landed), so a retry re-HEADs and re-PUTs the manifest rather than re-uploading.
-    def _op(oci_token):
-        # Fetch the prior manifest BEFORE uploading: chunked-v2 needs it to build the
-        # dedup index (which chunks already exist, so only new chunks are packed). The
-        # same digest guards the PUT via If-Match, so moving the fetch earlier does not
-        # widen the concurrency window.
-        existing = fetch_manifest(registry, oci_repo, revision, oci_token, missing_ok=True)
+    # Normalize the input ONCE, OUTSIDE the retry wrapper: a file-like
+    # `path_or_fileobj` is drained to a temp file and is NOT re-seekable, so
+    # re-reading it on a 401 retry would upload empty/truncated content and commit it
+    # as success (a BinaryIO would corrupt; str/Path/bytes are unaffected). The
+    # resolved `file_path` is threaded into `_op`, so the retry never touches the
+    # caller's stream. `cleanup()` runs exactly once, after the retry settles.
+    file_path, cleanup = _normalize_path_or_fileobj(path_or_fileobj)
+    try:
+        # Refresh the OCI token and retry once on a 401 (audit M2): a token minted
+        # here can expire mid-upload on a large multi-GB blob that outlives its TTL.
+        # The manifest fetch, blob/pack uploads, config blob, and manifest PUT all use
+        # `oci_token`, so the whole token-using body runs inside the refresh wrapper.
+        # Blob pushes are idempotent (content-addressed HEAD-dedup skips what already
+        # landed), so a retry re-HEADs and re-PUTs the manifest rather than re-uploading.
+        def _op(oci_token):
+            # Fetch the prior manifest BEFORE uploading: chunked-v2 needs it to build
+            # the dedup index (which chunks already exist, so only new chunks are
+            # packed). The same digest guards the PUT via If-Match, so moving the fetch
+            # earlier does not widen the concurrency window.
+            existing = fetch_manifest(registry, oci_repo, revision, oci_token, missing_ok=True)
 
-        file_path, cleanup = _normalize_path_or_fileobj(path_or_fileobj)
-        try:
             dedup_index: Dict[str, tuple] = {}
             pack_sizes: Dict[str, int] = {}
             # Only build the dedup index (a pointer-blob GET fan-out over the prior
@@ -894,22 +900,22 @@ def upload_file(
             new_layers = _upload_file_layers(
                 file_path, path_in_repo, registry, oci_repo, oci_token, dedup_index, pack_sizes
             )
-        finally:
-            cleanup()
 
-        existing_layers = existing.manifest.get("layers", []) if existing else []
-        prev_digest = _prev_digest_or_warn(existing, repo_id, revision)
-        merged_layers = _merge_layers(existing_layers, new_layers)
+            existing_layers = existing.manifest.get("layers", []) if existing else []
+            prev_digest = _prev_digest_or_warn(existing, repo_id, revision)
+            merged_layers = _merge_layers(existing_layers, new_layers)
 
-        config_digest, config_size = _ensure_config_blob_uploaded(registry, oci_repo, oci_token)
-        manifest = _assemble_manifest(
-            config_digest, config_size, merged_layers, commit_message, commit_description
-        )
+            config_digest, config_size = _ensure_config_blob_uploaded(registry, oci_repo, oci_token)
+            manifest = _assemble_manifest(
+                config_digest, config_size, merged_layers, commit_message, commit_description
+            )
 
-        resp = _put_manifest(registry, oci_repo, revision, oci_token, manifest, if_match=prev_digest)
-        return _build_commit_info(registry, repo_id, revision, resp, commit_message, commit_description)
+            resp = _put_manifest(registry, oci_repo, revision, oci_token, manifest, if_match=prev_digest)
+            return _build_commit_info(registry, repo_id, revision, resp, commit_message, commit_description)
 
-    return call_with_oci_token_refresh(oci_repo, token, push=True, endpoint=endpoint, operation=_op)
+        return call_with_oci_token_refresh(oci_repo, token, push=True, endpoint=endpoint, operation=_op)
+    finally:
+        cleanup()
 
 
 def upload_folder(
