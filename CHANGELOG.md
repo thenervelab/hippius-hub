@@ -62,6 +62,36 @@ the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 
 ### Fixed
 
+- **Connection & transport hardening.** A top-to-bottom audit of the Rust data
+  plane and Python control plane:
+  - Uploads now abort a stalled body write: a peer that completes TCP+TLS then
+    stops draining the socket (invisible to the connect timeout and TCP
+    keep-alive) is cut by an idle-progress watchdog and retried, instead of
+    hanging forever and wedging a whole folder upload. The pack upload-init POST
+    is bounded too.
+  - A `206`'s `Content-Range` is validated to cover exactly the requested bytes,
+    so a range-aliasing proxy can no longer silently write mis-placed bytes into
+    a file cached under the correct-looking digest.
+  - Transient control-plane failures (manifest fetch, token fetch — `408`/`429`/
+    `5xx` and connection blips) are retried with jittered backoff like the data
+    plane, instead of aborting the whole operation on one registry hiccup.
+  - Retry backoff jitter no longer collapses to `0` on microsecond-resolution
+    clocks (which re-created the lockstep retry storm it exists to prevent).
+  - `snapshot_download` and `upload_folder` fail fast — the first error (or
+    Ctrl-C) cancels queued transfers instead of draining the whole repo first.
+  - `HIPPIUS_CONNECT_TIMEOUT` / `HIPPIUS_READ_TIMEOUT` now reach real transfers,
+    not only `diagnose`; setting `HIPPIUS_READ_TIMEOUT` opts real downloads into
+    per-read stall detection.
+  - `diagnose` bounds DNS resolution and tries every resolved address (a dead
+    first IPv6 no longer produces a false-negative), and its token fetch honors
+    `--endpoint`.
+  - `models list`/`show` no longer crash on a null `format` field; the Harbor
+    whoami/create/delete admin calls use the same 30s timeout as their siblings;
+    a wedged `docker login` is bounded to 60s; a folder of only-small files no
+    longer builds the chunked-v2 dedup index it never consults.
+  - The pack fetch is bounded against an over-sending server; the upload hash
+    uses an 8 MiB read buffer (~128× fewer read syscalls); a dead per-download
+    `fsync` of the pre-allocation was removed.
 - A `206 Partial Content` whose body is shorter — or longer — than the requested
   byte range is now rejected and retried instead of being written as a
   truncated/mis-sized chunk and cached under the correct-looking digest. An
