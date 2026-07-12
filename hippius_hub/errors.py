@@ -96,6 +96,30 @@ class ConcurrentManifestUpdateError(HfHubHTTPError):
         super().__init__(message, response=response)
 
 
+class ManifestBlobUnknownError(HfHubHTTPError):
+    """A manifest PUT was rejected because the registry can't resolve a blob it
+    references — Harbor's ``MANIFEST_BLOB_UNKNOWN`` — *after* the manifest-PUT
+    commit-visibility retry budget is already spent.
+
+    This is the durable case, distinct from the transient commit→visibility lag
+    the manifest retry rides out: reaching here means the referenced blob is
+    genuinely absent (a registry-side GC reaped an untagged blob, or a commit
+    that returned 2xx never landed under storage pressure), so the content must
+    be re-pushed, not merely re-awaited. ``upload_file`` catches this to re-run
+    the upload (re-PUTting every referenced blob) a bounded number of times
+    before surfacing it.
+
+    Subclasses ``HfHubHTTPError`` so ``except HfHubHTTPError:`` handlers still
+    catch it. ``missing_digests`` carries the blob digests Harbor named in the
+    error body (a best-effort scan — a stripping proxy can mangle the JSON), for
+    logging and future targeted re-push.
+    """
+
+    def __init__(self, message: str, *, response: httpx.Response, missing_digests: tuple = ()):
+        super().__init__(message, response=response)
+        self.missing_digests = tuple(missing_digests)
+
+
 __all__ = [
     "BadRequestError",
     "CacheNotFound",
@@ -107,6 +131,7 @@ __all__ = [
     "HfHubHTTPError",
     "LocalEntryNotFoundError",
     "LocalTokenNotFoundError",
+    "ManifestBlobUnknownError",
     "ManifestTooLargeError",
     "MalformedManifestError",
     "OfflineModeIsEnabled",

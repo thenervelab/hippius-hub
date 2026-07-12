@@ -33,7 +33,7 @@ import httpx
 import pytest
 import respx
 
-from hippius_hub.errors import ConcurrentManifestUpdateError, HfHubHTTPError
+from hippius_hub.errors import ConcurrentManifestUpdateError, HfHubHTTPError, ManifestBlobUnknownError
 
 
 def _valid_jwt() -> str:
@@ -493,15 +493,21 @@ def test_manifest_put_does_not_retry_malformed_400(tmp_path, monkeypatch):
 
 
 @respx.mock
-def test_manifest_put_exhausts_retries_and_surfaces_error_body(tmp_path, monkeypatch):
-    """A persistent BLOB_UNKNOWN 400 exhausts the bounded retries and raises with
-    the OCI body.
+def test_manifest_put_exhausts_retries_and_reuploads_then_surfaces_error_body(tmp_path, monkeypatch):
+    """A persistent BLOB_UNKNOWN 400 exhausts the per-PUT retries AND the bounded
+    blob re-uploads, then raises the typed ManifestBlobUnknownError with the OCI body.
 
-    `raise_for_status` used to hide Harbor's error code; the raised message must
-    now carry MANIFEST_BLOB_UNKNOWN (and repo:revision) so the terminal outcome is
-    diagnosable instead of an opaque `400 Bad Request`.
+    A blob the registry keeps dropping can neither be waited out (the per-PUT budget)
+    nor re-pushed away (the re-upload budget), so the client re-runs the whole upload
+    BLOB_REUPLOAD_MAX_RETRIES + 1 times — each burning the full manifest-PUT budget —
+    and then surfaces MANIFEST_BLOB_UNKNOWN as a TYPED error carrying repo:revision and
+    the body, so callers can tell it apart from a permanent 400.
     """
-    from hippius_hub.file_upload import MANIFEST_PUT_MAX_RETRIES, upload_file
+    from hippius_hub.file_upload import (
+        BLOB_REUPLOAD_MAX_RETRIES,
+        MANIFEST_PUT_MAX_RETRIES,
+        upload_file,
+    )
 
     _no_backoff(monkeypatch)
     payload, sha_hex, _size = _write_payload(tmp_path)
@@ -513,7 +519,7 @@ def test_manifest_put_exhausts_retries_and_surfaces_error_body(tmp_path, monkeyp
         f"{REGISTRY}/v2/{REPO_ID}/manifests/{REVISION}"
     ).mock(return_value=httpx.Response(400, json=_BLOB_UNKNOWN_BODY))
 
-    with pytest.raises(httpx.HTTPStatusError) as exc_info:
+    with pytest.raises(ManifestBlobUnknownError) as exc_info:
         upload_file(
             path_or_fileobj=str(payload),
             path_in_repo="hello.txt",
@@ -522,10 +528,74 @@ def test_manifest_put_exhausts_retries_and_surfaces_error_body(tmp_path, monkeyp
             revision=REVISION,
         )
 
-    assert put_route.call_count == MANIFEST_PUT_MAX_RETRIES + 1
+    assert put_route.call_count == (MANIFEST_PUT_MAX_RETRIES + 1) * (BLOB_REUPLOAD_MAX_RETRIES + 1), (
+        "every re-upload burns the full manifest-PUT budget before the next re-upload"
+    )
+    assert isinstance(exc_info.value, HfHubHTTPError), "must stay catchable as HfHubHTTPError"
     msg = str(exc_info.value)
     assert "MANIFEST_BLOB_UNKNOWN" in msg, "Harbor's error body must be surfaced"
     assert REPO_ID in msg and REVISION in msg
+
+
+@respx.mock
+def test_persistent_blob_unknown_reconfirms_the_config_blob_on_reupload(tmp_path, monkeypatch):
+    """The config-lost self-heal: a persistent BLOB_UNKNOWN evicts the `{}`-config
+    cache so the re-upload re-confirms it through the REAL `_ensure_config_blob_uploaded`
+    instead of cache-skipping and failing identically.
+
+    This pins the eviction in `_put_manifest` — the mechanism for the PR's headline
+    scenario (a GC-reaped empty config). Remove the eviction and the re-run reuses the
+    cached config, so the config HEAD is not re-issued and this assertion drops from 2
+    to 1. Runs the real config helper (not a stub), so it actually exercises the link.
+    """
+    from hippius_hub.file_upload import (
+        MANIFEST_PUT_MAX_RETRIES,
+        clear_config_blob_cache,
+        upload_file,
+    )
+
+    clear_config_blob_cache()
+    _no_backoff(monkeypatch)
+    payload, sha_hex, _size = _write_payload(tmp_path)
+
+    empty_digest = "sha256:" + hashlib.sha256(b"{}").hexdigest()
+    respx.mock.get(
+        url__startswith=f"{REGISTRY}/service/token"
+    ).mock(return_value=httpx.Response(200, json={"token": _valid_jwt()}))
+    respx.mock.head(
+        f"{REGISTRY}/v2/{REPO_ID}/blobs/sha256:{sha_hex}"
+    ).mock(return_value=httpx.Response(200))
+    config_head = respx.mock.head(
+        f"{REGISTRY}/v2/{REPO_ID}/blobs/{empty_digest}"
+    ).mock(return_value=httpx.Response(200))
+    respx.mock.get(
+        f"{REGISTRY}/v2/{REPO_ID}/manifests/{REVISION}"
+    ).mock(return_value=httpx.Response(404))
+    # The whole first attempt 400s BLOB_UNKNOWN (exhausts the per-PUT budget → evicts the
+    # config cache → re-upload); the re-upload's single manifest PUT then lands.
+    put_route = respx.mock.put(
+        f"{REGISTRY}/v2/{REPO_ID}/manifests/{REVISION}"
+    ).mock(side_effect=(
+        [httpx.Response(400, json=_BLOB_UNKNOWN_BODY)] * (MANIFEST_PUT_MAX_RETRIES + 1)
+        + [httpx.Response(201, headers={"Docker-Content-Digest": "sha256:" + "e" * 64})]
+    ))
+
+    upload_file(
+        path_or_fileobj=str(payload),
+        path_in_repo="hello.txt",
+        repo_id=REPO_ID,
+        token="literal-token-value",
+        revision=REVISION,
+    )
+
+    assert config_head.call_count == 2, (
+        "the persistent BLOB_UNKNOWN must evict the {}-config cache so the re-upload "
+        "re-confirms it via the real _ensure_config_blob_uploaded — without the eviction "
+        "the config stays cached and this drops to 1"
+    )
+    assert put_route.call_count == MANIFEST_PUT_MAX_RETRIES + 2, (
+        "the full per-PUT budget on the first attempt, then one landing PUT on the re-upload"
+    )
 
 
 @respx.mock

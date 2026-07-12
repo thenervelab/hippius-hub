@@ -10,6 +10,7 @@ import hashlib
 import json
 import os
 import random
+import re
 import tempfile
 import threading
 import time
@@ -48,7 +49,12 @@ from .constants import (
     resolve_registry,
     resolve_upload_workers,
 )
-from .errors import ConcurrentManifestUpdateError, MalformedManifestError, ManifestTooLargeError
+from .errors import (
+    ConcurrentManifestUpdateError,
+    MalformedManifestError,
+    ManifestBlobUnknownError,
+    ManifestTooLargeError,
+)
 from .file_download import _oci_repo_path, _validate_repo_type
 
 try:
@@ -443,6 +449,13 @@ def _prev_digest_or_warn(existing, repo_id: str, revision: str) -> Optional[str]
 MANIFEST_PUT_MAX_RETRIES = _resolve_positive_int("HIPPIUS_MANIFEST_PUT_RETRIES", 12)
 _MANIFEST_PUT_BACKOFF_BASE_SECS = 0.5
 _MANIFEST_PUT_BACKOFF_CAP_SECS = 20.0
+
+# When a MANIFEST_BLOB_UNKNOWN survives the per-PUT retry budget above, a
+# referenced blob is durably gone (GC reaped it, or a 2xx commit never landed) —
+# not lagging. Re-run the whole upload, re-PUTting every referenced blob, at most
+# this many extra times. Small on purpose: a registry that keeps dropping a
+# just-committed blob is an infra fault to surface, not a client-retry target.
+BLOB_REUPLOAD_MAX_RETRIES = _resolve_positive_int("HIPPIUS_BLOB_REUPLOAD_RETRIES", 2)
 # Transient statuses, matching the Rust uploader's is_retryable (408/429/5xx).
 # 400 is handled separately (only the BLOB_UNKNOWN commit-race variant); 412 is a
 # real concurrent-write conflict, surfaced typed and never retried.
@@ -464,6 +477,21 @@ def _is_blob_commit_race(resp: httpx.Response) -> bool:
     OCI error document is `{"errors":[{"code":"MANIFEST_BLOB_UNKNOWN",...}]}` and
     every such code contains `BLOB_UNKNOWN`."""
     return resp.status_code == 400 and "BLOB_UNKNOWN" in (resp.text or "")
+
+
+def _blob_unknown_digests(resp: httpx.Response) -> tuple:
+    """The blob digests Harbor named in a MANIFEST_BLOB_UNKNOWN error body.
+
+    Best-effort and parser-free: the OCI error doc is
+    `{"errors":[{"code":...,"detail":"sha256:..."}]}`, but a stripping proxy can
+    mangle the JSON, so we scan the raw text for `sha256:<64 hex>` rather than
+    trust the structure. Order-preserving + de-duplicated so the value is stable
+    for logging; empty when the body names none (the whole upload re-runs anyway,
+    so the digest list is diagnostic, not load-bearing)."""
+    seen: Dict[str, None] = {}
+    for digest in re.findall(r"sha256:[0-9a-f]{64}", resp.text or ""):
+        seen.setdefault(digest, None)
+    return tuple(seen)
 
 
 def _put_manifest(
@@ -540,12 +568,20 @@ def _put_manifest(
         )
         time.sleep(delay)
 
-    # A BLOB_UNKNOWN that outlived the retry budget may be a blob we cache-skip (the
-    # empty `{}` config), GC'd since we last confirmed it — not the transient
-    # commit-visibility race the retries assume. Evict the config-blob cache entry so
-    # a re-run re-confirms/re-PUTs it instead of skipping and failing identically.
+    # A BLOB_UNKNOWN that outlived the retry budget is a durably-missing blob, not
+    # the transient commit-visibility race the retries assume: the empty `{}` config
+    # GC'd since we last confirmed it, or a pack whose commit never landed. Evict the
+    # config-blob cache so a re-run re-confirms/re-PUTs it, and raise a TYPED error so
+    # `upload_file` re-uploads every referenced blob rather than getting an opaque
+    # HTTPStatusError it can't distinguish from a permanent 400.
     if resp is not None and _is_blob_commit_race(resp):
         _config_blob_present.discard((registry, repo_id))
+        raise ManifestBlobUnknownError(
+            f"manifest PUT for {repo_id}:{revision} failed with {resp.status_code} "
+            f"after {attempt + 1} attempt(s): {_manifest_error_detail(resp)}",
+            response=resp,
+            missing_digests=_blob_unknown_digests(resp),
+        )
     raise httpx.HTTPStatusError(
         f"manifest PUT for {repo_id}:{revision} failed with {resp.status_code} "
         f"after {attempt + 1} attempt(s): {_manifest_error_detail(resp)}",
@@ -834,6 +870,31 @@ def _handle_unsupported_kwargs(create_pr, parent_commit, run_as_future):
 
 # ---- public API ----
 
+def _commit_with_blob_reupload(run_commit, *, repo_id: str, revision: str) -> CommitInfo:
+    """Run one full upload+manifest commit; on a durable MANIFEST_BLOB_UNKNOWN, re-run it.
+
+    `run_commit` performs one whole attempt (upload every referenced blob, then PUT the
+    manifest) and must raise `ManifestBlobUnknownError` when a referenced blob is still
+    missing after `_put_manifest`'s own per-PUT retry budget — the durable case a
+    re-await can't fix (a GC reap, or a commit that returned 2xx but never landed).
+    Re-running re-PUTs every blob (packs always re-upload; the `{}`-config cache was
+    evicted at the raise site so it re-confirms too). Bounded by
+    `BLOB_REUPLOAD_MAX_RETRIES`; the final attempt propagates, so a registry that keeps
+    dropping the blob surfaces the infra fault. Shared by `upload_file` and
+    `upload_folder` so both self-heal identically — the folder path pushes more blobs
+    and has the wider GC window, so it needs this at least as much."""
+    for reupload in range(BLOB_REUPLOAD_MAX_RETRIES):
+        try:
+            return run_commit()
+        except ManifestBlobUnknownError as exc:
+            named = ", ".join(exc.missing_digests) or "a referenced blob"
+            tqdm.write(
+                f"↻ {repo_id}:{revision} — registry lost {named} after commit; "
+                f"re-uploading and retrying [{reupload + 1}/{BLOB_REUPLOAD_MAX_RETRIES}]"
+            )
+    return run_commit()
+
+
 def upload_file(
     *,
     path_or_fileobj: Union[str, Path, bytes, BinaryIO],
@@ -920,7 +981,12 @@ def upload_file(
             resp = _put_manifest(registry, oci_repo, revision, oci_token, manifest, if_match=prev_digest)
             return _build_commit_info(registry, repo_id, revision, resp, commit_message, commit_description)
 
-        return call_with_oci_token_refresh(oci_repo, token, push=True, endpoint=endpoint, operation=_op)
+        return _commit_with_blob_reupload(
+            lambda: call_with_oci_token_refresh(
+                oci_repo, token, push=True, endpoint=endpoint, operation=_op
+            ),
+            repo_id=repo_id, revision=revision,
+        )
     finally:
         cleanup()
 
@@ -1063,7 +1129,10 @@ def upload_folder(
         print(f"🎉 Successfully pushed {len(filtered)} file(s) to {repo_id}:{revision}")
         return commit_info
 
-    return call_with_oci_token_refresh(oci_repo, token, push=True, endpoint=endpoint, operation=_op)
+    return _commit_with_blob_reupload(
+        lambda: call_with_oci_token_refresh(oci_repo, token, push=True, endpoint=endpoint, operation=_op),
+        repo_id=repo_id, revision=revision,
+    )
 
 
 def hippius_hub_upload(
