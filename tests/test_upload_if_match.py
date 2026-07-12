@@ -33,7 +33,7 @@ import httpx
 import pytest
 import respx
 
-from hippius_hub.errors import ConcurrentManifestUpdateError, HfHubHTTPError
+from hippius_hub.errors import ConcurrentManifestUpdateError, HfHubHTTPError, ManifestBlobUnknownError
 
 
 def _valid_jwt() -> str:
@@ -493,15 +493,21 @@ def test_manifest_put_does_not_retry_malformed_400(tmp_path, monkeypatch):
 
 
 @respx.mock
-def test_manifest_put_exhausts_retries_and_surfaces_error_body(tmp_path, monkeypatch):
-    """A persistent BLOB_UNKNOWN 400 exhausts the bounded retries and raises with
-    the OCI body.
+def test_manifest_put_exhausts_retries_and_reuploads_then_surfaces_error_body(tmp_path, monkeypatch):
+    """A persistent BLOB_UNKNOWN 400 exhausts the per-PUT retries AND the bounded
+    blob re-uploads, then raises the typed ManifestBlobUnknownError with the OCI body.
 
-    `raise_for_status` used to hide Harbor's error code; the raised message must
-    now carry MANIFEST_BLOB_UNKNOWN (and repo:revision) so the terminal outcome is
-    diagnosable instead of an opaque `400 Bad Request`.
+    A blob the registry keeps dropping can neither be waited out (the per-PUT budget)
+    nor re-pushed away (the re-upload budget), so the client re-runs the whole upload
+    BLOB_REUPLOAD_MAX_RETRIES + 1 times — each burning the full manifest-PUT budget —
+    and then surfaces MANIFEST_BLOB_UNKNOWN as a TYPED error carrying repo:revision and
+    the body, so callers can tell it apart from a permanent 400.
     """
-    from hippius_hub.file_upload import MANIFEST_PUT_MAX_RETRIES, upload_file
+    from hippius_hub.file_upload import (
+        BLOB_REUPLOAD_MAX_RETRIES,
+        MANIFEST_PUT_MAX_RETRIES,
+        upload_file,
+    )
 
     _no_backoff(monkeypatch)
     payload, sha_hex, _size = _write_payload(tmp_path)
@@ -513,7 +519,7 @@ def test_manifest_put_exhausts_retries_and_surfaces_error_body(tmp_path, monkeyp
         f"{REGISTRY}/v2/{REPO_ID}/manifests/{REVISION}"
     ).mock(return_value=httpx.Response(400, json=_BLOB_UNKNOWN_BODY))
 
-    with pytest.raises(httpx.HTTPStatusError) as exc_info:
+    with pytest.raises(ManifestBlobUnknownError) as exc_info:
         upload_file(
             path_or_fileobj=str(payload),
             path_in_repo="hello.txt",
@@ -522,7 +528,10 @@ def test_manifest_put_exhausts_retries_and_surfaces_error_body(tmp_path, monkeyp
             revision=REVISION,
         )
 
-    assert put_route.call_count == MANIFEST_PUT_MAX_RETRIES + 1
+    assert put_route.call_count == (MANIFEST_PUT_MAX_RETRIES + 1) * (BLOB_REUPLOAD_MAX_RETRIES + 1), (
+        "every re-upload burns the full manifest-PUT budget before the next re-upload"
+    )
+    assert isinstance(exc_info.value, HfHubHTTPError), "must stay catchable as HfHubHTTPError"
     msg = str(exc_info.value)
     assert "MANIFEST_BLOB_UNKNOWN" in msg, "Harbor's error body must be surfaced"
     assert REPO_ID in msg and REVISION in msg
