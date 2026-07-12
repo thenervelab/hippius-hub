@@ -52,16 +52,29 @@ class _State:
         self.close_count = 0
         self.monolithic_count = 0
         self.patch_offsets: list[int] = []
+        self.patch_lengths: list[int] = []  # committed body size per PATCH
         # patch_script[i] drives the (i+1)-th PATCH; "ok" once exhausted.
         # entries: "ok" | "503"|"403"|"405"|"416" | "drop" | "commit_drop" | ("partial", n)
         self.patch_script: list = []
         self.get_404 = False
         self.close_503_remaining = 0
         self.final_content: bytes = b""
+        # OCI-Chunk-Min-Length advertised on POST (0 = don't advertise).
+        self.min_chunk_length = 0
+        # When True the mock rotates each session's `_state` token per PATCH and
+        # REJECTS a request carrying a stale one — so a client that stopped
+        # following the `Location` header end-to-end fails the upload.
+        self.enforce_location = False
+        self.current_state: dict[str, str] = {}
 
 
 def _extract_uuid(path: str) -> str:
     return path.split("?", 1)[0].rstrip("/").split("/")[-1]
+
+
+def _query_param(path: str, key: str) -> str:
+    query = path.split("?", 1)[1] if "?" in path else ""
+    return next((kv[len(key) + 1:] for kv in query.split("&") if kv.startswith(key + "=")), "")
 
 
 def _read_chunked(rfile) -> bytes:
@@ -95,9 +108,12 @@ class _Handler(BaseHTTPRequestHandler):
         self.st.post_count += 1
         uuid = f"sess{self.st.post_count}"
         self.st.sessions[uuid] = bytearray()
+        self.st.current_state[uuid] = "init"
         self.send_response(202)
         self.send_header("Location", f"/v2/foo/bar/blobs/uploads/{uuid}?_state=init")
         self.send_header("Range", "0-0")  # empty session marker
+        if self.st.min_chunk_length:
+            self.send_header("OCI-Chunk-Min-Length", str(self.st.min_chunk_length))
         self.send_header("Content-Length", "0")
         self.end_headers()
 
@@ -109,8 +125,22 @@ class _Handler(BaseHTTPRequestHandler):
         cr = self.headers.get("Content-Range", "")
         offset = int(cr.split("-", 1)[0]) if "-" in cr else 0
         self.st.patch_offsets.append(offset)
-        length = int(self.headers.get("Content-Length", "0") or "0")
-        body = self.rfile.read(length) if length else b""
+        # The resumable PATCH streams a framed body → Transfer-Encoding: chunked
+        # (no Content-Length). Read whichever framing the client used so the
+        # reassembly stays byte-exact (Harbor accepts the chunked-TE PATCH).
+        te = self.headers.get("Transfer-Encoding", "").lower()
+        if "chunked" in te:
+            body = _read_chunked(self.rfile)
+        else:
+            length = int(self.headers.get("Content-Length", "0") or "0")
+            body = self.rfile.read(length) if length else b""
+
+        # Location-following enforcement: reject a request that carries a stale
+        # `_state` token (i.e. a client that stopped threading the PATCH `Location`
+        # into the next request). Off by default so the other tests are unaffected.
+        if self.st.enforce_location and _query_param(self.path, "_state") != self.st.current_state.get(uuid):
+            self._empty(400)
+            return
 
         action = self.st.patch_script[idx] if idx < len(self.st.patch_script) else "ok"
 
@@ -136,8 +166,11 @@ class _Handler(BaseHTTPRequestHandler):
             self._empty(416)
             return
         sess.extend(body)
+        self.st.patch_lengths.append(len(body))
+        state = f"p{self.st.patch_count}"
+        self.st.current_state[uuid] = state
         self.send_response(202)
-        self.send_header("Location", f"/v2/foo/bar/blobs/uploads/{uuid}?_state=p{self.st.patch_count}")
+        self.send_header("Location", f"/v2/foo/bar/blobs/uploads/{uuid}?_state={state}")
         self.send_header("Range", f"0-{len(sess) - 1}")
         self.send_header("Content-Length", "0")
         self.end_headers()
@@ -147,6 +180,11 @@ class _Handler(BaseHTTPRequestHandler):
         if self.st.get_404:
             self._empty(404)
             return
+        if self.st.enforce_location:
+            uuid = _extract_uuid(self.path)
+            if _query_param(self.path, "_state") != self.st.current_state.get(uuid):
+                self._empty(400)
+                return
         committed = len(self.st.sessions.get(_extract_uuid(self.path), b""))
         self.send_response(204)
         self.send_header("Range", f"0-{committed - 1}" if committed > 0 else "0-0")
@@ -361,3 +399,46 @@ def test_close_put_retries_on_transient_without_reupload(registry):
     assert st.post_count == 1
     assert st.close_count == 2  # closed twice (one 503 + one 201)
     assert st.patch_count == 5  # ceil(4*4096+123/4096)=5 — bytes NOT re-uploaded
+
+
+def test_empty_blob_uploads_via_close_only(registry):
+    """A 0-byte blob: the `while offset < size` loop is skipped entirely, so there
+    is NO PATCH — just POST + the finalising `PUT ?digest=<empty-sha256>`. This is
+    the canonical OCI monolithic empty-blob close and must succeed."""
+    _, st = registry
+    _upload(registry, b"")
+    assert st.final_content == b""
+    assert st.post_count == 1
+    assert st.patch_count == 0  # nothing to PATCH
+    assert st.close_count == 1  # closed once, empty digest accepted
+
+
+def test_client_follows_rotating_location(registry):
+    """Each PATCH hands back a fresh `_state` in `Location`; the client must thread
+    it into the next request. With enforcement on, a client that stopped following
+    the `Location` header would send a stale `_state` and get rejected — so this
+    upload only completes because the client resolves and reuses each new URL."""
+    _, st = registry
+    st.enforce_location = True
+    data = _payload(4)
+    _upload(registry, data)
+    assert st.final_content == data
+    assert st.post_count == 1  # no rejection → no fresh-session restart
+    assert st.patch_count == 5
+
+
+def test_honors_chunk_min_length(registry):
+    """The registry advertises `OCI-Chunk-Min-Length` larger than the configured
+    chunk size; the client must clamp UP so every non-final PATCH meets the minimum
+    (the final short chunk is spec-exempt)."""
+    _, st = registry
+    st.min_chunk_length = 2 * CHUNK  # 8192 > the 4096 env chunk size
+    data = _payload(6)  # 6*4096+123 = 24699 bytes → 8192,8192,8192,123
+    _upload(registry, data)
+    assert st.final_content == data
+    assert st.post_count == 1
+    # Non-final PATCHes must be >= the advertised minimum; only the last may be
+    # smaller. With the clamp they are exactly 8192.
+    assert st.patch_lengths[:-1] == [2 * CHUNK] * (len(st.patch_lengths) - 1)
+    assert all(n >= st.min_chunk_length for n in st.patch_lengths[:-1])
+    assert st.patch_lengths[-1] == 123

@@ -321,33 +321,32 @@ impl<S: Stream> Stream for DoneOnEof<S> {
     }
 }
 
-/// Send a chunked-encoded PUT of `body_stream`, aborting with a retryable
-/// [`CoreError::Stall`] if reqwest stops pulling body frames for `write_stall` —
-/// i.e. a peer that completed the handshake then stopped draining the socket, the
-/// H1 wedge that `connect_timeout`/`tcp_keepalive` cannot see and reqwest offers
-/// no per-operation write timeout for.
+/// Attach `body_stream` as a chunked-encoded body to `req` and send it, aborting
+/// with a retryable [`CoreError::Stall`] if reqwest stops pulling body frames for
+/// `write_stall` — i.e. a peer that completed the handshake then stopped draining
+/// the socket, the H1 wedge that `connect_timeout`/`tcp_keepalive` cannot see and
+/// reqwest offers no per-operation write timeout for.
 ///
-/// Shared by the whole-file ([`put_streaming`]) and pack ([`try_pack_upload_once`])
-/// PUT paths so both get the same protection. `done` is driven off the body stream
-/// reaching end-of-input (see [`DoneOnEof`]), so the write phase is guarded while a
-/// legitimately slow blob-commit RESPONSE (`JuiceFS` backpressure) never trips it,
-/// correct even when the streamed length diverges from any earlier stat.
+/// `req` must already carry the method, URL, headers, and auth — only the body is
+/// attached here — so the ONE watchdog guards the whole-file/pack `PUT`
+/// ([`send_put_watchdogged`]) and the resumable `PATCH` ([`chunked_patch_upload`])
+/// alike. `done` is driven off the body stream reaching end-of-input (see
+/// [`DoneOnEof`]), so the write phase is guarded while a legitimately slow
+/// blob-commit RESPONSE (`JuiceFS` backpressure) never trips it, correct even when
+/// the streamed length diverges from any earlier stat.
 ///
 /// Atomics (not a lock) so the body-stamping closure never holds a guard across
 /// reqwest's `.await` and the watchdog's reads are wait-free; `Relaxed` is enough
 /// because the watchdog only needs to eventually observe the latest stamp, not a
 /// happens-before edge (no data is published through the flags).
-async fn send_put_watchdogged<S>(
-    url: &str,
+async fn send_streaming_watchdogged<S>(
+    req: reqwest::RequestBuilder,
     body_stream: S,
-    auth_token: Option<&str>,
     write_stall: Duration,
 ) -> Result<reqwest::Response, CoreError>
 where
     S: Stream<Item = Result<Bytes, std::io::Error>> + Send + 'static,
 {
-    let client = upload_client()?;
-
     let base = Instant::now();
     let last_ms = Arc::new(AtomicU64::new(elapsed_ms(base)));
     let done = Arc::new(AtomicBool::new(false));
@@ -363,20 +362,12 @@ where
     });
     let body = reqwest::Body::wrap_stream(DoneOnEof::new(stamped, Arc::clone(&done)));
 
-    let mut req = client
-        .put(url)
-        .header(header::CONTENT_TYPE, "application/octet-stream")
-        .body(body);
-    if let Some(token) = auth_token {
-        req = req.bearer_auth(token);
-    }
-
     // Drive the send, aborting if the body WRITE stalls (audit H1). Dropping the
     // send future on a stall (the `return` below) cancels the reqwest request and
     // severs the socket the peer stopped draining. select! polls the pinned send
     // future and re-arms a 1s timer each round; the timer branch checks idle time
     // only while `done` is false, so the response-wait phase is never tripped.
-    let send_fut = req.send();
+    let send_fut = req.body(body).send();
     tokio::pin!(send_fut);
     let stall_ms = u64::try_from(write_stall.as_millis()).unwrap_or(u64::MAX);
     loop {
@@ -392,6 +383,28 @@ where
             }
         }
     }
+}
+
+/// Whole-file/pack `PUT` wrapper over [`send_streaming_watchdogged`]: builds the
+/// octet-stream, bearer-authed `PUT` so the two PUT call sites stay one-liners and
+/// share the exact watchdog the resumable `PATCH` uses.
+async fn send_put_watchdogged<S>(
+    url: &str,
+    body_stream: S,
+    auth_token: Option<&str>,
+    write_stall: Duration,
+) -> Result<reqwest::Response, CoreError>
+where
+    S: Stream<Item = Result<Bytes, std::io::Error>> + Send + 'static,
+{
+    let client = upload_client()?;
+    let mut req = client
+        .put(url)
+        .header(header::CONTENT_TYPE, "application/octet-stream");
+    if let Some(token) = auth_token {
+        req = req.bearer_auth(token);
+    }
+    send_streaming_watchdogged(req, body_stream, write_stall).await
 }
 
 /// Stream `reader` to `url` as a chunked-encoded PUT body, ticking a progress
@@ -502,7 +515,25 @@ fn committed_bytes(range: Option<&str>) -> u64 {
         .and_then(|n| n.trim().parse::<u64>().ok())
     {
         Some(0) | None => 0,
-        Some(end) => end + 1,
+        // saturating_add: a hostile `0-18446744073709551615` would otherwise
+        // overflow (panic under overflow-checks / wrap to 0 in release). Clamping
+        // to u64::MAX only over-reports on a value no real registry sends; the
+        // caller's `server_off > offset` guard then treats it as "already past".
+        Some(end) => end.saturating_add(1),
+    }
+}
+
+/// Coerce a resume give-up cause into a RETRYABLE error so `upload_blob_async`
+/// opens a FRESH session (offset 0) — the actual recovery for a session that is
+/// gone, or a `416` offset-desync the intra-session GET could not resolve. `416`
+/// alone is not [`CoreError::is_retryable`], so returning it raw would make the
+/// outer loop give up instead of restarting; map any non-retryable give-up cause
+/// onto a retryable status that still names the real code.
+fn force_retryable(e: CoreError) -> CoreError {
+    if e.is_retryable() {
+        e
+    } else {
+        CoreError::ServerError(503, format!("upload session unrecoverable ({e}); restarting"))
     }
 }
 
@@ -526,13 +557,14 @@ fn resolve_location(current: &str, location: &str) -> Result<String, CoreError> 
 }
 
 /// `POST /blobs/uploads/` to open a fresh session; return the resolved absolute
-/// session URL (no `?digest=`). Split from [`init_upload_session`] so the
-/// resumable `PATCH` path can address the raw session while the monolithic path
-/// still appends the digest.
+/// session URL (no `?digest=`) and the registry's optional `OCI-Chunk-Min-Length`
+/// (the minimum bytes it will accept per non-final `PATCH`). Split from
+/// [`init_upload_session`] so the resumable `PATCH` path can address the raw
+/// session while the monolithic path still appends the digest.
 async fn post_upload_session(
     uploads_url: &str,
     auth_token: Option<&str>,
-) -> Result<String, CoreError> {
+) -> Result<(String, Option<u64>), CoreError> {
     let client = upload_client()?;
     let mut init = client
         .post(uploads_url)
@@ -550,12 +582,21 @@ async fn post_upload_session(
             "blob upload init failed".to_string(),
         ));
     }
+    // OCI: a registry MAY advertise a per-chunk minimum; the client SHOULD honor
+    // it (final chunk exempt). Harbor does not send it today, so this is normally
+    // None and the default 16 MiB chunk applies unchanged.
+    let min_chunk = resp
+        .headers()
+        .get("OCI-Chunk-Min-Length")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|&n| n > 0);
     let location = resp
         .headers()
         .get(header::LOCATION)
         .and_then(|v| v.to_str().ok())
         .ok_or_else(|| CoreError::Integrity("registry omitted Location on upload init".to_string()))?;
-    resolve_location(uploads_url, location)
+    Ok((resolve_location(uploads_url, location)?, min_chunk))
 }
 
 /// `GET <session>` (OCI "get blob upload status") → count of bytes the registry
@@ -595,11 +636,15 @@ async fn chunked_patch_upload(
     session: &str,
     path: &Path,
     size: u64,
+    min_chunk: Option<u64>,
     auth_token: Option<&str>,
     pb: &ProgressBar,
 ) -> Result<PatchOutcome, CoreError> {
     let client = upload_client()?;
-    let chunk_size = upload_chunk_size();
+    // Honor OCI-Chunk-Min-Length if the registry advertised one: a non-final PATCH
+    // below the minimum is rejected, so clamp the configured chunk size UP to it
+    // (the final short chunk is spec-exempt). Normally None → the env/default wins.
+    let chunk_size = upload_chunk_size().max(min_chunk.unwrap_or(0));
     let mut location = session.to_owned();
     let mut offset: u64 = 0;
     // Consecutive resume attempts with no server-side progress before giving up
@@ -612,19 +657,28 @@ async fn chunked_patch_upload(
         let body = Bytes::from(read_ranges(path, &[(offset, len)]).await?);
         let end_inclusive = end - 1;
 
+        // Stream the chunk through the SHARED write-stall watchdog (audit H1). The
+        // PATCH is now the default data-carrying op; a bare `send().await` would
+        // wedge forever against a peer that stops draining mid-body, because
+        // `upload_client` has no flat request timeout — the exact H1 hang this work
+        // exists to kill. Framing lets the watchdog re-stamp as the socket accepts
+        // each frame (see `PUT_FRAME_BYTES`); Harbor accepts the resulting
+        // chunked-TE PATCH.
+        let frames = frame_bytes(&body, PUT_FRAME_BYTES);
+        let body_stream = futures::stream::iter(frames.into_iter().map(Ok::<Bytes, std::io::Error>));
         let mut req = client
             .patch(&location)
             .header(header::CONTENT_TYPE, "application/octet-stream")
-            .header(header::CONTENT_RANGE, format!("{offset}-{end_inclusive}"))
-            .body(body);
+            .header(header::CONTENT_RANGE, format!("{offset}-{end_inclusive}"));
         if let Some(token) = auth_token {
             req = req.bearer_auth(token);
         }
 
         // On 202 advance; classify anything else. A transient failure (transport
-        // error or 5xx/408/429) drops to the GET-offset resume below; a permanent
-        // 4xx fails fast; 405/501 on the first chunk means PATCH is unsupported.
-        let transient: CoreError = match req.send().await {
+        // error, a write stall, or 5xx/408/429) drops to the GET-offset resume
+        // below; a permanent 4xx fails fast; 405/501 on the first chunk means
+        // PATCH is unsupported.
+        let transient: CoreError = match send_streaming_watchdogged(req, body_stream, WRITE_STALL_TIMEOUT).await {
             Ok(resp) => {
                 let status = resp.status();
                 if status.as_u16() == 202 {
@@ -650,7 +704,7 @@ async fn chunked_patch_upload(
                 }
                 err
             }
-            Err(e) => CoreError::from(e), // transport error — retryable
+            Err(e) => e, // transport error or write Stall — both retryable
         };
 
         // Resume from whatever the registry actually committed.
@@ -660,15 +714,18 @@ async fn chunked_patch_upload(
                 pb.set_position(offset);
                 stall = 0;
             }
-            // Session gone → surface the retryable error so `upload_blob_async`
-            // restarts with a fresh session from offset 0.
-            Ok(None) => return Err(transient),
+            // Session gone → give up on it as a RETRYABLE error so
+            // `upload_blob_async` restarts with a fresh session from offset 0
+            // (`force_retryable` covers the 416 case, which is not itself
+            // retryable but IS recoverable by a fresh session).
+            Ok(None) => return Err(force_retryable(transient)),
             // No progress (or a failing status GET): back off and re-send the
-            // same chunk, up to the stall budget.
+            // same chunk, up to the stall budget, then give up (retryable → the
+            // outer loop restarts a fresh session).
             Ok(Some(_)) | Err(_) => {
                 stall += 1;
                 if stall > UPLOAD_MAX_RETRIES {
-                    return Err(transient);
+                    return Err(force_retryable(transient));
                 }
                 tokio::time::sleep(crate::retry::backoff_delay(stall)).await;
             }
@@ -681,6 +738,15 @@ async fn chunked_patch_upload(
 /// bytes already arrived via `PATCH`). Retries a transient close in place a few
 /// times — the bytes are up, so re-closing is cheap and avoids a full
 /// fresh-session restart just because the closing PUT blipped.
+///
+/// No flat `.timeout()` here (unlike the init POST / status GET): this PUT is what
+/// triggers the registry's server-side blob COMMIT, and that commit legitimately
+/// takes many seconds — minutes on a large blob — under `JuiceFS`/S3 backpressure
+/// (observed multi-minute PUT-with-digest finalises). Capping it at the 30s
+/// init-POST budget would abort an in-progress commit and fail an upload whose
+/// bytes are all durably written. A wedged (half-open) close is instead caught by
+/// the client's `tcp_keepalive` and retried; the empty body has no write phase for
+/// the stall watchdog to guard.
 async fn close_chunked_upload(
     session: &str,
     digest: &str,
@@ -690,7 +756,7 @@ async fn close_chunked_upload(
     let url = append_digest(session, digest);
     let mut attempt: u32 = 0;
     loop {
-        let mut req = client.put(&url).header(header::CONTENT_LENGTH, "0").timeout(INIT_POST_TIMEOUT);
+        let mut req = client.put(&url).header(header::CONTENT_LENGTH, "0");
         if let Some(token) = auth_token {
             req = req.bearer_auth(token);
         }
@@ -716,7 +782,7 @@ async fn try_upload_blob_once(
     // Re-init a fresh OCI upload session on every attempt (audit L2): a PATCH/PUT
     // to a session a prior failed attempt already consumed fails, so init lives
     // inside the retried unit (symmetry with `try_pack_upload_once`).
-    let session = post_upload_session(uploads_url, auth_token).await?;
+    let (session, min_chunk) = post_upload_session(uploads_url, auth_token).await?;
     let file_size = File::open(path).await?.metadata().await?.len();
     let basename = basename_of(path);
 
@@ -736,7 +802,7 @@ async fn try_upload_blob_once(
 
     // Resumable chunked PATCH; fall back to the monolithic streaming PUT if the
     // registry doesn't support PATCH.
-    let result = match chunked_patch_upload(&session, path, file_size, auth_token, &pb).await {
+    let result = match chunked_patch_upload(&session, path, file_size, min_chunk, auth_token, &pb).await {
         Ok(PatchOutcome::Done(final_session)) => close_chunked_upload(&final_session, digest, auth_token).await,
         Ok(PatchOutcome::Unsupported) => {
             let file = File::open(path).await?;
@@ -766,7 +832,10 @@ async fn init_upload_session(
     digest: &str,
     auth_token: Option<&str>,
 ) -> Result<String, CoreError> {
-    Ok(append_digest(&post_upload_session(uploads_url, auth_token).await?, digest))
+    // The pack path uploads a whole-buffer monolithic PUT, so the chunk-min hint
+    // is irrelevant here — discard it.
+    let (session, _min_chunk) = post_upload_session(uploads_url, auth_token).await?;
+    Ok(append_digest(&session, digest))
 }
 
 /// Read the given file byte-ranges in order into one pack blob and push it via a
@@ -1281,6 +1350,64 @@ mod tests {
             matches!(outcome, Ok(Err(CoreError::Stall(_)))),
             "a stalled pack PUT must abort via the shared watchdog as a retryable Stall, got {outcome:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn patch_stall_aborts_via_shared_watchdog() {
+        // Audit H1 (review P1): the resumable PATCH — now the DEFAULT data-carrying
+        // op — routes through `send_streaming_watchdogged`. `upload_client` has no
+        // flat request timeout, so without the watchdog a peer that reads the head
+        // then stops draining wedges the PATCH forever (the exact H1 hang this work
+        // exists to kill). Drive the shared helper with a PATCH request + framed
+        // body against that stall and assert a retryable `Stall` within the window.
+        use tokio::io::AsyncReadExt;
+        use tokio::net::TcpListener;
+        let Ok(listener) = TcpListener::bind("127.0.0.1:0").await else { return };
+        let Ok(addr) = listener.local_addr() else { return };
+        let server = tokio::spawn(async move {
+            if let Ok((mut sock, _)) = listener.accept().await {
+                let mut buf = [0u8; 4096];
+                let _ = sock.read(&mut buf).await;
+                tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+            }
+        });
+
+        let url = format!("http://{addr}/v2/x/blobs/uploads/uuid");
+        let Ok(client) = super::upload_client() else { return };
+        let mut req = client
+            .patch(&url)
+            .header(reqwest::header::CONTENT_TYPE, "application/octet-stream");
+        req = req.header(reqwest::header::CONTENT_RANGE, "0-8388607");
+        // 8 MiB body → many 1 MiB frames; far exceeds the OS send buffer so reqwest
+        // stalls mid-write. write_stall = 1s keeps the test fast.
+        let body = Bytes::from(vec![0u8; 8 * 1024 * 1024]);
+        let frames = super::frame_bytes(&body, super::PUT_FRAME_BYTES);
+        let body_stream = futures::stream::iter(frames.into_iter().map(Ok::<Bytes, std::io::Error>));
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(8),
+            super::send_streaming_watchdogged(req, body_stream, std::time::Duration::from_secs(1)),
+        )
+        .await;
+        server.abort();
+        assert!(
+            matches!(outcome, Ok(Err(CoreError::Stall(_)))),
+            "a stalled PATCH must abort via the shared watchdog as a retryable Stall, got {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn force_retryable_maps_416_to_a_retryable_error() {
+        // Review P2: a 416 routed to the resume path is stored as the give-up
+        // cause, but 416 is NOT `is_retryable` — returning it raw would make
+        // `upload_blob_async` give up instead of restarting a fresh session.
+        // `force_retryable` must turn it into a retryable error that still names
+        // the original code.
+        let mapped = super::force_retryable(CoreError::ServerError(416, "PATCH failed: 416".into()));
+        assert!(mapped.is_retryable(), "a 416 give-up must become retryable");
+        assert!(format!("{mapped}").contains("416"), "the real code must survive");
+        // An already-retryable cause passes through untouched.
+        let passthrough = super::force_retryable(CoreError::ServerError(503, "x".into()));
+        assert!(matches!(passthrough, CoreError::ServerError(503, _)));
     }
 
     proptest::proptest! {
