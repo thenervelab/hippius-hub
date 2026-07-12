@@ -24,11 +24,13 @@ from __future__ import annotations
 import threading
 from types import SimpleNamespace
 
+import httpx
 import pytest
 
 from hippius_hub import _snapshot_download as sd
 from hippius_hub import auth
 from hippius_hub import file_upload as fu
+from hippius_hub.errors import ManifestBlobUnknownError
 
 # Enough files that, with max_workers=2, the vast majority are queued (never
 # started) and therefore cancellable — makes "not all ran" a strong signal.
@@ -136,6 +138,44 @@ def test_upload_folder_refreshes_token_on_worker_401(monkeypatch, tmp_path):
     )
     assert result == "commit-ok", "the fan-out must re-run with a fresh token and commit"
     assert next(tokens, "exhausted") == "exhausted", "exactly two mints: initial + one refresh"
+
+
+def test_upload_folder_reuploads_on_persistent_blob_unknown(monkeypatch, tmp_path):
+    # Folder uploads must self-heal like upload_file: a durable MANIFEST_BLOB_UNKNOWN at
+    # finalize (a blob the registry lost — GC reap / a commit that never landed) re-runs
+    # the WHOLE fan-out so every blob is re-PUT, bounded, then commits. The folder path
+    # pushes more blobs and has the wider GC window, so it needs this at least as much.
+    monkeypatch.setenv("HIPPIUS_CHUNKED_WRITE", "0")
+    folder = tmp_path / "repo"
+    _write_files(folder, 3)
+    auth.clear_oci_token_cache()
+    monkeypatch.setattr(auth, "get_oci_bearer_token", lambda *a, **k: "tok")
+
+    lost = "sha256:" + "e" * 64
+    resp = httpx.Response(
+        400, request=httpx.Request("PUT", "http://x/v2/acme/model/manifests/main"),
+        json={"errors": [{"code": "MANIFEST_BLOB_UNKNOWN", "detail": lost}]},
+    )
+    finalize_calls: list[int] = []
+
+    def fake_finalize(**k):
+        finalize_calls.append(1)
+        if len(finalize_calls) == 1:
+            raise ManifestBlobUnknownError("blob unknown", response=resp, missing_digests=(lost,))
+        return "commit-ok"
+
+    monkeypatch.setattr(fu, "_finalize_upload_manifest", fake_finalize)
+
+    fanout_runs: list[str] = []
+    monkeypatch.setattr(fu, "_upload_one_file", lambda **kw: fanout_runs.append(kw["rel_path"]) or [])
+
+    result = fu.upload_folder(
+        repo_id="acme/model", folder_path=str(folder), repo_type="model", max_workers=2
+    )
+
+    assert result == "commit-ok", "the folder upload must re-run and commit on the re-upload"
+    assert len(finalize_calls) == 2, "a durable BLOB_UNKNOWN must trigger exactly one folder re-upload"
+    assert len(fanout_runs) == 6, "the whole 3-file fan-out must re-run so every lost blob is re-PUT"
 
 
 def test_l10_dedup_index_skipped_for_small_only_folder(monkeypatch, tmp_path):

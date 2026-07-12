@@ -66,11 +66,11 @@ the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html
   manifest PUT keeps failing `MANIFEST_BLOB_UNKNOWN` after the commit-visibility
   retry budget is spent, the referenced blob is durably gone — a registry-side GC
   reaped an untagged blob, or a commit that returned `2xx` never landed under
-  storage pressure — not merely lagging, so re-awaiting it can't help. `upload_file`
-  now re-runs the whole upload (re-PUTting every referenced blob) up to
-  `HIPPIUS_BLOB_REUPLOAD_RETRIES` (default 2) times before surfacing the new typed
-  `ManifestBlobUnknownError`, instead of an opaque `HTTPStatusError` it retried in
-  vain.
+  storage pressure — not merely lagging, so re-awaiting it can't help. Both
+  `upload_file` and `upload_folder` now re-run the whole upload (re-PUTting every
+  referenced blob) up to `HIPPIUS_BLOB_REUPLOAD_RETRIES` (default 2) times before
+  surfacing the new typed `ManifestBlobUnknownError`, instead of an opaque
+  `HTTPStatusError` they retried in vain.
 - **Connection & transport hardening.** A top-to-bottom audit of the Rust data
   plane and Python control plane:
   - Uploads now abort a stalled body write: a peer that completes TCP+TLS then

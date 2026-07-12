@@ -870,6 +870,31 @@ def _handle_unsupported_kwargs(create_pr, parent_commit, run_as_future):
 
 # ---- public API ----
 
+def _commit_with_blob_reupload(run_commit, *, repo_id: str, revision: str) -> CommitInfo:
+    """Run one full upload+manifest commit; on a durable MANIFEST_BLOB_UNKNOWN, re-run it.
+
+    `run_commit` performs one whole attempt (upload every referenced blob, then PUT the
+    manifest) and must raise `ManifestBlobUnknownError` when a referenced blob is still
+    missing after `_put_manifest`'s own per-PUT retry budget — the durable case a
+    re-await can't fix (a GC reap, or a commit that returned 2xx but never landed).
+    Re-running re-PUTs every blob (packs always re-upload; the `{}`-config cache was
+    evicted at the raise site so it re-confirms too). Bounded by
+    `BLOB_REUPLOAD_MAX_RETRIES`; the final attempt propagates, so a registry that keeps
+    dropping the blob surfaces the infra fault. Shared by `upload_file` and
+    `upload_folder` so both self-heal identically — the folder path pushes more blobs
+    and has the wider GC window, so it needs this at least as much."""
+    for reupload in range(BLOB_REUPLOAD_MAX_RETRIES):
+        try:
+            return run_commit()
+        except ManifestBlobUnknownError as exc:
+            named = ", ".join(exc.missing_digests) or "a referenced blob"
+            tqdm.write(
+                f"↻ {repo_id}:{revision} — registry lost {named} after commit; "
+                f"re-uploading and retrying [{reupload + 1}/{BLOB_REUPLOAD_MAX_RETRIES}]"
+            )
+    return run_commit()
+
+
 def upload_file(
     *,
     path_or_fileobj: Union[str, Path, bytes, BinaryIO],
@@ -956,23 +981,12 @@ def upload_file(
             resp = _put_manifest(registry, oci_repo, revision, oci_token, manifest, if_match=prev_digest)
             return _build_commit_info(registry, repo_id, revision, resp, commit_message, commit_description)
 
-        # A MANIFEST_BLOB_UNKNOWN that outlived `_put_manifest`'s own retry budget
-        # means a referenced blob is durably gone, not lagging — re-run the whole
-        # operation so every blob is re-PUT (packs always re-upload; the config cache
-        # was evicted at the raise site). Bounded: the final attempt propagates, so a
-        # registry that keeps dropping the blob surfaces as the infra fault it is.
-        for reupload in range(BLOB_REUPLOAD_MAX_RETRIES):
-            try:
-                return call_with_oci_token_refresh(
-                    oci_repo, token, push=True, endpoint=endpoint, operation=_op
-                )
-            except ManifestBlobUnknownError as exc:
-                named = ", ".join(exc.missing_digests) or "a referenced blob"
-                tqdm.write(
-                    f"↻ {repo_id}:{revision} — registry lost {named} after commit; "
-                    f"re-uploading and retrying [{reupload + 1}/{BLOB_REUPLOAD_MAX_RETRIES}]"
-                )
-        return call_with_oci_token_refresh(oci_repo, token, push=True, endpoint=endpoint, operation=_op)
+        return _commit_with_blob_reupload(
+            lambda: call_with_oci_token_refresh(
+                oci_repo, token, push=True, endpoint=endpoint, operation=_op
+            ),
+            repo_id=repo_id, revision=revision,
+        )
     finally:
         cleanup()
 
@@ -1115,7 +1129,10 @@ def upload_folder(
         print(f"🎉 Successfully pushed {len(filtered)} file(s) to {repo_id}:{revision}")
         return commit_info
 
-    return call_with_oci_token_refresh(oci_repo, token, push=True, endpoint=endpoint, operation=_op)
+    return _commit_with_blob_reupload(
+        lambda: call_with_oci_token_refresh(oci_repo, token, push=True, endpoint=endpoint, operation=_op),
+        repo_id=repo_id, revision=revision,
+    )
 
 
 def hippius_hub_upload(
