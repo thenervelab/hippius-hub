@@ -116,7 +116,11 @@ def test_chunked_v2_many_packs_ordering(tmp_path, cache_dir, logged_in, test_rep
 
     size = 8 * 1024 * 1024
     src = tmp_path / "many.bin"
-    expected = write_test_file(src, size, seed=b"v2-many-packs")
+    # Per-run-fresh content (see the note in test_chunked_v2_live_roundtrip): a fixed
+    # seed yields byte-identical packs whose digests collide with any GC-wedged blob,
+    # which the manifest PUT then can't commit. The >= 8 pack-count assertion has ample
+    # margin over the ~16 statistically-stable packs, so fresh content is safe here.
+    expected = write_test_file(src, size, seed=revision.encode())
 
     hippius_hub_upload(repo_id=test_repo, local_path=str(src), revision=revision)
 
