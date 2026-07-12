@@ -50,7 +50,15 @@ def test_chunked_v2_live_roundtrip(tmp_path, cache_dir, logged_in, test_repo, re
 
     size = 4 * 1024 * 1024
     src = tmp_path / "big.bin"
-    expected = write_test_file(src, size, seed=b"v2-live")
+    # Key the content to the unique per-run revision, NOT a fixed seed. A fixed seed
+    # yields byte-identical packs every run, so the pack digests collide with any
+    # registry-side GC-wedged blob of that digest — a deterministic pack a prior run
+    # left half-committed (blob reaped, DB row gone) can never re-commit, and the
+    # manifest PUT fails MANIFEST_BLOB_UNKNOWN forever. Fresh-per-run content gives
+    # every run brand-new digests (referenced by the committing manifest, so GC keeps
+    # them); it stays reproducible within the run, so the edit+re-upload dedup check
+    # below still holds.
+    expected = write_test_file(src, size, seed=revision.encode())
 
     hippius_hub_upload(repo_id=test_repo, local_path=str(src), revision=revision)
 
