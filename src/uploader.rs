@@ -468,31 +468,69 @@ fn basename_of(path: &Path) -> String {
         .map_or_else(|| "blob".to_string(), |n| n.to_string_lossy().into_owned())
 }
 
-async fn try_upload_blob_once(
-    uploads_url: &str,
-    path: &Path,
-    digest: &str,
-    auth_token: Option<&str>,
-) -> Result<(), CoreError> {
-    // Re-init a fresh OCI upload session on every attempt (audit L2): a PUT to a
-    // session a prior failed attempt already consumed fails, so init must live inside
-    // the retried unit (symmetry with `try_pack_upload_once`), not once on the Python
-    // side re-PUTting the same dead session.
-    let put_url = init_upload_session(uploads_url, digest, auth_token).await?;
-    let file = File::open(path).await?;
-    // Size is for the progress bar only — see put_streaming on why it is not a
-    // Content-Length.
-    let file_size = file.metadata().await?.len();
-    put_streaming(&put_url, file, file_size, &basename_of(path), auth_token, WRITE_STALL_TIMEOUT).await
+/// Bytes per `PATCH` chunk (env `HIPPIUS_UPLOAD_CHUNK_SIZE`, default 16 MiB). A
+/// mid-upload disconnect re-sends at most one chunk; the GET-offset resume skips
+/// everything the registry already committed. Tests set it small to force many
+/// chunks on a tiny payload.
+fn upload_chunk_size() -> u64 {
+    std::env::var("HIPPIUS_UPLOAD_CHUNK_SIZE")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(16 * 1024 * 1024)
 }
 
-/// POST-init a fresh OCI blob-upload session at `uploads_url`, resolve the returned
-/// `Location`, and append `?digest={digest}` — the URL a monolithic PUT-with-digest
-/// targets. Shared by the plain ([`try_upload_blob_once`]) and pack
-/// ([`try_pack_upload_once`]) paths so BOTH re-init per retry attempt (audit L2).
-async fn init_upload_session(
+/// Result of the chunked-`PATCH` phase of one session.
+enum PatchOutcome {
+    /// Every byte was `PATCH`ed; carries the current session URL to finalise.
+    Done(String),
+    /// The registry rejected `PATCH` (405/501) on the first chunk — the caller
+    /// falls back to the monolithic streaming `PUT`.
+    Unsupported,
+}
+
+/// Parse an OCI upload `Range: 0-<end>` (inclusive) into the count of committed
+/// bytes. Harbor returns `0-0` for an EMPTY session (right after POST, nothing
+/// committed) and `0-<end>` once bytes land, so `0-0` is treated as 0, not 1 —
+/// mis-reading it as 1 on a first-chunk-failure resume would skip byte 0. An
+/// absent/garbled header also means nothing committed. Under-counting only
+/// re-sends already-present bytes (the server 416s or overwrites); over-counting
+/// would silently drop data, so we bias to under-count.
+fn committed_bytes(range: Option<&str>) -> u64 {
+    match range
+        .and_then(|r| r.rsplit('-').next())
+        .and_then(|n| n.trim().parse::<u64>().ok())
+    {
+        Some(0) | None => 0,
+        Some(end) => end + 1,
+    }
+}
+
+/// Append `?digest=<digest>` to a session URL (raw, unencoded `:` — the registry
+/// matches the literal digest; percent-encoding it breaks the match).
+fn append_digest(session: &str, digest: &str) -> String {
+    let mut url = session.to_owned();
+    url.push(if url.contains('?') { '&' } else { '?' });
+    url.push_str("digest=");
+    url.push_str(digest);
+    url
+}
+
+/// Resolve a possibly-relative `Location` header against the current session URL
+/// (each PATCH/POST response may hand back a new session URL carrying state).
+fn resolve_location(current: &str, location: &str) -> Result<String, CoreError> {
+    reqwest::Url::parse(current)
+        .and_then(|base| base.join(location))
+        .map(|u| u.to_string())
+        .map_err(|e| CoreError::Integrity(format!("bad upload Location {location:?}: {e}")))
+}
+
+/// `POST /blobs/uploads/` to open a fresh session; return the resolved absolute
+/// session URL (no `?digest=`). Split from [`init_upload_session`] so the
+/// resumable `PATCH` path can address the raw session while the monolithic path
+/// still appends the digest.
+async fn post_upload_session(
     uploads_url: &str,
-    digest: &str,
     auth_token: Option<&str>,
 ) -> Result<String, CoreError> {
     let client = upload_client()?;
@@ -505,29 +543,230 @@ async fn init_upload_session(
     if let Some(token) = auth_token {
         init = init.bearer_auth(token);
     }
-    let init_resp = init.send().await?;
-    if !init_resp.status().is_success() {
+    let resp = init.send().await?;
+    if !resp.status().is_success() {
         return Err(CoreError::ServerError(
-            init_resp.status().as_u16(),
+            resp.status().as_u16(),
             "blob upload init failed".to_string(),
         ));
     }
-    let location = init_resp
+    let location = resp
         .headers()
         .get(header::LOCATION)
         .and_then(|v| v.to_str().ok())
         .ok_or_else(|| CoreError::Integrity("registry omitted Location on upload init".to_string()))?;
-    // Resolve a possibly-relative Location against the uploads URL, then append the
-    // digest as a RAW query pair (":" is legal unencoded in a query; percent-encoding
-    // it via query_pairs_mut breaks the registry's digest match).
-    let resolved = reqwest::Url::parse(uploads_url)
-        .and_then(|base| base.join(location))
-        .map_err(|e| CoreError::Integrity(format!("bad upload Location {location:?}: {e}")))?;
-    let mut put_url = resolved.to_string();
-    put_url.push(if put_url.contains('?') { '&' } else { '?' });
-    put_url.push_str("digest=");
-    put_url.push_str(digest);
-    Ok(put_url)
+    resolve_location(uploads_url, location)
+}
+
+/// `GET <session>` (OCI "get blob upload status") → count of bytes the registry
+/// has committed, i.e. the resume offset. `Ok(None)` means the session is gone
+/// (404) and must be restarted with a fresh `POST`; a transient failure is
+/// surfaced as `Err` so the caller backs off.
+async fn session_offset(
+    session: &str,
+    auth_token: Option<&str>,
+) -> Result<Option<u64>, CoreError> {
+    let client = upload_client()?;
+    let mut req = client.get(session).timeout(INIT_POST_TIMEOUT);
+    if let Some(token) = auth_token {
+        req = req.bearer_auth(token);
+    }
+    let resp = req.send().await?;
+    let status = resp.status();
+    if status.as_u16() == 404 {
+        return Ok(None); // session expired / gone
+    }
+    if !status.is_success() {
+        return Err(CoreError::ServerError(
+            status.as_u16(),
+            "upload status GET failed".to_string(),
+        ));
+    }
+    let range = resp.headers().get(header::RANGE).and_then(|v| v.to_str().ok());
+    Ok(Some(committed_bytes(range)))
+}
+
+/// Upload `path` to `session` in [`upload_chunk_size`]-byte chunks via OCI
+/// `PATCH`, resuming from the registry-committed offset after any transient
+/// failure instead of re-sending the whole blob. Returns the (possibly updated)
+/// session URL to close, or [`PatchOutcome::Unsupported`] if `PATCH` is rejected
+/// on the first chunk.
+async fn chunked_patch_upload(
+    session: &str,
+    path: &Path,
+    size: u64,
+    auth_token: Option<&str>,
+    pb: &ProgressBar,
+) -> Result<PatchOutcome, CoreError> {
+    let client = upload_client()?;
+    let chunk_size = upload_chunk_size();
+    let mut location = session.to_owned();
+    let mut offset: u64 = 0;
+    // Consecutive resume attempts with no server-side progress before giving up
+    // (the outer loop then restarts with a fresh session).
+    let mut stall: u32 = 0;
+
+    while offset < size {
+        let end = (offset + chunk_size).min(size);
+        let len = end - offset;
+        let body = Bytes::from(read_ranges(path, &[(offset, len)]).await?);
+        let end_inclusive = end - 1;
+
+        let mut req = client
+            .patch(&location)
+            .header(header::CONTENT_TYPE, "application/octet-stream")
+            .header(header::CONTENT_RANGE, format!("{offset}-{end_inclusive}"))
+            .body(body);
+        if let Some(token) = auth_token {
+            req = req.bearer_auth(token);
+        }
+
+        // On 202 advance; classify anything else. A transient failure (transport
+        // error or 5xx/408/429) drops to the GET-offset resume below; a permanent
+        // 4xx fails fast; 405/501 on the first chunk means PATCH is unsupported.
+        let transient: CoreError = match req.send().await {
+            Ok(resp) => {
+                let status = resp.status();
+                if status.as_u16() == 202 {
+                    if let Some(loc) = resp.headers().get(header::LOCATION).and_then(|v| v.to_str().ok()) {
+                        location = resolve_location(&location, loc)?;
+                    }
+                    offset = end;
+                    pb.set_position(offset);
+                    stall = 0;
+                    continue;
+                }
+                let code = status.as_u16();
+                if offset == 0 && matches!(code, 405 | 501) {
+                    return Ok(PatchOutcome::Unsupported);
+                }
+                let err = CoreError::ServerError(code, format!("PATCH failed: {status}"));
+                // 416 Range Not Satisfiable = out-of-order chunk: the OCI spec
+                // says GET the upload status and resync, so route it to the
+                // resume path below rather than failing (it is otherwise a 4xx).
+                // Any other non-retryable status is a genuine permanent error.
+                if code != 416 && !err.is_retryable() {
+                    return Err(err); // permanent (e.g. 400/403)
+                }
+                err
+            }
+            Err(e) => CoreError::from(e), // transport error — retryable
+        };
+
+        // Resume from whatever the registry actually committed.
+        match session_offset(&location, auth_token).await {
+            Ok(Some(server_off)) if server_off > offset => {
+                offset = server_off;
+                pb.set_position(offset);
+                stall = 0;
+            }
+            // Session gone → surface the retryable error so `upload_blob_async`
+            // restarts with a fresh session from offset 0.
+            Ok(None) => return Err(transient),
+            // No progress (or a failing status GET): back off and re-send the
+            // same chunk, up to the stall budget.
+            Ok(Some(_)) | Err(_) => {
+                stall += 1;
+                if stall > UPLOAD_MAX_RETRIES {
+                    return Err(transient);
+                }
+                tokio::time::sleep(crate::retry::backoff_delay(stall)).await;
+            }
+        }
+    }
+    Ok(PatchOutcome::Done(location))
+}
+
+/// Finalise a chunked upload: `PUT <session>?digest=` with an empty body (all
+/// bytes already arrived via `PATCH`). Retries a transient close in place a few
+/// times — the bytes are up, so re-closing is cheap and avoids a full
+/// fresh-session restart just because the closing PUT blipped.
+async fn close_chunked_upload(
+    session: &str,
+    digest: &str,
+    auth_token: Option<&str>,
+) -> Result<(), CoreError> {
+    let client = upload_client()?;
+    let url = append_digest(session, digest);
+    let mut attempt: u32 = 0;
+    loop {
+        let mut req = client.put(&url).header(header::CONTENT_LENGTH, "0").timeout(INIT_POST_TIMEOUT);
+        if let Some(token) = auth_token {
+            req = req.bearer_auth(token);
+        }
+        let err: CoreError = match req.send().await {
+            Ok(resp) if resp.status().is_success() => return Ok(()),
+            Ok(resp) => CoreError::ServerError(resp.status().as_u16(), "upload close failed".to_string()),
+            Err(e) => CoreError::from(e),
+        };
+        attempt += 1;
+        if !err.is_retryable() || attempt > UPLOAD_MAX_RETRIES {
+            return Err(err);
+        }
+        tokio::time::sleep(crate::retry::backoff_delay(attempt)).await;
+    }
+}
+
+async fn try_upload_blob_once(
+    uploads_url: &str,
+    path: &Path,
+    digest: &str,
+    auth_token: Option<&str>,
+) -> Result<(), CoreError> {
+    // Re-init a fresh OCI upload session on every attempt (audit L2): a PATCH/PUT
+    // to a session a prior failed attempt already consumed fails, so init lives
+    // inside the retried unit (symmetry with `try_pack_upload_once`).
+    let session = post_upload_session(uploads_url, auth_token).await?;
+    let file_size = File::open(path).await?.metadata().await?.len();
+    let basename = basename_of(path);
+
+    let pb = ProgressBar::new(file_size);
+    // The template string is a compile-time literal; `indicatif` only errors on
+    // malformed format directives, which we control at the call site.
+    #[expect(clippy::expect_used, reason = "infallible static template")]
+    pb.set_style(
+        ProgressStyle::default_bar()
+            .template(
+                "{msg} {spinner:.green} [{elapsed_precise}] [{bar:40.green/blue}] {bytes}/{total_bytes} ({bytes_per_sec}, {eta})",
+            )
+            .expect("indicatif template is static and infallible")
+            .progress_chars("#>-"),
+    );
+    pb.set_message(format!("📤 {basename}"));
+
+    // Resumable chunked PATCH; fall back to the monolithic streaming PUT if the
+    // registry doesn't support PATCH.
+    let result = match chunked_patch_upload(&session, path, file_size, auth_token, &pb).await {
+        Ok(PatchOutcome::Done(final_session)) => close_chunked_upload(&final_session, digest, auth_token).await,
+        Ok(PatchOutcome::Unsupported) => {
+            let file = File::open(path).await?;
+            let put_url = append_digest(&session, digest);
+            // put_streaming owns its own progress bar; clear ours so they don't
+            // fight over the terminal line.
+            pb.finish_and_clear();
+            return put_streaming(&put_url, file, file_size, &basename, auth_token, WRITE_STALL_TIMEOUT).await;
+        }
+        Err(e) => Err(e),
+    };
+
+    match &result {
+        Ok(()) => pb.finish_with_message(format!("✅ {basename} uploaded")),
+        Err(CoreError::Stall(_)) => pb.finish_with_message(format!("❌ {basename} stalled")),
+        Err(_) => pb.finish_with_message(format!("❌ {basename} failed")),
+    }
+    result
+}
+
+/// POST-init a fresh OCI blob-upload session and append `?digest=` — the URL a
+/// monolithic PUT-with-digest targets. Still used by the pack path
+/// ([`try_pack_upload_once`]); the plain path now uses [`post_upload_session`] +
+/// chunked `PATCH` directly.
+async fn init_upload_session(
+    uploads_url: &str,
+    digest: &str,
+    auth_token: Option<&str>,
+) -> Result<String, CoreError> {
+    Ok(append_digest(&post_upload_session(uploads_url, auth_token).await?, digest))
 }
 
 /// Read the given file byte-ranges in order into one pack blob and push it via a
@@ -802,6 +1041,55 @@ mod cdc_tests {
 mod tests {
     use super::CoreError;
     use bytes::Bytes;
+
+    // --- resumable-upload pure helpers (audit: resumable chunked PATCH) ---
+
+    #[test]
+    fn committed_bytes_parses_inclusive_range() {
+        // OCI `Range: 0-<end>` is inclusive → committed = end + 1.
+        assert_eq!(super::committed_bytes(Some("0-1023")), 1024);
+        assert_eq!(super::committed_bytes(Some("0-9999999")), 10_000_000);
+    }
+
+    #[test]
+    fn committed_bytes_treats_empty_marker_and_garbage_as_zero() {
+        // `0-0` is Harbor's EMPTY-session marker (post-POST, nothing committed),
+        // NOT one byte — mis-reading it as 1 would skip byte 0 on a resume.
+        assert_eq!(super::committed_bytes(Some("0-0")), 0);
+        assert_eq!(super::committed_bytes(None), 0);
+        assert_eq!(super::committed_bytes(Some("")), 0);
+        assert_eq!(super::committed_bytes(Some("0-notanumber")), 0);
+        assert_eq!(super::committed_bytes(Some("bogus")), 0);
+    }
+
+    #[test]
+    fn append_digest_picks_the_right_query_separator() {
+        // Bare session → `?`; a session that already carries `?_state=` → `&`.
+        assert_eq!(
+            super::append_digest("https://reg/v2/x/blobs/uploads/uuid", "sha256:ab"),
+            "https://reg/v2/x/blobs/uploads/uuid?digest=sha256:ab"
+        );
+        assert_eq!(
+            super::append_digest("https://reg/v2/x/blobs/uploads/uuid?_state=z", "sha256:ab"),
+            "https://reg/v2/x/blobs/uploads/uuid?_state=z&digest=sha256:ab"
+        );
+    }
+
+    #[test]
+    fn resolve_location_handles_absolute_and_relative() {
+        // A relative Location resolves against the current session URL; an
+        // absolute one replaces it wholesale.
+        let base = "https://reg/v2/x/blobs/uploads/uuid?_state=a";
+        assert!(super::resolve_location(base, "/v2/x/blobs/uploads/uuid?_state=b")
+            .is_ok_and(|u| u == "https://reg/v2/x/blobs/uploads/uuid?_state=b"));
+        assert!(super::resolve_location(base, "https://other/v2/x/blobs/uploads/uuid2")
+            .is_ok_and(|u| u == "https://other/v2/x/blobs/uploads/uuid2"));
+        // A malformed Location is a typed Integrity error, not a panic.
+        assert!(matches!(
+            super::resolve_location("not a url", "also not"),
+            Err(CoreError::Integrity(_))
+        ));
+    }
 
     /// Source-grep guard. Setting `Content-Length` on a streaming PUT
     /// re-introduces the TOCTOU race fixed in audit U2: between
