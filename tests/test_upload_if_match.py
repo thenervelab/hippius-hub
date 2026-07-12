@@ -538,6 +538,67 @@ def test_manifest_put_exhausts_retries_and_reuploads_then_surfaces_error_body(tm
 
 
 @respx.mock
+def test_persistent_blob_unknown_reconfirms_the_config_blob_on_reupload(tmp_path, monkeypatch):
+    """The config-lost self-heal: a persistent BLOB_UNKNOWN evicts the `{}`-config
+    cache so the re-upload re-confirms it through the REAL `_ensure_config_blob_uploaded`
+    instead of cache-skipping and failing identically.
+
+    This pins the eviction in `_put_manifest` — the mechanism for the PR's headline
+    scenario (a GC-reaped empty config). Remove the eviction and the re-run reuses the
+    cached config, so the config HEAD is not re-issued and this assertion drops from 2
+    to 1. Runs the real config helper (not a stub), so it actually exercises the link.
+    """
+    from hippius_hub.file_upload import (
+        MANIFEST_PUT_MAX_RETRIES,
+        clear_config_blob_cache,
+        upload_file,
+    )
+
+    clear_config_blob_cache()
+    _no_backoff(monkeypatch)
+    payload, sha_hex, _size = _write_payload(tmp_path)
+
+    empty_digest = "sha256:" + hashlib.sha256(b"{}").hexdigest()
+    respx.mock.get(
+        url__startswith=f"{REGISTRY}/service/token"
+    ).mock(return_value=httpx.Response(200, json={"token": _valid_jwt()}))
+    respx.mock.head(
+        f"{REGISTRY}/v2/{REPO_ID}/blobs/sha256:{sha_hex}"
+    ).mock(return_value=httpx.Response(200))
+    config_head = respx.mock.head(
+        f"{REGISTRY}/v2/{REPO_ID}/blobs/{empty_digest}"
+    ).mock(return_value=httpx.Response(200))
+    respx.mock.get(
+        f"{REGISTRY}/v2/{REPO_ID}/manifests/{REVISION}"
+    ).mock(return_value=httpx.Response(404))
+    # The whole first attempt 400s BLOB_UNKNOWN (exhausts the per-PUT budget → evicts the
+    # config cache → re-upload); the re-upload's single manifest PUT then lands.
+    put_route = respx.mock.put(
+        f"{REGISTRY}/v2/{REPO_ID}/manifests/{REVISION}"
+    ).mock(side_effect=(
+        [httpx.Response(400, json=_BLOB_UNKNOWN_BODY)] * (MANIFEST_PUT_MAX_RETRIES + 1)
+        + [httpx.Response(201, headers={"Docker-Content-Digest": "sha256:" + "e" * 64})]
+    ))
+
+    upload_file(
+        path_or_fileobj=str(payload),
+        path_in_repo="hello.txt",
+        repo_id=REPO_ID,
+        token="literal-token-value",
+        revision=REVISION,
+    )
+
+    assert config_head.call_count == 2, (
+        "the persistent BLOB_UNKNOWN must evict the {}-config cache so the re-upload "
+        "re-confirms it via the real _ensure_config_blob_uploaded — without the eviction "
+        "the config stays cached and this drops to 1"
+    )
+    assert put_route.call_count == MANIFEST_PUT_MAX_RETRIES + 2, (
+        "the full per-PUT budget on the first attempt, then one landing PUT on the re-upload"
+    )
+
+
+@respx.mock
 def test_manifest_put_does_not_retry_non_transient_403(tmp_path, monkeypatch):
     """A 403 is a permanent rejection (auth/quota), not the commit race: fail fast.
 
