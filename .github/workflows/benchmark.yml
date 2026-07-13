@@ -64,10 +64,15 @@ on:
         required: false
         default: '4'
 
-# Serialize benchmark runs so two don't load the test namespace at once. Never
-# cancel an in-flight run — a partial transfer leaves orphan chunk blobs for GC.
+# Share e2e.yml's per-ref concurrency group so a push to `staging` does NOT run the
+# benchmark and the e2e suite against test/e2e-client at the same time — parallel
+# writes to the same revision produce 412s that masquerade as real If-Match
+# regressions. Same group => they serialize. cancel-in-progress stays false here so
+# a benchmark isn't cut mid-transfer under normal queueing; if e2e (which cancels)
+# ever pre-empts an in-flight benchmark, the only cost is orphan chunk blobs a GC
+# reclaims — the same tolerance the transfer already assumes.
 concurrency:
-  group: benchmark
+  group: e2e-${{ github.ref }}
   cancel-in-progress: false
 
 permissions:
@@ -76,17 +81,22 @@ permissions:
 jobs:
   benchmark:
     runs-on: ubuntu-latest
+    # A network-heavy transfer job (512 MiB × N over a possibly-stalled registry —
+    # the exact failure this release hardens) must not sit on the 6h default and
+    # hold the shared concurrency group. Generous enough for a dispatched GB-scale
+    # run, bounded so a wedged transfer fails instead of hanging.
+    timeout-minutes: 90
     permissions:
       contents: read
     steps:
-      # SHA pins mirror e2e.yml — refresh via `gh api repos/<owner>/<repo>/git/refs/tags/<tag>`.
+      # SHA pins match e2e.yml — refresh via `gh api repos/<owner>/<repo>/git/refs/tags/<tag>`.
       - name: Checkout
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
         with:
           persist-credentials: false
 
       - name: Set up Python
-        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1  # v6.3.0
         with:
           python-version: '3.10'
 
