@@ -256,3 +256,55 @@ def test_v2_folder_reupload_dedups_unchanged_chunk(monkeypatch, tmp_path):
 
     # Only the NEW chunk "b" (40, 60) was packed; chunk "a" was reused by range.
     assert packs_seen == [[(40, 60)]]
+
+
+def test_build_dedup_index_excludes_a_lost_pack(monkeypatch):
+    # The blob-loss self-heal for a REUSED pack: when the registry reports a pack
+    # gone (BLOB_UNKNOWN), the next commit attempt must drop that pack from the
+    # dedup index so its chunks re-pack, instead of re-referencing the missing pack
+    # and failing identically. Two prior packs P0 (chunk "a") and P1 (chunk "b").
+    import types
+
+    p0 = "sha256:" + "a0" * 32
+    p1 = "sha256:" + "b1" * 32
+    prior_pointer = json.dumps({
+        "version": "chunked-v2",
+        "file": {"size": 80, "digest": "sha256:" + "d" * 64},
+        "chunks": [
+            {"digest": "sha256:" + "a" * 64, "size": 40, "pack": p0, "offset": 0},
+            {"digest": "sha256:" + "b" * 64, "size": 40, "pack": p1, "offset": 0},
+        ],
+    }).encode()
+    prior_ptr_digest = "sha256:" + hashlib.sha256(prior_pointer).hexdigest()
+    manifest = {
+        "schemaVersion": 2,
+        "layers": [
+            {"mediaType": POINTER_MEDIA_TYPE_V2, "digest": prior_ptr_digest,
+             "size": len(prior_pointer),
+             "annotations": {"org.opencontainers.image.title": "big.bin",
+                             "com.hippius.file.size": "80",
+                             "com.hippius.file.digest": "sha256:" + "d" * 64,
+                             "com.hippius.chunk.count": "2"}},
+            {"mediaType": PACK_MEDIA_TYPE, "digest": p0, "size": 40},
+            {"mediaType": PACK_MEDIA_TYPE, "digest": p1, "size": 40},
+        ],
+        "annotations": {LAYOUT_ANNOTATION_KEY: CHUNKED_LAYOUT_V2},
+    }
+    existing = types.SimpleNamespace(manifest=manifest)
+    # Serve the pointer blob from memory so the index builds without a network.
+    monkeypatch.setattr(file_upload, "_fetch_blob", lambda *a, **k: prior_pointer)
+
+    # No exclusion: both chunks are reusable and both pack sizes are known.
+    index, sizes = file_upload._build_dedup_index(existing, MOCK_REGISTRY, REPO, "tok")
+    assert set(sizes) == {p0, p1}
+    assert index["sha256:" + "a" * 64][0] == p0
+    assert index["sha256:" + "b" * 64][0] == p1
+
+    # Exclude the lost pack P1: its chunk "b" drops from the index (so it re-packs)
+    # and its size drops from pack_sizes (so it is not re-listed); P0 is untouched.
+    index2, sizes2 = file_upload._build_dedup_index(
+        existing, MOCK_REGISTRY, REPO, "tok", exclude_packs=frozenset({p1})
+    )
+    assert set(sizes2) == {p0}
+    assert ("sha256:" + "a" * 64) in index2
+    assert ("sha256:" + "b" * 64) not in index2

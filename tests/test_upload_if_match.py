@@ -504,8 +504,8 @@ def test_manifest_put_exhausts_retries_and_reuploads_then_surfaces_error_body(tm
     the body, so callers can tell it apart from a permanent 400.
     """
     from hippius_hub.file_upload import (
-        BLOB_REUPLOAD_MAX_RETRIES,
         MANIFEST_PUT_MAX_RETRIES,
+        blob_reupload_max_retries,
         upload_file,
     )
 
@@ -528,7 +528,7 @@ def test_manifest_put_exhausts_retries_and_reuploads_then_surfaces_error_body(tm
             revision=REVISION,
         )
 
-    assert put_route.call_count == (MANIFEST_PUT_MAX_RETRIES + 1) * (BLOB_REUPLOAD_MAX_RETRIES + 1), (
+    assert put_route.call_count == (MANIFEST_PUT_MAX_RETRIES + 1) * (blob_reupload_max_retries() + 1), (
         "every re-upload burns the full manifest-PUT budget before the next re-upload"
     )
     assert isinstance(exc_info.value, HfHubHTTPError), "must stay catchable as HfHubHTTPError"
