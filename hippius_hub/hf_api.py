@@ -75,7 +75,12 @@ class HippiusApi(HfApi):
         return self._explicit_token
 
     def _inject(self, kwargs):
-        kwargs.setdefault("token", self._resolve_token(kwargs.get("token")))
+        # Assign unconditionally, not setdefault (audit L-INJECT-TOKEN): setdefault
+        # is a no-op when "token" is present-with-None, so a caller relaying
+        # `token=None` would silently drop the constructor token and fall through to
+        # anonymous/ambient creds. `_resolve_token(None)` returns the constructor
+        # token, which is the intended default.
+        kwargs["token"] = self._resolve_token(kwargs.get("token"))
         if self.endpoint is not None:
             kwargs.setdefault("endpoint", self.endpoint)
         return kwargs

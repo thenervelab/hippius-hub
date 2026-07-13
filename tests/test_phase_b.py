@@ -279,7 +279,12 @@ def test_list_tags_follows_pagination(monkeypatch):
         first: _FakeResp(["a", "b"], '</v2/r/tags/list?last=b&n=2>; rel="next"'),
         "https://reg/v2/r/tags/list?last=b&n=2": _FakeResp(["c"]),
     }
-    monkeypatch.setattr(_repo_ops.httpx, "get", lambda url, **kwargs: pages[url])
+    class _FakeClient:
+        def get(self, url, **kwargs):
+            return pages[url]
+
+    # _list_tags now sends through the shared pooled client; patch that seam.
+    monkeypatch.setattr(_repo_ops._http, "client", lambda: _FakeClient())
     assert _repo_ops._list_tags("https://reg", "r", "tok") == ["a", "b", "c"]
 
 

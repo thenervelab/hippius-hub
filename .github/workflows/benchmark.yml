@@ -1,0 +1,124 @@
+name: Benchmark (chunked transfer)
+
+# Runs on a push to `staging` (so a merge to staging produces benchmark numbers
+# right next to the e2e run) and on manual dispatch (to tune size / runs / probe).
+# The push-triggered run stays within a hosted runner: a 512 MiB single file over
+# 3 fresh-content runs per mode, plus a small folder tier (4 × 128 MiB) that
+# saturates the real worker pools so its measured peak RSS validates — and projects
+# — the production memory ceiling WITHOUT moving GB. No production config/deployment
+# change; chunks are ordinary content-addressed blobs a later GC reclaims — so it
+# stays OFF `main` and every other branch. On a push event the dispatch inputs are
+# empty, so the script uses its built-in defaults. Dispatch with larger shard/size
+# from a machine with capacity to measure the true 2–3 GB shard shape directly.
+on:
+  push:
+    branches: [staging]
+  workflow_dispatch:
+    inputs:
+      tiers:
+        description: Comma-separated tiers to run (single,folder)
+        required: false
+        default: 'single,folder'
+      size_mib:
+        description: Single-file transfer-benchmark file size in MiB
+        required: false
+        default: '512'
+      runs:
+        description: Measured runs per mode (median-of-N, fresh content each)
+        required: false
+        default: '3'
+      pack_mib:
+        description: Pack blob size in MiB (production default 64 — the memory projection extrapolates to this)
+        required: false
+        default: '64'
+      upload_workers:
+        description: Concurrent packs per file (HIPPIUS_UPLOAD_WORKERS)
+        required: false
+        default: '8'
+      folder_shards:
+        description: Folder-tier shard count (raise toward ~30 to match an 80 GB model)
+        required: false
+        default: '4'
+      shard_mib:
+        description: Folder-tier per-shard size in MiB (raise toward 2048–3072 for the real shard size)
+        required: false
+        default: '128'
+      folder_file_workers:
+        description: Concurrent files in the folder tier (upload_folder max_workers)
+        required: false
+        default: '8'
+      harbor_probe:
+        description: Run the Harbor-flow bottleneck probe (latency + concurrency sweep)
+        required: false
+        default: 'true'
+      probe_mib:
+        description: Bytes moved per Harbor-probe measurement, in MiB
+        required: false
+        default: '128'
+      cdc_avg_mib:
+        description: FastCDC average chunk size in MiB (max 4 — fastcdc AVERAGE_MAX)
+        required: false
+        default: '4'
+      patch_mib:
+        description: Edit size in MiB for the incremental re-upload test
+        required: false
+        default: '4'
+
+# Serialize benchmark runs so two don't load the test namespace at once. Never
+# cancel an in-flight run — a partial transfer leaves orphan chunk blobs for GC.
+concurrency:
+  group: benchmark
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  benchmark:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      # SHA pins mirror e2e.yml — refresh via `gh api repos/<owner>/<repo>/git/refs/tags/<tag>`.
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5
+        with:
+          python-version: '3.10'
+
+      - name: Set up Rust toolchain
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8  # stable @ 2026-05-27
+        with:
+          toolchain: stable
+
+      - name: Build and install hippius_hub
+        run: |
+          python -m venv .venv
+          .venv/bin/pip install --upgrade pip maturin
+          .venv/bin/maturin develop --release
+
+      # Inputs flow through `env:` (never interpolated into the shell) so a crafted
+      # dispatch input can't inject a command. HIPPIUS_CHUNKED_WRITE is set inside
+      # the script per mode, so it is intentionally not set here.
+      - name: Run chunked-transfer benchmark
+        env:
+          BENCH_TIERS: ${{ inputs.tiers }}
+          BENCH_SIZE_MIB: ${{ inputs.size_mib }}
+          BENCH_RUNS: ${{ inputs.runs }}
+          BENCH_PACK_MIB: ${{ inputs.pack_mib }}
+          BENCH_UPLOAD_WORKERS: ${{ inputs.upload_workers }}
+          BENCH_FOLDER_SHARDS: ${{ inputs.folder_shards }}
+          BENCH_SHARD_MIB: ${{ inputs.shard_mib }}
+          BENCH_FOLDER_FILE_WORKERS: ${{ inputs.folder_file_workers }}
+          BENCH_HARBOR_PROBE: ${{ inputs.harbor_probe }}
+          BENCH_PROBE_MIB: ${{ inputs.probe_mib }}
+          BENCH_CDC_AVG_MIB: ${{ inputs.cdc_avg_mib }}
+          BENCH_PATCH_MIB: ${{ inputs.patch_mib }}
+          HIPPIUS_TEST_USER: ${{ secrets.HIPPIUS_TEST_USER }}
+          HIPPIUS_TEST_PASS: ${{ secrets.HIPPIUS_TEST_PASS }}
+          HIPPIUS_TEST_TOKEN: ${{ secrets.HIPPIUS_TEST_TOKEN }}
+        run: .venv/bin/python scripts/bench_chunked_transfer.py

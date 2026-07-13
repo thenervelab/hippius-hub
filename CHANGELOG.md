@@ -5,6 +5,146 @@ All notable changes to `hippius_hub` are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **Chunked-v2 (pack) layout for large files.** Files at or above
+  `HIPPIUS_CHUNK_THRESHOLD` (256 MiB) are stored as content-defined chunks
+  (FastCDC, ~4 MiB average) packed into ~64 MiB content-addressed *pack* blobs —
+  a titled `pointer.v2` layer (mapping each chunk to its pack, offset, and size)
+  plus the untitled pack blobs it references, typed with `artifactType` and a
+  `com.hippius.layout: chunked-v2` annotation. A re-uploaded slightly-changed
+  model references unchanged chunks by range into existing packs and uploads only
+  the packs holding new chunks; downloads fetch each pack once and slice its
+  chunks to their file offsets. Concurrent pack uploads are bounded across all
+  files by a shared cap so folder uploads don't multiply resident memory. Small
+  files and every pre-existing artifact are unchanged (one plain blob).
+- New Rust extension functions: `chunk_and_hash_native`, `pack_upload_native`,
+  `download_packs_native`.
+- New env vars: `HIPPIUS_CHUNK_THRESHOLD`, `HIPPIUS_CDC_AVG_SIZE`,
+  `HIPPIUS_PACK_SIZE`, `HIPPIUS_MAX_INFLIGHT_PACKS`, `HIPPIUS_CHUNKED_WRITE`
+  (rollout escape hatch — the chunked-v2 write path is opt-in this release; unset
+  or `0` keeps the single-blob layout for large files).
+- Forward-compatibility guard: a manifest with an unknown `com.hippius.layout`
+  is refused with `UnsupportedLayoutError` (new) instead of misread. Malformed
+  chunked manifests raise `MalformedManifestError` (new).
+
+### Removed
+
+- The in-cluster staged blob **receiver** (`receiver/` crate,
+  `Dockerfile.receiver`, `deploy/receiver/`) and the client multipart upload
+  route it fronted (`upload_blob_multipart_native`, `HIPPIUS_RECEIVER_URL`,
+  `HIPPIUS_MULTIPART_*`, the `diagnose-upload` CLI and its upload throughput
+  probe). Chunking pushes chunk blobs straight to Harbor, so the receiver is
+  superseded. The download `diagnose` command and its probe are unchanged.
+
+### Changed
+
+- **Uploads no longer carry a fixed 1-hour total-request timeout.** A large
+  upload on a slow link was aborted at the 1h mark and — because a timeout is
+  retryable — re-streamed from the start up to the retry budget (~4h of dead
+  transfer). A dead or stalled peer is now detected by connect-timeout + TCP
+  keepalive instead, without ever capping an honest transfer.
+- **`HIPPIUS_VERIFY_HASH=1` now raises on a mismatched plain (non-chunked)
+  download** (`OSError`, matching huggingface_hub) instead of silently caching
+  the content. Previously the computed digest was only used to name the cache
+  blob and was never compared to the manifest digest, so the check was a no-op
+  on the primary (non-chunked) workload.
+- The legacy Range download shares a process-global in-flight cap, so a snapshot
+  of many large files opens at most ~32 concurrent registry connections rather
+  than `snapshot_workers × 32`.
+- `HIPPIUS_READ_TIMEOUT` is now applied to the `diagnose` transfer probe (it was
+  accepted and displayed but never enforced).
+- Transport retry backoff is now jittered (was a deterministic `2^n · 100ms`), so
+  concurrent chunk/pack/upload retries under a registry `429`/`503` no longer
+  collide in lockstep.
+
+### Fixed
+
+- **Chunked-v2 upload self-heals a blob the registry silently lost.** When a
+  manifest PUT keeps failing `MANIFEST_BLOB_UNKNOWN` after the commit-visibility
+  retry budget is spent, the referenced blob is durably gone — a registry-side GC
+  reaped an untagged blob, or a commit that returned `2xx` never landed under
+  storage pressure — not merely lagging, so re-awaiting it can't help. Both
+  `upload_file` and `upload_folder` now re-run the whole upload (re-PUTting every
+  referenced blob) up to `HIPPIUS_BLOB_REUPLOAD_RETRIES` (default 2) times before
+  surfacing the new typed `ManifestBlobUnknownError`, instead of an opaque
+  `HTTPStatusError` they retried in vain.
+- **Connection & transport hardening.** A top-to-bottom audit of the Rust data
+  plane and Python control plane:
+  - Uploads now abort a stalled body write: a peer that completes TCP+TLS then
+    stops draining the socket (invisible to the connect timeout and TCP
+    keep-alive) is cut by an idle-progress watchdog and retried, instead of
+    hanging forever and wedging a whole folder upload. The watchdog covers both
+    the whole-file PUT and the chunked-write pack PUT, keys "body fully sent" off
+    the stream reaching end-of-input (so a file rewritten mid-upload can't
+    false-trip it), and the pack upload-init POST is bounded too.
+  - A `206`'s `Content-Range` is validated to cover exactly the requested bytes,
+    so a range-aliasing proxy can no longer silently write mis-placed bytes into
+    a file cached under the correct-looking digest.
+  - A whole-file `200 OK` to a single-chunk small-file download (the range covers
+    the entire object) is now accepted as RFC-legal instead of rejected; a
+    multi-chunk range-ignored `200` is still refused.
+  - Transient control-plane failures (manifest fetch, token fetch — `408`/`429`/
+    `5xx` and connection blips) are retried with jittered backoff like the data
+    plane, instead of aborting the whole operation on one registry hiccup.
+  - Retry backoff jitter no longer collapses to `0` on microsecond-resolution
+    clocks (which re-created the lockstep retry storm it exists to prevent).
+  - `snapshot_download` and `upload_folder` fail fast — the first error (or
+    Ctrl-C) cancels queued transfers instead of draining the whole repo first.
+  - `HIPPIUS_CONNECT_TIMEOUT` / `HIPPIUS_READ_TIMEOUT` now reach real transfers,
+    not only `diagnose`; setting `HIPPIUS_READ_TIMEOUT` opts real downloads into
+    per-read stall detection.
+  - `diagnose` bounds DNS resolution and tries every resolved address (a dead
+    first IPv6 no longer produces a false-negative), and its token fetch honors
+    `--endpoint`.
+  - `models list`/`show` no longer crash on a null `format` field; the Harbor
+    whoami/create/delete admin calls use the same 30s timeout as their siblings;
+    a wedged `docker login` is bounded to 60s; a folder of only-small files no
+    longer builds the chunked-v2 dedup index it never consults.
+  - The pack fetch is bounded against an over-sending server; the upload hash
+    uses an 8 MiB read buffer (~128× fewer read syscalls); a dead per-download
+    `fsync` of the pre-allocation was removed.
+- **Connection & transport hardening — follow-up.** The deferred cluster from the
+  same audit:
+  - Native downloads and uploads are now interruptible by Ctrl-C: a `SIGINT`
+    during a long transfer is checked ~10×/s and cancels the in-flight work
+    instead of hanging until the transfer finishes.
+  - A bearer token that expires mid-operation on a long transfer is refreshed and
+    the upload/download retried once, instead of failing on the `401`.
+  - Each download body read has a default-on 30s idle timeout (overridable by
+    `HIPPIUS_READ_TIMEOUT`), so a peer that dribbles then stalls mid-body is cut
+    promptly rather than only after the 5-minute per-chunk total timeout.
+  - The plain blob upload re-initiates its OCI upload session on every retry, so a
+    transient failure no longer re-PUTs a session the failed attempt consumed.
+  - The legacy Range downloader bounds its live chunk tasks to a spawn window
+    (drain-as-they-land) instead of eager-spawning one task per chunk; the pack
+    verify/scatter and pack-body hashing moved off the async runtime onto the
+    blocking pool.
+- A `206 Partial Content` whose body is shorter — or longer — than the requested
+  byte range is now rejected and retried instead of being written as a
+  truncated/mis-sized chunk and cached under the correct-looking digest. An
+  over-length body is bounded so its surplus cannot corrupt the adjacent chunk.
+- `list_repo_refs` (and `HfApi(endpoint=...).list_repo_refs`) minted its auth
+  token against the default registry, returning `401` on every custom endpoint;
+  it now honors `endpoint=`.
+- The upload client now sets a connect-timeout (a stalled handshake was
+  previously unbounded).
+- `diagnose` no longer hangs indefinitely on a stalled server (read-timeout plus
+  a bounded raw connect), and one failed parallel range no longer discards the
+  whole report. The size-probe HEAD also gained a request timeout.
+- A missing upload-init `Location` header now raises a clear error instead of a
+  `TypeError`.
+- A non-numeric JWT `exp` claim is rejected instead of poisoning the OCI token
+  cache with a persistent `TypeError`.
+- `HippiusApi` no longer drops the constructor token when a call passes
+  `token=None` explicitly.
+- An interrupted cache download (`KeyboardInterrupt`/`SystemExit`) no longer
+  leaves a temp blob behind.
+- A pointer referencing a pack absent from the manifest raises
+  `MalformedManifestError` instead of a bare `KeyError`.
+
 ## [0.5.0] — 2026-05-27
 
 A consolidation release that lands the 45-finding security/correctness audit

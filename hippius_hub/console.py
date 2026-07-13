@@ -18,6 +18,7 @@ from typing import Any, Optional
 
 import httpx
 
+from . import _http
 from .constants import API_TOKEN_PATH, DEFAULT_API_URL, DEFAULT_CACHE_DIR, DEFAULT_HTTP_TIMEOUT
 
 
@@ -73,7 +74,7 @@ def _request(method: str, path: str, *, token: Optional[str] = None,
     """Send one HTTP request to the console API and decode the JSON response."""
     url = (base_url or DEFAULT_API_URL).rstrip("/") + path
     try:
-        r = httpx.request(
+        r = _http.client().request(
             method,
             url,
             headers=_headers(token, require=require_auth),

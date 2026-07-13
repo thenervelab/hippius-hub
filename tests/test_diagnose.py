@@ -130,6 +130,39 @@ def test_cli_diagnose_help_parses():
     assert "throughput" in result.stdout
 
 
+def test_run_diagnose_passes_none_read_timeout_when_env_unset(monkeypatch):
+    """Offline regression for the `int(resolve_read_timeout())` crash.
+
+    `resolve_read_timeout()` returns None by default (HIPPIUS_READ_TIMEOUT unset),
+    so wrapping it in `int()` raised TypeError and exited the `diagnose` CLI with
+    status 1 — a break only the e2e smoke test caught. This pins that the native
+    probe receives `read_timeout_secs=None` on the default env, without a network.
+    """
+    import hippius_hub.diagnose as dg
+
+    monkeypatch.delenv("HIPPIUS_READ_TIMEOUT", raising=False)
+
+    class _ManifestResult:
+        manifest = {"layers": [{"digest": "sha256:abc"}]}
+
+    captured = {}
+
+    def _fake_native(**kwargs):
+        captured.update(kwargs)
+        return "{}"
+
+    monkeypatch.setattr(dg, "get_oci_bearer_token", lambda *a, **k: "tok")
+    monkeypatch.setattr(dg, "fetch_manifest", lambda *a, **k: _ManifestResult())
+    monkeypatch.setattr(dg, "layer_title", lambda layer: "diag.bin")
+    monkeypatch.setattr(dg, "_verdict", lambda report: [])
+    monkeypatch.setattr(dg, "diagnose_blob_native", _fake_native)
+
+    report = dg.run_diagnose("test/repo", "diag.bin")
+
+    assert captured["read_timeout_secs"] is None
+    assert report["repo_id"] == "test/repo"
+
+
 @pytest.mark.e2e
 def test_cli_diagnose_smoke(tmp_path, test_repo, creds, revision):
     src = tmp_path / "diag.bin"

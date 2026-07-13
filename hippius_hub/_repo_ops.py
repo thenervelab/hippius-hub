@@ -5,16 +5,17 @@ Each function maps a HF API call onto Harbor's /api/v2.0 admin endpoints plus
 the OCI v2 manifest API. Functions accept a `token` kwarg in HF's three-state
 shape (None/True=saved, False=no auth, str=use literal).
 """
+from concurrent.futures import ThreadPoolExecutor
 from typing import List, Optional, Union
 
-import httpx
 from huggingface_hub import GitRefInfo, GitRefs, ModelInfo, RepoUrl
 
+from . import _http
 from ._harbor import (harbor_create_project, harbor_delete_repository,
                       harbor_get_artifact, harbor_get_project, harbor_get_repository,
                       split_repo_id, )
-from ._oci import fetch_manifest, head_manifest, iter_titled_layers, layer_titles
-from .auth import get_oci_bearer_token, resolve_auth_header, resolve_token_value
+from ._oci import fetch_manifest, group_files, head_manifest, layer_titles
+from .auth import get_oci_bearer_token, resolve_auth_header
 from .constants import DEFAULT_HTTP_TIMEOUT, resolve_registry
 from .errors import (LocalTokenNotFoundError, RepositoryNotFoundError, )
 from .file_download import _oci_repo_path, _validate_repo_type
@@ -49,7 +50,7 @@ def _list_tags(registry: str, repo_id: str, oci_token: str) -> Optional[list]:
     seen = set()
     while url and url not in seen:
         seen.add(url)
-        resp = httpx.get(url, headers=headers, timeout=DEFAULT_HTTP_TIMEOUT)
+        resp = _http.client().get(url, headers=headers, timeout=DEFAULT_HTTP_TIMEOUT)
         if resp.status_code == 404:
             return None
         resp.raise_for_status()
@@ -78,28 +79,20 @@ def _next_link(link_header: Optional[str], registry: str) -> Optional[str]:
     return None
 
 
-def _manifest_digest(registry: str, repo_id: str, revision: str, oci_token: str) -> Optional[str]:
-    """Return the content digest of a revision's manifest, or None if unreachable.
+def _revision_digest_and_created(registry: str, repo_id: str, revision: str, oci_token: str) -> tuple:
+    """Return (manifest digest, upload timestamp) for a revision in ONE GET.
 
-    Used as the commit-like identifier for a revision. A cheap HEAD suffices —
-    the digest comes back in the Docker-Content-Digest response header.
-    """
-    head = head_manifest(registry, repo_id, revision, oci_token)
-    if head.status_code != 200:
-        return None
-    return head.headers.get("Docker-Content-Digest")
-
-
-def _revision_created(registry: str, repo_id: str, revision: str, oci_token: str) -> Optional[str]:
-    """Return a revision's upload timestamp (ISO8601), or None if absent.
-
-    Read from the manifest's org.opencontainers.image.created annotation, which
-    uploads via this tool stamp. Revisions pushed by other tooling may lack it.
+    fetch_manifest already returns both the manifest body — carrying the
+    org.opencontainers.image.created annotation — AND the Docker-Content-Digest
+    response header, so a separate digest-only HEAD per revision is redundant.
+    `cmd_revisions` uses this to fetch each revision once (N GETs) rather than 2N
+    (HEAD + GET). Returns (None, None) when the revision is gone (404).
     """
     result = fetch_manifest(registry, repo_id, revision, oci_token, missing_ok=True)
     if result is None:
-        return None
-    return result.manifest.get("annotations", {}).get("org.opencontainers.image.created")
+        return None, None
+    created = result.manifest.get("annotations", {}).get("org.opencontainers.image.created")
+    return result.digest, created
 
 
 def _normalize_oci_timestamp(ts: Optional[str]) -> Optional[str]:
@@ -201,27 +194,35 @@ def repo_info(repo_id: str, *, revision: Optional[str] = None, repo_type: Option
     project, repo = split_repo_id(oci_repo)
 
     auth_header = resolve_auth_header(token, endpoint=endpoint)
-    # Harbor lookups are best-effort: robot accounts often lack admin-API
-    # perms (returns None). The OCI manifest fetch below is the source of truth.
-    harbor_repo = harbor_get_repository(auth_header, project, repo,
-                                        endpoint=endpoint) if auth_header else None
-    harbor_project = harbor_get_project(auth_header, project,
-                                        endpoint=endpoint) if auth_header else None
+    # The three Harbor admin lookups and the OCI token fetch are mutually
+    # independent (only fetch_manifest needs the token); fan them out concurrently
+    # instead of 5 serial RTTs, then fetch the manifest once the token is in. Harbor
+    # lookups stay best-effort — robot accounts often lack admin-API perms and get
+    # None/FORBIDDEN; the manifest fetch is the source of truth. A token-fetch
+    # failure still propagates (it is required), and a Harbor call that raised
+    # re-raises from .result(), exactly as in the old serial path.
+    with ThreadPoolExecutor(max_workers=4) as ex:
+        f_token = ex.submit(get_oci_bearer_token, oci_repo, token, push=False, endpoint=endpoint)
+        f_repo = ex.submit(harbor_get_repository, auth_header, project, repo, endpoint=endpoint) if auth_header else None
+        f_project = ex.submit(harbor_get_project, auth_header, project, endpoint=endpoint) if auth_header else None
+        f_artifact = ex.submit(harbor_get_artifact, auth_header, project, repo, revision, endpoint=endpoint) if auth_header else None
+        oci_token = f_token.result()
+        harbor_repo = f_repo.result() if f_repo else None
+        harbor_project = f_project.result() if f_project else None
+        artifact = f_artifact.result() if f_artifact else None
 
-    oci_token = get_oci_bearer_token(oci_repo, token, push=False, endpoint=endpoint)
     # Read path: we only need the manifest body, not the digest — `repo_info`
     # never PUTs, so there's no If-Match to thread.
     manifest = fetch_manifest(resolve_registry(endpoint), oci_repo, revision, oci_token).manifest
 
     # ModelInfo's __init__ treats each entry in `siblings` as a dict and
-    # builds the RepoSibling internally — pass raw dicts here.
-    siblings = [{"rfilename": title, "size": layer.get("size"), "blobId": layer.get("digest")} for
-        title, layer in iter_titled_layers(manifest)]
+    # builds the RepoSibling internally — pass raw dicts here. group_files reports
+    # the *whole-file* size/digest for a chunked file (from its pointer's
+    # annotations), so a sibling is the logical file, not the tiny pointer blob.
+    siblings = [{"rfilename": g.title, "size": g.size, "blobId": g.digest}
+        for g in group_files(manifest)]
 
-    # Per-revision metadata: artifact info has push_time
-    artifact = harbor_get_artifact(auth_header, project, repo, revision,
-                                   endpoint=endpoint) if auth_header else None
-
+    # artifact (per-revision push_time) was fetched concurrently above.
     last_modified = None
     created_at = None
     # Distinguish "we read it and saw no value" from "we couldn't read it" so
@@ -296,7 +297,7 @@ def list_repo_refs(repo_id: str, *, repo_type: Optional[str] = None,
     _validate_repo_type(repo_type)
     oci_repo = _oci_repo_path(repo_id, repo_type)
     registry = resolve_registry(endpoint)
-    oci_token = get_oci_bearer_token(oci_repo, resolve_token_value(token), push=False)
+    oci_token = get_oci_bearer_token(oci_repo, token, push=False, endpoint=endpoint)
     tags = _list_tags(registry, oci_repo, oci_token)
     if tags is None:
         # RepositoryNotFoundError (an HfHubHTTPError) requires a response object;

@@ -20,23 +20,55 @@ pyo3-async-runtimes = { version = "0.29", features = ["tokio-runtime"] }
 tokio = { version = "1.35", features = ["rt", "rt-multi-thread", "macros", "fs", "time", "net"] }
 tokio-util = { version = "0.7", features = ["codec"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+# Already in the tree via reqwest/tokio-util; declared direct so the pack-upload
+# body can be an O(1)-cloneable `Bytes` (one allocation per in-flight pack, shared
+# across retries) instead of a per-attempt `Vec` copy.
+bytes = "1"
 indicatif = "0.17.8"
 futures = "0.3"
 hex = "0.4"
 thiserror = "1.0"
+# Content-defined chunking for the chunked-artifact upload path. FastCDC's
+# rolling Gear-hash is a correctness- and determinism-critical primitive (its
+# boundaries are part of the wire contract — identical content must re-chunk
+# identically for cross-version dedup), so we use the audited crate rather than
+# hand-roll it. `StreamCDC` chunks a `Read` in bounded memory (no whole-file load).
+fastcdc = "3"
 # Diagnostics probe (src/diagnostics.rs) serializes its DiagnosticReport into
 # a JSON string handed back to Python.
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
-[target.'cfg(all(target_arch = "x86_64", target_os = "linux"))'.dependencies]
+# SHA-256 is the dominant per-byte CPU cost of the transport: every uploaded byte
+# is hashed 2-3x (whole-file + per-chunk + per-pack) and every downloaded byte at
+# least once (per-chunk verify). The `asm` feature routes sha2 to a hardware
+# backend: SHA-NI on x86_64 (via sha2-asm) and the ARMv8 crypto extension on
+# aarch64 (via sha2's own aarch64 backend). The aarch64 backend runtime-detects
+# the extension through cpufeatures and falls back to software, so enabling it is
+# safe on any aarch64 core (no SIGILL on Graviton / non-crypto ARM). Measured 6.2x
+# on Apple Silicon (0.32 -> 1.99 GiB/s), digest-identical. Both aarch64 wheel
+# targets we ship or run — aarch64-apple-darwin (the macos-latest wheel) and
+# aarch64 Linux (Graviton) — reach the accelerated path here. x86_64 stays
+# linux-only: sha2-asm's x86 assembly is gated to the platform the original audit
+# validated (STRUCT-1); macOS/Windows x86_64 keep the portable backend.
+[target.'cfg(any(all(target_arch = "x86_64", target_os = "linux"), all(target_arch = "aarch64", any(target_os = "linux", target_os = "macos"))))'.dependencies]
 sha2 = { version = "0.10", features = ["asm"] }
 
-[target.'cfg(not(all(target_arch = "x86_64", target_os = "linux")))'.dependencies]
+[target.'cfg(not(any(all(target_arch = "x86_64", target_os = "linux"), all(target_arch = "aarch64", any(target_os = "linux", target_os = "macos")))))'.dependencies]
 sha2 = "0.10"
 
 [dev-dependencies]
 proptest = "1.5"
+
+# The extension is CPU-bound on the hash/chunking hot loops, so trade build time
+# for cross-crate inlining of the FastCDC gear-hash, hex::encode, and bytes/reqwest
+# glue that the default release profile (lto=false, codegen-units=16) leaves on the
+# table. Digests/bytes are bit-identical — this is pure codegen. panic="abort" is
+# deliberately NOT set: pyo3 unwinds Rust panics across the FFI boundary to turn
+# them into Python exceptions, and aborting would crash the interpreter instead.
+[profile.release]
+lto = "thin"
+codegen-units = 1
 
 [lints.clippy]
 pedantic = { level = "warn", priority = -1 }

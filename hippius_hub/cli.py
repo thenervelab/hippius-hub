@@ -12,13 +12,14 @@ import os
 import shutil
 import subprocess
 import sys
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
 from . import __version__
 from .auth import get_oci_bearer_token, login, resolve_token_value
 from .constants import resolve_registry
 from .file_download import _oci_repo_path, hippius_hub_download
-from ._repo_ops import _list_tags, _manifest_digest, _revision_created
+from ._repo_ops import _list_tags, _revision_digest_and_created
 from . import console
 from .console import ConsoleError
 
@@ -186,10 +187,18 @@ def _maybe_docker_login(host: str, user: str, secret: str, *, auto: bool):
         print("    hippius-hub's own auth is set up; only `docker push`/`pull` will be unavailable.")
         print(f"    Run manually if you install docker later: docker login {host} -u '{user}' -p '...'")
         return
-    p = subprocess.run(
-        ["docker", "login", host, "-u", user, "--password-stdin"],
-        input=secret.encode(), capture_output=True,
-    )
+    try:
+        p = subprocess.run(
+            ["docker", "login", host, "-u", user, "--password-stdin"],
+            input=secret.encode(), capture_output=True,
+            # Bound a wedged docker daemon (audit L8): hippius auth is already saved
+            # above, so a hung `docker login` must not block the CLI indefinitely.
+            timeout=60,
+        )
+    except subprocess.TimeoutExpired:
+        print("⚠️  docker login timed out (docker daemon unresponsive) — hippius auth "
+              "is already saved; run `docker login` manually if you need docker push/pull.")
+        return
     if p.returncode == 0:
         print(f"✅ docker login {host} OK")
     else:
@@ -461,7 +470,7 @@ def cmd_models_list(args):
     print(f"Found {total} model(s):")
     for m in res.get("results", []):
         own = " [mine]" if m.get("is_mine") else (" [public]" if m.get("is_public") else "")
-        print(f"  {m['project']}/{m['repo']:30} {m.get('format'):12} "
+        print(f"  {m['project']}/{m['repo']:30} {(m.get('format') or '—'):12} "
               f"arch={m.get('architecture') or '—':10} params={_fmt_params(m.get('parameter_count')):>7}  "
               f"quant={m.get('quantization') or '—':6}  size={_fmt_bytes(m.get('total_size_bytes')):>9}{own}")
 
@@ -487,7 +496,7 @@ def cmd_models_show(args):
         print(f"  Digest:   {res.get('digest')}")
         print("  Files:")
         for f in res.get("files", []):
-            print(f"    {f['filename']:40} {f['format']:12} {_fmt_bytes(f['size_bytes'])}")
+            print(f"    {f['filename']:40} {(f.get('format') or '—'):12} {_fmt_bytes(f['size_bytes'])}")
         print(f"\n  pull: {res.get('pull_command')}")
     else:
         res = console.model_repo(project, repo)
@@ -525,13 +534,16 @@ def cmd_revisions(args):
         print("No revisions yet.")
         return
 
-    rows = []
-    for tag in tags:
-        rows.append({
-            "revision": tag,
-            "digest": _manifest_digest(registry, oci_repo, tag, oci_token),
-            "created": _revision_created(registry, oci_repo, tag, oci_token),
-        })
+    # One GET per tag (fetch_manifest returns both the digest header and the created
+    # annotation, so the old per-tag HEAD was redundant), fanned out concurrently:
+    # 2N serial round-trips -> N parallel. Rows are re-sorted below, so completion
+    # order doesn't matter.
+    def _row(tag):
+        digest, created = _revision_digest_and_created(registry, oci_repo, tag, oci_token)
+        return {"revision": tag, "digest": digest, "created": created}
+
+    with ThreadPoolExecutor(max_workers=8) as ex:
+        rows = list(ex.map(_row, tags))
 
     # Newest first: revisions carrying an upload timestamp sort above those
     # without (e.g. pushed by other tooling); ties break on the revision name.

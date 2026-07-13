@@ -117,6 +117,40 @@ pub enum CoreError {
     /// discriminant.
     #[error("server did not return Content-Length")]
     MissingContentLength,
+
+    /// A downloaded chunk (or the assembled whole file) did not match its
+    /// content-addressed digest or its declared byte length. Distinct from
+    /// `ServerError`: transport succeeded and the bytes arrived, but they are
+    /// the *wrong* bytes — so a content-addressed blob will serve the same
+    /// wrong bytes on retry (see `is_retryable`, which classifies this
+    /// permanent). The string carries the offending context (chunk offset /
+    /// "assembled file") plus expected-vs-got so the Python side can surface a
+    /// diagnosable message.
+    #[error("integrity check failed: {0}")]
+    Integrity(String),
+
+    /// The request-body write stalled: reqwest stopped pulling body bytes for
+    /// longer than the upload write-stall window while the body was not yet fully
+    /// sent. This is an application-level watchdog on the *upload* write path
+    /// (audit H1) covering a gap reqwest cannot: the peer completed TCP+TLS (so
+    /// `connect_timeout` passed) and keeps the connection alive at the TCP layer
+    /// (so `tcp_keepalive` never fires) but stopped draining the socket, for which
+    /// reqwest has no per-operation timeout. The `Duration` is the observed idle
+    /// gap. Retryable — a fresh attempt to a healthy replica (a rolling redeploy
+    /// or a dead backend behind a live load balancer) is expected to succeed.
+    #[error("upload write stalled: no progress for {0:?}")]
+    Stall(std::time::Duration),
+
+    /// A chunk-body READ stalled: no data arrived within the download idle-timeout
+    /// window (audit M4). The download counterpart to [`CoreError::Stall`]: a peer
+    /// that completed the handshake then dribbled or stopped mid-body, which
+    /// `connect_timeout`/`tcp_keepalive` cannot see and reqwest's opt-in client
+    /// `read_timeout` only catches when enabled. Default-on and reset on each
+    /// successful read, so it bounds a slow-loris without capping an honest
+    /// slow-but-steady transfer. The `Duration` is the idle window that elapsed.
+    /// Retryable — a fresh attempt to a healthy replica should succeed.
+    #[error("download read stalled: no data for {0:?}")]
+    ReadStall(std::time::Duration),
 }
 
 impl CoreError {
@@ -160,8 +194,10 @@ impl CoreError {
     #[must_use]
     pub fn is_retryable(&self) -> bool {
         match self {
-            // Network/transport errors are retryable.
-            CoreError::Reqwest(_) | CoreError::Io(_) => true,
+            // Network/transport errors are retryable, and so is an upload
+            // write-stall (audit H1) — the watchdog aborts a socket the peer
+            // stopped draining; a fresh attempt to a healthy replica succeeds.
+            CoreError::Reqwest(_) | CoreError::Io(_) | CoreError::Stall(_) | CoreError::ReadStall(_) => true,
             // 5xx server errors are retryable, plus the two retryable 4xx
             // (408 Request Timeout, 429 Too Many Requests). Everything else
             // 4xx is permanent. `(500..600).contains(status)` operates on
@@ -177,9 +213,13 @@ impl CoreError {
             //     loop already declared unrecoverable.
             //   - MissingContentLength is a HEAD-response shape error,
             //     not a transient network condition.
+            //   - Integrity is a wrong-bytes error on a content-addressed
+            //     blob: the source serves the same bytes on retry, so it is
+            //     permanent, not a transient blip to back off and re-attempt.
             CoreError::ChunkFailed { .. }
             | CoreError::JoinFailed { .. }
-            | CoreError::MissingContentLength => false,
+            | CoreError::MissingContentLength
+            | CoreError::Integrity(_) => false,
         }
     }
 }
@@ -213,8 +253,16 @@ mod tests {
             current = s.source();
         }
 
-        assert_eq!(chain.len(), 2, "expected wrapper + inner ServerError in chain, got {chain:?}");
-        assert!(chain[0].contains("chunk 7 failed"), "wrapper display: {}", chain[0]);
+        assert_eq!(
+            chain.len(),
+            2,
+            "expected wrapper + inner ServerError in chain, got {chain:?}"
+        );
+        assert!(
+            chain[0].contains("chunk 7 failed"),
+            "wrapper display: {}",
+            chain[0]
+        );
         assert!(chain[1].contains("503"), "inner display: {}", chain[1]);
     }
 
@@ -233,8 +281,10 @@ mod tests {
         // Coercing the closure to a fully-typed `fn(...)` pointer is
         // the compile-time check: a field rename or type change
         // surfaces here, not just at faraway use sites.
-        let ctor: fn(tokio::task::JoinError) -> CoreError =
-            |source| CoreError::JoinFailed { index: None, source };
+        let ctor: fn(tokio::task::JoinError) -> CoreError = |source| CoreError::JoinFailed {
+            index: None,
+            source,
+        };
         // Use `ctor` as a value so the binding has an observed
         // effect (clippy::no_effect_underscore_binding). Pointer
         // equality against itself is the smallest observation that
@@ -245,11 +295,30 @@ mod tests {
     // The `#[from] io::Error` derive provides this conversion; the
     // test pins the wiring so a refactor that swapped the variant
     // for a manual `From` impl with the wrong arm would fail loudly.
+    // An upload write-stall (audit H1) must classify retryable so the upload
+    // retry loop re-attempts against a healthy replica rather than surfacing the
+    // watchdog abort as terminal.
+    #[test]
+    fn stall_is_retryable() {
+        assert!(CoreError::Stall(std::time::Duration::from_secs(30)).is_retryable());
+    }
+
+    // A download read-stall (audit M4) must also classify retryable so the per-chunk
+    // retry loop re-fetches from a healthy replica instead of surfacing the idle-cut
+    // as terminal — the download counterpart of the upload write-stall above.
+    #[test]
+    fn read_stall_is_retryable() {
+        assert!(CoreError::ReadStall(std::time::Duration::from_secs(30)).is_retryable());
+    }
+
     #[test]
     fn from_io_error_routes_to_io_variant() {
         let io_err = std::io::Error::other("test");
         let core_err: CoreError = io_err.into();
-        assert!(matches!(core_err, CoreError::Io(_)), "expected Io variant, got {core_err:?}");
+        assert!(
+            matches!(core_err, CoreError::Io(_)),
+            "expected Io variant, got {core_err:?}"
+        );
     }
 
     // Verify the `Result<T>` alias is exported as a `Result<T,
@@ -261,6 +330,9 @@ mod tests {
         fn returns_core_err() -> Result<()> {
             Err(CoreError::MissingContentLength)
         }
-        assert!(matches!(returns_core_err(), Err(CoreError::MissingContentLength)));
+        assert!(matches!(
+            returns_core_err(),
+            Err(CoreError::MissingContentLength)
+        ));
     }
 }

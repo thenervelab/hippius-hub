@@ -317,12 +317,21 @@ Existing code that catches HF's exceptions keeps working.
 | `HIPPIUS_CONNECT_TIMEOUT` | `30` | TCP connect timeout (seconds) |
 | `HIPPIUS_READ_TIMEOUT` | unset | Opt-in per-chunk total request timeout (seconds) |
 | `HIPPIUS_SNAPSHOT_WORKERS` | `8` | Concurrent files in `snapshot_download` |
-| `HIPPIUS_UPLOAD_WORKERS` | `8` | Concurrent files in a folder upload |
+| `HIPPIUS_UPLOAD_WORKERS` | `8` | Concurrent files in a folder upload / concurrent chunk uploads per large file |
+| `HIPPIUS_CHUNK_THRESHOLD` | `268435456` (256 MiB) | Files at or above this size upload as content-defined chunks; below it, one plain blob |
+| `HIPPIUS_CDC_AVG_SIZE` | `4194304` (4 MiB) | FastCDC average chunk size — 4 MiB is fastcdc's max (larger panics the splitter); part of the layout wire contract |
+| `HIPPIUS_CHUNKED_WRITE` | off | Opt-in for this release. Set to `1`/`true` to store large files as content-defined chunks; unset keeps the pre-chunking single-blob layout until the chunk-aware reader is universally deployed |
 | `HIPPIUS_DEBUG` / `RUST_LOG` | off | Verbose transport logging (per-chunk timings, retries) |
 | `HIPPIUS_API_URL` | `https://api.hippius.com` | Console API base used by the `registry` + `models` CLI subtrees |
 | `HIPPIUS_TEST_REPO` | `test/e2e-client` | Override the test repo used by the e2e suite |
 
 Programmatic overrides via the `endpoint=` kwarg on any function let you point at an alternative Hippius registry.
+
+### Large-file chunking
+
+Files at or above `HIPPIUS_CHUNK_THRESHOLD` (256 MiB) are stored as **content-defined chunks** (FastCDC, ~4 MiB average) packed into ~64 MiB content-addressed **pack** blobs (`HIPPIUS_PACK_SIZE`) rather than one blob. The layout is a Git-LFS-style pointer: one titled `pointer.v2` layer per file — mapping each chunk to its pack, offset, and size — plus the untitled pack blobs it references, marked with `artifactType` and a `com.hippius.layout: chunked-v2` annotation. A re-uploaded, slightly-changed model references unchanged chunks by range into existing packs and uploads only the packs holding new chunks; downloads fetch each pack once (concurrently) and slice its chunks to their file offsets. Packing into ~64 MiB blobs cuts per-file upload round-trips versus one-blob-per-chunk, and a shared cap (`HIPPIUS_MAX_INFLIGHT_PACKS`) bounds concurrent pack uploads so folder uploads don't multiply resident memory. Small files and every pre-existing artifact are unchanged (one plain blob), so nothing already stored is rewritten.
+
+Chunked **writes are opt-in for this release** (`HIPPIUS_CHUNKED_WRITE=1`) because the reader-side guard ships in this same release: a client that carries it refuses a chunked artifact loudly (`UnsupportedLayoutError`, with an upgrade hint) instead of misreading it, but no already-released client (≤ v0.5.1) has that guard, so it would silently write the pointer blob as the file. Deploy the chunk-aware reader to every consumer first; once the fleet is upgraded, a later release flips the default on. Set `HIPPIUS_CHUNKED_WRITE=1` on a producer to test end-to-end (e.g. on staging) before then.
 
 ### Diagnosing slow transfers
 

@@ -14,10 +14,13 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Optional, Union
 
-from ._oci import fetch_manifest, layer_title
-from .auth import get_oci_bearer_token, get_token, resolve_token_value
+from . import _http
+from ._oci import FileGroup, fetch_manifest, group_files, parse_pointer_v2
+from .auth import call_with_oci_token_refresh
 from .constants import (
     DEFAULT_CACHE_DIR,
+    DEFAULT_HTTP_TIMEOUT,
+    PACK_MEDIA_TYPE,
     resolve_chunk_size,
     resolve_connect_timeout,
     resolve_max_concurrent,
@@ -25,16 +28,18 @@ from .constants import (
     resolve_registry,
     resolve_verify_hash,
 )
-from .auth import get_oci_bearer_token
-from .constants import DEFAULT_CACHE_DIR, resolve_registry
 from .errors import (
     EntryNotFoundError,
     LocalEntryNotFoundError,
+    MalformedManifestError,
     RevisionNotFoundError,
 )
 
 try:
-    from .hippius_core import download_file_native
+    from .hippius_core import (
+        download_file_native,
+        download_packs_native,
+    )
 except ImportError:
     raise ImportError("hippius_core is not installed. Did you run `maturin develop`?")
 
@@ -222,24 +227,30 @@ def _resolve_dest_paths(
     )
 
 
-def _resolve_target_digest(
+def _digest_hex(digest: str) -> str:
+    """Strip an OCI `algo:` prefix, yielding the bare hex the Rust layer verifies
+    against and the cache uses as a blob name. Tolerates an already-bare hex."""
+    return digest.split(":", 1)[-1]
+
+
+def _resolve_file_group(
     manifest: Dict,
     filename: str,
     repo_id: str,
     revision: str,
-) -> str:
-    """Find the layer whose title matches `filename` and return its digest.
+):
+    """Find the logical file named `filename` and return its FileGroup.
 
-    Raises EntryNotFoundError if no layer matches OR if a matching layer has
-    no digest — preserves the exact behavior of the inline `if not target_digest`
-    fall-through that previously lived in hf_hub_download (both the "no match"
-    and "matched but digest is falsy" cases produced the same error message).
+    Works across layouts: a plain file resolves to a K=0 group carrying its own
+    blob digest; a chunked file resolves to its pointer group carrying the
+    whole-file digest and the ordered chunk list. Preserves the old
+    `_resolve_target_digest` contract — a match whose (plain) digest is falsy is
+    treated as "not found" so callers never fetch a blob at an empty digest.
     """
-    for layer in manifest.get("layers", []):
-        if layer_title(layer) == filename:
-            digest = layer.get("digest")
-            if digest:
-                return digest
+    for group in group_files(manifest):
+        if group.title == filename:
+            if group.is_chunked or group.digest:
+                return group
             break
     raise EntryNotFoundError(
         f"File '{filename}' not found in the OCI manifest of '{repo_id}:{revision}'"
@@ -287,6 +298,7 @@ def hf_hub_download(
     dry_run: bool = False,
     _resolved_manifest: Optional[Dict] = None,
     _oci_token: Optional[str] = None,
+    _resolved_group: Optional[FileGroup] = None,
 ) -> str:
     """Drop-in replacement for huggingface_hub.hf_hub_download against an
     OCI-backed Hippius registry.
@@ -342,33 +354,104 @@ def hf_hub_download(
         )
 
     registry = resolve_registry(endpoint)
-    # _oci_token / _resolved_manifest let snapshot_download avoid N+1 round-trips.
-    # Token resolution + the off-origin credential guard happen inside
-    # get_oci_bearer_token, which mints from `registry` (= resolve_registry(endpoint)).
-    oci_token = _oci_token or get_oci_bearer_token(oci_repo, token, endpoint=endpoint)
-    manifest = _resolve_manifest(
-        registry=registry,
-        oci_repo=oci_repo,
-        revision=revision,
-        oci_token=oci_token,
-        cached=_resolved_manifest,
+
+    # Refresh the OCI token and retry once on a 401 (audit M2): a token minted here
+    # can expire mid-download on a large multi-GB blob that outlives its TTL. The
+    # manifest fetch + native downloads all use `oci_token`, so the whole token-using
+    # body runs inside the refresh wrapper. `initial=_oci_token` reuses
+    # snapshot_download's per-file shared token on the first attempt (see the kwarg
+    # notes) without re-minting.
+    def _download(oci_token):
+        manifest = _resolve_manifest(
+            registry=registry,
+            oci_repo=oci_repo,
+            revision=revision,
+            oci_token=oci_token,
+            cached=_resolved_manifest,
+        )
+        # snapshot_download resolves every file's group once from the shared manifest
+        # and threads it here, so a snapshot doesn't re-run group_files (an O(layers)
+        # parse) per file under the GIL. A direct caller passes nothing and resolves it.
+        group = (
+            _resolved_group
+            if _resolved_group is not None
+            else _resolve_file_group(manifest, filename, repo_id, revision)
+        )
+        # Re-assert _resolve_file_group's guard on the threaded path: a snapshot-
+        # supplied group skips that call, so without this a titled plain layer with a
+        # falsy digest would reach the plain path and build a `.../blobs/None` URL
+        # instead of raising the same EntryNotFoundError a direct hf_hub_download would.
+        if not group.is_chunked and not group.digest:
+            raise EntryNotFoundError(
+                f"File '{filename}' not found in the OCI manifest of '{repo_id}:{revision}'"
+            )
+        # Chunked files pull K content-addressed chunk blobs in parallel and assemble
+        # them; plain files keep the single-blob Range-parallel path unchanged, so
+        # every pre-chunking artifact downloads exactly as before.
+        if group.is_chunked:
+            if local_dir is not None:
+                return _download_chunked_to_local_dir(
+                    group, registry, oci_repo, paths.dest_file, oci_token, manifest
+                )
+            return _download_chunked_to_cache(
+                group=group,
+                registry=registry,
+                oci_repo=oci_repo,
+                repo_dir=paths.repo_dir,
+                snapshots_dir=paths.snapshots_dir,
+                filename=filename,
+                oci_token=oci_token,
+                manifest=manifest,
+            )
+        blob_url = f"{registry}/v2/{oci_repo}/blobs/{group.digest}"
+        # group.size is the manifest layer size (byte-accurate == the blob's
+        # Content-Length), so the Rust downloader can pre-allocate + range without a
+        # HEAD. None only for a malformed layer, where the native side HEADs as before.
+        if local_dir is not None:
+            return _download_to_local_dir(
+                blob_url, paths.dest_file, oci_token, group.digest, group.size
+            )
+        return _download_to_cache(
+            blob_url=blob_url,
+            repo_dir=paths.repo_dir,
+            snapshots_dir=paths.snapshots_dir,
+            filename=filename,
+            oci_token=oci_token,
+            target_digest=group.digest,
+            content_length=group.size,
+        )
+
+    return call_with_oci_token_refresh(
+        oci_repo, token, push=False, endpoint=endpoint, operation=_download, initial=_oci_token
     )
-    target_digest = _resolve_target_digest(manifest, filename, repo_id, revision)
-    blob_url = f"{registry}/v2/{oci_repo}/blobs/{target_digest}"
-    if local_dir is not None:
-        return _download_to_local_dir(blob_url, paths.dest_file, oci_token)
-    return _download_to_cache(
-        blob_url=blob_url,
-        repo_dir=paths.repo_dir,
-        snapshots_dir=paths.snapshots_dir,
-        filename=filename,
-        oci_token=oci_token,
-        target_digest=target_digest,
-    )
+
+
+def _assert_download_matches_digest(calculated_hash, target_digest, filename) -> None:
+    """Raise when a verify-on download's SHA-256 disagrees with the manifest digest.
+
+    `calculated_hash` is None when HIPPIUS_VERIFY_HASH is off (verification skipped)
+    — there is nothing to check. When present it MUST equal the manifest's bare-hex
+    digest; a mismatch means the registry/CDN served wrong bytes (or a truncated 206
+    slipped through), which must fail loudly rather than be cached under the trusted
+    digest. Mirrors the chunked-v2 path, whose native assembler already errors on a
+    whole-file digest mismatch, and huggingface_hub, which raises on the same case.
+    Raising `OSError` matches huggingface_hub's integrity-failure type.
+    """
+    # `calculated_hash is None` → verification skipped. `not target_digest` guards a
+    # (currently upstream-prevented) missing expected digest so the helper can never
+    # `AttributeError` on `None.replace(...)`; there is nothing to compare against.
+    if calculated_hash is None or not target_digest:
+        return
+    expected = target_digest.replace("sha256:", "")
+    if calculated_hash != expected:
+        raise OSError(
+            f"Integrity check failed for {filename!r}: downloaded content sha256 "
+            f"{calculated_hash} does not match the manifest digest {expected}"
+        )
 
 
 def _download_to_cache(
-    blob_url, repo_dir, snapshots_dir, filename, oci_token, target_digest
+    blob_url, repo_dir, snapshots_dir, filename, oci_token, target_digest, content_length=None
 ):
     """Cache-structured download mirroring huggingface_hub's layout."""
     # Cache layout modeled on huggingface_hub
@@ -407,11 +490,23 @@ def _download_to_cache(
             auth_token=oci_token,
             chunk_size=resolve_chunk_size(),
             verify_hash=verify_hash,
+            content_length=content_length,
+            # Env-resolved so HIPPIUS_CONNECT/READ_TIMEOUT reach real transfers,
+            # not just `hippius-hub diagnose` (audit L9).
+            connect_timeout_secs=resolve_connect_timeout(),
+            read_timeout_secs=resolve_read_timeout(),
         )
-    except Exception:
-        # Clean up the mkstemp file before bubbling up. The inner OSError
-        # swallow is intentional: a cleanup failure (file already gone,
-        # permissions) must not shadow the original download exception.
+        # Audit M-VERIFY-PLAIN: when verify is on, the computed digest MUST equal
+        # the manifest digest, else we would cache wrong/truncated bytes under the
+        # trusted `sha256:` name and serve them forever. No-op when verify is off.
+        # Inside the try so the cleanup below removes the temp blob on a mismatch.
+        _assert_download_matches_digest(calculated_hash, target_digest, filename)
+    except BaseException:
+        # Clean up the mkstemp file before bubbling up. Catches BaseException (not
+        # Exception) so a KeyboardInterrupt/SystemExit at the native-call boundary
+        # also removes the temp blob (audit L-TEMP-LEAK) — matches the sibling
+        # helpers. The inner OSError swallow is intentional: a cleanup failure must
+        # not shadow the original download/verify exception.
         if os.path.exists(temp_path):
             try:
                 os.remove(temp_path)
@@ -440,7 +535,7 @@ def _download_to_cache(
     return file_path
 
 
-def _download_to_local_dir(blob_url, dest_file, oci_token):
+def _download_to_local_dir(blob_url, dest_file, oci_token, target_digest, content_length=None):
     """Direct download to a user-chosen directory — bypasses the cache layout.
 
     Downloads to a per-call temp sibling and atomically `os.replace`s it into
@@ -467,20 +562,178 @@ def _download_to_local_dir(blob_url, dest_file, oci_token):
     )
     os.close(fd)
     try:
-        # local_dir mode writes to the user-chosen path and does not assemble a
-        # content-addressed blob layout, so the calculated hash (Optional[str]
-        # post Phase 3.12) is intentionally unused — the path is the identity.
-        download_file_native(
+        # local_dir mode writes to the user-chosen path (the path is the identity,
+        # not a content-addressed blob name), but a verify-on download must still
+        # confirm the bytes match the manifest digest (audit M-VERIFY-PLAIN) — the
+        # digest is no longer discarded. Inside the try so the cleanup below removes
+        # the temp file on a mismatch.
+        calculated_hash = download_file_native(
             url=blob_url,
             dest_path=temp_path,
             auth_token=oci_token,
             chunk_size=resolve_chunk_size(),
             verify_hash=resolve_verify_hash(),
+            content_length=content_length,
+            # Env-resolved so HIPPIUS_CONNECT/READ_TIMEOUT reach real transfers,
+            # not just `hippius-hub diagnose` (audit L9).
+            connect_timeout_secs=resolve_connect_timeout(),
+            read_timeout_secs=resolve_read_timeout(),
+        )
+        _assert_download_matches_digest(
+            calculated_hash, target_digest, os.path.basename(dest_file)
         )
     except BaseException:
         # Remove the partial temp file before propagating. The inner OSError
         # swallow mirrors `_download_to_cache`: a cleanup failure must not
         # shadow the original download exception (or KeyboardInterrupt).
+        if os.path.exists(temp_path):
+            try:
+                os.remove(temp_path)
+            except OSError:
+                pass
+        raise
+    os.replace(temp_path, dest_file)
+    return dest_file
+
+
+def _pull_packs(group, manifest, registry, oci_repo, temp_path, oci_token) -> Optional[str]:
+    """Assemble a chunked-v2 file from its pack blobs.
+
+    Fetches the pointer blob (the pack→chunk map), coalesces the chunks by pack,
+    and hands the plan to the native pack assembler, which fetches each pack once
+    (a full `200`) and slices its chunks to their file offsets. Whole-file digest
+    is always verified — it is the only check that proves cross-pack ordering.
+    """
+    blob = _fetch_blob_bytes(registry, oci_repo, group.pointer_digest, oci_token)
+    refs = parse_pointer_v2(blob)
+    pack_layer_sizes = {
+        layer["digest"]: layer["size"]
+        for layer in manifest.get("layers", [])
+        if layer.get("mediaType") == PACK_MEDIA_TYPE
+    }
+    # Group chunks by pack (first-appearance order) and compute file offsets.
+    by_pack: Dict[str, list] = {}
+    file_offset = 0
+    for ref in refs:
+        by_pack.setdefault(ref.pack_digest, []).append(
+            (ref.pack_offset, ref.size, file_offset, _digest_hex(ref.chunk_digest))
+        )
+        file_offset += ref.size
+    total_size = file_offset
+
+    pack_urls, pack_sizes, pack_chunks = [], [], []
+    for pack_digest, targets in by_pack.items():
+        pack_urls.append(f"{registry}/v2/{oci_repo}/blobs/{pack_digest}")
+        # A pointer that references a pack whose manifest layer was stripped/dropped
+        # is a malformed chunked-v2 artifact, not a KeyError bug — surface the typed
+        # error the symmetric upload path raises (audit L-PACK-KEYERROR) so callers
+        # see a clear cause, not an opaque traceback.
+        try:
+            pack_sizes.append(pack_layer_sizes[pack_digest])
+        except KeyError as exc:
+            raise MalformedManifestError(
+                f"pointer references pack {pack_digest} absent from the manifest layers"
+            ) from exc
+        pack_chunks.append(targets)
+    return download_packs_native(
+        pack_urls=pack_urls,
+        pack_sizes=pack_sizes,
+        pack_chunks=pack_chunks,
+        dest_path=temp_path,
+        total_size=total_size,
+        file_digest=_digest_hex(group.digest),
+        auth_token=oci_token,
+        max_concurrent=resolve_max_concurrent(),
+        # See the plain path: env-resolved timeouts reach the pack assembler (L9).
+        connect_timeout_secs=resolve_connect_timeout(),
+        read_timeout_secs=resolve_read_timeout(),
+    )
+
+
+def _fetch_blob_bytes(registry, oci_repo, digest, oci_token) -> bytes:
+    """GET a blob's raw bytes (the v2 pointer blob is small and read whole)."""
+    resp = _http.client().get(
+        f"{registry}/v2/{oci_repo}/blobs/{digest}",
+        headers={"Authorization": f"Bearer {oci_token}"},
+        timeout=DEFAULT_HTTP_TIMEOUT,
+    )
+    resp.raise_for_status()
+    return resp.content
+
+
+def _pull_chunks(group, registry, oci_repo, temp_path, oci_token, manifest=None) -> Optional[str]:
+    """Fetch a chunked-v2 file's pack blobs into `temp_path` via the Rust engine.
+
+    Per-chunk digest verification is always on in the native layer; the whole-file
+    digest is ALSO always verified — unlike the single-blob path's opt-in
+    HIPPIUS_VERIFY_HASH — because per-chunk digests prove each chunk's *bytes* but
+    not its *position*, and the whole-file `sha256(concat)` pass is the only check
+    on ordering. Returns the computed whole-file hash.
+    """
+    return _pull_packs(group, manifest or {}, registry, oci_repo, temp_path, oci_token)
+
+
+def _download_chunked_to_cache(
+    *, group, registry, oci_repo, repo_dir, snapshots_dir, filename, oci_token, manifest=None
+):
+    """Chunked-file analog of `_download_to_cache`.
+
+    Assembles the chunk blobs into a temp file, then places it in the
+    content-addressed cache under the *whole-file* digest and symlinks it into
+    the snapshot — so a chunked file dedups on disk against identical content
+    stored plainly, and the snapshot layout is identical to the single-blob path.
+    """
+    blobs_dir = os.path.join(repo_dir, "blobs")
+    os.makedirs(blobs_dir, exist_ok=True)
+    os.makedirs(snapshots_dir, exist_ok=True)
+    file_path = os.path.join(snapshots_dir, filename)
+
+    safe_name = filename.replace("/", "_")
+    fd, temp_path = tempfile.mkstemp(dir=blobs_dir, prefix=f"tmp_{safe_name}_")
+    os.close(fd)
+
+    print(f"Downloading {filename} (parallel)...")
+    try:
+        computed = _pull_chunks(group, registry, oci_repo, temp_path, oci_token, manifest)
+    except BaseException:
+        # Mirror the single-blob cleanup: drop the partial temp on any failure
+        # (including KeyboardInterrupt) so a later cache-hit check can't serve it.
+        if os.path.exists(temp_path):
+            try:
+                os.remove(temp_path)
+            except OSError:
+                pass
+        raise
+
+    # When verification is skipped the native call returns None; the whole-file
+    # digest from the pointer is authoritative for naming the blob either way.
+    final_hash = computed if computed is not None else _digest_hex(group.digest)
+    blob_path = os.path.join(blobs_dir, f"sha256:{final_hash}")
+    if not os.path.exists(blob_path):
+        os.rename(temp_path, blob_path)
+    elif os.path.exists(temp_path):
+        os.remove(temp_path)
+
+    _create_symlink(blob_path, file_path)
+    return file_path
+
+
+def _download_chunked_to_local_dir(group, registry, oci_repo, dest_file, oci_token, manifest=None):
+    """Chunked-file analog of `_download_to_local_dir`: assemble to a temp
+    sibling, then atomically `os.replace` into `dest_file` only on full success,
+    so a failed/interrupted assemble never leaves a partial file at the user path.
+    """
+    parent = os.path.dirname(dest_file)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    print(f"Downloading {os.path.basename(dest_file)} (parallel)...")
+    fd, temp_path = tempfile.mkstemp(
+        dir=parent or ".", prefix=f".tmp_{os.path.basename(dest_file)}_"
+    )
+    os.close(fd)
+    try:
+        _pull_chunks(group, registry, oci_repo, temp_path, oci_token, manifest)
+    except BaseException:
         if os.path.exists(temp_path):
             try:
                 os.remove(temp_path)

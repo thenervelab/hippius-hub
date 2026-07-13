@@ -3,7 +3,10 @@ name: E2E
 on:
   pull_request:
   push:
-    branches: [main]
+    # `staging` runs the full suite (regression) plus the chunked-layout step
+    # below, which is gated to this branch only. `main` never emits chunked
+    # artifacts in CI — the chunked write path is opt-in this release.
+    branches: [main, staging]
     tags: ['v*']
   release:
     types: [published]
@@ -132,6 +135,24 @@ jobs:
           HIPPIUS_TEST_TOKEN: ${{ secrets.HIPPIUS_TEST_TOKEN }}
           HIPPIUS_TEST_CONSOLE_TOKEN: ${{ secrets.HIPPIUS_TEST_CONSOLE_TOKEN }}
         run: .venv/bin/pytest -v
+
+      # Chunked-v2 (pack layout) e2e — STAGING ONLY, against the test/e2e-client
+      # namespace. The chunked WRITE path is opt-in this release (default off)
+      # because the reader-side layout guard ships in the same release, so no
+      # already-deployed reader carries it. Setting HIPPIUS_CHUNKED_WRITE=1 both
+      # enables the feature AND un-skips the gated live test, exercising the native
+      # pack upload/download + re-upload dedup + many-packs ordering. Nothing in
+      # production config/deployment changes: packs are ordinary content-addressed
+      # blobs in a test namespace. `github.ref` is compared to a literal — no
+      # untrusted input reaches `run:`.
+      - name: Chunked-v2 pack-layout e2e (staging only, test namespace)
+        if: github.ref == 'refs/heads/staging'
+        env:
+          HIPPIUS_CHUNKED_WRITE: '1'
+          HIPPIUS_TEST_USER: ${{ secrets.HIPPIUS_TEST_USER }}
+          HIPPIUS_TEST_PASS: ${{ secrets.HIPPIUS_TEST_PASS }}
+          HIPPIUS_TEST_TOKEN: ${{ secrets.HIPPIUS_TEST_TOKEN }}
+        run: .venv/bin/pytest -v tests/test_live_chunked_v2_roundtrip.py
 
       # Expensive suite: on-chain subscribe/cancel, robot rotation,
       # publicity toggle (quota resize). Only runs on release events,
