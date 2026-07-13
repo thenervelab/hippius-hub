@@ -151,6 +151,25 @@ pub enum CoreError {
     /// Retryable — a fresh attempt to a healthy replica should succeed.
     #[error("download read stalled: no data for {0:?}")]
     ReadStall(std::time::Duration),
+
+    /// A caller/configuration input was invalid — e.g. a `FastCDC` average
+    /// outside the splitter's accepted range, or a size that does not fit this
+    /// platform's `usize`. Distinct from [`CoreError::Integrity`]: the bytes are
+    /// not wrong, the *parameters* are. Permanent (see `is_retryable`) — the same
+    /// bad input reproduces the same failure, so retrying only wastes backoff.
+    #[error("invalid argument: {0}")]
+    InvalidArgument(String),
+
+    /// The server completed the request but returned a response that violates the
+    /// protocol contract in a way that is plausibly transient — a missing/invalid
+    /// `Location` on upload-init, or a body whose length disagrees with the
+    /// declared size (short/over-send). Distinct from [`CoreError::ServerError`]
+    /// (which carries a status code) and [`CoreError::Integrity`] (wrong bytes,
+    /// permanent): a load balancer mid-rollout or a mangling proxy can emit these,
+    /// so `is_retryable` classifies them retryable — a fresh attempt to a healthy
+    /// replica is expected to return a well-formed response.
+    #[error("malformed server response: {0}")]
+    BadResponse(String),
 }
 
 impl CoreError {
@@ -197,7 +216,15 @@ impl CoreError {
             // Network/transport errors are retryable, and so is an upload
             // write-stall (audit H1) — the watchdog aborts a socket the peer
             // stopped draining; a fresh attempt to a healthy replica succeeds.
-            CoreError::Reqwest(_) | CoreError::Io(_) | CoreError::Stall(_) | CoreError::ReadStall(_) => true,
+            // Network/transport blips, both stall watchdogs, and a
+            // malformed-but-plausibly-transient response (missing Location, a
+            // short/over-sent body) all clear on a fresh attempt to a healthy
+            // replica — retryable.
+            CoreError::Reqwest(_)
+            | CoreError::Io(_)
+            | CoreError::Stall(_)
+            | CoreError::ReadStall(_)
+            | CoreError::BadResponse(_) => true,
             // 5xx server errors are retryable, plus the two retryable 4xx
             // (408 Request Timeout, 429 Too Many Requests). Everything else
             // 4xx is permanent. `(500..600).contains(status)` operates on
@@ -216,10 +243,13 @@ impl CoreError {
             //   - Integrity is a wrong-bytes error on a content-addressed
             //     blob: the source serves the same bytes on retry, so it is
             //     permanent, not a transient blip to back off and re-attempt.
+            //   - InvalidArgument is a bad caller/config input that reproduces
+            //     identically on retry (a wrong FastCDC average, an oversize).
             CoreError::ChunkFailed { .. }
             | CoreError::JoinFailed { .. }
             | CoreError::MissingContentLength
-            | CoreError::Integrity(_) => false,
+            | CoreError::Integrity(_)
+            | CoreError::InvalidArgument(_) => false,
         }
     }
 }
@@ -309,6 +339,22 @@ mod tests {
     #[test]
     fn read_stall_is_retryable() {
         assert!(CoreError::ReadStall(std::time::Duration::from_secs(30)).is_retryable());
+    }
+
+    // A malformed-but-plausibly-transient response (missing Location on
+    // upload-init, a short/over-sent body) must classify retryable so the
+    // transport retry loop re-attempts against a healthy replica instead of
+    // surfacing an LB-mid-rollout hiccup as terminal.
+    #[test]
+    fn bad_response_is_retryable() {
+        assert!(CoreError::BadResponse("registry omitted Location".into()).is_retryable());
+    }
+
+    // An invalid caller/config argument reproduces on retry, so it must classify
+    // permanent — retrying a bad FastCDC average only burns backoff.
+    #[test]
+    fn invalid_argument_is_not_retryable() {
+        assert!(!CoreError::InvalidArgument("avg out of range".into()).is_retryable());
     }
 
     #[test]

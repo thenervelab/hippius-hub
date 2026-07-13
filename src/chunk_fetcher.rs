@@ -61,6 +61,16 @@ const DOWNLOAD_READ_IDLE: Duration = Duration::from_secs(30);
 /// real (semaphore-bounded) concurrency.
 const DOWNLOAD_POOL_MAX_IDLE: usize = 32;
 
+/// Absolute ceiling on a single pack blob's declared size, before any of its bytes
+/// are read or reserved. A pack aggregates `FastCDC` chunks toward `HIPPIUS_PACK_SIZE`
+/// (~64 MiB default; 16 MiB max chunk), so no legitimate pack approaches 1 GiB — the
+/// cap exists solely to bound a hostile or corrupt manifest. Without it, the pack
+/// size comes straight from a registry-controlled OCI layer descriptor: a declared
+/// 1 TiB would make `fetch_pack` reserve 1 TiB up front (an uncatchable alloc abort)
+/// and accept up to 1 TiB of body before the length check fires. Both the up-front
+/// reservation and the streaming cap are clamped to this value.
+const MAX_PACK_BYTES: u64 = 1024 * 1024 * 1024;
+
 /// Process-global HTTP/1 client shared by both download paths (pack assembly here
 /// and the legacy Range downloader). Mirrors `uploader::upload_client`: building a
 /// `Client` per native call starts with an empty pool and forces a fresh
@@ -420,6 +430,15 @@ impl PackAssembler {
 /// a `file_offset + size` that would itself overflow `u64`.
 fn validate_pack_plan(packs: &[PackPlanEntry], total_size: u64) -> Result<(), CoreError> {
     for pack in packs {
+        // Reject an absurd declared pack size BEFORE fetch_pack reserves or streams
+        // it (see MAX_PACK_BYTES): the size is registry-controlled, so an unbounded
+        // value is a hostile-manifest DoS, not an integrity mismatch of real bytes.
+        if pack.size > MAX_PACK_BYTES {
+            return Err(CoreError::Integrity(format!(
+                "pack {} declares {} bytes, over the {MAX_PACK_BYTES}-byte ceiling",
+                pack.url, pack.size
+            )));
+        }
         for c in &pack.chunks {
             let end = c.file_offset.checked_add(c.size).ok_or_else(|| {
                 CoreError::Integrity(format!("chunk at file offset {} size {} overflows u64", c.file_offset, c.size))
@@ -531,7 +550,13 @@ async fn fetch_pack(
     // balloon memory well past the intended ~pack_size ceiling (x32 concurrent
     // packs) before rejection. Abort the moment the accumulated body exceeds
     // `pack_size`, so peak memory stays bounded to one pack.
-    let cap = usize::try_from(pack_size).unwrap_or(usize::MAX);
+    // Clamp the up-front reservation to MAX_PACK_BYTES so a registry-declared
+    // pack_size (validate_pack_plan rejects > MAX_PACK_BYTES up front, but this is
+    // the defense-in-depth backstop) can never turn `with_capacity` into a
+    // multi-TiB alloc abort. A larger-but-legal pack still grows the Vec on demand,
+    // bounded by the `received > pack_size` check below.
+    let reserve = pack_size.min(MAX_PACK_BYTES);
+    let cap = usize::try_from(reserve).unwrap_or(usize::MAX);
     let mut bytes: Vec<u8> = Vec::with_capacity(cap);
     let mut received: u64 = 0;
     // Each body read is bounded by the default-on read-idle window (audit M4): a
@@ -540,14 +565,19 @@ async fn fetch_pack(
     while let Some(chunk) = read_chunk_bounded(&mut res, download_read_idle()).await? {
         received = received.saturating_add(chunk.len() as u64);
         if received > pack_size {
-            return Err(CoreError::Integrity(format!(
+            // Transport length anomaly, not a wrong-bytes integrity failure — a
+            // proxy/CDN that over-sends a self-consistent body can clear on retry,
+            // so classify it retryable (matches the Range path's short/over-length
+            // handling in chunked_downloader). Bounded by pack_size so a runaway
+            // stream is cut here, well under the MAX_PACK_BYTES ceiling.
+            return Err(CoreError::BadResponse(format!(
                 "pack {url}: body exceeds expected {pack_size} bytes (over-send)"
             )));
         }
         bytes.extend_from_slice(&chunk);
     }
     if bytes.len() as u64 != pack_size {
-        return Err(CoreError::Integrity(format!(
+        return Err(CoreError::BadResponse(format!(
             "pack {url}: expected {pack_size} bytes, got {}",
             bytes.len()
         )));
@@ -568,8 +598,11 @@ async fn fetch_pack(
 /// Verify each carved chunk's sha256 against `bytes` and scatter its slice to the
 /// file offset. Runs on the blocking pool (audit L14): hashing is CPU-bound and the
 /// writes are local disk, so this does no async work and must not sit on the async
-/// runtime. A digest mismatch or out-of-range chunk is a retryable `Integrity`
-/// error (a corrupt/mis-placed pack must never be written past its bounds).
+/// runtime. A digest mismatch or out-of-range chunk is a PERMANENT `Integrity` error
+/// (a content-addressed blob serves the same wrong bytes on retry, and an
+/// out-of-bounds range is a bad plan) — distinct from the transport length anomalies
+/// in `fetch_pack`, which are the retryable `BadResponse`. A corrupt/mis-placed pack
+/// must never be written past its bounds.
 fn verify_and_scatter(
     url: &str,
     bytes: &[u8],
@@ -1093,6 +1126,27 @@ mod tests {
     }
 
     #[test]
+    fn validate_pack_plan_rejects_pack_size_over_ceiling() {
+        // A registry-declared pack size above MAX_PACK_BYTES must be refused BEFORE
+        // fetch_pack reserves or streams it — the hostile-manifest DoS the ceiling
+        // exists to bound. The chunks are otherwise in-bounds, so only the declared
+        // pack.size trips the guard.
+        let packs = vec![PackPlanEntry {
+            url: "reg/packHuge".to_string(),
+            size: MAX_PACK_BYTES + 1,
+            chunks: vec![chunk_target(0, 10, 0, String::new())],
+        }];
+        assert!(matches!(validate_pack_plan(&packs, 10), Err(CoreError::Integrity(ref m)) if m.contains("ceiling")));
+        // Exactly at the ceiling is still accepted (boundary, not a hostile value).
+        let ok = vec![PackPlanEntry {
+            url: String::new(),
+            size: MAX_PACK_BYTES,
+            chunks: vec![chunk_target(0, 10, 0, String::new())],
+        }];
+        assert!(validate_pack_plan(&ok, 10).is_ok());
+    }
+
+    #[test]
     fn incremental_extent_beyond_total_size_returns_none() {
         // A stray extent past total_size (a pack that wrote beyond the file end) must
         // NOT be accepted via the [0, total_size) prefix: the leftover in `pending`
@@ -1230,8 +1284,14 @@ mod tests {
         let _g = TempFileGuard(dest.clone());
         let res = fetch_pack(client, &format!("{base}/pack"), None, 1000, &[], &dest, &pb).await;
         assert!(
-            matches!(res, Err(CoreError::Integrity(ref m)) if m.contains("over-send")),
+            matches!(res, Err(CoreError::BadResponse(ref m)) if m.contains("over-send")),
             "an over-length pack body must be rejected (bounded), got {res:?}"
+        );
+        // A transport length anomaly is a plausibly-transient BadResponse, so the
+        // retry loop re-attempts it — distinct from a permanent Integrity mismatch.
+        assert!(
+            res.is_err_and(|e| e.is_retryable()),
+            "an over-send is retryable so fetch_pack_with_retry re-attempts it"
         );
     }
 

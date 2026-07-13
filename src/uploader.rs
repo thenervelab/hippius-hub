@@ -71,14 +71,14 @@ fn chunk_and_hash_reader<R: std::io::Read>(
     avg_size: u64,
 ) -> Result<(String, ChunkList), CoreError> {
     if !(CDC_MIN_AVG..=CDC_MAX_AVG).contains(&avg_size) {
-        return Err(CoreError::Integrity(format!(
+        return Err(CoreError::InvalidArgument(format!(
             "FastCDC average size {avg_size} out of range [{CDC_MIN_AVG}, {CDC_MAX_AVG}]"
         )));
     }
     // The range check above guarantees min/avg/max fit u32; try_from keeps that
     // provable to clippy without an unchecked `as` cast.
     let to_u32 = |v: u64| -> Result<u32, CoreError> {
-        u32::try_from(v).map_err(|_| CoreError::Integrity(format!("chunk size {v} exceeds u32")))
+        u32::try_from(v).map_err(|_| CoreError::InvalidArgument(format!("chunk size {v} exceeds u32")))
     };
     let (min, max) = (to_u32(avg_size / 4)?, to_u32(avg_size * 4)?);
     let avg = to_u32(avg_size)?;
@@ -163,6 +163,17 @@ const WRITE_STALL_TIMEOUT: Duration = Duration::from_secs(30);
 /// bounded without measurable overhead against a multi-GB streamed body.
 const WRITE_STALL_CHECK: Duration = Duration::from_secs(1);
 
+/// Per-read idle window on the upload client (audit H1 follow-up). The write-stall
+/// watchdog covers only the request-body *write* phase and disarms the instant the
+/// body is fully sent, so nothing bounded the wait for the registry's *response* —
+/// a Harbor that accepts the pack then hangs on the `JuiceFS` blob commit keeps the
+/// TCP connection live (so `tcp_keepalive` never fires) and blocks the pack upload
+/// forever, draining the shared pack gate. `reqwest`'s `read_timeout` resets on each
+/// successful read, so it bounds that response-phase hang without capping an honest
+/// slow-but-progressing transfer. Generous (2 min) so a legitimately slow commit
+/// under `JuiceFS` metadata backpressure (~25 s observed) never false-trips.
+const UPLOAD_READ_IDLE: Duration = Duration::from_mins(2);
+
 /// Total budget for the zero-body pack upload-init POST (audit H1). Init only
 /// allocates an upload session and returns a `Location`; it has no legitimate
 /// slow path, so a tight total timeout turns a hung/black-holed registry into a
@@ -174,11 +185,13 @@ const INIT_POST_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Frame size the in-memory pack PUT body is sliced into before streaming (audit
 /// H1). The write-stall watchdog re-stamps its progress clock only when reqwest
-/// pulls the next body frame, so a single 64 `MiB` frame would read as idle for the
-/// whole write and false-trip `Stall` against a slow-but-progressing peer. 1 `MiB`
-/// frames re-stamp often enough that only a genuinely stalled socket trips the
-/// watchdog, and the slices are cheap `Bytes` views (a refcount bump, not a copy).
-const PUT_FRAME_BYTES: usize = 1024 * 1024;
+/// pulls the next body frame, so the frame must drain in well under
+/// `WRITE_STALL_TIMEOUT` on any link we mean to support, or a slow-but-progressing
+/// peer false-trips `Stall`. At 1 `MiB` the watchdog cut a healthy uplink slower
+/// than ~35 KB/s (one frame > 30 s); 256 `KiB` drops that floor to ~8.5 KB/s so a
+/// throttled/shared link uploads instead of failing. The slices are cheap `Bytes`
+/// views (a refcount bump, not a copy), so more frames cost no extra allocation.
+const PUT_FRAME_BYTES: usize = 256 * 1024;
 
 /// Stream-upload a file to the OCI URL returned by /blobs/uploads/ (the PUT-with-digest finalises the blob).
 /// Shows a per-call progress bar — useful for large blobs (multi-GB).
@@ -259,12 +272,14 @@ pub(crate) fn upload_client() -> Result<&'static Client, CoreError> {
     // legitimately slow large upload (multi-GB model on a slow uplink, the default
     // non-chunked path) would trip it, and because a reqwest timeout is
     // `is_retryable()`, `upload_blob_async` then re-streamed the whole file from
-    // byte 0 up to the retry budget (~4× the wall). A dead or stalled peer is
-    // instead detected by `connect_timeout` (handshake) + `tcp_keepalive` (an
-    // idle/half-open connection) without ever capping an honest transfer — the
-    // exact policy `download_client` uses.
+    // byte 0 up to the retry budget (~4× the wall). A dead peer's handshake is
+    // caught by `connect_timeout`; a `read_timeout` (per-read, reset on progress)
+    // bounds the RESPONSE phase — a peer that accepts the body then hangs on its
+    // commit — which `tcp_keepalive` cannot see on a still-live socket, without
+    // ever capping an honest streamed body (a write, not a read).
     let built = Client::builder()
         .connect_timeout(Duration::from_secs(CONNECT_TIMEOUT_SECS))
+        .read_timeout(UPLOAD_READ_IDLE)
         .http1_only()
         .tcp_keepalive(Duration::from_secs(30))
         // Generous fixed idle cap (was 8) so raising HIPPIUS_MAX_INFLIGHT_PACKS /
@@ -516,13 +531,17 @@ async fn init_upload_session(
         .headers()
         .get(header::LOCATION)
         .and_then(|v| v.to_str().ok())
-        .ok_or_else(|| CoreError::Integrity("registry omitted Location on upload init".to_string()))?;
+        // A missing Location is an out-of-contract response, not a wrong-bytes
+        // integrity failure: an LB mid-rollout can emit it, so classify it
+        // retryable (BadResponse) rather than the permanent Integrity it used to
+        // be — otherwise a transient registry hiccup fails the upload outright.
+        .ok_or_else(|| CoreError::BadResponse("registry omitted Location on upload init".to_string()))?;
     // Resolve a possibly-relative Location against the uploads URL, then append the
     // digest as a RAW query pair (":" is legal unencoded in a query; percent-encoding
     // it via query_pairs_mut breaks the registry's digest match).
     let resolved = reqwest::Url::parse(uploads_url)
         .and_then(|base| base.join(location))
-        .map_err(|e| CoreError::Integrity(format!("bad upload Location {location:?}: {e}")))?;
+        .map_err(|e| CoreError::BadResponse(format!("bad upload Location {location:?}: {e}")))?;
     let mut put_url = resolved.to_string();
     put_url.push(if put_url.contains('?') { '&' } else { '?' });
     put_url.push_str("digest=");
@@ -580,7 +599,7 @@ async fn read_ranges(path: &Path, ranges: &[(u64, u64)]) -> Result<Vec<u8>, Core
     let mut file = File::open(path).await?;
     let total: u64 = ranges.iter().map(|(_off, len)| *len).sum();
     let cap = usize::try_from(total)
-        .map_err(|_| CoreError::Integrity(format!("pack size {total} exceeds usize")))?;
+        .map_err(|_| CoreError::InvalidArgument(format!("pack size {total} exceeds usize")))?;
     let mut buf: Vec<u8> = Vec::with_capacity(cap);
     for &(offset, len) in ranges {
         file.seek(SeekFrom::Start(offset)).await?;

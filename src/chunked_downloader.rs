@@ -65,8 +65,10 @@ fn global_range_gate() -> Arc<Semaphore> {
 /// Number of HTTP Range requests needed to cover `content_length` bytes when
 /// each chunk is `chunk_size` bytes. Returns 0 for empty files (caller is
 /// expected to handle that as a special case). Returns 0 for `chunk_size == 0`
-/// to avoid a division-by-zero panic if a caller sets `HIPPIUS_CHUNK_SIZE=0` —
-/// the Python layer also validates this, but defense-in-depth.
+/// to avoid a division-by-zero panic; `download` turns that degenerate case into
+/// a loud `InvalidArgument` for a non-empty file rather than writing zeros (the
+/// Python layer also rejects a non-positive `HIPPIUS_CHUNK_SIZE`, but the pyo3
+/// entry point can bypass it — defense-in-depth).
 fn num_chunks(content_length: u64, chunk_size: u64) -> usize {
     if content_length == 0 || chunk_size == 0 {
         return 0;
@@ -177,6 +179,19 @@ impl ChunkedDownloader {
         pb.set_message("📥 Downloading");
 
         let num_chunks = num_chunks(content_length, self.chunk_size);
+
+        // A non-empty file that yields zero chunks means chunk_size == 0 (num_chunks
+        // returns 0 to dodge a div-by-zero). Left unguarded, the spawn loop below
+        // runs zero times, the set_len pre-allocation stands, and this returns
+        // Ok(None) over an all-zero file — which the Python layer would then rename
+        // into the content-addressed cache under the trusted sha256 name. Fail loudly
+        // instead: chunk_size == 0 is an invalid argument, not an empty download.
+        if content_length > 0 && num_chunks == 0 {
+            return Err(CoreError::InvalidArgument(format!(
+                "chunk_size 0 yields no chunks for a {content_length}-byte file; \
+                 a zero HIPPIUS_CHUNK_SIZE would silently write an all-zero file"
+            )));
+        }
 
         // Prepare the destination directory
         let parent_dir = dest_path.parent().unwrap_or_else(|| Path::new("."));
@@ -1351,6 +1366,32 @@ mod retry_classification_tests {
         let Ok(Ok(_)) = out else { unreachable!("52-chunk download must complete, got {out:?}") };
         let Ok(got) = tokio::fs::read(&dest).await else { unreachable!("read dest") };
         assert_eq!(got, body, "every chunk past the window must have been refilled and written");
+        let _ = std::fs::remove_file(&dest);
+    }
+
+    #[tokio::test]
+    async fn download_rejects_zero_chunk_size_for_nonempty_file() {
+        // A chunk_size of 0 for a non-empty file must fail loudly, never silently
+        // produce the set_len'd all-zero file. content_length is supplied, so the
+        // guard fires before any HTTP — the URL is never contacted.
+        let Ok(dl) = ChunkedDownloader::new(
+            "http://127.0.0.1:1/never-contacted".to_string(),
+            None,
+            Some(0),
+            Some(4096),
+            crate::chunk_fetcher::TransportTimeouts::default(),
+        ) else {
+            unreachable!("downloader builds")
+        };
+        let dest = std::env::temp_dir().join(format!("hippius-zerochunk-{}.bin", std::process::id()));
+        let res = dl.download(&dest, false).await;
+        assert!(
+            matches!(res, Err(CoreError::InvalidArgument(ref m)) if m.contains("all-zero")),
+            "chunk_size 0 must reject, not write zeros; got {res:?}"
+        );
+        // The guard must return BEFORE the set_len pre-allocation runs, so no
+        // zero-filled file is left behind.
+        assert!(!dest.exists(), "no destination file may be created on the zero-chunk-size path");
         let _ = std::fs::remove_file(&dest);
     }
 }
