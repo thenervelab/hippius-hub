@@ -163,16 +163,16 @@ const WRITE_STALL_TIMEOUT: Duration = Duration::from_secs(30);
 /// bounded without measurable overhead against a multi-GB streamed body.
 const WRITE_STALL_CHECK: Duration = Duration::from_secs(1);
 
-/// Per-read idle window on the upload client (audit H1 follow-up). The write-stall
-/// watchdog covers only the request-body *write* phase and disarms the instant the
-/// body is fully sent, so nothing bounded the wait for the registry's *response* —
-/// a Harbor that accepts the pack then hangs on the `JuiceFS` blob commit keeps the
-/// TCP connection live (so `tcp_keepalive` never fires) and blocks the pack upload
-/// forever, draining the shared pack gate. `reqwest`'s `read_timeout` resets on each
-/// successful read, so it bounds that response-phase hang without capping an honest
-/// slow-but-progressing transfer. Generous (2 min) so a legitimately slow commit
-/// under `JuiceFS` metadata backpressure (~25 s observed) never false-trips.
-const UPLOAD_READ_IDLE: Duration = Duration::from_mins(2);
+/// Bound on the wait for the registry's response AFTER the request body is fully
+/// sent (audit H1 follow-up). The write-stall watchdog guards only the body-write
+/// phase and disarms the instant the body is drained, so without this a Harbor that
+/// accepts the pack then hangs on the `JuiceFS` blob commit keeps the TCP connection
+/// live (so `tcp_keepalive` never fires) and blocks the pack upload forever, draining
+/// the shared pack gate. `send_put_watchdogged` arms this deadline only once `done`
+/// flips, so it never caps an honest streamed body — only a hung post-body commit.
+/// Generous (2 min) so a legitimately slow commit under `JuiceFS` metadata
+/// backpressure (~25 s observed) never false-trips.
+const RESPONSE_WAIT_TIMEOUT: Duration = Duration::from_mins(2);
 
 /// Total budget for the zero-body pack upload-init POST (audit H1). Init only
 /// allocates an upload session and returns a `Location`; it has no legitimate
@@ -266,20 +266,21 @@ pub(crate) fn upload_client() -> Result<&'static Client, CoreError> {
     // multiplexing, lets uploads spread across multiple connections if the caller
     // parallelizes.
     //
-    // No flat whole-request timeout (audit H-UPLOAD-TIMEOUT): reqwest's client
-    // `.timeout()` is a wall-clock deadline over the ENTIRE request including the
-    // streamed body, so a 1h cap silently bounded total *transfer* time — a
-    // legitimately slow large upload (multi-GB model on a slow uplink, the default
-    // non-chunked path) would trip it, and because a reqwest timeout is
-    // `is_retryable()`, `upload_blob_async` then re-streamed the whole file from
-    // byte 0 up to the retry budget (~4× the wall). A dead peer's handshake is
-    // caught by `connect_timeout`; a `read_timeout` (per-read, reset on progress)
-    // bounds the RESPONSE phase — a peer that accepts the body then hangs on its
-    // commit — which `tcp_keepalive` cannot see on a still-live socket, without
-    // ever capping an honest streamed body (a write, not a read).
+    // No client-level timeout of any kind on the upload path (audit H-UPLOAD-TIMEOUT).
+    // reqwest's `.timeout()` is a wall-clock deadline over the WHOLE request including
+    // the streamed body — a 1h cap silently bounded total transfer, and since a reqwest
+    // timeout is `is_retryable()`, `upload_blob_async` re-streamed from byte 0 up to the
+    // retry budget (~4× the wall). `.read_timeout()` is NOT a safe substitute here: in
+    // reqwest 0.12 it is a single non-resetting deadline over the `PendingRequest` phase
+    // (request-send + wait-for-response-head) and only becomes a per-read resetting idle
+    // timeout for the RESPONSE body — so on an upload it is a fixed wall on the body
+    // write, reintroducing the same re-stream failure. Progress is instead bounded per
+    // phase in `send_put_watchdogged`: `WRITE_STALL_TIMEOUT` guards the body write (idle,
+    // resets on each accepted frame) and `RESPONSE_WAIT_TIMEOUT` bounds the wait for the
+    // registry's response after the body is fully sent — neither caps an honest transfer.
+    // A dead peer's handshake is caught by `connect_timeout`.
     let built = Client::builder()
         .connect_timeout(Duration::from_secs(CONNECT_TIMEOUT_SECS))
-        .read_timeout(UPLOAD_READ_IDLE)
         .http1_only()
         .tcp_keepalive(Duration::from_secs(30))
         // Generous fixed idle cap (was 8) so raising HIPPIUS_MAX_INFLIGHT_PACKS /
@@ -337,16 +338,21 @@ impl<S: Stream> Stream for DoneOnEof<S> {
 }
 
 /// Send a chunked-encoded PUT of `body_stream`, aborting with a retryable
-/// [`CoreError::Stall`] if reqwest stops pulling body frames for `write_stall` —
-/// i.e. a peer that completed the handshake then stopped draining the socket, the
-/// H1 wedge that `connect_timeout`/`tcp_keepalive` cannot see and reqwest offers
-/// no per-operation write timeout for.
+/// [`CoreError::Stall`] on either of the two ways a live-socket peer can wedge an
+/// upload that `connect_timeout`/`tcp_keepalive` cannot see and reqwest offers no
+/// per-operation timeout for:
+///   - the body WRITE stalls — no frame accepted for `write_stall` (the H1 wedge);
+///   - the peer accepts the whole body then never RESPONDS for `response_wait` (a
+///     commit hung behind `JuiceFS` backpressure).
 ///
 /// Shared by the whole-file ([`put_streaming`]) and pack ([`try_pack_upload_once`])
-/// PUT paths so both get the same protection. `done` is driven off the body stream
-/// reaching end-of-input (see [`DoneOnEof`]), so the write phase is guarded while a
-/// legitimately slow blob-commit RESPONSE (`JuiceFS` backpressure) never trips it,
-/// correct even when the streamed length diverges from any earlier stat.
+/// PUT paths so both get the same protection. `done` (driven off the body stream
+/// reaching end-of-input, see [`DoneOnEof`]) switches the guard between the two
+/// phases, so the write deadline never caps a slow-but-progressing body and the
+/// response deadline is measured only from body-completion — correct even when the
+/// streamed length diverges from any earlier stat. `response_wait` is generous
+/// relative to `write_stall` because a legitimately slow commit is expected; it
+/// exists only to bound an indefinitely hung one.
 ///
 /// Atomics (not a lock) so the body-stamping closure never holds a guard across
 /// reqwest's `.await` and the watchdog's reads are wait-free; `Relaxed` is enough
@@ -357,6 +363,7 @@ async fn send_put_watchdogged<S>(
     body_stream: S,
     auth_token: Option<&str>,
     write_stall: Duration,
+    response_wait: Duration,
 ) -> Result<reqwest::Response, CoreError>
 where
     S: Stream<Item = Result<Bytes, std::io::Error>> + Send + 'static,
@@ -386,20 +393,34 @@ where
         req = req.bearer_auth(token);
     }
 
-    // Drive the send, aborting if the body WRITE stalls (audit H1). Dropping the
-    // send future on a stall (the `return` below) cancels the reqwest request and
-    // severs the socket the peer stopped draining. select! polls the pinned send
-    // future and re-arms a 1s timer each round; the timer branch checks idle time
-    // only while `done` is false, so the response-wait phase is never tripped.
+    // Drive the send, aborting on either stall phase (audit H1 + its follow-up).
+    // Dropping the send future on a stall (the `return` below) cancels the reqwest
+    // request and severs the socket. select! polls the pinned send future and re-arms
+    // a 1s timer each round. Two phases, switched on `done` (body fully sent):
+    //   - writing (!done): abort if no frame was accepted for `write_stall` (idle,
+    //     resets on each accepted frame — never caps a slow-but-progressing body);
+    //   - waiting for the response (done): abort if the registry hasn't responded
+    //     within `response_wait` of the body finishing (the hung-commit case a live
+    //     socket hides from tcp_keepalive). `done_at` is stamped the first tick we
+    //     observe `done`, so the deadline is measured from body-completion, not send
+    //     start.
     let send_fut = req.send();
     tokio::pin!(send_fut);
     let stall_ms = u64::try_from(write_stall.as_millis()).unwrap_or(u64::MAX);
+    let response_ms = u64::try_from(response_wait.as_millis()).unwrap_or(u64::MAX);
+    let mut done_at: Option<u64> = None;
     loop {
         tokio::select! {
             r = &mut send_fut => return Ok(r?),
             () = tokio::time::sleep(WRITE_STALL_CHECK) => {
-                if !done.load(Ordering::Relaxed) {
-                    let idle = elapsed_ms(base).saturating_sub(last_ms.load(Ordering::Relaxed));
+                let now = elapsed_ms(base);
+                if done.load(Ordering::Relaxed) {
+                    let since_done = now.saturating_sub(*done_at.get_or_insert(now));
+                    if since_done >= response_ms {
+                        return Err(CoreError::Stall(Duration::from_millis(since_done)));
+                    }
+                } else {
+                    let idle = now.saturating_sub(last_ms.load(Ordering::Relaxed));
                     if idle >= stall_ms {
                         return Err(CoreError::Stall(Duration::from_millis(idle)));
                     }
@@ -456,7 +477,7 @@ where
         })
     });
 
-    let res = match send_put_watchdogged(url, stream, auth_token, write_stall).await {
+    let res = match send_put_watchdogged(url, stream, auth_token, write_stall, RESPONSE_WAIT_TIMEOUT).await {
         Ok(res) => res,
         Err(e) => {
             let msg = match &e {
@@ -632,7 +653,7 @@ async fn try_pack_upload_once(
     // as the socket accepts each frame (see `PUT_FRAME_BYTES`).
     let frames = pack_frames(body);
     let body_stream = futures::stream::iter(frames.into_iter().map(Ok::<Bytes, std::io::Error>));
-    let put_resp = send_put_watchdogged(&put_url, body_stream, auth_token, WRITE_STALL_TIMEOUT).await?;
+    let put_resp = send_put_watchdogged(&put_url, body_stream, auth_token, WRITE_STALL_TIMEOUT, RESPONSE_WAIT_TIMEOUT).await?;
     if !put_resp.status().is_success() {
         return Err(CoreError::ServerError(
             put_resp.status().as_u16(),
@@ -1004,13 +1025,59 @@ mod tests {
         let body_stream = futures::stream::iter(frames.into_iter().map(Ok::<Bytes, std::io::Error>));
         let outcome = tokio::time::timeout(
             std::time::Duration::from_secs(8),
-            super::send_put_watchdogged(&url, body_stream, None, std::time::Duration::from_secs(1)),
+            // Long response_wait: this test stalls the WRITE phase, so `done` never
+            // flips and the response deadline must stay inert — only write_stall fires.
+            super::send_put_watchdogged(&url, body_stream, None, std::time::Duration::from_secs(1), std::time::Duration::from_secs(30)),
         )
         .await;
         server.abort();
         assert!(
             matches!(outcome, Ok(Err(CoreError::Stall(_)))),
             "a stalled pack PUT must abort via the shared watchdog as a retryable Stall, got {outcome:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn response_wait_aborts_when_peer_hangs_after_body() {
+        // Audit H1 follow-up: after the body is fully sent, a peer that accepts every
+        // byte then never responds (the hung JuiceFS commit case) must be cut by the
+        // response-wait deadline — the gap the write-stall watchdog leaves once `done`
+        // flips. Read the WHOLE request (head + the small body) so `done` flips, then
+        // hang; a short response_wait keeps the test fast.
+        use tokio::io::AsyncReadExt;
+        use tokio::net::TcpListener;
+        let Ok(listener) = TcpListener::bind("127.0.0.1:0").await else { return };
+        let Ok(addr) = listener.local_addr() else { return };
+        let server = tokio::spawn(async move {
+            if let Ok((mut sock, _)) = listener.accept().await {
+                // Drain the full request (head + body) so DoneOnEof flips `done`, then
+                // never write a response.
+                let mut sink = [0u8; 4096];
+                while let Ok(n) = sock.read(&mut sink).await {
+                    if n == 0 {
+                        break;
+                    }
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+            }
+        });
+
+        let url = format!("http://{addr}/v2/blobs/uploads/x?digest=sha256:deadbeef");
+        // A tiny body drains instantly, so `done` flips almost immediately and the
+        // response-wait deadline (1s) governs. write_stall is generous so only the
+        // response phase can trip.
+        let body = Bytes::from(vec![7u8; 64]);
+        let frames = super::pack_frames(&body);
+        let body_stream = futures::stream::iter(frames.into_iter().map(Ok::<Bytes, std::io::Error>));
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(8),
+            super::send_put_watchdogged(&url, body_stream, None, std::time::Duration::from_secs(30), std::time::Duration::from_secs(1)),
+        )
+        .await;
+        server.abort();
+        assert!(
+            matches!(outcome, Ok(Err(CoreError::Stall(_)))),
+            "a peer that hangs after accepting the body must be cut by the response-wait deadline, got {outcome:?}"
         );
     }
 

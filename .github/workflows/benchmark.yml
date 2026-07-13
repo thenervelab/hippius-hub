@@ -68,9 +68,11 @@ on:
 # benchmark and the e2e suite against test/e2e-client at the same time — parallel
 # writes to the same revision produce 412s that masquerade as real If-Match
 # regressions. Same group => they serialize. cancel-in-progress stays false here so
-# a benchmark isn't cut mid-transfer under normal queueing; if e2e (which cancels)
-# ever pre-empts an in-flight benchmark, the only cost is orphan chunk blobs a GC
-# reclaims — the same tolerance the transfer already assumes.
+# a benchmark isn't cut mid-transfer under normal queueing. The one accepted edge:
+# because e2e sets cancel-in-progress:true, if a benchmark is already running when
+# e2e enters the group, e2e cancels it — that push then produces no benchmark
+# numbers (re-run via workflow_dispatch), and the interrupted transfer leaves orphan
+# chunk blobs a GC reclaims. Both costs are cheaper than a false If-Match regression.
 concurrency:
   group: e2e-${{ github.ref }}
   cancel-in-progress: false

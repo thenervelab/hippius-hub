@@ -9,7 +9,7 @@ blob that is genuinely gone.
 
 `upload_file` now treats a MANIFEST_BLOB_UNKNOWN that outlives that budget as a
 durable loss and RE-RUNS the whole upload (packs always re-upload; the config
-cache is evicted at the raise site), bounded by `BLOB_REUPLOAD_MAX_RETRIES` so a
+cache is evicted at the raise site), bounded by `blob_reupload_max_retries()` so a
 registry that keeps dropping the blob surfaces as the infra fault it is rather
 than looping forever. These tests pin: re-upload-then-succeed, the bound, that a
 non-BLOB_UNKNOWN failure is NOT re-uploaded, and the digest extraction.

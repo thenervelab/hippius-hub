@@ -499,7 +499,7 @@ def test_manifest_put_exhausts_retries_and_reuploads_then_surfaces_error_body(tm
 
     A blob the registry keeps dropping can neither be waited out (the per-PUT budget)
     nor re-pushed away (the re-upload budget), so the client re-runs the whole upload
-    BLOB_REUPLOAD_MAX_RETRIES + 1 times — each burning the full manifest-PUT budget —
+    blob_reupload_max_retries() + 1 times — each burning the full manifest-PUT budget —
     and then surfaces MANIFEST_BLOB_UNKNOWN as a TYPED error carrying repo:revision and
     the body, so callers can tell it apart from a permanent 400.
     """
