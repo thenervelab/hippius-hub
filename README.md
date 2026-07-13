@@ -119,6 +119,9 @@ The full `registry` sub-tree:
 | `registry subscribe <plan> [--pay-upfront N]` | Subscribe to a plan on-chain. `<plan>` is the name (e.g. `Builder`) or numeric id. Debits your own credits — backend is just the whitelisted relayer. |
 | `registry subscriptions` | List your current subscriptions (synced from chain every ~3 min) |
 | `registry unsubscribe <sub-id>` | Cancel a subscription by its on-chain `SubscriptionId`. 30-day grace before the project is hard-deleted; re-subscribe within that window to keep everything. |
+| `registry keys list` | List this project's scoped API keys / robot accounts |
+| `registry keys create <name> --role read\|push\|push-delete\|admin [--expires-days N] [--docker-login]` | Mint a scoped key (`robot$<project>+<name>`); secret shown **once**. Roles: `read`=pull/list, `push`=+push/create, `push-delete`=+delete, `admin`=full project |
+| `registry keys show <id>` / `rotate <id>` / `revoke <id>` | Inspect a key (no secret) / rotate its secret / delete it (irreversible) |
 
 ## Search the AI model index
 
@@ -324,8 +327,10 @@ Existing code that catches HF's exceptions keeps working.
 | `HIPPIUS_PACK_SIZE` | `67108864` (64 MiB) | Target size of a content-addressed pack blob (many CDC chunks per pack) |
 | `HIPPIUS_MAX_INFLIGHT_PACKS` | `HIPPIUS_UPLOAD_WORKERS` (8) | Process-wide cap on concurrent pack uploads (bounds resident memory during folder uploads); defaults to the upload-worker count |
 | `HIPPIUS_BLOB_REUPLOAD_RETRIES` | `2` | Extra whole-upload retries when the registry reports a just-committed blob as missing (`BLOB_UNKNOWN`) |
+| `HIPPIUS_MANIFEST_PUT_RETRIES` | `12` | Retries for the final manifest PUT — widens the window for the registry's blob-commit-visibility lag (`MANIFEST_BLOB_UNKNOWN` / transient 5xx) without a release |
 | `HIPPIUS_CHUNKED_WRITE` | on | Set `0`/`false` to store large files in the pre-chunking single-blob layout. Default on as of 0.6.0 — a reader must be ≥ 0.6.0 to read a chunked artifact |
 | `HIPPIUS_DEBUG` / `RUST_LOG` | off | Verbose transport logging (per-chunk timings, retries) |
+| `HIPPIUS_HUB_NO_UPDATE_CHECK` | off | Set `1`/`true` to skip the CLI's "newer version available" check (auto-skipped when `CI` is set) |
 | `HIPPIUS_API_URL` | `https://api.hippius.com` | Console API base used by the `registry` + `models` CLI subtrees |
 | `HIPPIUS_TEST_REPO` | `test/e2e-client` | Override the test repo used by the e2e suite |
 

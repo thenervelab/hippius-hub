@@ -99,6 +99,9 @@ hippius-hub registry unsubscribe <sub-id>                     # cancel_user_subs
 hippius-hub registry repos [--page N --page-size M]
 hippius-hub registry artifacts <repo> [--page N --page-size M]
 hippius-hub registry usage                       # storage used + 7-day history
+hippius-hub registry keys list                                # per-project scoped API keys / robots
+hippius-hub registry keys create <name> --role read|push|push-delete|admin [--expires-days N] [--docker-login]   # secret shown once; -> robot$<project>+<name>
+hippius-hub registry keys show|rotate|revoke <key-id>         # inspect / rotate secret / delete
 
 # --- AI model index (server-side parser: GGUF, safetensors, ONNX, Diffusers) ---
 hippius-hub models list [--format gguf|safetensors|onnx|diffusers] \
@@ -276,7 +279,7 @@ Fields with no OCI analog return `None`: `pipeline_tag`, `library_name`, `tags`,
 
 ## Concurrency caveat
 
-Multiple parallel `upload_file` calls to the same `repo_id:revision` race on the manifest with no `If-Match` check. Last writer wins. Serialize same-revision uploads in the caller if it matters.
+Parallel `upload_file` calls to the same `repo_id:revision` are guarded by an `If-Match` on the manifest PUT: the **first writer wins**, the rest raise `ConcurrentManifestUpdateError` (a subclass of `HfHubHTTPError`) and can retry on a fresh baseline. If the registry omits `Docker-Content-Digest` on the manifest GET, the PUT proceeds unguarded and emits a `UserWarning` (grep-able in logs).
 
 ## Environment variables
 
@@ -292,8 +295,10 @@ Multiple parallel `upload_file` calls to the same `repo_id:revision` race on the
 - `HIPPIUS_PACK_SIZE` (default `67108864` = 64 MiB) — target size of a content-addressed pack blob (many CDC chunks per pack)
 - `HIPPIUS_MAX_INFLIGHT_PACKS` (default = `HIPPIUS_UPLOAD_WORKERS`, i.e. `8`) — process-wide cap on concurrent pack uploads, so a folder upload doesn't multiply resident memory
 - `HIPPIUS_BLOB_REUPLOAD_RETRIES` (default `2`) — extra whole-upload retries when the registry reports a just-committed blob as missing (`BLOB_UNKNOWN`)
+- `HIPPIUS_MANIFEST_PUT_RETRIES` (default `12`) — retries for the final manifest PUT; widens the window for the registry's blob-commit-visibility lag (`MANIFEST_BLOB_UNKNOWN` / transient 5xx)
 - `HIPPIUS_CHUNKED_WRITE` (default on) — set to `0`/`false` to emit the pre-chunking single-blob layout for large files (escape hatch; a reader must be >= 0.6.0 to read a chunked artifact — older readers have no guard and misread it)
 - `HIPPIUS_DEBUG` / `RUST_LOG` (default off) — verbose transport logging (per-chunk timings, retries)
+- `HIPPIUS_HUB_NO_UPDATE_CHECK` (default off) — set `1`/`true` to skip the CLI's "newer version available" check (auto-skipped when `CI` is set)
 - `HIPPIUS_API_URL` (default `https://api.hippius.com`) — console API base for the `registry` + `models` CLI subtrees
 - `HIPPIUS_TEST_REPO` (default `test/e2e-client`) — only used by the e2e test suite
 
