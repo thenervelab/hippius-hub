@@ -25,14 +25,6 @@ yanked = "deny"
 # and a follow-up plan. Review at every Dependabot merge to confirm
 # the exception is still legitimate.
 ignore = [
-    { id = "RUSTSEC-2025-0020", reason = """
-pyo3 0.22.x PyString::from_object reads past nul bytes in &str. Fixed in
-pyo3 0.24.1+, but we don't call PyString::from_object anywhere in
-src/ (verified via `rg PyString src/` — no matches as of 2026-05-27).
-The audit just migrated 0.20 → 0.22 (STRUCT-1 / CT3); forcing
-another major upgrade is out of scope for this PR. Remove this
-ignore when upgrading pyo3 to ≥0.24.1.
-""" },
     { id = "RUSTSEC-2025-0119", reason = """
 number_prefix 0.4.0 (transitive via indicatif 0.17) is unmaintained
 but not insecure — RUSTSEC-2025-0119 is an "unmaintained" advisory,
