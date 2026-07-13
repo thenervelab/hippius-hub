@@ -7,8 +7,7 @@ credential resolution (saved token, env var, fresh login, etc.).
 import base64
 from typing import Optional
 
-import httpx
-
+from . import _http
 from .constants import DEFAULT_HTTP_TIMEOUT, resolve_registry
 from .errors import LocalTokenNotFoundError
 
@@ -53,9 +52,14 @@ def harbor_whoami(auth_header: str, endpoint: Optional[str] = None) -> dict:
             "orgs": [],
         }
 
-    resp = httpx.get(
+    resp = _http.client().get(
         f"{_base(endpoint)}/api/v2.0/users/current",
         headers=_headers(auth_header),
+        # Explicit timeout (audit L6): the shared client has no client-level
+        # timeout, so an omitted timeout falls back to httpx's 5s default while
+        # sibling Harbor reads pass 30s — a slow-but-healthy Harbor could then fail
+        # login verification (a raw ReadTimeout) while metadata reads succeed.
+        timeout=DEFAULT_HTTP_TIMEOUT,
     )
     if resp.status_code == 401:
         raise LocalTokenNotFoundError(
@@ -87,10 +91,11 @@ def harbor_create_project(
 
     Raises httpx.HTTPStatusError on failure. 409 means the project already exists.
     """
-    resp = httpx.post(
+    resp = _http.client().post(
         f"{_base(endpoint)}/api/v2.0/projects",
         headers=_headers(auth_header, json=True),
         json={"project_name": project_name, "public": public},
+        timeout=DEFAULT_HTTP_TIMEOUT,  # audit L6: 30s, not httpx's 5s default
     )
     resp.raise_for_status()
     location = resp.headers.get("Location", "")
@@ -115,7 +120,7 @@ def harbor_get_project(
     flag on ModelInfo) should treat FORBIDDEN as "unknown" rather than
     inferring private/public from absent data.
     """
-    resp = httpx.get(
+    resp = _http.client().get(
         f"{_base(endpoint)}/api/v2.0/projects/{project_name}",
         headers=_headers(auth_header),
         timeout=DEFAULT_HTTP_TIMEOUT,
@@ -136,9 +141,10 @@ def harbor_delete_project(
     missing_ok: bool = False,
 ) -> None:
     """Delete a Harbor project; with `missing_ok=True`, 404 is swallowed."""
-    resp = httpx.delete(
+    resp = _http.client().delete(
         f"{_base(endpoint)}/api/v2.0/projects/{project_name}",
         headers=_headers(auth_header),
+        timeout=DEFAULT_HTTP_TIMEOUT,  # audit L6: 30s, not httpx's 5s default
     )
     if resp.status_code == 404 and missing_ok:
         return
@@ -158,7 +164,7 @@ def harbor_get_repository(
     Harbor encodes those as `%2F` in the URL.
     """
     encoded = repo_name.replace("/", "%2F")
-    resp = httpx.get(
+    resp = _http.client().get(
         f"{_base(endpoint)}/api/v2.0/projects/{project_name}/repositories/{encoded}",
         headers=_headers(auth_header),
         timeout=DEFAULT_HTTP_TIMEOUT,
@@ -181,9 +187,12 @@ def harbor_delete_repository(
 ) -> None:
     """Delete a Harbor repository under `project_name`; with `missing_ok=True`, 404 is swallowed."""
     encoded = repo_name.replace("/", "%2F")
-    resp = httpx.delete(
+    resp = _http.client().delete(
         f"{_base(endpoint)}/api/v2.0/projects/{project_name}/repositories/{encoded}",
         headers=_headers(auth_header),
+        # audit L6: a repo DELETE that cascades >5s must not time out client-side
+        # after Harbor has already begun the deletion; match the 30s siblings.
+        timeout=DEFAULT_HTTP_TIMEOUT,
     )
     if resp.status_code == 404 and missing_ok:
         return
@@ -206,7 +215,7 @@ def harbor_get_artifact(
         "with_label": str(with_label).lower(),
         "with_tag": str(with_tag).lower(),
     }
-    resp = httpx.get(
+    resp = _http.client().get(
         f"{_base(endpoint)}/api/v2.0/projects/{project_name}/repositories/{encoded}/artifacts/{reference}",
         headers=_headers(auth_header),
         params=params,

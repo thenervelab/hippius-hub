@@ -312,17 +312,30 @@ Existing code that catches HF's exceptions keeps working.
 | Env var | Default | Purpose |
 |---|---|---|
 | `HIPPIUS_CHUNK_SIZE` | `104857600` (100 MiB) | Per-chunk size for the parallel Rust downloader |
-| `HIPPIUS_VERIFY_HASH` | unset (off) | Set to `1`/`true` to SHA256-verify downloads locally |
+| `HIPPIUS_VERIFY_HASH` | on | Whole-file SHA256 verification of downloads before caching. Set `0`/`false` to skip on the plain/Range path (the chunked-v2 path always verifies) |
 | `HIPPIUS_MAX_CONCURRENT` | `32` | Parallel connections per file download |
 | `HIPPIUS_CONNECT_TIMEOUT` | `30` | TCP connect timeout (seconds) |
 | `HIPPIUS_READ_TIMEOUT` | unset | Opt-in per-chunk total request timeout (seconds) |
 | `HIPPIUS_SNAPSHOT_WORKERS` | `8` | Concurrent files in `snapshot_download` |
-| `HIPPIUS_UPLOAD_WORKERS` | `8` | Concurrent files in a folder upload |
+| `HIPPIUS_UPLOAD_WORKERS` | `8` | Concurrent files in a folder upload / concurrent chunk uploads per large file |
+| `HIPPIUS_CHUNK_THRESHOLD` | `268435456` (256 MiB) | Files at or above this size upload as content-defined chunks; below it, one plain blob |
+| `HIPPIUS_CDC_AVG_SIZE` | `4194304` (4 MiB) | FastCDC average chunk size — 4 MiB is fastcdc's max (larger is rejected); part of the layout wire contract |
+| `HIPPIUS_UPLOAD_CHUNK_SIZE` | `16777216` (16 MiB) | Per-`PATCH` chunk size for resumable plain-blob uploads (resume granularity on a transient failure) |
+| `HIPPIUS_PACK_SIZE` | `67108864` (64 MiB) | Target size of a content-addressed pack blob (many CDC chunks per pack) |
+| `HIPPIUS_MAX_INFLIGHT_PACKS` | `HIPPIUS_UPLOAD_WORKERS` (8) | Process-wide cap on concurrent pack uploads (bounds resident memory during folder uploads); defaults to the upload-worker count |
+| `HIPPIUS_BLOB_REUPLOAD_RETRIES` | `2` | Extra whole-upload retries when the registry reports a just-committed blob as missing (`BLOB_UNKNOWN`) |
+| `HIPPIUS_CHUNKED_WRITE` | on | Set `0`/`false` to store large files in the pre-chunking single-blob layout. Default on as of 0.6.0 — a reader must be ≥ 0.6.0 to read a chunked artifact |
 | `HIPPIUS_DEBUG` / `RUST_LOG` | off | Verbose transport logging (per-chunk timings, retries) |
 | `HIPPIUS_API_URL` | `https://api.hippius.com` | Console API base used by the `registry` + `models` CLI subtrees |
 | `HIPPIUS_TEST_REPO` | `test/e2e-client` | Override the test repo used by the e2e suite |
 
 Programmatic overrides via the `endpoint=` kwarg on any function let you point at an alternative Hippius registry.
+
+### Large-file chunking
+
+Files at or above `HIPPIUS_CHUNK_THRESHOLD` (256 MiB) are stored as **content-defined chunks** (FastCDC, ~4 MiB average) packed into ~64 MiB content-addressed **pack** blobs (`HIPPIUS_PACK_SIZE`) rather than one blob. The layout is a Git-LFS-style pointer: one titled `pointer.v2` layer per file — mapping each chunk to its pack, offset, and size — plus the untitled pack blobs it references, marked with `artifactType` and a `com.hippius.layout: chunked-v2` annotation. A re-uploaded, slightly-changed model references unchanged chunks by range into existing packs and uploads only the packs holding new chunks; downloads fetch each pack once (concurrently) and slice its chunks to their file offsets. Packing into ~64 MiB blobs cuts per-file upload round-trips versus one-blob-per-chunk, and a shared cap (`HIPPIUS_MAX_INFLIGHT_PACKS`) bounds concurrent pack uploads so folder uploads don't multiply resident memory. Small files and every pre-existing artifact are unchanged (one plain blob), so nothing already stored is rewritten.
+
+Chunked **writes are on by default as of 0.6.0** (`HIPPIUS_CHUNKED_WRITE`). The reader-side guard ships from 0.6.0: a 0.6.0+ client refuses an unknown layout loudly (`UnsupportedLayoutError`, with an upgrade hint) instead of misreading it, and reads a chunked-v2 artifact correctly. An already-released client (≤ v0.5.1) has no guard, so it silently writes the pointer blob as the file — **every consumer of large files must be on ≥ 0.6.0** before you push them. Set `HIPPIUS_CHUNKED_WRITE=0` to fall back to the byte-identical single-blob layout while a consumer is still on an older client.
 
 ### Diagnosing slow transfers
 

@@ -7,8 +7,13 @@ parallelise per-file via a ThreadPoolExecutor.
 """
 import datetime
 import hashlib
+import json
 import os
+import random
+import re
 import tempfile
+import threading
+import time
 import warnings
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
@@ -19,32 +24,68 @@ from huggingface_hub import CommitInfo
 from huggingface_hub.utils import filter_repo_objects
 from tqdm import tqdm
 
-from ._oci import fetch_manifest, layer_title
-from .auth import get_oci_bearer_token
-from .constants import DEFAULT_HTTP_TIMEOUT, LAYER_TITLE_KEY, resolve_registry
-from .errors import ConcurrentManifestUpdateError
-from .auth import get_oci_bearer_token, get_token, resolve_token_value
-from .constants import DEFAULT_HTTP_TIMEOUT, LAYER_TITLE_KEY, resolve_registry, resolve_upload_workers
+from . import _http
+from ._oci import fetch_manifest, group_files, layer_title, parse_pointer_v2
+from ._packing import plan_packs, pointer_v2_bytes, resolve_pointer_chunks
+from .auth import call_with_oci_token_refresh
+from .constants import (
+    ARTIFACT_TYPE_CHUNKED_V2,
+    CHUNK_COUNT_KEY,
+    CHUNKED_LAYOUT_V2,
+    DEFAULT_HTTP_TIMEOUT,
+    _resolve_positive_int,
+    FILE_DIGEST_KEY,
+    FILE_SIZE_KEY,
+    LAYER_TITLE_KEY,
+    LAYOUT_ANNOTATION_KEY,
+    MAX_MANIFEST_BYTES,
+    PACK_MEDIA_TYPE,
+    POINTER_MEDIA_TYPE_V2,
+    resolve_cdc_avg_size,
+    resolve_chunk_threshold,
+    resolve_chunked_write_enabled,
+    resolve_max_inflight_packs,
+    resolve_pack_size,
+    resolve_registry,
+    resolve_upload_workers,
+)
+from .errors import (
+    ConcurrentManifestUpdateError,
+    MalformedManifestError,
+    ManifestBlobUnknownError,
+    ManifestTooLargeError,
+)
 from .file_download import _oci_repo_path, _validate_repo_type
 
 try:
-    from .hippius_core import hash_file_native, upload_blob_native
+    from .hippius_core import (
+        chunk_and_hash_native,
+        hash_file_native,
+        pack_upload_native,
+        upload_blob_native,
+    )
 except ImportError:
     raise ImportError("hippius_core is not installed. Did you run `maturin develop`?")
 
 
 # ---- helpers ----
 
-def _oci_bearer(repo_id: str, token, push: bool = True, endpoint=None) -> str:
-    # Token resolution + the off-origin credential guard happen inside
-    # get_oci_bearer_token, which mints from `resolve_registry(endpoint)`.
-    return get_oci_bearer_token(repo_id, token, push=push, endpoint=endpoint)
-
-
 def _empty_config_blob_descriptor() -> tuple:
     data = b"{}"
     digest = f"sha256:{hashlib.sha256(data).hexdigest()}"
     return data, digest, len(data)
+
+
+def _upload_blob_single_put(registry: str, repo_id: str, oci_token: str, file_path: str, digest: str) -> None:
+    """One plain (sub-threshold) whole-file blob upload; large files take the
+    chunked-v2 path instead (`_upload_file_chunked_v2`).
+
+    Rust owns the POST-init + streaming PUT-with-digest and re-inits the OCI upload
+    session on every retry attempt (audit L2), so a transient failure re-POSTs a
+    fresh session rather than re-PUTting the one a prior attempt already consumed.
+    We therefore hand it the `/blobs/uploads/` endpoint and the digest, not a
+    pre-initiated PUT URL."""
+    upload_blob_native(f"{registry}/v2/{repo_id}/blobs/uploads/", file_path, digest, oci_token)
 
 
 def _ensure_blob_uploaded(
@@ -53,50 +94,307 @@ def _ensure_blob_uploaded(
     oci_token: str,
     file_path: str,
     sha256_hash: str,
-    file_size: int,
 ) -> bool:
-    """POST/PUT a blob if not already present at its digest. Returns True if a
-    new upload happened, False if the blob already existed and was skipped."""
+    """Upload a plain whole-file blob if not already present at its digest.
+    Returns True if a new upload happened, False if the blob already existed and
+    was skipped (the dedup HEAD)."""
     digest = f"sha256:{sha256_hash}"
     headers = {"Authorization": f"Bearer {oci_token}"}
-    check = httpx.head(f"{registry}/v2/{repo_id}/blobs/{digest}", headers=headers, timeout=DEFAULT_HTTP_TIMEOUT)
+    check = _http.client().head(f"{registry}/v2/{repo_id}/blobs/{digest}", headers=headers, timeout=DEFAULT_HTTP_TIMEOUT)
     if check.status_code == 200:
         return False
-
-    # The session init (POST /blobs/uploads/) + streaming PUT both run in Rust
-    # (`upload_blob_native`) so that each retry attempt starts a FRESH upload
-    # session. Doing the POST once here and only retrying the PUT was the bug
-    # behind production "upload resumed at wrong offset" / blob-upload-invalid
-    # failures: a mid-stream disconnect left the session at a nonzero offset, and
-    # the retry's offset-0 PUT was rejected. Rust re-POSTs per attempt instead.
-    uploads_url = f"{registry}/v2/{repo_id}/blobs/uploads/"
-    upload_blob_native(uploads_url, digest, file_path, oci_token)
+    _upload_blob_single_put(registry, repo_id, oci_token, file_path, digest)
     return True
 
 
-def _ensure_config_blob_uploaded(registry: str, repo_id: str, oci_token: str) -> tuple:
-    """Push the empty-object config blob if missing. Returns (digest, size)."""
-    data, digest, size = _empty_config_blob_descriptor()
-    headers = {"Authorization": f"Bearer {oci_token}"}
-    check = httpx.head(f"{registry}/v2/{repo_id}/blobs/{digest}", headers=headers, timeout=DEFAULT_HTTP_TIMEOUT)
-    if check.status_code != 200:
-        init = httpx.post(
+# Process-wide record of (registry, oci_repo) whose empty-config blob we've
+# confirmed present (a 200 HEAD, or our own successful PUT). The empty `{}` config
+# is the SAME 2-byte blob for every manifest and stays referenced -- so never
+# GC-eligible -- while any tag exists, so re-HEADing it before every upload to a
+# repo we've already confirmed is a pure wasted round-trip. Keyed per (registry,
+# repo): a blob in repo A implies nothing about repo B, and the registry is part of
+# the key so a custom endpoint is never assumed from the default.
+_config_blob_present: set = set()
+_config_blob_lock = threading.Lock()
+
+
+def clear_config_blob_cache() -> None:
+    """Drop the confirmed-config-blob cache. For tests reusing a (registry, repo)
+    key across cases -- the process-wide cache would otherwise skip a HEAD the test
+    set a respx route up for."""
+    with _config_blob_lock:
+        _config_blob_present.clear()
+
+
+def _put_blob_with_session(registry: str, repo_id: str, headers: dict, digest: str, data: bytes) -> None:
+    """POST a fresh upload session then monolithic PUT-with-digest `data`, retrying
+    transient failures (audit L3 parity for the small in-memory blobs).
+
+    Each retry re-POSTs a fresh session before re-PUTting — never re-uses a spent
+    one — the same audit-L2 invariant the Rust uploader holds, so a 503 on init or
+    PUT during a rolling redeploy no longer aborts the whole (potentially multi-GB)
+    upload the way a single bare PUT did. A durable non-2xx surfaces via
+    `raise_for_status`; a missing `Location` is a permanent shape error (not retried).
+    """
+    def _attempt() -> httpx.Response:
+        init = _http.client().post(
             f"{registry}/v2/{repo_id}/blobs/uploads/",
             headers={**headers, "Content-Length": "0"},
             timeout=DEFAULT_HTTP_TIMEOUT,
         )
-        init.raise_for_status()
+        if not init.is_success:
+            return init  # let request_with_retry re-attempt (5xx) or the caller raise
         loc = init.headers.get("Location")
-        if loc and loc.startswith("/"):
+        if not loc:
+            raise ValueError("Registry did not return a Location header for upload initiation")
+        if loc.startswith("/"):
             loc = f"{registry}{loc}"
         sep = "&" if "?" in loc else "?"
-        httpx.put(
+        return _http.client().put(
             f"{loc}{sep}digest={digest}",
             headers={**headers, "Content-Type": "application/octet-stream"},
             content=data,
             timeout=DEFAULT_HTTP_TIMEOUT,
         )
+
+    _http.request_with_retry(_attempt).raise_for_status()
+
+
+def _ensure_config_blob_uploaded(registry: str, repo_id: str, oci_token: str) -> tuple:
+    """Push the empty-object config blob if missing. Returns (digest, size).
+
+    Skips the HEAD once this (registry, repo) is confirmed (see
+    `_config_blob_present`). Edge: if every tag in the repo were deleted mid-process
+    and Harbor GC then reaped the `{}` config, the skip means the following manifest
+    PUT sees a 400 MANIFEST_BLOB_UNKNOWN. `_put_manifest` evicts this cache entry on
+    a persistent BLOB_UNKNOWN, so re-running the upload re-HEADs/re-PUTs the config
+    rather than skipping and failing the same way again."""
+    data, digest, size = _empty_config_blob_descriptor()
+    cache_key = (registry, repo_id)
+    with _config_blob_lock:
+        if cache_key in _config_blob_present:
+            return digest, size
+    headers = {"Authorization": f"Bearer {oci_token}"}
+    check = _http.request_with_retry(
+        lambda: _http.client().head(f"{registry}/v2/{repo_id}/blobs/{digest}", headers=headers, timeout=DEFAULT_HTTP_TIMEOUT)
+    )
+    if check.status_code != 200:
+        # Raise on a failed config PUT: otherwise the manifest PUT that follows
+        # fails later with an opaque MANIFEST_BLOB_UNKNOWN instead of the real cause.
+        _put_blob_with_session(registry, repo_id, headers, digest, data)
+    # Confirmed present now (the HEAD hit, or we just PUT it) -- skip the HEAD on
+    # later uploads to this repo in this process.
+    with _config_blob_lock:
+        _config_blob_present.add(cache_key)
     return digest, size
+
+
+def _ensure_bytes_blob_uploaded(registry: str, repo_id: str, oci_token: str, data: bytes, digest: str) -> None:
+    """Push an in-memory blob (the pointer blob) if not already present at its
+    digest. HEAD-dedups first, then runs the retrying OCI init + PUT-with-digest
+    dance (a transient 5xx no longer aborts the whole upload — see
+    `_put_blob_with_session`)."""
+    headers = {"Authorization": f"Bearer {oci_token}"}
+    check = _http.request_with_retry(
+        lambda: _http.client().head(f"{registry}/v2/{repo_id}/blobs/{digest}", headers=headers, timeout=DEFAULT_HTTP_TIMEOUT)
+    )
+    if check.status_code == 200:
+        return
+    _put_blob_with_session(registry, repo_id, headers, digest, data)
+
+
+def _fetch_blob(registry: str, oci_repo: str, digest: str, oci_token: str) -> bytes:
+    """GET a blob's raw bytes (used to read prior-revision v2 pointer blobs)."""
+    resp = _http.client().get(
+        f"{registry}/v2/{oci_repo}/blobs/{digest}",
+        headers={"Authorization": f"Bearer {oci_token}"},
+        timeout=DEFAULT_HTTP_TIMEOUT,
+    )
+    resp.raise_for_status()
+    return resp.content
+
+
+def _build_dedup_index(
+    existing, registry: str, oci_repo: str, oci_token: str,
+    exclude_packs: frozenset = frozenset(),
+) -> tuple:
+    """From the prior revision's manifest, map already-stored chunks to their pack
+    location and record each pack's size — the v2 "upload only new chunks" index.
+
+    Returns `(chunk_index, pack_sizes)`: `chunk_index[chunk_digest] = (pack_digest,
+    pack_offset)` for every chunk in a prior chunked-v2 file (fetched from its
+    pointer blob), and `pack_sizes[pack_digest] = size` from the manifest's pack
+    layers (so a reused pack can be re-listed with its size). A prior plain-blob
+    revision contributes nothing — there are no packs to reuse.
+
+    `exclude_packs` (each a `sha256:...` digest) drops any pack the registry has
+    lost: its chunks are omitted from the index so they re-pack into a fresh,
+    re-uploaded pack. Without this the blob-loss self-heal cannot fix a lost
+    *reused* pack — a re-run would rebuild the identical index, re-reference the
+    same missing pack, and fail identically (see `_commit_with_blob_reupload`).
+    """
+    chunk_index: Dict[str, tuple] = {}
+    pack_sizes: Dict[str, int] = {}
+    if existing is None:
+        return chunk_index, pack_sizes
+    manifest = existing.manifest
+    for layer in manifest.get("layers", []):
+        if layer.get("mediaType") == PACK_MEDIA_TYPE and layer["digest"] not in exclude_packs:
+            pack_sizes[layer["digest"]] = layer["size"]
+    # Fetch every prior chunked file's pointer blob CONCURRENTLY (independent,
+    # small, read-only GETs) before the first new byte leaves the machine, then
+    # merge in group order so the index stays deterministic (setdefault = first
+    # wins). Uses the shared pooled httpx client, so the fan-out reuses warm
+    # connections instead of re-handshaking per pointer.
+    pointer_digests = [
+        g.pointer_digest
+        for g in group_files(manifest)
+        if g.layout == CHUNKED_LAYOUT_V2 and g.pointer_digest is not None
+    ]
+    if pointer_digests:
+        with ThreadPoolExecutor(max_workers=resolve_upload_workers()) as executor:
+            blobs = list(executor.map(
+                lambda pd: _fetch_blob(registry, oci_repo, pd, oci_token),
+                pointer_digests,
+            ))
+        for blob in blobs:
+            for ref in parse_pointer_v2(blob):
+                if ref.pack_digest in exclude_packs:
+                    continue  # lost pack — force its chunks to re-pack
+                chunk_index.setdefault(ref.chunk_digest, (ref.pack_digest, ref.pack_offset))
+    return chunk_index, pack_sizes
+
+
+# Process-wide bound on concurrent pack uploads. Shared across every file in a
+# folder upload so the nested file×pack parallelism cannot multiply resident pack
+# buffers past one ceiling. Rebuilt only when the configured cap changes (between
+# top-level uploads), so a test can retune it via HIPPIUS_MAX_INFLIGHT_PACKS.
+_pack_gate_lock = threading.Lock()
+_pack_gate_state: Dict[str, object] = {"cap": None, "sem": None}
+
+
+def _pack_upload_gate() -> threading.BoundedSemaphore:
+    """Return the shared semaphore capping concurrent pack uploads (memory ceiling)."""
+    cap = resolve_max_inflight_packs()
+    with _pack_gate_lock:
+        if _pack_gate_state["cap"] != cap:
+            _pack_gate_state["cap"] = cap
+            _pack_gate_state["sem"] = threading.BoundedSemaphore(cap)
+        return _pack_gate_state["sem"]
+
+
+def _upload_file_chunked_v2(
+    abs_path: str,
+    repo_title: str,
+    file_size: int,
+    registry: str,
+    oci_repo: str,
+    oci_token: str,
+    dedup_index: Dict[str, tuple],
+    pack_sizes: Dict[str, int],
+) -> List[dict]:
+    """Store a large file as a chunked-v2 pointer + ~64 MiB pack blobs.
+
+    Chunks at the same 4 MiB CDC boundaries as v1, but chunks already present
+    (per `dedup_index`) are referenced by range into their existing packs — only
+    NEW chunks are packed and uploaded. The manifest lists the pointer plus every
+    pack it references (new and reused) so each stays GC-safe. Pointer written
+    last, like v1, so a crash leaves only unreferenced packs for GC."""
+    whole_hex, chunk_metas = chunk_and_hash_native(abs_path, resolve_cdc_avg_size())
+    chunks = [(f"sha256:{h}", size, offset) for h, offset, size in chunk_metas]
+    plan = plan_packs(chunks, dedup_index, resolve_pack_size())
+    uploads_url = f"{registry}/v2/{oci_repo}/blobs/uploads/"
+
+    # Shared across all files: a thread blocks here BEFORE the native call
+    # allocates the pack, so at most `resolve_max_inflight_packs()` packs are
+    # resident at once regardless of how many files upload concurrently.
+    gate = _pack_upload_gate()
+
+    def _upload_pack(new_pack) -> str:
+        with gate:
+            hex_digest = pack_upload_native(
+                uploads_url=uploads_url,
+                path=abs_path,
+                ranges=list(new_pack.ranges),
+                auth_token=oci_token,
+            )
+        return f"sha256:{hex_digest}"
+
+    # Packs are independent blobs → upload in parallel (the round-trip win: ~K/16
+    # pack PUTs instead of K chunk PUTs). Order is preserved so digests line up
+    # with plan.new_packs for resolve_pointer_chunks. The gate above caps the
+    # cross-file total even though this pool is per-file.
+    with ThreadPoolExecutor(max_workers=resolve_upload_workers()) as executor:
+        new_pack_digests = list(executor.map(_upload_pack, plan.new_packs))
+
+    pointer_chunks = resolve_pointer_chunks(plan, new_pack_digests)
+    pointer_bytes = pointer_v2_bytes(whole_hex, file_size, pointer_chunks)
+    pointer_digest = f"sha256:{hashlib.sha256(pointer_bytes).hexdigest()}"
+    _ensure_bytes_blob_uploaded(registry, oci_repo, oci_token, pointer_bytes, pointer_digest)
+
+    all_pack_sizes = dict(pack_sizes)
+    for new_pack, digest in zip(plan.new_packs, new_pack_digests):
+        all_pack_sizes[digest] = new_pack.size
+
+    pointer_layer = {
+        "mediaType": POINTER_MEDIA_TYPE_V2,
+        "size": len(pointer_bytes),
+        "digest": pointer_digest,
+        "annotations": {
+            LAYER_TITLE_KEY: repo_title.replace("\\", "/"),
+            FILE_SIZE_KEY: str(file_size),
+            FILE_DIGEST_KEY: f"sha256:{whole_hex}",
+            CHUNK_COUNT_KEY: str(len(chunk_metas)),
+        },
+    }
+    # One pack layer per referenced pack, in first-appearance order (deterministic).
+    referenced: Dict[str, int] = {}
+    for _cd, _sz, pack_digest, _off in pointer_chunks:
+        if pack_digest not in referenced:
+            try:
+                referenced[pack_digest] = all_pack_sizes[pack_digest]
+            except KeyError as exc:
+                raise MalformedManifestError(
+                    f"chunked-v2 references pack {pack_digest} with no known size "
+                    "(prior manifest and pack layer are inconsistent)"
+                ) from exc
+    pack_layers = [
+        {"mediaType": PACK_MEDIA_TYPE, "size": size, "digest": pd}
+        for pd, size in referenced.items()
+    ]
+    return [pointer_layer, *pack_layers]
+
+
+def _upload_file_layers(
+    abs_path: str,
+    repo_title: str,
+    registry: str,
+    oci_repo: str,
+    oci_token: str,
+    dedup_index: Optional[Dict[str, tuple]] = None,
+    pack_sizes: Optional[Dict[str, int]] = None,
+) -> List[dict]:
+    """Upload one file and return its manifest layer(s).
+
+    A file at or above the chunk threshold is stored as chunked-v2 (a pointer +
+    ~64 MiB packs, reusing prior chunks by range via `dedup_index`) unless the
+    rollout gate (`HIPPIUS_CHUNKED_WRITE=0`) forces plain uploads. Below the
+    threshold, one plain blob — byte-identical to the pre-chunking layout, so
+    small files cross-dedup."""
+    file_size = os.path.getsize(abs_path)
+    if file_size >= resolve_chunk_threshold() and resolve_chunked_write_enabled():
+        return _upload_file_chunked_v2(
+            abs_path, repo_title, file_size, registry, oci_repo, oci_token,
+            dedup_index or {}, pack_sizes or {},
+        )
+    sha256_hash, size = hash_file_native(abs_path)
+    if not _ensure_blob_uploaded(registry, oci_repo, oci_token, abs_path, sha256_hash):
+        # Blob already present at its digest — the dedup HEAD hit. Surface the same
+        # skip feedback the pre-chunking uploader emitted (dropped in the chunked
+        # refactor); users and test_idempotency both read it as proof that "upload
+        # only the bytes we're missing" is working.
+        tqdm.write(f"✅ Already published (skipped): {repo_title}")
+    return [_build_layer(sha256_hash, size, repo_title)]
 
 
 def _prev_digest_or_warn(existing, repo_id: str, revision: str) -> Optional[str]:
@@ -127,6 +425,101 @@ def _prev_digest_or_warn(existing, repo_id: str, revision: str) -> Optional[str]
     return existing.digest
 
 
+# Manifest-PUT resilience. Every blob a manifest references — packs, the pointer,
+# the empty config — is uploaded (its PUT returned 2xx, all content-addressed)
+# before we PUT the manifest listing them. But Harbor's S3-backed blob commit
+# (the "Move" from the upload session into the blob store) has a measured
+# multi-second window between accepting a blob (201) and making it visible to
+# manifest validation: a just-PUT 8 MiB blob HEADs 404 for ~3.4s here. A fast
+# client (a low-latency CI runner) can PUT the manifest inside that window and
+# get an opaque 400 MANIFEST_BLOB_UNKNOWN; a slow (WAN) client never sees it,
+# which is why this only ever reproduced on staging CI, never locally.
+#
+# The manifest bytes are deterministic and the revision-tag write is idempotent
+# (content-addressed), so we retry, with bounded exponential backoff + jitter,
+# the SAME set of transient conditions the Rust uploader retries (see
+# `CoreError::is_retryable` in src/error.rs: connection/timeout errors + 408/429/
+# 5xx — a plain 4xx is permanent, pinned by `upload_retry_skips_4xx`), PLUS one
+# Harbor-manifest-specific case: a 400 whose OCI error code is (MANIFEST_)
+# BLOB_UNKNOWN, i.e. the commit-visibility race above. Any OTHER 400 (a malformed
+# or oversized manifest, MANIFEST_INVALID, a bad path/scope) is a real client
+# error and fails fast — retrying it would only waste the backoff budget and
+# mislabel the cause.
+#
+# Known edge (narrow, intentionally not handled here): on an *update* (a prior
+# manifest exists, so If-Match is sent), if the registry commits our write but
+# the response is lost to a retryable 5xx, the retry re-sends the now-stale
+# If-Match and gets 412 → ConcurrentManifestUpdateError. The write in fact
+# succeeded; re-running the upload (which re-fetches the digest and re-PUTs the
+# identical, content-addressed manifest) resolves it. The blob-commit race — the
+# case this fix targets — happens BEFORE the manifest is accepted, so If-Match is
+# still valid on its retries.
+# The commit→visibility window was originally ~3.4s (see the module note above), so
+# 5 retries / ~13s covered it. Under sustained JuiceFS-mount backpressure that window
+# has grown to tens of seconds, and a fast CI runner (which PUTs the manifest sooner
+# than a WAN client) now outruns the old budget and fails with a spurious
+# MANIFEST_BLOB_UNKNOWN even though the blob DOES become visible shortly after (a
+# concurrent slower folder upload to the same registry commits fine). The blob commit
+# is idempotent and the manifest bytes are deterministic, so a longer patient budget
+# only costs latency in the pathological lag case (the common case still succeeds on
+# the first retry); ~2 min of bounded backoff comfortably absorbs the observed lag.
+# Tunable via HIPPIUS_MANIFEST_PUT_RETRIES so ops can widen further without a release
+# if the backend degrades. Same budget applies to a persistent 5xx — rare, and
+# waiting it out before failing a bulk upload is acceptable.
+MANIFEST_PUT_MAX_RETRIES = _resolve_positive_int("HIPPIUS_MANIFEST_PUT_RETRIES", 12)
+_MANIFEST_PUT_BACKOFF_BASE_SECS = 0.5
+_MANIFEST_PUT_BACKOFF_CAP_SECS = 20.0
+
+# When a MANIFEST_BLOB_UNKNOWN survives the per-PUT retry budget above, a
+# referenced blob is durably gone (GC reaped it, or a 2xx commit never landed) —
+# not lagging. Re-run the whole upload, re-PUTting every referenced blob, at most
+# this many extra times. Small on purpose: a registry that keeps dropping a
+# just-committed blob is an infra fault to surface, not a client-retry target.
+def blob_reupload_max_retries() -> int:
+    """Resolve HIPPIUS_BLOB_REUPLOAD_RETRIES at call time (default 2).
+
+    Resolved per call, not frozen at import, so setting the env var actually takes
+    effect — a module-level constant read once at import made the documented knob
+    inert (and untestable via the env)."""
+    return _resolve_positive_int("HIPPIUS_BLOB_REUPLOAD_RETRIES", 2)
+# Transient statuses, matching the Rust uploader's is_retryable (408/429/5xx).
+# 400 is handled separately (only the BLOB_UNKNOWN commit-race variant); 412 is a
+# real concurrent-write conflict, surfaced typed and never retried.
+_RETRYABLE_MANIFEST_STATUS = frozenset({408, 429, 500, 502, 503, 504})
+
+
+def _manifest_error_detail(resp: httpx.Response) -> str:
+    """Raw (truncated) response body from a failed manifest PUT, so the raised
+    error carries Harbor's OCI error code (e.g. MANIFEST_BLOB_UNKNOWN) instead of
+    an opaque status line. `raise_for_status` hides the body; this doesn't."""
+    body = (resp.text or "").strip()
+    return body[:500] if body else "(empty response body)"
+
+
+def _is_blob_commit_race(resp: httpx.Response) -> bool:
+    """True when a 400 carries Harbor's (MANIFEST_)BLOB_UNKNOWN OCI error code —
+    the blob commit→visibility race (see the module note), the one 400 worth
+    retrying. Substring-matches the raw body (no JSON parse, no try/except): the
+    OCI error document is `{"errors":[{"code":"MANIFEST_BLOB_UNKNOWN",...}]}` and
+    every such code contains `BLOB_UNKNOWN`."""
+    return resp.status_code == 400 and "BLOB_UNKNOWN" in (resp.text or "")
+
+
+def _blob_unknown_digests(resp: httpx.Response) -> tuple:
+    """The blob digests Harbor named in a MANIFEST_BLOB_UNKNOWN error body.
+
+    Best-effort and parser-free: the OCI error doc is
+    `{"errors":[{"code":...,"detail":"sha256:..."}]}`, but a stripping proxy can
+    mangle the JSON, so we scan the raw text for `sha256:<64 hex>` rather than
+    trust the structure. Order-preserving + de-duplicated so the value is stable
+    for logging; empty when the body names none (the whole upload re-runs anyway,
+    so the digest list is diagnostic, not load-bearing)."""
+    seen: Dict[str, None] = {}
+    for digest in re.findall(r"sha256:[0-9a-f]{64}", resp.text or ""):
+        seen.setdefault(digest, None)
+    return tuple(seen)
+
+
 def _put_manifest(
     registry: str,
     repo_id: str,
@@ -144,6 +537,10 @@ def _put_manifest(
     the revision in between — we surface that as ConcurrentManifestUpdateError
     so callers can choose to retry or serialize externally rather than silently
     overwriting the other writer's layer.
+
+    Transient conditions — a connection/timeout error, a 408/429/5xx, or the
+    Harbor blob-commit-visibility 400 (see the module note) — are retried with
+    bounded exponential backoff + jitter. Any other status fails fast.
     """
     url = f"{registry}/v2/{repo_id}/manifests/{revision}"
     headers = {
@@ -152,14 +549,71 @@ def _put_manifest(
     }
     if if_match:
         headers["If-Match"] = if_match
-    resp = httpx.put(url, headers=headers, json=manifest, timeout=DEFAULT_HTTP_TIMEOUT * 2)
-    if resp.status_code == 412:
-        raise ConcurrentManifestUpdateError(
-            f"manifest at {repo_id}:{revision} changed between read and write",
-            response=resp,
+
+    resp = None
+    for attempt in range(MANIFEST_PUT_MAX_RETRIES + 1):
+        # A connection reset / timeout / protocol error mid-PUT (e.g. a Harbor
+        # redeploy) is a transient transport failure — the same class the Rust
+        # uploader retries. httpx raises it rather than returning a response, so
+        # this narrow catch is load-bearing: retry it like a retryable status,
+        # and re-raise once the attempts are spent.
+        transport_error = None
+        try:
+            resp = _http.client().put(url, headers=headers, json=manifest, timeout=DEFAULT_HTTP_TIMEOUT * 2)
+        except httpx.TransportError as exc:
+            transport_error = exc
+
+        if transport_error is None:
+            if resp.status_code == 412:
+                raise ConcurrentManifestUpdateError(
+                    f"manifest at {repo_id}:{revision} changed between read and write",
+                    response=resp,
+                )
+            if resp.is_success:
+                return resp
+            if (resp.status_code not in _RETRYABLE_MANIFEST_STATUS
+                    and not _is_blob_commit_race(resp)):
+                break
+            if attempt == MANIFEST_PUT_MAX_RETRIES:
+                break
+            reason = ("blob-commit visibility lag" if _is_blob_commit_race(resp)
+                      else f"transient {resp.status_code}")
+        else:
+            if attempt == MANIFEST_PUT_MAX_RETRIES:
+                raise transport_error
+            reason = f"transient network error ({type(transport_error).__name__})"
+
+        backoff = min(_MANIFEST_PUT_BACKOFF_BASE_SECS * (2 ** attempt), _MANIFEST_PUT_BACKOFF_CAP_SECS)
+        # Full jitter (50–100% of the computed delay) so independent uploaders
+        # riding out the same registry blip don't retry in lockstep and re-storm
+        # a recovering registry.
+        delay = backoff * (0.5 + random.random() * 0.5)
+        tqdm.write(
+            f"⏳ Manifest PUT for {revision} — {reason}; retrying in {delay:.1f}s "
+            f"[attempt {attempt + 1}/{MANIFEST_PUT_MAX_RETRIES + 1}]"
         )
-    resp.raise_for_status()
-    return resp
+        time.sleep(delay)
+
+    # A BLOB_UNKNOWN that outlived the retry budget is a durably-missing blob, not
+    # the transient commit-visibility race the retries assume: the empty `{}` config
+    # GC'd since we last confirmed it, or a pack whose commit never landed. Evict the
+    # config-blob cache so a re-run re-confirms/re-PUTs it, and raise a TYPED error so
+    # `upload_file` re-uploads every referenced blob rather than getting an opaque
+    # HTTPStatusError it can't distinguish from a permanent 400.
+    if resp is not None and _is_blob_commit_race(resp):
+        _config_blob_present.discard((registry, repo_id))
+        raise ManifestBlobUnknownError(
+            f"manifest PUT for {repo_id}:{revision} failed with {resp.status_code} "
+            f"after {attempt + 1} attempt(s): {_manifest_error_detail(resp)}",
+            response=resp,
+            missing_digests=_blob_unknown_digests(resp),
+        )
+    raise httpx.HTTPStatusError(
+        f"manifest PUT for {repo_id}:{revision} failed with {resp.status_code} "
+        f"after {attempt + 1} attempt(s): {_manifest_error_detail(resp)}",
+        request=resp.request,
+        response=resp,
+    )
 
 
 def _normalize_path_or_fileobj(path_or_fileobj) -> tuple:
@@ -216,22 +670,100 @@ def _build_layer(sha256_hash: str, file_size: int, path_in_repo: str) -> dict:
     }
 
 
+def _partition_groups(layers: List[dict]) -> List[tuple]:
+    """Split a layer list into (title, [layers]) file-groups.
+
+    A titled layer starts a group; untitled chunk layers attach to the preceding
+    group. So a chunked file's pointer + K chunk layers are one indivisible unit:
+    dropping it by title drops its chunks too, and keeping it keeps them all.
+    This is what makes `_merge_layers` group-aware — the fix for the data-loss
+    bug where a title-keyed merge either collapsed a chunked file to its pointer
+    or wiped its chunk layers when an unrelated file was committed."""
+    groups: List[tuple] = []
+    for layer in layers:
+        title = layer_title(layer)
+        if title or not groups:
+            groups.append((title, [layer]))
+        else:
+            groups[-1][1].append(layer)
+    return groups
+
+
 def _merge_layers(
     existing: List[dict],
     new_layers: List[dict],
     delete_titles: Optional[set] = None,
 ) -> List[dict]:
-    """Build a layer list combining `existing` with `new_layers`.
-    New layers replace existing ones with the same title; titles in `delete_titles` are dropped."""
+    """Combine `existing` with `new_layers` at file-group granularity.
+
+    An existing file-group is dropped when its title is being replaced by
+    `new_layers` or is in `delete_titles`; every surviving group is preserved
+    INTACT (pointer + all its chunk layers), then the new layers are appended.
+    A file's group is never partially rewritten, so committing one file can't
+    damage another chunked file, and replacing a chunked file swaps its whole
+    group. For plain single-layer files this reduces to the old title-keyed
+    behavior (new replaces same-title, deletes drop, others preserved)."""
     delete_titles = delete_titles or set()
-    by_title = {}
-    for layer in existing:
-        title = layer_title(layer)
-        if title and title not in delete_titles:
-            by_title[title] = layer
-    for layer in new_layers:
-        by_title[layer["annotations"][LAYER_TITLE_KEY]] = layer
-    return list(by_title.values())
+    new_titles = {title for title, _ in _partition_groups(new_layers) if title}
+    result: List[dict] = []
+    for title, group_layers in _partition_groups(existing):
+        if title is not None and (title in delete_titles or title in new_titles):
+            continue
+        result.extend(group_layers)
+    result.extend(new_layers)
+    return result
+
+
+def _assemble_manifest(
+    config_digest: str,
+    config_size: int,
+    merged_layers: List[dict],
+    commit_message: Optional[str],
+    commit_description: Optional[str],
+) -> dict:
+    """Build the OCI manifest, typing it as a chunked artifact only when it holds
+    at least one chunked file.
+
+    A manifest with any pointer layer gets `artifactType` (so image tooling / Trivy
+    treat it as a generic artifact, not a broken image) and the
+    `com.hippius.layout` annotation (so a layout-blind client hits the Phase 0
+    guard). A purely-plain manifest stays byte-identical to the pre-chunking
+    output, preserving cross-dedup with existing artifacts."""
+    annotations = _commit_annotations(commit_message, commit_description)
+    manifest = {
+        "schemaVersion": 2,
+        "mediaType": "application/vnd.oci.image.manifest.v1+json",
+        "config": {
+            "mediaType": "application/vnd.oci.empty.v1+json",
+            "digest": config_digest,
+            "size": config_size,
+        },
+        "layers": merged_layers,
+        "annotations": annotations,
+    }
+    # Tag the manifest chunked-v2 if any file in it uses the pack layout; the layout
+    # annotation gates the whole manifest through the reader's forward-compat guard.
+    if any(layer.get("mediaType") == POINTER_MEDIA_TYPE_V2 for layer in merged_layers):
+        manifest["artifactType"] = ARTIFACT_TYPE_CHUNKED_V2
+        annotations[LAYOUT_ANNOTATION_KEY] = CHUNKED_LAYOUT_V2
+    _guard_manifest_size(manifest)
+    return manifest
+
+
+def _guard_manifest_size(manifest: dict) -> None:
+    """Refuse a manifest that would exceed the registry's 4 MiB PUT cap.
+
+    Checked here, before the blobs' manifest is PUT, so a too-large artifact
+    fails with a clear error instead of the registry's opaque 400 after every
+    blob is already uploaded. Serialized the same way httpx sends it (default
+    `json.dumps` + utf-8) so the measured size matches the wire body."""
+    size = len(json.dumps(manifest).encode("utf-8"))
+    if size > MAX_MANIFEST_BYTES:
+        raise ManifestTooLargeError(
+            f"manifest is {size} bytes with {len(manifest['layers'])} layers, over the "
+            f"{MAX_MANIFEST_BYTES}-byte registry limit; this artifact has too many chunks "
+            "for a single manifest (Referrers/index fan-out is a planned follow-up)."
+        )
 
 
 def _commit_annotations(commit_message: Optional[str], commit_description: Optional[str]) -> dict:
@@ -276,27 +808,27 @@ def _upload_one_file(
     registry: str,
     oci_repo: str,
     oci_token: str,
-) -> dict:
-    """Upload one file from a folder and return its layer dict for the manifest.
+    dedup_index: Optional[Dict[str, tuple]] = None,
+    pack_sizes: Optional[Dict[str, int]] = None,
+) -> List[dict]:
+    """Upload one file from a folder and return its manifest layer(s).
 
-    Extracted from the per-file closure inside `upload_folder` so the thread-pool
-    body is testable in isolation and `upload_folder` stays under the project
-    line-length limit. Keeping this module-private (and not reused by
-    `upload_file`) because the two paths diverge in titling and progress output —
-    sharing them would re-introduce the very coupling this split removes.
+    Returns a LIST because a chunked file contributes a pointer layer plus K
+    chunk layers (a plain file contributes one). Extracted from the per-file
+    closure in `upload_folder` so the thread-pool body is testable in isolation.
+
+    `dedup_index`/`pack_sizes` come from the prior revision (built once by
+    `upload_folder`) so a chunked file references already-stored chunks by range
+    instead of re-uploading them; empty/None for plain uploads.
     """
     abs_path = os.path.join(base_dir, rel_path)
-    sha256_hash, file_size = hash_file_native(abs_path)
     repo_title = f"{path_in_repo}/{rel_path}" if path_in_repo else rel_path
-    tqdm.write(f"🚀 Uploading: {repo_title} ({file_size} bytes)...")
-    uploaded = _ensure_blob_uploaded(
-        registry, oci_repo, oci_token, abs_path, sha256_hash, file_size,
+    tqdm.write(f"🚀 Uploading: {repo_title} ({os.path.getsize(abs_path)} bytes)...")
+    layers = _upload_file_layers(
+        abs_path, repo_title, registry, oci_repo, oci_token, dedup_index, pack_sizes
     )
-    if uploaded:
-        tqdm.write(f"✅ Uploaded: {repo_title}")
-    else:
-        tqdm.write(f"✅ Already published (skipped): {repo_title}")
-    return _build_layer(sha256_hash, file_size, repo_title)
+    tqdm.write(f"✅ Uploaded: {repo_title}")
+    return layers
 
 
 def _finalize_upload_manifest(
@@ -331,17 +863,9 @@ def _finalize_upload_manifest(
     merged_layers = _merge_layers(existing_layers, new_layers, delete_titles=delete_titles)
 
     config_digest, config_size = _ensure_config_blob_uploaded(registry, oci_repo, oci_token)
-    manifest = {
-        "schemaVersion": 2,
-        "mediaType": "application/vnd.oci.image.manifest.v1+json",
-        "config": {
-            "mediaType": "application/vnd.oci.empty.v1+json",
-            "digest": config_digest,
-            "size": config_size,
-        },
-        "layers": merged_layers,
-        "annotations": _commit_annotations(commit_message, commit_description),
-    }
+    manifest = _assemble_manifest(
+        config_digest, config_size, merged_layers, commit_message, commit_description
+    )
 
     print(f"📝 Publishing OCI Manifest for {revision}...")
     resp = _put_manifest(registry, oci_repo, revision, oci_token, manifest, if_match=prev_digest)
@@ -371,6 +895,40 @@ def _handle_unsupported_kwargs(create_pr, parent_commit, run_as_future):
 
 
 # ---- public API ----
+
+def _commit_with_blob_reupload(run_commit, *, repo_id: str, revision: str) -> CommitInfo:
+    """Run one full upload+manifest commit; on a durable MANIFEST_BLOB_UNKNOWN, re-run it.
+
+    `run_commit(exclude_packs)` performs one whole attempt (upload every referenced
+    blob, then PUT the manifest) and must raise `ManifestBlobUnknownError` when a
+    referenced blob is still missing after `_put_manifest`'s own per-PUT retry budget
+    — the durable case a re-await can't fix (a GC reap, or a commit that returned 2xx
+    but never landed). Between attempts the digests the registry named are accumulated
+    into `exclude_packs` and threaded back in, so the dedup index drops any lost
+    *reused* pack and re-packs its chunks into a fresh upload — otherwise an identical
+    plan would re-reference the same missing pack and fail identically. A new pack
+    re-uploads unconditionally; the `{}`-config cache was evicted at the raise site so
+    it re-confirms too. Bounded by `blob_reupload_max_retries()`; the final attempt
+    propagates, so a registry that keeps dropping the blob surfaces the infra fault.
+
+    Note: healing a lost reused pack needs the registry to NAME it in the error body
+    (`exc.missing_digests`); an error that names none can only re-run the same plan —
+    no worse than before, but not self-healing for that case. Shared by `upload_file`
+    and `upload_folder` so both self-heal identically."""
+    max_retries = blob_reupload_max_retries()
+    exclude_packs: set = set()
+    for reupload in range(max_retries):
+        try:
+            return run_commit(frozenset(exclude_packs))
+        except ManifestBlobUnknownError as exc:
+            exclude_packs.update(exc.missing_digests)
+            named = ", ".join(exc.missing_digests) or "a referenced blob"
+            tqdm.write(
+                f"↻ {repo_id}:{revision} — registry lost {named} after commit; "
+                f"re-uploading and retrying [{reupload + 1}/{max_retries}]"
+            )
+    return run_commit(frozenset(exclude_packs))
+
 
 def upload_file(
     *,
@@ -410,36 +968,65 @@ def upload_file(
 
     oci_repo = _oci_repo_path(repo_id, repo_type)
     registry = resolve_registry(endpoint)
-    oci_token = _oci_bearer(oci_repo, token, push=True, endpoint=endpoint)
 
+    # Normalize the input ONCE, OUTSIDE the retry wrapper: a file-like
+    # `path_or_fileobj` is drained to a temp file and is NOT re-seekable, so
+    # re-reading it on a 401 retry would upload empty/truncated content and commit it
+    # as success (a BinaryIO would corrupt; str/Path/bytes are unaffected). The
+    # resolved `file_path` is threaded into `_op`, so the retry never touches the
+    # caller's stream. `cleanup()` runs exactly once, after the retry settles.
     file_path, cleanup = _normalize_path_or_fileobj(path_or_fileobj)
     try:
-        sha256_hash, file_size = hash_file_native(file_path)
-        _ensure_blob_uploaded(registry, oci_repo, oci_token, file_path, sha256_hash, file_size)
-        new_layer = _build_layer(sha256_hash, file_size, path_in_repo)
+        # Refresh the OCI token and retry once on a 401 (audit M2): a token minted
+        # here can expire mid-upload on a large multi-GB blob that outlives its TTL.
+        # The manifest fetch, blob/pack uploads, config blob, and manifest PUT all use
+        # `oci_token`, so the whole token-using body runs inside the refresh wrapper.
+        # Blob pushes are idempotent (content-addressed HEAD-dedup skips what already
+        # landed), so a retry re-HEADs and re-PUTs the manifest rather than re-uploading.
+        def _op(oci_token, exclude_packs=frozenset()):
+            # Fetch the prior manifest BEFORE uploading: chunked-v2 needs it to build
+            # the dedup index (which chunks already exist, so only new chunks are
+            # packed). The same digest guards the PUT via If-Match, so moving the fetch
+            # earlier does not widen the concurrency window.
+            existing = fetch_manifest(registry, oci_repo, revision, oci_token, missing_ok=True)
+
+            dedup_index: Dict[str, tuple] = {}
+            pack_sizes: Dict[str, int] = {}
+            # Only build the dedup index (a pointer-blob GET fan-out over the prior
+            # revision) when THIS file is large enough to take the chunked-v2 path
+            # (audit L-DEDUP-EARLY). A sub-threshold file uploads as one plain blob and
+            # never reads the index, so building it would be pure wasted round-trips.
+            if resolve_chunked_write_enabled() and (
+                os.path.getsize(file_path) >= resolve_chunk_threshold()
+            ):
+                dedup_index, pack_sizes = _build_dedup_index(
+                    existing, registry, oci_repo, oci_token, exclude_packs=exclude_packs
+                )
+            new_layers = _upload_file_layers(
+                file_path, path_in_repo, registry, oci_repo, oci_token, dedup_index, pack_sizes
+            )
+
+            existing_layers = existing.manifest.get("layers", []) if existing else []
+            prev_digest = _prev_digest_or_warn(existing, repo_id, revision)
+            merged_layers = _merge_layers(existing_layers, new_layers)
+
+            config_digest, config_size = _ensure_config_blob_uploaded(registry, oci_repo, oci_token)
+            manifest = _assemble_manifest(
+                config_digest, config_size, merged_layers, commit_message, commit_description
+            )
+
+            resp = _put_manifest(registry, oci_repo, revision, oci_token, manifest, if_match=prev_digest)
+            return _build_commit_info(registry, repo_id, revision, resp, commit_message, commit_description)
+
+        return _commit_with_blob_reupload(
+            lambda exclude_packs: call_with_oci_token_refresh(
+                oci_repo, token, push=True, endpoint=endpoint,
+                operation=lambda tok: _op(tok, exclude_packs),
+            ),
+            repo_id=repo_id, revision=revision,
+        )
     finally:
         cleanup()
-
-    existing = fetch_manifest(registry, oci_repo, revision, oci_token, missing_ok=True)
-    existing_layers = existing.manifest.get("layers", []) if existing else []
-    prev_digest = _prev_digest_or_warn(existing, repo_id, revision)
-    merged_layers = _merge_layers(existing_layers, [new_layer])
-
-    config_digest, config_size = _ensure_config_blob_uploaded(registry, oci_repo, oci_token)
-    manifest = {
-        "schemaVersion": 2,
-        "mediaType": "application/vnd.oci.image.manifest.v1+json",
-        "config": {
-            "mediaType": "application/vnd.oci.empty.v1+json",
-            "digest": config_digest,
-            "size": config_size,
-        },
-        "layers": merged_layers,
-        "annotations": _commit_annotations(commit_message, commit_description),
-    }
-
-    resp = _put_manifest(registry, oci_repo, revision, oci_token, manifest, if_match=prev_digest)
-    return _build_commit_info(registry, repo_id, revision, resp, commit_message, commit_description)
 
 
 def upload_folder(
@@ -505,43 +1092,90 @@ def upload_folder(
 
     oci_repo = _oci_repo_path(repo_id, repo_type)
     registry = resolve_registry(endpoint)
-    oci_token = _oci_bearer(oci_repo, token, push=True, endpoint=endpoint)
 
-    new_layers = []
-    if filtered:
-        print(f"📦 Preparing to upload {len(filtered)} file(s) to {repo_id}:{revision}...")
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            futures = [
-                executor.submit(
-                    _upload_one_file,
-                    rel_path=rel,
-                    base_dir=base_dir,
-                    path_in_repo=path_in_repo,
-                    registry=registry,
-                    oci_repo=oci_repo,
-                    oci_token=oci_token,
+    # Refresh the OCI token and retry once on a 401 (audit M2), mirroring upload_file:
+    # one token minted up front is shared across every worker for the whole folder's
+    # wall-clock time, so a large/slow folder can outlive the token's TTL and every
+    # worker then 401s. On a 401 the fan-out re-runs with a fresh token; blob pushes
+    # are idempotent (content-addressed HEAD-dedup skips what already landed) and the
+    # manifest PUT is deferred until all files succeed, so a re-run re-HEADs the
+    # completed blobs and re-commits rather than re-uploading. Folder workers read
+    # files from disk by path, so there is no stream-reconsumption hazard.
+    def _op(oci_token, exclude_packs=frozenset()):
+        # Build the chunked-v2 dedup index ONCE from the prior revision (as upload_file
+        # does) so every large file in the folder references chunks already stored
+        # instead of re-packing and re-uploading them. Read-only and taken before the
+        # fan-out; _finalize_upload_manifest re-fetches for the merge + If-Match, so
+        # this does not widen that write's read-modify-write window. Only built under
+        # HIPPIUS_CHUNKED_WRITE — plain uploads dedup per-blob via HEAD.
+        dedup_index: Dict[str, tuple] = {}
+        pack_sizes: Dict[str, int] = {}
+        if resolve_chunked_write_enabled():
+            # Only build the dedup index (a manifest GET + N pointer-blob GETs) when at
+            # least one file will actually be chunked (audit L10) — otherwise a folder
+            # of only-small files pays ~2N+1 wasted round-trips before the first byte,
+            # for a plain-path upload that never consults the index. Mirrors upload_file.
+            threshold = resolve_chunk_threshold()
+            if any(os.path.getsize(os.path.join(base_dir, rel)) >= threshold for rel in filtered):
+                prior = fetch_manifest(registry, oci_repo, revision, oci_token, missing_ok=True)
+                dedup_index, pack_sizes = _build_dedup_index(
+                    prior, registry, oci_repo, oci_token, exclude_packs=exclude_packs
                 )
-                for rel in filtered
-            ]
-            for fut in tqdm(as_completed(futures), total=len(filtered), desc="Uploading", unit="file"):
-                new_layers.append(fut.result())
 
-    commit_info = _finalize_upload_manifest(
-        registry=registry,
-        oci_repo=oci_repo,
-        oci_token=oci_token,
-        repo_id=repo_id,
-        revision=revision,
-        new_layers=new_layers,
-        delete_patterns=delete_patterns,
-        commit_message=commit_message,
-        commit_description=commit_description,
+        new_layers = []
+        if filtered:
+            print(f"📦 Preparing to upload {len(filtered)} file(s) to {repo_id}:{revision}...")
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                futures = [
+                    executor.submit(
+                        _upload_one_file,
+                        rel_path=rel,
+                        base_dir=base_dir,
+                        path_in_repo=path_in_repo,
+                        registry=registry,
+                        oci_repo=oci_repo,
+                        oci_token=oci_token,
+                        dedup_index=dedup_index,
+                        pack_sizes=pack_sizes,
+                    )
+                    for rel in filtered
+                ]
+                try:
+                    for fut in tqdm(as_completed(futures), total=len(filtered), desc="Uploading", unit="file"):
+                        new_layers.extend(fut.result())
+                except BaseException:
+                    # Fail-fast (audit M3): mirror _snapshot_download — drop queued
+                    # uploads on the first failure / Ctrl-C. Blob PUTs are idempotent
+                    # and the manifest PUT is deferred to after all files succeed, so a
+                    # partial run leaves only orphan content-addressed blobs a GC
+                    # reclaims — never a bad manifest. A 401 re-raised here is caught by
+                    # the token-refresh wrapper, which retries the whole fan-out once.
+                    executor.shutdown(wait=False, cancel_futures=True)
+                    raise
+
+        commit_info = _finalize_upload_manifest(
+            registry=registry,
+            oci_repo=oci_repo,
+            oci_token=oci_token,
+            repo_id=repo_id,
+            revision=revision,
+            new_layers=new_layers,
+            delete_patterns=delete_patterns,
+            commit_message=commit_message,
+            commit_description=commit_description,
+        )
+        # Count logical files uploaded, not manifest layers: a chunked file expands
+        # to a pointer + K chunk layers, so len(new_layers) would overcount.
+        print(f"🎉 Successfully pushed {len(filtered)} file(s) to {repo_id}:{revision}")
+        return commit_info
+
+    return _commit_with_blob_reupload(
+        lambda exclude_packs: call_with_oci_token_refresh(
+            oci_repo, token, push=True, endpoint=endpoint,
+            operation=lambda tok: _op(tok, exclude_packs),
+        ),
+        repo_id=repo_id, revision=revision,
     )
-    # Kept in the caller (not the finalize helper) because the count refers to
-    # files just iterated here, not layers actually written to the manifest —
-    # the two differ when delete_patterns trims pre-existing titles.
-    print(f"🎉 Successfully pushed {len(new_layers)} file(s) to {repo_id}:{revision}")
-    return commit_info
 
 
 def hippius_hub_upload(

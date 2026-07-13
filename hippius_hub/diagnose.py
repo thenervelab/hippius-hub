@@ -97,7 +97,10 @@ def run_diagnose(
     }
 
     logger.debug("requesting auth token for %s", oci_repo)
-    oci_token, token_ms = _timed(get_oci_bearer_token, oci_repo, auth_token)
+    # Thread `endpoint` through (audit critic#3): without it a --endpoint-customized
+    # diagnose mints the bearer token from the DEFAULT registry while the blob probe
+    # targets the custom host — a token/origin mismatch (401 on the probe).
+    oci_token, token_ms = _timed(get_oci_bearer_token, oci_repo, auth_token, endpoint=endpoint)
     report["token"] = {"ms": round(token_ms, 1)}
 
     logger.debug("fetching metadata for %s:%s", oci_repo, revision)
@@ -124,6 +127,13 @@ def run_diagnose(
         probe_bytes=probe_bytes,
         max_concurrent=resolve_max_concurrent(),
         connect_timeout_secs=resolve_connect_timeout(),
+        # Wire the read/idle timeout into the probe (audit M-DIAG-TIMEOUT): it now
+        # bounds a stalled read so `diagnose` cannot hang forever, and makes
+        # HIPPIUS_READ_TIMEOUT a real knob for the probe instead of dead config.
+        # `resolve_read_timeout()` returns Optional[int] (None when unset — the
+        # default); pass it through as-is (pyo3 maps None -> Rust None, which the
+        # probe defaults to 30s). Do NOT wrap in int() — int(None) raises.
+        read_timeout_secs=resolve_read_timeout(),
     )
     report["blob"] = json.loads(raw)
     report["verdict"] = _verdict(report)

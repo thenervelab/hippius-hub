@@ -1,5 +1,5 @@
+use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::exceptions::PyRuntimeError;
 use std::error::Error as StdError;
 use std::fmt::Write as _;
 use std::path::PathBuf;
@@ -7,10 +7,13 @@ use std::path::PathBuf;
 mod error;
 pub use error::{CoreError, Result};
 
+mod chunk_fetcher;
 mod chunked_downloader;
 mod diagnostics;
+mod retry;
 mod uploader;
 
+use chunk_fetcher::{PackAssembler, PackChunkTarget, PackPlanEntry, TransportTimeouts};
 use chunked_downloader::ChunkedDownloader;
 
 /// Render a `CoreError` (plus its full `source()` chain) as a single
@@ -50,8 +53,7 @@ fn core_err_to_py(e: &CoreError) -> PyErr {
 /// callers would share threads instead of fighting over two unrelated pools.
 ///
 /// The library's `get_runtime` signature is `pub fn get_runtime<'a>() -> &'a
-/// Runtime` (verified at docs.rs/pyo3-async-runtimes/0.22.0 source line 197);
-/// the `'a` is free elision over the underlying `OnceCell` static, so
+/// Runtime`; the `'a` is free elision over the underlying `OnceCell` static, so
 /// coercion to `&'static` is sound — the storage outlives the process.
 ///
 /// The previous manual `OnceLock` build with a custom `"hippius-core"` thread
@@ -59,6 +61,59 @@ fn core_err_to_py(e: &CoreError) -> PyErr {
 /// cosmetic; we accepted the library's default in exchange for the interop.
 fn shared_runtime() -> &'static tokio::runtime::Runtime {
     pyo3_async_runtimes::tokio::get_runtime()
+}
+
+/// Poll cadence for the Ctrl-C signal check while a native transfer runs (audit M1).
+/// 100 ms keeps the interrupt latency low without measurable overhead against a
+/// multi-minute transfer.
+const SIGNAL_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// Drive `fut` to completion, polling `poll_interrupt` every `interval`; if it
+/// returns `Some(e)`, stop and return `Err(e)`, DROPPING `fut` — which cancels its
+/// in-flight work. Cancellation is structural: the download `JoinSet` and the pack
+/// `AbortOnDrop` guard abort their spawned tasks on drop, and a directly-awaited
+/// streamed send is cancelled by dropping its future.
+///
+/// This is what makes a native transfer interruptible by Ctrl-C (audit M1). The
+/// entry points run inside `py.detach` (GIL released), so `poll_interrupt` briefly
+/// re-`attach`es and calls `check_signals`, which processes a pending `SIGINT` and
+/// returns the `KeyboardInterrupt`. `check_signals` only acts on the interpreter's
+/// MAIN thread — which is where `block_on` drives this loop for a DIRECT native call
+/// (the case that otherwise hangs on Ctrl-C); a fan-out worker thread no-ops the
+/// check and relies on the main thread's own signal handling plus audit M3.
+///
+/// Returns `Ok(fut_output)` on normal completion (the caller maps its inner
+/// `CoreError`) or `Err(e)` on interrupt. Generic over the interrupt type `E` and
+/// the poll closure so it is unit-testable without a live Python interpreter.
+async fn run_interruptible<T, E, F>(
+    fut: F,
+    interval: std::time::Duration,
+    mut poll_interrupt: impl FnMut() -> Option<E>,
+) -> std::result::Result<T, E>
+where
+    F: std::future::Future<Output = T>,
+{
+    tokio::pin!(fut);
+    loop {
+        tokio::select! {
+            // `biased`: poll the work future first each round so a transfer that
+            // finishes on the same tick as the timer wins over a spurious interrupt.
+            biased;
+            output = &mut fut => return Ok(output),
+            () = tokio::time::sleep(interval) => {
+                if let Some(interrupt) = poll_interrupt() {
+                    return Err(interrupt);
+                }
+            }
+        }
+    }
+}
+
+/// The `run_interruptible` poll for the real entry points: briefly re-acquire the
+/// GIL and check for a pending Ctrl-C, yielding the `KeyboardInterrupt` `PyErr` when
+/// one is raised. See `run_interruptible` for why this only fires on the main thread.
+fn poll_ctrl_c() -> Option<PyErr> {
+    Python::attach(|py| py.check_signals().err())
 }
 
 /// Download a file from `url` to `dest_path` using the shared tokio runtime.
@@ -87,7 +142,11 @@ fn shared_runtime() -> &'static tokio::runtime::Runtime {
 /// Releases the Python GIL across the blocking I/O via `py.detach`
 /// so other Python threads can make progress during the download.
 #[pyfunction]
-#[pyo3(signature = (url, dest_path, auth_token=None, chunk_size=None, verify_hash=true))]
+#[pyo3(signature = (url, dest_path, auth_token=None, chunk_size=None, verify_hash=true, content_length=None, connect_timeout_secs=None, read_timeout_secs=None))]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "each parameter is a distinct Python-supplied download argument; the two timeouts are resolved in constants.py and threaded here (audit L9) — bundling would add a wrapper type for no call-site clarity"
+)]
 fn download_file_native(
     py: Python<'_>,
     url: String,
@@ -95,6 +154,9 @@ fn download_file_native(
     auth_token: Option<String>,
     chunk_size: Option<u64>,
     verify_hash: bool,
+    content_length: Option<u64>,
+    connect_timeout_secs: Option<u64>,
+    read_timeout_secs: Option<u64>,
 ) -> PyResult<Option<String>> {
     // Audit L6 (Phase 3.12): `Option<String>` instead of `String` for the
     // hash result. pyo3 0.20's blanket `IntoPy` impl on `Option<T>` maps
@@ -107,15 +169,34 @@ fn download_file_native(
     // sentinel-shaped trap if a future SHA-0-like algorithm ever
     // produced an empty digest).
     let rt = shared_runtime();
-    let downloader = ChunkedDownloader::new(url, auth_token, chunk_size).map_err(|e| core_err_to_py(&e))?;
     let dest = PathBuf::from(dest_path);
 
     // Release the GIL so other Python threads can run during the (long)
     // network/disk I/O. pyo3 acquires the GIL automatically on function
-    // entry; detach explicitly releases it for the closure body.
+    // entry; detach (the post-0.27 name for allow_threads) explicitly
+    // releases it for the closure body. Building the downloader — which now
+    // clones the shared download client rather than constructing a fresh one —
+    // happens inside the closure so client access never holds the GIL, matching
+    // download_packs_native (where PackAssembler::new already runs detached).
+    // Timeouts resolved in Python (constants.resolve_connect_timeout /
+    // resolve_read_timeout) so `HIPPIUS_CONNECT_TIMEOUT` / `HIPPIUS_READ_TIMEOUT`
+    // reach real transfers, not just the diagnose probe (audit L9). `None` keeps
+    // the crate default (30s each). `TransportTimeouts` is `Copy`.
+    let timeouts = TransportTimeouts::from_secs(connect_timeout_secs, read_timeout_secs);
+
     py.detach(|| {
-        rt.block_on(async { downloader.download(&dest, verify_hash).await })
-            .map_err(|e| core_err_to_py(&e))
+        let downloader = ChunkedDownloader::new(url, auth_token, chunk_size, content_length, timeouts)
+            .map_err(|e| core_err_to_py(&e))?;
+        // Interruptible by Ctrl-C (audit M1): on a pending SIGINT the download future
+        // is dropped, whose JoinSet aborts the in-flight chunk tasks.
+        match rt.block_on(run_interruptible(
+            downloader.download(&dest, verify_hash),
+            SIGNAL_POLL_INTERVAL,
+            poll_ctrl_c,
+        )) {
+            Ok(result) => result.map_err(|e| core_err_to_py(&e)),
+            Err(interrupt) => Err(interrupt),
+        }
     })
 }
 
@@ -153,6 +234,38 @@ fn hash_file_native(py: Python<'_>, path: String) -> PyResult<(String, u64)> {
     })
 }
 
+/// Split a file into content-defined chunks and hash each chunk + the whole file.
+///
+/// The chunked-v2 upload primitive: chunk once here, then the Python layer plans
+/// packs (`_packing.plan_packs`) and pushes each new pack via `pack_upload_native`.
+///
+/// # Arguments
+/// - `path`: local file to chunk.
+/// - `avg_size`: `FastCDC` target average chunk size in bytes (min/max derived
+///   as avg/4 .. avg*4). Pinned by the caller — it is part of the layout's wire
+///   contract, so identical files chunk identically and dedup.
+///
+/// # Returns
+/// `tuple[str, list[tuple[str, int, int]]]` — the whole-file sha256 hex, and the
+/// per-chunk `(sha256_hex, offset, length)` list in file order.
+///
+/// # Errors
+/// `PyRuntimeError` if the file cannot be read or `avg_size` is out of range.
+///
+/// # GIL
+/// Releases the Python GIL across the blocking chunk+hash pass via `py.detach`.
+#[pyfunction]
+#[pyo3(signature = (path, avg_size))]
+fn chunk_and_hash_native(
+    py: Python<'_>,
+    path: String,
+    avg_size: u64,
+) -> PyResult<(String, uploader::ChunkList)> {
+    let dest = PathBuf::from(path);
+    // Sync CPU+I/O pass; no runtime needed. Detach releases the GIL for it.
+    py.detach(|| uploader::chunk_and_hash(&dest, avg_size).map_err(|e| core_err_to_py(&e)))
+}
+
 /// Upload a local file to `url` as the body of a chunked HTTP PUT.
 ///
 /// # Arguments
@@ -177,7 +290,7 @@ fn hash_file_native(py: Python<'_>, path: String) -> PyResult<(String, u64)> {
 /// `py.detach` so other Python threads can make progress while
 /// the file is being streamed.
 #[pyfunction]
-#[pyo3(signature = (uploads_url, digest, path, auth_token=None))]
+#[pyo3(signature = (uploads_url, path, digest, auth_token=None))]
 #[expect(
     clippy::needless_pass_by_value,
     reason = "pyo3 #[pyfunction] requires owned values to extract from Python args"
@@ -185,22 +298,27 @@ fn hash_file_native(py: Python<'_>, path: String) -> PyResult<(String, u64)> {
 fn upload_blob_native(
     py: Python<'_>,
     uploads_url: String,
-    digest: String,
     path: String,
+    digest: String,
     auth_token: Option<String>,
 ) -> PyResult<()> {
     let rt = shared_runtime();
     let dest = PathBuf::from(path);
 
-    // Release the GIL across the blocking upload; see `download_file_native`.
-    // `uploads_url` is the /blobs/uploads/ session endpoint; the POST that starts
-    // a session happens per-attempt inside `upload_blob_async`, so each retry gets
-    // a fresh session (fixes the "wrong offset" BLOB_UPLOAD_INVALID failures).
+    // Release the GIL across the blocking upload; see `download_file_native`. Rust
+    // owns the POST-init + PUT and re-inits the session per retry (audit L2), so the
+    // Python caller passes the `/blobs/uploads/` endpoint + digest, not a pre-PUT URL.
     py.detach(|| {
-        rt.block_on(async {
-            uploader::upload_blob_async(&uploads_url, &digest, &dest, auth_token.as_deref()).await
-        })
-        .map_err(|e| core_err_to_py(&e))
+        // Interruptible by Ctrl-C (audit M1): dropping the upload future on a pending
+        // SIGINT cancels the in-flight streamed send.
+        match rt.block_on(run_interruptible(
+            uploader::upload_blob_async(&uploads_url, &dest, &digest, auth_token.as_deref()),
+            SIGNAL_POLL_INTERVAL,
+            poll_ctrl_c,
+        )) {
+            Ok(result) => result.map_err(|e| core_err_to_py(&e)),
+            Err(interrupt) => Err(interrupt),
+        }
     })
 }
 
@@ -210,7 +328,7 @@ fn upload_blob_native(
 /// so the wire contract is intentionally a string — every new field added to
 /// `DiagnosticReport` flows through without changing the pyo3 signature.
 #[pyfunction]
-#[pyo3(signature = (blob_url, auth_token=None, probe_bytes=33_554_432, max_concurrent=None, connect_timeout_secs=None))]
+#[pyo3(signature = (blob_url, auth_token=None, probe_bytes=33_554_432, max_concurrent=None, connect_timeout_secs=None, read_timeout_secs=None))]
 #[expect(
     clippy::needless_pass_by_value,
     reason = "pyo3 #[pyfunction] requires owned values to extract from Python args"
@@ -222,6 +340,7 @@ fn diagnose_blob_native(
     probe_bytes: u64,
     max_concurrent: Option<usize>,
     connect_timeout_secs: Option<u64>,
+    read_timeout_secs: Option<u64>,
 ) -> PyResult<String> {
     let rt = shared_runtime();
     py.detach(|| {
@@ -233,6 +352,7 @@ fn diagnose_blob_native(
                     probe_bytes,
                     max_concurrent,
                     connect_timeout_secs,
+                    read_timeout_secs,
                 )
                 .await
             })
@@ -242,11 +362,139 @@ fn diagnose_blob_native(
     })
 }
 
+/// Pack a file's new-chunk byte ranges into one blob and upload it (chunked-v2).
+///
+/// # Arguments
+/// - `uploads_url`: the repo's `.../blobs/uploads/` endpoint; this call does the
+///   POST-init + monolithic PUT itself (a new pack is never dedup-HEADed — its
+///   content is new by construction).
+/// - `path`: local source file.
+/// - `ranges`: `(offset, length)` byte ranges to concatenate, in pack order.
+/// - `auth_token`: optional bearer token.
+///
+/// # Returns
+/// The pack blob's lowercase-hex sha256 (no prefix) — recorded in the v2 pointer.
+///
+/// # GIL
+/// Releases the GIL across the blocking read+upload via `py.detach`.
+#[pyfunction]
+#[pyo3(signature = (uploads_url, path, ranges, auth_token=None))]
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "pyo3 #[pyfunction] requires owned values to extract from Python args"
+)]
+fn pack_upload_native(
+    py: Python<'_>,
+    uploads_url: String,
+    path: String,
+    ranges: Vec<(u64, u64)>,
+    auth_token: Option<String>,
+) -> PyResult<String> {
+    let rt = shared_runtime();
+    let dest = PathBuf::from(path);
+    py.detach(|| {
+        // Interruptible by Ctrl-C (audit M1): dropping the pack-upload future on a
+        // pending SIGINT cancels the in-flight streamed pack send.
+        match rt.block_on(run_interruptible(
+            uploader::pack_upload_async(&uploads_url, &dest, &ranges, auth_token.as_deref()),
+            SIGNAL_POLL_INTERVAL,
+            poll_ctrl_c,
+        )) {
+            Ok(result) => result.map_err(|e| core_err_to_py(&e)),
+            Err(interrupt) => Err(interrupt),
+        }
+    })
+}
+
+/// Assemble a chunked-v2 file by pulling its pack blobs in parallel and slicing
+/// each chunk to its file offset (the download companion to `pack_upload_native`).
+///
+/// # Arguments
+/// - `pack_urls` / `pack_sizes`: per-pack blob URL and byte length (equal length).
+/// - `pack_chunks`: per pack, a list of `(offset_in_pack, size, file_offset,
+///   chunk_sha256_hex)` targets to carve and verify.
+/// - `dest_path`: destination, pre-allocated to `total_size`.
+/// - `total_size`: whole-file byte length (from the pointer's `file.size`).
+/// - `file_digest`: optional whole-file sha256 (hex, no prefix) — always passed
+///   for chunked files; proves chunk ordering across packs.
+///
+/// # Returns
+/// The verified whole-file sha256 hex when `file_digest` is given, else `None`.
+///
+/// # GIL
+/// Releases the GIL across the blocking transfer via `py.detach`.
+#[pyfunction]
+#[pyo3(signature = (pack_urls, pack_sizes, pack_chunks, dest_path, total_size, file_digest=None, auth_token=None, max_concurrent=None, connect_timeout_secs=None, read_timeout_secs=None))]
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "pyo3 #[pyfunction] requires owned values to extract from Python args"
+)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "each parameter is a distinct Python-supplied download argument; bundling into a #[pyclass] would add a wrapper type for no call-site clarity"
+)]
+fn download_packs_native(
+    py: Python<'_>,
+    pack_urls: Vec<String>,
+    pack_sizes: Vec<u64>,
+    pack_chunks: Vec<Vec<(u64, u64, u64, String)>>,
+    dest_path: String,
+    total_size: u64,
+    file_digest: Option<String>,
+    auth_token: Option<String>,
+    max_concurrent: Option<usize>,
+    connect_timeout_secs: Option<u64>,
+    read_timeout_secs: Option<u64>,
+) -> PyResult<Option<String>> {
+    if pack_urls.len() != pack_sizes.len() || pack_urls.len() != pack_chunks.len() {
+        return Err(PyValueError::new_err(format!(
+            "pack_urls ({}), pack_sizes ({}), pack_chunks ({}) must have equal length",
+            pack_urls.len(),
+            pack_sizes.len(),
+            pack_chunks.len()
+        )));
+    }
+    let mut packs: Vec<PackPlanEntry> = Vec::with_capacity(pack_urls.len());
+    for ((url, size), chunks) in pack_urls.into_iter().zip(pack_sizes).zip(pack_chunks) {
+        let targets = chunks
+            .into_iter()
+            .map(|(offset_in_pack, csize, file_offset, expected_sha256)| PackChunkTarget {
+                offset_in_pack,
+                size: csize,
+                file_offset,
+                expected_sha256,
+            })
+            .collect();
+        packs.push(PackPlanEntry { url, size, chunks: targets });
+    }
+
+    let rt = shared_runtime();
+    let dest = PathBuf::from(dest_path);
+    let concurrency = max_concurrent.unwrap_or(32).max(1);
+    // See `download_file_native`: env-resolved timeouts threaded to the shared
+    // download client (audit L9); `None` keeps the 30s crate defaults.
+    let timeouts = TransportTimeouts::from_secs(connect_timeout_secs, read_timeout_secs);
+
+    py.detach(|| {
+        let assembler = PackAssembler::new(auth_token, concurrency, timeouts).map_err(|e| core_err_to_py(&e))?;
+        // Interruptible by Ctrl-C (audit M1): on a pending SIGINT the assemble future
+        // is dropped, whose AbortOnDrop guard aborts the in-flight pack tasks.
+        match rt.block_on(run_interruptible(
+            assembler.assemble(&dest, &packs, file_digest.as_deref(), total_size),
+            SIGNAL_POLL_INTERVAL,
+            poll_ctrl_c,
+        )) {
+            Ok(result) => result.map_err(|e| core_err_to_py(&e)),
+            Err(interrupt) => Err(interrupt),
+        }
+    })
+}
+
 /// A Python module implemented in Rust.
 ///
-/// pyo3 0.22 migration: the `#[pymodule]` signature now takes
-/// `&Bound<'_, PyModule>` instead of the legacy `(Python, &PyModule)`
-/// pair. `Bound<'py, T>` is the post-0.21 GIL-bound smart pointer; the
+/// The `#[pymodule]` signature takes `&Bound<'_, PyModule>` (the pyo3 0.21+
+/// Bound API, current in 0.29) instead of the legacy `(Python, &PyModule)`
+/// pair. `Bound<'py, T>` is the GIL-bound smart pointer; the
 /// `'py` lifetime ties every Python object the closure produces to the
 /// GIL acquisition, so the borrow checker enforces what 0.20's GIL Refs
 /// proved manually. `wrap_pyfunction!(f, m)` keeps the same call shape
@@ -256,7 +504,10 @@ fn diagnose_blob_native(
 fn hippius_core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(download_file_native, m)?)?;
     m.add_function(wrap_pyfunction!(hash_file_native, m)?)?;
+    m.add_function(wrap_pyfunction!(chunk_and_hash_native, m)?)?;
     m.add_function(wrap_pyfunction!(upload_blob_native, m)?)?;
+    m.add_function(wrap_pyfunction!(pack_upload_native, m)?)?;
+    m.add_function(wrap_pyfunction!(download_packs_native, m)?)?;
     m.add_function(wrap_pyfunction!(diagnose_blob_native, m)?)?;
     Ok(())
 }
@@ -275,5 +526,72 @@ mod runtime_tests {
         let a: &'static _ = super::shared_runtime();
         let b: &'static _ = super::shared_runtime();
         assert!(std::ptr::eq(a, b));
+    }
+
+    #[tokio::test]
+    async fn run_interruptible_surfaces_the_interrupt_and_drops_the_future() {
+        // Audit M1: on an interrupt, run_interruptible must return Err AND drop the
+        // work future — dropping is what cancels its in-flight work (the JoinSet /
+        // AbortOnDrop guard abort their tasks, a streamed send is cut). A guard held
+        // across the never-completing await proves the drop happened.
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        struct Guard(Arc<AtomicBool>);
+        impl Drop for Guard {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+
+        let dropped = Arc::new(AtomicBool::new(false));
+        let guard = Guard(Arc::clone(&dropped));
+        let never = async move {
+            let _held = guard;
+            std::future::pending::<()>().await;
+        };
+
+        // Fire the interrupt on the 2nd poll; a short interval keeps the test fast.
+        let mut polls = 0u32;
+        let outcome: std::result::Result<(), &str> = super::run_interruptible(
+            never,
+            std::time::Duration::from_millis(20),
+            || {
+                polls += 1;
+                (polls >= 2).then_some("interrupted")
+            },
+        )
+        .await;
+
+        assert_eq!(outcome, Err("interrupted"), "the interrupt must be surfaced");
+        assert!(dropped.load(Ordering::SeqCst), "the cancelled work future must be dropped");
+    }
+
+    #[tokio::test]
+    async fn run_interruptible_returns_output_when_the_future_finishes_first() {
+        // No pending signal (poll always None) → the work future's own output wins,
+        // so a normal transfer is untouched by the signal poll.
+        let outcome: std::result::Result<i32, &str> =
+            super::run_interruptible(async { 42 }, std::time::Duration::from_millis(20), || None).await;
+        assert_eq!(outcome, Ok(42));
+    }
+
+    #[tokio::test]
+    async fn run_interruptible_completion_wins_a_same_tick_race() {
+        // The subtle `biased` guarantee (see run_interruptible's select! comment): a
+        // transfer that is ready on the SAME tick the timer fires must win over a
+        // pending interrupt, so a download that just finished is never reported as a
+        // spurious KeyboardInterrupt. A ZERO interval makes the sleep arm immediately
+        // ready too, so both branches are ready at once — only `biased` (fut polled
+        // first) makes completion win deterministically. Inverting the arm order or
+        // dropping `biased` turns this into a coin flip and fails/flakes here, even
+        // though the poll below would ALWAYS interrupt.
+        let outcome: std::result::Result<i32, &str> = super::run_interruptible(
+            async { 99 },
+            std::time::Duration::ZERO,
+            || Some("would interrupt but completion must win"),
+        )
+        .await;
+        assert_eq!(outcome, Ok(99), "a same-tick-ready future must beat the interrupt");
     }
 }

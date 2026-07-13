@@ -15,8 +15,7 @@ import time
 import warnings
 from typing import Literal, Optional, Union
 
-import httpx
-
+from . import _http
 from .constants import (
     DEFAULT_CACHE_DIR,
     DEFAULT_HTTP_TIMEOUT,
@@ -120,7 +119,19 @@ def _jwt_expiration(jwt_str: str):
             stacklevel=2,
         )
         return None
-    return payload.get("exp")
+    exp = payload.get("exp")
+    # RFC 7519 §4.1.4: `exp` is a NumericDate (a number). A non-conformant issuer
+    # sending a string/list/dict would be cached, then poison the read path
+    # (`cached_exp - leeway > now` raises TypeError for the process lifetime). `bool`
+    # is an int subclass but never a valid timestamp, so exclude it explicitly.
+    if exp is not None and (isinstance(exp, bool) or not isinstance(exp, (int, float))):
+        warnings.warn(
+            f"JWT 'exp' claim is not numeric ({type(exp).__name__}); token will not be cached",
+            UserWarning,
+            stacklevel=2,
+        )
+        return None
+    return exp
 
 
 def _atomic_write_secret(path: str, content: str) -> None:
@@ -415,7 +426,12 @@ def get_oci_bearer_token(
             # Backward compatibility
             headers["Authorization"] = f"Bearer {effective_token}"
 
-    resp = httpx.get(auth_url, headers=headers, timeout=DEFAULT_HTTP_TIMEOUT)
+    # Retry transient blips (audit L3): the token endpoint is hit up front for every
+    # operation, so a 503/429 here aborts even operations whose data plane would
+    # have retried. Auth is idempotent, so retrying is safe.
+    resp = _http.request_with_retry(
+        lambda: _http.client().get(auth_url, headers=headers, timeout=DEFAULT_HTTP_TIMEOUT)
+    )
     resp.raise_for_status()
     fresh_token = resp.json().get("token")
 
@@ -432,3 +448,46 @@ def clear_oci_token_cache():
     """Drop all cached OCI bearer tokens. For tests that monkeypatch credentials."""
     with _OCI_TOKEN_CACHE_LOCK:
         _OCI_TOKEN_CACHE.clear()
+
+
+def _is_oci_auth_error(exc: BaseException) -> bool:
+    """True when `exc` signals a 401 Unauthorized from an OCI request.
+
+    Covers both surfaces: an httpx response error carries `exc.response.status_code`
+    (as `raise_for_status`/a control-plane call raises), and a native transfer error
+    from the Rust extension surfaces `CoreError::ServerError(401, ...)` as a
+    `RuntimeError` whose message is `server returned 401 (...)`. Duck-typed on
+    `.response` so it needs no httpx import and matches either surface."""
+    resp = getattr(exc, "response", None)
+    if resp is not None and getattr(resp, "status_code", None) == 401:
+        return True
+    return "server returned 401" in str(exc)
+
+
+def call_with_oci_token_refresh(
+    oci_repo: str,
+    token,
+    *,
+    push: bool,
+    operation,
+    endpoint: Optional[str] = None,
+    initial: Optional[str] = None,
+):
+    """Run `operation(oci_token)`; on a 401, refresh the token and retry ONCE (M2).
+
+    A bearer token minted up front can expire mid-operation on a long transfer (the
+    per-op token is threaded into a multi-GB native upload/download that outlives the
+    token's TTL). On a 401 we clear the cache, re-mint a fresh token
+    (`use_cache=False`), and re-run `operation` once. A second 401 is a genuine
+    authorization failure (the fresh token was also rejected), so it propagates
+    rather than looping. `initial` uses a caller-supplied token on the first attempt
+    (e.g. snapshot_download's per-file shared token) instead of minting one."""
+    oci_token = initial or get_oci_bearer_token(oci_repo, token, push=push, endpoint=endpoint)
+    try:
+        return operation(oci_token)
+    except Exception as exc:
+        if not _is_oci_auth_error(exc):
+            raise
+        clear_oci_token_cache()
+        fresh = get_oci_bearer_token(oci_repo, token, push=push, use_cache=False, endpoint=endpoint)
+        return operation(fresh)

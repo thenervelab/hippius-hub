@@ -9,8 +9,6 @@ of holes at the user's path — and because ``hf_hub_download`` short-circuits o
 cache hit. These are pure unit tests (no network): they fake
 ``download_file_native`` to reproduce the pre-allocate-then-fail shape.
 """
-import os
-
 import pytest
 
 import hippius_hub.file_download as fd
@@ -29,7 +27,7 @@ def test_failed_local_dir_download_leaves_no_file(tmp_path, monkeypatch):
     dest = tmp_path / "model.bin"
 
     with pytest.raises(RuntimeError, match="chunk 3 failed"):
-        fd._download_to_local_dir("https://registry.example/blob", str(dest), "tok")
+        fd._download_to_local_dir("https://registry.example/blob", str(dest), "tok", "sha256:" + "a" * 64)
 
     assert not dest.exists(), (
         "a failed local_dir download must not leave a partial file at the "
@@ -42,7 +40,7 @@ def test_failed_local_dir_download_leaves_no_temp_siblings(tmp_path, monkeypatch
     dest = tmp_path / "sub" / "model.bin"
 
     with pytest.raises(RuntimeError):
-        fd._download_to_local_dir("https://registry.example/blob", str(dest), "tok")
+        fd._download_to_local_dir("https://registry.example/blob", str(dest), "tok", "sha256:" + "a" * 64)
 
     leftovers = sorted(p.name for p in (tmp_path / "sub").iterdir())
     assert leftovers == [], f"temp files leaked into the local dir: {leftovers}"
@@ -57,8 +55,29 @@ def test_successful_local_dir_download_writes_dest(tmp_path, monkeypatch):
     monkeypatch.setattr(fd, "download_file_native", _ok)
     dest = tmp_path / "model.bin"
 
-    out = fd._download_to_local_dir("https://registry.example/blob", str(dest), "tok")
+    out = fd._download_to_local_dir("https://registry.example/blob", str(dest), "tok", "sha256:" + "a" * 64)
 
     assert out == str(dest)
     assert dest.read_bytes() == b"payload"
     assert sorted(p.name for p in tmp_path.iterdir()) == ["model.bin"]
+
+
+def test_local_dir_download_rejects_digest_mismatch(tmp_path, monkeypatch):
+    """M-VERIFY-PLAIN: a verify-on download whose computed SHA disagrees with the
+    manifest digest must raise and leave no file — not silently write wrong bytes."""
+
+    def _wrong_hash(*, url, dest_path, **kwargs):
+        with open(dest_path, "wb") as f:
+            f.write(b"payload")
+        return "b" * 64  # computed hash disagrees with the expected digest below
+
+    monkeypatch.setattr(fd, "download_file_native", _wrong_hash)
+    dest = tmp_path / "model.bin"
+
+    with pytest.raises(OSError, match="Integrity check failed"):
+        fd._download_to_local_dir(
+            "https://registry.example/blob", str(dest), "tok", "sha256:" + "a" * 64
+        )
+
+    assert not dest.exists(), "a digest-mismatched download must not leave a file"
+    assert sorted(p.name for p in tmp_path.iterdir()) == [], "no temp siblings leak"

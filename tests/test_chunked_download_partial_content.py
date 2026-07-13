@@ -1,16 +1,18 @@
-"""End-to-end test for audit D2: Rust enforces 206 Partial Content.
+"""End-to-end test for audit D2 + L5: Rust's status discipline on a Range GET.
 
-`chunked_downloader.rs:require_partial_content` rejects a 200 OK to a
-Range request — without that check, a server (or a buggy proxy) that
-silently ignored the Range header would respond with the full body, and
-we'd seek to the chunk's offset and overwrite everything past `end + 1`,
-producing a silently corrupt file.
+`chunked_downloader.rs:require_acceptable_status` rejects a 200 OK to a Range
+request whose range is NOT the whole object (a MULTI-chunk download) — without
+that check, a server (or buggy proxy) that silently ignored the Range header
+would respond with the full body, and we'd seek to the chunk's offset and
+overwrite everything past `end + 1`, producing a silently corrupt file. The one
+exception (audit L5) is a single-chunk download whose range IS the whole file: a
+200-with-full-body is then RFC-legal and correct, so it is accepted.
 
-The Rust unit test `rejects_200_with_diagnostic` (chunked_downloader.rs:
-708) covers the helper in isolation. This file is the integration
-counterpart: a real localhost HTTP server, the real Rust extension via
-`download_file_native`, and an assertion that the diagnostic surfaces in
-Python's exception message with the offsets named.
+The Rust unit tests `rejects_range_ignored_200_with_diagnostic` /
+`accepts_whole_file_200` cover the helper in isolation. This file is the
+integration counterpart: a real localhost HTTP server, the real Rust extension
+via `download_file_native`, and assertions on both the multi-chunk rejection
+(with the diagnostic) and the whole-file acceptance.
 
 respx isn't a fit here — it monkeypatches httpx, not the Rust reqwest
 client. A real socket-bound `http.server.HTTPServer` is the simplest way
@@ -142,25 +144,27 @@ def test_200_to_range_request_raises_with_diagnostic(partial_content_violator, t
     # the signal — we're done if it raises.
 
 
-def test_200_to_range_single_chunk_path_also_protected(partial_content_violator, tmp_path):
-    """Even when chunk_size >= content_length (a single Range request),
-    the 200-not-206 check must still fire. A regression that conditioned
-    require_partial_content on `num_chunks > 1` would silently regress
-    small downloads.
+def test_200_to_range_single_chunk_whole_file_is_accepted(partial_content_violator, tmp_path):
+    """Audit L5: when the request covers the WHOLE object (a single-chunk
+    small-file download, chunk_size >= content_length), a `200 OK` with the full
+    body is RFC 9110 §15.3.7-legal and correct — the full body written at offset 0
+    IS the file — so it is accepted and written, not rejected.
+
+    This intentionally reverses the earlier reject-all-200 behavior. The
+    MULTI-chunk range-ignored 200 (where the range is NOT the whole object) is
+    still rejected loudly — see `test_200_to_range_request_raises_with_diagnostic`.
     """
     dest = tmp_path / "blob.bin"
 
-    with pytest.raises(Exception) as exc_info:
-        download_file_native(
-            url=partial_content_violator,
-            dest_path=str(dest),
-            auth_token=None,
-            # Larger than PAYLOAD → single Range request.
-            chunk_size=4096,
-            verify_hash=False,
-        )
-
-    msg = str(exc_info.value)
-    assert "ignored Range" in msg or "200 OK instead of 206" in msg, (
-        f"single-chunk path lost the 206 guard: {msg!r}"
+    # chunk_size > PAYLOAD → one Range request spanning the whole file, so the
+    # server's 200-with-full-body is the correct whole file, not a range-ignored
+    # partial. download_file_native must succeed and write it.
+    download_file_native(
+        url=partial_content_violator,
+        dest_path=str(dest),
+        auth_token=None,
+        chunk_size=4096,
+        verify_hash=False,
     )
+
+    assert dest.read_bytes() == PAYLOAD

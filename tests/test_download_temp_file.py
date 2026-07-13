@@ -40,7 +40,7 @@ def test_temp_paths_are_unique_per_call(cache_layout, monkeypatch):
     repo_dir, snapshots_dir = cache_layout
     seen_temp_paths: list[str] = []
 
-    def fake_download(*, url, dest_path, auth_token, chunk_size, verify_hash):
+    def fake_download(*, url, dest_path, auth_token, chunk_size, verify_hash, content_length=None, **_):
         seen_temp_paths.append(dest_path)
         with open(dest_path, "wb") as f:
             f.write(b"x")
@@ -81,7 +81,7 @@ def test_temp_paths_unique_under_thread_concurrency(cache_layout, monkeypatch):
     seen_lock = threading.Lock()
     barrier = threading.Barrier(8)
 
-    def fake_download(*, url, dest_path, auth_token, chunk_size, verify_hash):
+    def fake_download(*, url, dest_path, auth_token, chunk_size, verify_hash, content_length=None, **_):
         # Force all 8 threads into mkstemp at roughly the same time. Without
         # the barrier, Python's scheduling can serialize them and a
         # non-unique implementation would still happen to pass.
@@ -130,7 +130,7 @@ def test_temp_file_cleaned_up_on_download_failure(cache_layout, monkeypatch):
     repo_dir, snapshots_dir = cache_layout
     captured: dict[str, str] = {}
 
-    def fake_download(*, url, dest_path, auth_token, chunk_size, verify_hash):
+    def fake_download(*, url, dest_path, auth_token, chunk_size, verify_hash, content_length=None, **_):
         captured["temp_path"] = dest_path
         # mkstemp already created the empty file; simulate a partial write
         # then a network error.

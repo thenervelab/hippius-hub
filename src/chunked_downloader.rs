@@ -1,7 +1,7 @@
-use futures::stream::{FuturesUnordered, StreamExt};
 use reqwest::{header, Client};
 use sha2::{Digest, Sha256};
 use std::path::Path;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use indicatif::{ProgressBar, ProgressStyle};
 use tokio::fs::OpenOptions;
@@ -10,19 +10,21 @@ use tokio::fs::OpenOptions;
 // trait inside `compute_sha256`, so the async-read trait is no longer
 // needed at module scope.
 use tokio::io::{AsyncSeekExt, AsyncWriteExt, SeekFrom, BufWriter};
-use tokio::task::AbortHandle;
+use tokio::sync::Semaphore;
 
 use crate::error::CoreError;
 
 const DEFAULT_CHUNK_SIZE: u64 = 100 * 1024 * 1024; // 100 MB default
-const MAX_CONCURRENT_DOWNLOADS: usize = 32; // default; overridable via HIPPIUS_MAX_CONCURRENT
-const DEFAULT_CONNECT_TIMEOUT_SECS: u64 = 30;
 const MAX_RETRIES: u32 = 3;
+/// In-flight cap for the legacy Range downloader's eager-spawned chunk tasks, so a
+/// small caller-set `HIPPIUS_CHUNK_SIZE` on a huge file can't open O(file/chunk)
+/// connections at once. 32 mirrors the pack path's default concurrency.
+const MAX_INFLIGHT_CHUNKS: usize = 32;
 const VERIFY_READ_BUFFER: usize = 8 * 1024 * 1024; // 8 MB read buffer for SHA256 verification
 
 /// Per-chunk request timeout (audit D6).
 ///
-/// The `Client::builder().connect_timeout(30s)` on line 64 covers the
+/// The shared `chunk_fetcher::download_client`'s `connect_timeout(30s)` covers the
 /// TCP handshake; this constant is the FULL-REQUEST budget applied
 /// per chunk GET via `.timeout(...)`. A slow-loris server that
 /// completes the handshake then dribbles bytes can hold a connection
@@ -39,11 +41,34 @@ const VERIFY_READ_BUFFER: usize = 8 * 1024 * 1024; // 8 MB read buffer for SHA25
 /// Three-layer defense without self-reference.
 const CHUNK_REQUEST_TIMEOUT: Duration = Duration::from_mins(5);
 
+/// Read/total request budget for the size-probe HEAD (audit L-HEAD-TIMEOUT). The
+/// shared `download_client` sets only `connect_timeout(30s)`, which covers the
+/// handshake but not a peer that completes it then never sends response headers —
+/// `req.send().await` on the HEAD would otherwise hang indefinitely. A HEAD has no
+/// body, so a tight bound is safe.
+const HEAD_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Process-global cap on Range GETs in flight across ALL concurrent legacy
+/// downloads (audit M-RANGE-GATE). The per-file `permits` semaphore below bounds
+/// ONE file's chunks; without a global gate a snapshot `ThreadPoolExecutor`
+/// running N files each opens up to `MAX_INFLIGHT_CHUNKS` connections, so
+/// `N * 32` GETs hit the registry at once — FD/ephemeral-port pressure and per-IP
+/// 429 storms — while `pool_max_idle_per_host(32)` retains only 32 for reuse.
+/// First-caller-wins fixed sizing mirrors `chunk_fetcher::global_pack_gate`: a
+/// single large file still gets the full 32; N files SHARE that budget instead of
+/// multiplying it.
+fn global_range_gate() -> Arc<Semaphore> {
+    static GATE: OnceLock<Arc<Semaphore>> = OnceLock::new();
+    Arc::clone(GATE.get_or_init(|| Arc::new(Semaphore::new(MAX_INFLIGHT_CHUNKS))))
+}
+
 /// Number of HTTP Range requests needed to cover `content_length` bytes when
 /// each chunk is `chunk_size` bytes. Returns 0 for empty files (caller is
 /// expected to handle that as a special case). Returns 0 for `chunk_size == 0`
-/// to avoid a division-by-zero panic if a caller sets `HIPPIUS_CHUNK_SIZE=0` —
-/// the Python layer also validates this, but defense-in-depth.
+/// to avoid a division-by-zero panic; `download` turns that degenerate case into
+/// a loud `InvalidArgument` for a non-empty file rather than writing zeros (the
+/// Python layer also rejects a non-positive `HIPPIUS_CHUNK_SIZE`, but the pyo3
+/// entry point can bypass it — defense-in-depth).
 fn num_chunks(content_length: u64, chunk_size: u64) -> usize {
     if content_length == 0 || chunk_size == 0 {
         return 0;
@@ -80,27 +105,36 @@ pub struct ChunkedDownloader {
     url: String,
     auth_token: Option<String>,
     chunk_size: u64,
+    // Pre-known whole-file size from the OCI manifest layer descriptor
+    // (byte-accurate == the blob's Content-Length), threaded from Python so the
+    // plain-blob path can skip the HEAD it otherwise issues to learn the size.
+    // `None` -> HEAD for Content-Length as before.
+    content_length: Option<u64>,
 }
 
 impl ChunkedDownloader {
     /// Construct a new concurrent downloader.
-    pub fn new(url: String, auth_token: Option<String>, chunk_size_bytes: Option<u64>) -> Result<Self, CoreError> {
-        // Force HTTP/1.1: with h2 reqwest multiplexes all chunks on a single TCP,
-        // which caps aggregate throughput at the per-connection BBR ceiling (~150 MB/s
-        // even on a fast edge). Forcing h1 makes each parallel chunk get its own TCP,
-        // letting the kernel/qdisc fan out across the available bandwidth.
-        let client = Client::builder()
-            .connect_timeout(Duration::from_secs(DEFAULT_CONNECT_TIMEOUT_SECS))
-            .http1_only()
-            .pool_max_idle_per_host(MAX_CONCURRENT_DOWNLOADS)
-            .tcp_keepalive(Duration::from_secs(30))
-            .build()?;
-
+    pub fn new(
+        url: String,
+        auth_token: Option<String>,
+        chunk_size_bytes: Option<u64>,
+        content_length: Option<u64>,
+        timeouts: crate::chunk_fetcher::TransportTimeouts,
+    ) -> Result<Self, CoreError> {
+        // Clone the process-global download client (shared with the pack path)
+        // rather than building a fresh client + empty pool per file, so connections
+        // stay warm across back-to-back downloads. It is HTTP/1-only for the same
+        // reason as before: with h2 reqwest multiplexes all chunks on a single TCP
+        // and caps aggregate throughput at the per-connection ceiling, whereas h1
+        // lets each parallel chunk get its own TCP and fan out across the available
+        // bandwidth. See `chunk_fetcher::download_client`.
+        let client = crate::chunk_fetcher::download_client(timeouts)?.clone();
         Ok(Self {
             client,
             url,
             auth_token,
             chunk_size: chunk_size_bytes.unwrap_or(DEFAULT_CHUNK_SIZE),
+            content_length,
         })
     }
 
@@ -118,8 +152,14 @@ impl ChunkedDownloader {
     /// branch still returns `Some(sha256_of_empty_bytes)` because the
     /// file exists and has a defined (non-skipped) digest.
     pub async fn download(&self, dest_path: &Path, verify_hash: bool) -> Result<Option<String>, CoreError> {
-        // 1. Fetch the total blob size
-        let content_length = self.get_content_length().await?;
+        // 1. Total blob size: use the manifest-supplied size when Python passed it
+        //    (the common path), else HEAD for Content-Length. Skipping the HEAD
+        //    removes one control-plane RTT per plain-file download — meaningful for
+        //    the many small files in a snapshot.
+        let content_length = match self.content_length {
+            Some(n) => n,
+            None => self.get_content_length().await?,
+        };
 
         // Handle the empty-file case. `create_empty_file` keeps its
         // `Result<String, _>` shape because an empty file has a defined
@@ -140,6 +180,19 @@ impl ChunkedDownloader {
 
         let num_chunks = num_chunks(content_length, self.chunk_size);
 
+        // A non-empty file that yields zero chunks means chunk_size == 0 (num_chunks
+        // returns 0 to dodge a div-by-zero). Left unguarded, the spawn loop below
+        // runs zero times, the set_len pre-allocation stands, and this returns
+        // Ok(None) over an all-zero file — which the Python layer would then rename
+        // into the content-addressed cache under the trusted sha256 name. Fail loudly
+        // instead: chunk_size == 0 is an invalid argument, not an empty download.
+        if content_length > 0 && num_chunks == 0 {
+            return Err(CoreError::InvalidArgument(format!(
+                "chunk_size 0 yields no chunks for a {content_length}-byte file; \
+                 a zero HIPPIUS_CHUNK_SIZE would silently write an all-zero file"
+            )));
+        }
+
         // Prepare the destination directory
         let parent_dir = dest_path.parent().unwrap_or_else(|| Path::new("."));
         tokio::fs::create_dir_all(parent_dir).await?;
@@ -156,7 +209,10 @@ impl ChunkedDownloader {
                 .open(dest_path)
                 .await?;
             f.set_len(content_length).await?;
-            f.sync_all().await?; // Ensure the size is persisted before parallel writes
+            // No `sync_all` (audit L15): the parallel chunk writers see the
+            // `set_len` size through the page cache without forcing metadata to
+            // disk. It only bought crash durability of the pre-allocation, which is
+            // discarded anyway — a crash re-downloads (the dest opens `truncate`).
         }
 
         let dest_path_buf = dest_path.to_path_buf();
@@ -164,80 +220,73 @@ impl ChunkedDownloader {
         // 3. Launch concurrent downloads — each streams directly to its
         //    correct offset in the final file.
         //
-        // Audit D4: previously this used `buffer_unordered(MAX_CONCURRENT_DOWNLOADS)`
-        // and early-returned on the first error, but dropping the `Buffered` stream
-        // does NOT cancel the `tokio::spawn`'d tasks behind it — `JoinHandle::drop`
-        // detaches a tokio task, leaving it running in the background where it
-        // continues writing to `dest_path` and holding sockets after we've already
-        // bubbled an error up. We now collect the spawn-side `AbortHandle`s eagerly
-        // and call `.abort()` on every survivor before propagating the error, so
-        // the survivors stop at their next await point instead of racing the next
-        // download. The chunk-level HTTP concurrency bound that
-        // `buffer_unordered(MAX_CONCURRENT_DOWNLOADS)` used to enforce is now
-        // carried by `pool_max_idle_per_host(MAX_CONCURRENT_DOWNLOADS)` on the
-        // reqwest client (line 98) — beyond pool capacity, reqwest queues HTTP
-        // requests on the existing connections, so eager spawn does not multiply
-        // network concurrency.
-        let mut joins: FuturesUnordered<tokio::task::JoinHandle<(usize, Result<(), CoreError>)>> =
-            FuturesUnordered::new();
-        let mut abort_handles: Vec<AbortHandle> = Vec::with_capacity(num_chunks);
-
-        for i in 0..num_chunks {
-            let (start, end) = chunk_bounds(content_length, self.chunk_size, i);
-
-            let client = self.client.clone();
-            let url = self.url.clone();
-            let token = self.auth_token.clone();
-            let chunk_pb = pb.clone();
+        // Bounded-spawn window (audit L13): keep at most MAX_INFLIGHT_CHUNKS tasks
+        // live and spawn the next only as one lands, instead of eager-spawning one
+        // task per chunk (which, for a huge file under a small HIPPIUS_CHUNK_SIZE,
+        // meant O(file/chunk) live tasks plus an O(num_chunks) abort-handle Vec —
+        // `pool_max_idle_per_host` caps only IDLE connections, not in-flight GETs).
+        // A `JoinSet` owns the live tasks; dropping it on an early error return
+        // ABORTS every survivor (audit D4 — a detached `tokio::spawn` would keep
+        // writing to `dest_path` and holding sockets after we bubbled the error up),
+        // so no manual `AbortHandle` bookkeeping is needed. The window is this file's
+        // in-flight cap; `global_range_gate` (audit M-RANGE-GATE) still bounds TOTAL
+        // Range GETs across every concurrent legacy download.
+        let base_client = self.client.clone();
+        let base_url = self.url.clone();
+        let base_token = self.auth_token.clone();
+        let chunk_size = self.chunk_size;
+        let spawn_pb = pb.clone();
+        let mut set: tokio::task::JoinSet<(usize, Result<(), CoreError>)> = tokio::task::JoinSet::new();
+        let spawn_chunk = |set: &mut tokio::task::JoinSet<(usize, Result<(), CoreError>)>, i: usize| {
+            let (start, end) = chunk_bounds(content_length, chunk_size, i);
+            let client = base_client.clone();
+            let url = base_url.clone();
+            let token = base_token.clone();
+            let chunk_pb = spawn_pb.clone();
             let path = dest_path_buf.clone();
-
-            let handle = tokio::spawn(async move {
-                let res = download_chunk_with_retry(client, url, token, start, end, i, path, chunk_pb).await;
+            set.spawn(async move {
+                // Global permit (RAII-released on completion or abort) bounds TOTAL
+                // in-flight Range GETs across every concurrent legacy download so a
+                // snapshot fan-out cannot open workers × MAX_INFLIGHT_CHUNKS at once.
+                let _global_permit = match global_range_gate().acquire_owned().await {
+                    Ok(p) => p,
+                    Err(e) => return (i, Err(CoreError::Io(std::io::Error::other(e)))),
+                };
+                let res = download_chunk_with_retry(client, url, token, start, end, content_length, i, path, chunk_pb).await;
                 (i, res)
             });
-            // `abort_handle()` clones the cooperative-cancel signal; the original
-            // `JoinHandle` is what `FuturesUnordered` polls for completion.
-            abort_handles.push(handle.abort_handle());
-            joins.push(handle);
+        };
+
+        // Prime the window; the drain loop below refills it one-for-one.
+        let mut next = 0usize;
+        while next < num_chunks && set.len() < MAX_INFLIGHT_CHUNKS {
+            spawn_chunk(&mut set, next);
+            next += 1;
         }
 
-        // Drain the `FuturesUnordered` of `JoinHandle`s. Exhaustive match preserves
-        // both the spawn-side (`JoinError`) and the download-layer cause: previously
-        // both collapsed into a bare `ChunkFailed(usize)`, hiding which chunk failed
-        // AND why. Phase 3.8 replaced the `usize::MAX` sentinel with
-        // `JoinFailed.index: Option<usize>` — `None` here because the chunk index
-        // lives inside the future's return tuple, and a `JoinError` that escapes
-        // before the tuple is constructed has lost that identity. The thiserror
-        // `Display` renders `None` as `<unknown>`.
+        // Drain the JoinSet, refilling the window as each chunk lands. Exhaustive
+        // match preserves both the spawn-side (`JoinError`) and the download-layer
+        // cause: previously both collapsed into a bare `ChunkFailed(usize)`, hiding
+        // which chunk failed AND why. `JoinFailed.index` is `None` because the chunk
+        // index lives inside the future's return tuple, and a `JoinError` escaping
+        // before the tuple is built has lost that identity (`Display` → `<unknown>`).
         //
-        // On any error we abort every collected handle before returning. Aborting
-        // an already-completed handle is a documented no-op (tokio), so iterating
-        // the full `abort_handles` vector is correct even though some tasks have
-        // finished. We do not drain the remaining `joins` after firing the aborts:
-        // tokio cancellation is cooperative — the spawned futures will return
-        // `JoinError::is_cancelled()` at their next await and shut down on their
-        // own; awaiting them here would only delay the user-visible failure.
-        while let Some(res) = joins.next().await {
-            match res {
+        // On any error we return immediately; dropping `set` aborts every still-
+        // running task (audit D4) so no survivor keeps writing to `dest_path`.
+        while let Some(joined) = set.join_next().await {
+            match joined {
                 Err(join_err) => {
-                    for a in &abort_handles {
-                        a.abort();
-                    }
-                    return Err(CoreError::JoinFailed {
-                        index: None,
-                        source: join_err,
-                    });
+                    return Err(CoreError::JoinFailed { index: None, source: join_err });
                 }
                 Ok((i, Err(chunk_err))) => {
-                    for a in &abort_handles {
-                        a.abort();
-                    }
-                    return Err(CoreError::ChunkFailed {
-                        index: i,
-                        source: Box::new(chunk_err),
-                    });
+                    return Err(CoreError::ChunkFailed { index: i, source: Box::new(chunk_err) });
                 }
-                Ok((_, Ok(()))) => {}
+                Ok((_, Ok(()))) => {
+                    if next < num_chunks {
+                        spawn_chunk(&mut set, next);
+                        next += 1;
+                    }
+                }
             }
         }
 
@@ -267,7 +316,7 @@ impl ChunkedDownloader {
 
     /// Issue a HEAD request to obtain Content-Length
     async fn get_content_length(&self) -> Result<u64, CoreError> {
-        let mut req = self.client.head(&self.url);
+        let mut req = self.client.head(&self.url).timeout(HEAD_REQUEST_TIMEOUT);
         if let Some(ref token) = self.auth_token {
             req = req.bearer_auth(token);
         }
@@ -373,6 +422,7 @@ async fn download_chunk_with_retry(
     token: Option<String>,
     start: u64,
     end: u64,
+    content_length: u64,
     _chunk_index: usize,
     dest_path: std::path::PathBuf,
     pb: ProgressBar,
@@ -380,7 +430,7 @@ async fn download_chunk_with_retry(
     let mut retries = 0;
 
     loop {
-        match try_download_chunk_to_offset(&client, &url, token.as_deref(), start, end, &dest_path, &pb).await {
+        match try_download_chunk_to_offset(&client, &url, token.as_deref(), start, end, content_length, &dest_path, &pb).await {
             Ok(()) => return Ok(()),
             Err(e) => {
                 retries += 1;
@@ -391,31 +441,78 @@ async fn download_chunk_with_retry(
                 if !e.is_retryable() || retries > MAX_RETRIES {
                     return Err(e);
                 }
-                let wait_time = 2u64.pow(retries) * 100;
-                tokio::time::sleep(Duration::from_millis(wait_time)).await;
+                // Full-jitter backoff (audit L-JITTER): decorrelates the concurrent
+                // chunk retries so a registry 429/503 does not trigger a lockstep
+                // storm. Shared helper across the four transport retry loops.
+                tokio::time::sleep(crate::retry::backoff_delay(retries)).await;
             }
         }
     }
 }
 
+/// Parse a `Content-Range: bytes START-END/TOTAL` (or `.../*`) value into its
+/// `(start, end)` byte bounds. Returns `None` for anything that is not a
+/// well-formed byte range — wrong unit, missing `-` or `/`, or non-numeric
+/// bounds. The TOTAL is intentionally not validated (a proxy may legitimately
+/// send `*`); only the offsets matter for the alignment check below.
+fn parse_content_range(value: &str) -> Option<(u64, u64)> {
+    let range = value.trim().strip_prefix("bytes ")?.split('/').next()?;
+    let (start, end) = range.split_once('-')?;
+    Some((start.trim().parse().ok()?, end.trim().parse().ok()?))
+}
+
+/// Reject a 206 whose `Content-Range` does not cover exactly `bytes={start}-{end}`
+/// (audit L1). A range-aliasing edge/proxy can return a length-correct 206 for the
+/// WRONG offset; the chunk write then `seek(start)`s and lands the misplaced bytes,
+/// and with hash verification off (the default) the corrupt file is cached forever
+/// under the trusted content digest. A 206 MUST carry a matching `Content-Range`
+/// (RFC 9110 §15.3.7), so an absent, unparsable, or mismatched header is treated as
+/// a retryable anomaly (`Io`) that re-fetches rather than a silent write.
+fn require_content_range_matches(
+    headers: &reqwest::header::HeaderMap,
+    start: u64,
+    end: u64,
+) -> Result<(), CoreError> {
+    let raw = headers
+        .get(reqwest::header::CONTENT_RANGE)
+        .and_then(|v| v.to_str().ok());
+    if raw.and_then(parse_content_range) == Some((start, end)) {
+        return Ok(());
+    }
+    Err(CoreError::Io(std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        format!(
+            "chunk bytes={start}-{end}: 206 Content-Range {} does not cover the requested range",
+            raw.unwrap_or("<absent>")
+        ),
+    )))
+}
+
 /// Verify that a chunk GET produced exactly HTTP 206 Partial Content.
 ///
-/// Audit D2: previously `try_download_chunk_to_offset` accepted any 2xx
-/// status. A server that ignored the `Range` header would respond with
-/// 200 OK and the FULL body; we would then `seek(start)` and stream that
-/// full body starting at the chunk's offset, overwriting everything past
-/// `end + 1` and producing a silently corrupt file. The diagnostic on
-/// the 200 branch names the ignored range explicitly so the failure mode
-/// is unambiguous in logs — distinct from a "server returned the wrong
-/// bytes" error a caller might otherwise assume.
-fn require_partial_content(
+/// Audit D2: a server that ignores `Range` and returns 200 + the FULL body would,
+/// if `seek(start)`-written, overwrite everything past `end + 1` and corrupt the
+/// file — so a 200 is rejected, its diagnostic naming the ignored range (distinct
+/// from a "wrong bytes" error). This rejects a 200 even for a single-chunk
+/// whole-file request.
+///
+/// Audit L5: the one accepted 200 is a single-chunk small-file download whose
+/// range covers the WHOLE object (`start == 0 && end == content_length - 1`) — a
+/// `200 OK` with the full body is then RFC 9110 §15.3.7-legal and correct (the
+/// over-length write guard already bounds a stray full body). A multi-chunk
+/// download that got a range-ignored 200 still fails loudly, because its range is
+/// not the whole object. A 200 carries no `Content-Range`, so the caller runs
+/// [`require_content_range_matches`] only for a 206.
+fn require_acceptable_status(
     status: reqwest::StatusCode,
     start: u64,
     end: u64,
+    content_length: u64,
 ) -> Result<(), CoreError> {
     use reqwest::StatusCode;
     match status {
         StatusCode::PARTIAL_CONTENT => Ok(()),
+        StatusCode::OK if start == 0 && content_length > 0 && end == content_length - 1 => Ok(()),
         StatusCode::OK => Err(CoreError::ServerError(
             status.as_u16(),
             format!(
@@ -434,17 +531,23 @@ fn require_partial_content(
 /// (already pre-allocated). Each task opens its own file handle, seeks to its
 /// offset, and writes bytes as they arrive from the HTTP stream.
 /// Parallel writes to disjoint ranges are safe.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "each argument is a distinct per-chunk download input; content_length is needed for the whole-file-200 check (audit L5), matching download_chunk_with_retry's own expect"
+)]
 async fn try_download_chunk_to_offset(
     client: &Client,
     url: &str,
     token: Option<&str>,
     start: u64,
     end: u64,
+    content_length: u64,
     dest_path: &Path,
     pb: &ProgressBar,
 ) -> Result<(), CoreError> {
-    // Audit D6: per-request timeout on the chunk GET. The `Client` (line 97)
-    // sets `connect_timeout(30s)` but no full-request timeout, so a slow-loris
+    // Audit D6: per-request timeout on the chunk GET. The shared
+    // `chunk_fetcher::download_client` sets `connect_timeout(30s)` but no
+    // full-request timeout, so a slow-loris
     // server could hold a TCP open and dribble bytes indefinitely without ever
     // tripping the connect phase. 5 minutes per chunk is generous given the
     // 100 MB `DEFAULT_CHUNK_SIZE` (≈ 333 KB/s floor before timing out) — enough
@@ -462,7 +565,15 @@ async fn try_download_chunk_to_offset(
 
     let mut res = req.send().await?;
 
-    require_partial_content(res.status(), start, end)?;
+    let status = res.status();
+    require_acceptable_status(status, start, end, content_length)?;
+    // Audit L1: a 206 must cover exactly the requested range — a range-aliasing
+    // proxy can return a length-correct 206 for the WRONG offset, silently
+    // corrupting the file. A whole-file 200 (audit L5) carries no Content-Range,
+    // so validate it only for a 206.
+    if status == reqwest::StatusCode::PARTIAL_CONTENT {
+        require_content_range_matches(res.headers(), start, end)?;
+    }
 
     // Open this task's own handle on the pre-allocated final file, seek to start.
     let mut file = OpenOptions::new()
@@ -476,19 +587,66 @@ async fn try_download_chunk_to_offset(
 
     // Stream HTTP body chunks directly to disk at our position.
     // No temp file, no assembly phase.
+    let expected = end - start + 1;
+    let mut written: u64 = 0;
+    let mut over_range = false;
+    // Each body read is bounded by the default-on read-idle window (audit M4): a peer
+    // that dribbles the head then stalls mid-body is cut as a retryable ReadStall,
+    // rather than held open until the per-chunk 5-minute total timeout.
     loop {
-        match res.chunk().await {
+        match crate::chunk_fetcher::read_chunk_bounded(&mut res, crate::chunk_fetcher::download_read_idle()).await {
             Ok(Some(buf)) => {
-                let len = buf.len();
-                buf_writer.write_all(&buf).await?;
-                pb.inc(len as u64);
+                // Bound each write to the bytes still owed for this range (audit
+                // M-SHORT206 follow-up): a 206 whose body RUNS PAST the requested
+                // range would otherwise spill its surplus into the adjacent chunk's
+                // region — the concurrent tasks write disjoint ranges of one shared
+                // pre-allocated file. Write at most the remaining bytes and flag the
+                // over-send; the surplus is dropped, never written.
+                let remaining = expected - written;
+                // `remaining` (u64) may exceed usize on a 32-bit target; when it
+                // does, `buf.len()` is certainly the smaller bound, so fall back to
+                // it — no truncating cast either way.
+                let take = usize::try_from(remaining).map_or(buf.len(), |r| buf.len().min(r));
+                if take > 0 {
+                    buf_writer.write_all(&buf[..take]).await?;
+                    written += take as u64;
+                    pb.inc(take as u64);
+                }
+                if buf.len() as u64 > remaining {
+                    over_range = true;
+                    break;
+                }
             }
             Ok(None) => break,
-            Err(e) => return Err(e.into()),
+            Err(e) => return Err(e),
         }
     }
 
     buf_writer.flush().await?;
+
+    // Audit M-SHORT206: a 206 whose body is SHORTER than the requested range (an
+    // internally-consistent short sub-range: matching Content-Length + a sub-range
+    // Content-Range, as a proxy/CDN can emit) reaches a clean EOF here — `chunk()`
+    // returns `Ok(None)` and hyper raises no incomplete-body error because the body
+    // matched its own advertised length. Without a length check the chunk's tail
+    // stays as the file's pre-allocated `set_len` zeros: a silently truncated file
+    // cached forever under the trusted content digest. An OVER-length body (bounded
+    // above) is likewise anomalous. Both surface as a retryable `CoreError::Io` so a
+    // transient anomaly re-fetches before failing hard. `require_acceptable_status`
+    // already rejects a range-ignored 200; these close the short/long-206
+    // cases it cannot see.
+    if over_range {
+        return Err(CoreError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("chunk bytes={start}-{end}: server sent more than the {expected}-byte range"),
+        )));
+    }
+    if written != expected {
+        return Err(CoreError::Io(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            format!("chunk bytes={start}-{end}: received {written} bytes, expected {expected}"),
+        )));
+    }
     Ok(())
 }
 
@@ -748,19 +906,27 @@ mod partial_content_tests {
 
     #[test]
     fn accepts_206() {
-        assert!(require_partial_content(StatusCode::PARTIAL_CONTENT, 0, 99).is_ok());
+        assert!(require_acceptable_status(StatusCode::PARTIAL_CONTENT, 0, 99, 100).is_ok());
     }
 
-    // The diagnostic on the 200 branch is load-bearing: it is the only signal
-    // distinguishing "server ignored Range" from "server returned wrong bytes".
-    // `let ... else { unreachable!() }` is used instead of `.unwrap_err()` /
-    // `panic!()` because the project denies `unwrap_used` and `panic`
-    // cluster-wide; the test still fails clearly if the helper accepts 200.
+    // Audit L5: a 200 OK is accepted ONLY when the request covers the whole object
+    // (a single-chunk small-file download) — the full body written at offset 0 is
+    // then correct and RFC 9110 §15.3.7-legal.
     #[test]
-    fn rejects_200_with_diagnostic() {
-        let result = require_partial_content(StatusCode::OK, 0, 99);
-        let Err(err) = result else {
-            unreachable!("require_partial_content must reject 200 OK")
+    fn accepts_whole_file_200() {
+        assert!(require_acceptable_status(StatusCode::OK, 0, 99, 100).is_ok());
+    }
+
+    // A range-ignored 200 on a MULTI-chunk download (the range is not the whole
+    // object) still fails loudly, and the diagnostic names the ignored range — the
+    // only signal distinguishing "server ignored Range" from "wrong bytes".
+    // `let ... else { unreachable!() }` instead of `.unwrap_err()`/`panic!()`
+    // because the project denies `unwrap_used` and `panic` cluster-wide.
+    #[test]
+    fn rejects_range_ignored_200_with_diagnostic() {
+        // range 0-99 of a 1000-byte object is NOT the whole file → must reject.
+        let Err(err) = require_acceptable_status(StatusCode::OK, 0, 99, 1000) else {
+            unreachable!("a non-whole-file 200 must be rejected")
         };
         let msg = format!("{err:?}");
         assert!(
@@ -771,8 +937,164 @@ mod partial_content_tests {
 
     #[test]
     fn rejects_other_4xx_5xx() {
-        assert!(require_partial_content(StatusCode::NOT_FOUND, 0, 99).is_err());
-        assert!(require_partial_content(StatusCode::INTERNAL_SERVER_ERROR, 0, 99).is_err());
+        assert!(require_acceptable_status(StatusCode::NOT_FOUND, 0, 99, 100).is_err());
+        assert!(require_acceptable_status(StatusCode::INTERNAL_SERVER_ERROR, 0, 99, 100).is_err());
+    }
+
+    fn cr_headers(value: &str) -> reqwest::header::HeaderMap {
+        let mut h = reqwest::header::HeaderMap::new();
+        // Test values are ASCII, so `from_str` succeeds; `if let` avoids a denied
+        // `unwrap` while leaving the map empty on the (unreachable) error path.
+        if let Ok(v) = reqwest::header::HeaderValue::from_str(value) {
+            h.insert(reqwest::header::CONTENT_RANGE, v);
+        }
+        h
+    }
+
+    // Audit L1: the 206 Content-Range must cover exactly the requested bytes.
+    #[test]
+    fn content_range_matching_is_accepted() {
+        assert!(require_content_range_matches(&cr_headers("bytes 100-199/500"), 100, 199).is_ok());
+    }
+
+    #[test]
+    fn content_range_wrong_offset_is_rejected() {
+        // Length-correct (100 bytes) but offset-wrong (0- not 100-): the exact
+        // silent-corruption case L1 defends against.
+        assert!(require_content_range_matches(&cr_headers("bytes 0-99/500"), 100, 199).is_err());
+    }
+
+    #[test]
+    fn content_range_absent_is_rejected() {
+        assert!(require_content_range_matches(&reqwest::header::HeaderMap::new(), 0, 99).is_err());
+    }
+
+    #[test]
+    fn parse_content_range_reads_bounds() {
+        assert_eq!(parse_content_range("bytes 5-17/42"), Some((5, 17)));
+        assert_eq!(parse_content_range("bytes 0-0/*"), Some((0, 0)));
+        assert_eq!(parse_content_range("bogus"), None);
+        assert_eq!(parse_content_range("bytes 5/42"), None);
+    }
+
+    proptest::proptest! {
+        // Round-trip: any (start, end) formatted as a byte Content-Range parses
+        // back to the same bounds, so the parser agrees with the wire format the
+        // alignment check relies on — for offsets a hand-picked fixture would miss.
+        #[test]
+        fn parse_content_range_round_trips(start in 0u64.., extra in 0u64..) {
+            let end = start.saturating_add(extra);
+            let header = format!("bytes {start}-{end}/{}", end.saturating_add(1));
+            proptest::prop_assert_eq!(parse_content_range(&header), Some((start, end)));
+        }
+    }
+}
+
+// Audit M-SHORT206: a 206 whose body is shorter than the requested range must be
+// rejected (retryable), never written as a zero-padded truncation. Kept in its own
+// module — it drives a real HTTP/1 socket, distinct from the pure status/arith tests.
+#[cfg(test)]
+mod short_206_tests {
+    use super::*;
+    // `AsyncWriteExt` is already in scope via `super::*`; only the read half is new.
+    use tokio::io::AsyncReadExt as _;
+
+    /// Serve exactly one `206 Partial Content` whose Content-Length (and body) is
+    /// `body_len`, while the Content-Range claims the full `range_len`-byte range —
+    /// the internally-consistent short sub-range a misbehaving proxy/CDN can emit.
+    /// `connection: close` so there is no keep-alive framing to parse.
+    async fn serve_short_206(range_len: u64, body_len: usize) -> std::io::Result<String> {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let addr = listener.local_addr()?;
+        tokio::spawn(async move {
+            if let Ok((mut sock, _)) = listener.accept().await {
+                let mut req = Vec::new();
+                let mut tmp = [0u8; 1024];
+                while !req.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match sock.read(&mut tmp).await {
+                        Ok(0) | Err(_) => return,
+                        Ok(n) => req.extend_from_slice(&tmp[..n]),
+                    }
+                }
+                let body = vec![7u8; body_len];
+                let resp = format!(
+                    "HTTP/1.1 206 Partial Content\r\ncontent-length: {}\r\ncontent-range: bytes 0-{}/{}\r\nconnection: close\r\n\r\n",
+                    body_len,
+                    range_len.saturating_sub(1),
+                    range_len
+                );
+                let _ = sock.write_all(resp.as_bytes()).await;
+                let _ = sock.write_all(&body).await;
+                let _ = sock.shutdown().await;
+            }
+        });
+        Ok(format!("http://{addr}"))
+    }
+
+    async fn prealloc(size: u64) -> Option<std::path::PathBuf> {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        // A DISTINCT path per call, keyed on a monotonic counter — not the size —
+        // so two tests that pre-allocate the same size never share a temp file. The
+        // per-size path raced under the parallel test runner (one test's final
+        // remove_file unlinked the other's dest mid-download): a CI flake this fixes.
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "hippius_short206_{}_{seq}.bin",
+            std::process::id(),
+        ));
+        let f = OpenOptions::new().create(true).write(true).truncate(true).open(&path).await.ok()?;
+        f.set_len(size).await.ok()?;
+        Some(path)
+    }
+
+    #[tokio::test]
+    async fn short_206_is_rejected_not_silently_truncated() {
+        // Request 100 bytes; the server sends a consistent 50-byte 206 (matching
+        // Content-Length, so hyper sees a clean EOF and raises nothing). The
+        // byte-count guard must surface a retryable Io error instead of leaving the
+        // chunk's tail as pre-allocated zeros.
+        let Some(base) = serve_short_206(100, 50).await.ok() else { return };
+        let Ok(client) = crate::chunk_fetcher::download_client(crate::chunk_fetcher::TransportTimeouts::default()) else { return };
+        let Some(dest) = prealloc(100).await else { return };
+        let pb = ProgressBar::hidden();
+        let res = try_download_chunk_to_offset(client, &format!("{base}/blob"), None, 0, 99, 100, &dest, &pb).await;
+        let _ = std::fs::remove_file(&dest);
+        assert!(
+            matches!(res, Err(CoreError::Io(_))),
+            "short 206 must be a retryable Io error (silent truncation guard), got {res:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn full_length_206_is_accepted() {
+        // Control: a 206 whose body fills the requested range must succeed, so the
+        // guard rejects only genuine short reads.
+        let Some(base) = serve_short_206(100, 100).await.ok() else { return };
+        let Ok(client) = crate::chunk_fetcher::download_client(crate::chunk_fetcher::TransportTimeouts::default()) else { return };
+        let Some(dest) = prealloc(100).await else { return };
+        let pb = ProgressBar::hidden();
+        let res = try_download_chunk_to_offset(client, &format!("{base}/blob"), None, 0, 99, 100, &dest, &pb).await;
+        let _ = std::fs::remove_file(&dest);
+        assert!(res.is_ok(), "full-length 206 must be accepted, got {res:?}");
+    }
+
+    #[tokio::test]
+    async fn over_length_206_is_rejected_without_clobbering() {
+        // Server sends 150 bytes for a 100-byte range. The write must be bounded to
+        // 100 bytes — bytes [100, 200) of the shared file (the next chunk's region)
+        // must stay the pre-allocated zeros, not the surplus — and the over-send must
+        // surface as an error rather than a silent cross-chunk corruption.
+        let Some(base) = serve_short_206(100, 150).await.ok() else { return };
+        let Ok(client) = crate::chunk_fetcher::download_client(crate::chunk_fetcher::TransportTimeouts::default()) else { return };
+        let Some(dest) = prealloc(200).await else { return };
+        let pb = ProgressBar::hidden();
+        let res = try_download_chunk_to_offset(client, &format!("{base}/blob"), None, 0, 99, 100, &dest, &pb).await;
+        let tail_is_zero = std::fs::read(&dest)
+            .is_ok_and(|b| b.len() == 200 && b[100..].iter().all(|&x| x == 0));
+        let _ = std::fs::remove_file(&dest);
+        assert!(matches!(res, Err(CoreError::Io(_))), "over-length 206 must error, got {res:?}");
+        assert!(tail_is_zero, "surplus bytes must not clobber the neighbouring chunk region");
     }
 }
 
@@ -964,5 +1286,112 @@ mod retry_classification_tests {
             err_some.to_string().contains("chunk task 7 failed"),
             "Display for Some(7) must contain 'chunk task 7 failed', got: {err_some}",
         );
+    }
+
+    #[tokio::test]
+    async fn download_refills_window_beyond_max_inflight_chunks() {
+        // Audit L13: a file with MORE than MAX_INFLIGHT_CHUNKS chunks must download
+        // completely — the bounded-spawn window has to refill as chunks land, not
+        // stop after the first MAX_INFLIGHT_CHUNKS. A broken refill would leave the
+        // tail chunks never spawned (hang / short file); this asserts every byte
+        // lands by driving 52 four-byte chunks (> the 32 window) through a real 206
+        // Range server.
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let total: usize = (MAX_INFLIGHT_CHUNKS + 20) * 4; // 52 chunks of 4 bytes
+        let body: Vec<u8> = (0..total).map(|i| u8::try_from(i % 251).unwrap_or(0)).collect();
+
+        let Ok(listener) = TcpListener::bind("127.0.0.1:0").await else { return };
+        let Ok(addr) = listener.local_addr() else { return };
+        let body_srv = body.clone();
+        let server = tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else { return };
+                let body = body_srv.clone();
+                tokio::spawn(async move {
+                    // Read until the end of the request head (hyper may split it across
+                    // segments). Match the Range header case-insensitively: hyper writes
+                    // HTTP/1 header names lowercase (`range:`), not `Range:`.
+                    let mut acc: Vec<u8> = Vec::new();
+                    let mut buf = [0u8; 1024];
+                    loop {
+                        let Ok(n) = sock.read(&mut buf).await else { return };
+                        if n == 0 {
+                            break;
+                        }
+                        acc.extend_from_slice(&buf[..n]);
+                        if acc.windows(4).any(|w| w == b"\r\n\r\n") {
+                            break;
+                        }
+                    }
+                    let req = String::from_utf8_lossy(&acc).to_ascii_lowercase();
+                    // Echo exactly the requested inclusive byte range as a 206.
+                    let Some(rng) = req.lines().find_map(|l| l.strip_prefix("range: bytes=")) else {
+                        return;
+                    };
+                    let Some((s, e)) = rng.trim().split_once('-') else { return };
+                    let (Ok(start), Ok(end)) = (s.parse::<usize>(), e.parse::<usize>()) else {
+                        return;
+                    };
+                    let end = end.min(body.len().saturating_sub(1));
+                    if start > end {
+                        return;
+                    }
+                    let slice = &body[start..=end];
+                    let head = format!(
+                        "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes {}-{}/{}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        start, end, body.len(), slice.len()
+                    );
+                    let _ = sock.write_all(head.as_bytes()).await;
+                    let _ = sock.write_all(slice).await;
+                    let _ = sock.shutdown().await;
+                });
+            }
+        });
+
+        let url = format!("http://{addr}/blob");
+        let Ok(dl) = ChunkedDownloader::new(
+            url,
+            None,
+            Some(4),
+            Some(total as u64),
+            crate::chunk_fetcher::TransportTimeouts::default(),
+        ) else {
+            unreachable!("downloader builds")
+        };
+        let dest = std::env::temp_dir().join(format!("hippius-l13-{}.bin", std::process::id()));
+        let out = tokio::time::timeout(Duration::from_secs(20), dl.download(&dest, false)).await;
+        server.abort();
+        let Ok(Ok(_)) = out else { unreachable!("52-chunk download must complete, got {out:?}") };
+        let Ok(got) = tokio::fs::read(&dest).await else { unreachable!("read dest") };
+        assert_eq!(got, body, "every chunk past the window must have been refilled and written");
+        let _ = std::fs::remove_file(&dest);
+    }
+
+    #[tokio::test]
+    async fn download_rejects_zero_chunk_size_for_nonempty_file() {
+        // A chunk_size of 0 for a non-empty file must fail loudly, never silently
+        // produce the set_len'd all-zero file. content_length is supplied, so the
+        // guard fires before any HTTP — the URL is never contacted.
+        let Ok(dl) = ChunkedDownloader::new(
+            "http://127.0.0.1:1/never-contacted".to_string(),
+            None,
+            Some(0),
+            Some(4096),
+            crate::chunk_fetcher::TransportTimeouts::default(),
+        ) else {
+            unreachable!("downloader builds")
+        };
+        let dest = std::env::temp_dir().join(format!("hippius-zerochunk-{}.bin", std::process::id()));
+        let res = dl.download(&dest, false).await;
+        assert!(
+            matches!(res, Err(CoreError::InvalidArgument(ref m)) if m.contains("all-zero")),
+            "chunk_size 0 must reject, not write zeros; got {res:?}"
+        );
+        // The guard must return BEFORE the set_len pre-allocation runs, so no
+        // zero-filled file is left behind.
+        assert!(!dest.exists(), "no destination file may be created on the zero-chunk-size path");
+        let _ = std::fs::remove_file(&dest);
     }
 }
