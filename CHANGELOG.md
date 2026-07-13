@@ -22,6 +22,10 @@ the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html
   The plain/Range download path now verifies the downloaded bytes against the
   content-addressed digest before caching them, matching the chunked path (which
   always verified). Set `HIPPIUS_VERIFY_HASH=0` to restore transport-only checks.
+- Both boolean gates above now **reject an unrecognized value** (e.g.
+  `HIPPIUS_CHUNKED_WRITE=enabled`) with a `ValueError` instead of silently
+  falling back to a default — a typo on a layout-changing gate surfaces
+  immediately. Accepted spellings: `1`/`true`/`yes`/`on` and `0`/`false`/`no`/`off`.
 
 ### Added
 
