@@ -4,8 +4,8 @@ on:
   pull_request:
   push:
     # `staging` runs the full suite (regression) plus the chunked-layout step
-    # below, which is gated to this branch only. `main` never emits chunked
-    # artifacts in CI — the chunked write path is opt-in this release.
+    # below, which is gated to this branch only, so `main` CI never emits chunked
+    # artifacts even though chunked writes are the default from 0.6.0.
     branches: [main, staging]
     tags: ['v*']
   release:
@@ -137,11 +137,10 @@ jobs:
         run: .venv/bin/pytest -v
 
       # Chunked-v2 (pack layout) e2e — STAGING ONLY, against the test/e2e-client
-      # namespace. The chunked WRITE path is opt-in this release (default off)
-      # because the reader-side layout guard ships in the same release, so no
-      # already-deployed reader carries it. Setting HIPPIUS_CHUNKED_WRITE=1 both
-      # enables the feature AND un-skips the gated live test, exercising the native
-      # pack upload/download + re-upload dedup + many-packs ordering. Nothing in
+      # namespace. Chunked writes are the default from 0.6.0, but this step still
+      # sets HIPPIUS_CHUNKED_WRITE=1 explicitly to un-skip the gated live test
+      # regardless of the resolver default, exercising the native pack
+      # upload/download + re-upload dedup + many-packs ordering. Nothing in
       # production config/deployment changes: packs are ordinary content-addressed
       # blobs in a test namespace. `github.ref` is compared to a literal — no
       # untrusted input reaches `run:`.

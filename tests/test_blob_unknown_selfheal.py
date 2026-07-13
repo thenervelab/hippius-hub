@@ -9,7 +9,7 @@ blob that is genuinely gone.
 
 `upload_file` now treats a MANIFEST_BLOB_UNKNOWN that outlives that budget as a
 durable loss and RE-RUNS the whole upload (packs always re-upload; the config
-cache is evicted at the raise site), bounded by `BLOB_REUPLOAD_MAX_RETRIES` so a
+cache is evicted at the raise site), bounded by `blob_reupload_max_retries()` so a
 registry that keeps dropping the blob surfaces as the infra fault it is rather
 than looping forever. These tests pin: re-upload-then-succeed, the bound, that a
 non-BLOB_UNKNOWN failure is NOT re-uploaded, and the digest extraction.
@@ -24,7 +24,7 @@ import pytest
 
 from hippius_hub import auth, file_upload
 from hippius_hub.errors import HfHubHTTPError, ManifestBlobUnknownError
-from hippius_hub.file_upload import BLOB_REUPLOAD_MAX_RETRIES
+from hippius_hub.file_upload import blob_reupload_max_retries
 
 
 def _blob_unknown_response(digest: str) -> httpx.Response:
@@ -114,8 +114,8 @@ def test_bounded_reuploads_then_surfaces_the_error(monkeypatch):
             repo_type="model",
         )
 
-    assert len(layer_uploads) == BLOB_REUPLOAD_MAX_RETRIES + 1, (
-        "the upload must re-run exactly BLOB_REUPLOAD_MAX_RETRIES + 1 times before giving up"
+    assert len(layer_uploads) == blob_reupload_max_retries() + 1, (
+        "the upload must re-run exactly blob_reupload_max_retries() + 1 times before giving up"
     )
     assert isinstance(exc_info.value, HfHubHTTPError), "callers catching HfHubHTTPError must still catch it"
     assert exc_info.value.missing_digests == (DIGEST,)

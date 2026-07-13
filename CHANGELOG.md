@@ -7,8 +7,35 @@ the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 
 ## [Unreleased]
 
+## [0.6.0] — 2026-07-13
+
+### Changed (behavioral default — read before upgrading producers)
+
+- **Chunked-v2 writes are now ON by default** (`HIPPIUS_CHUNKED_WRITE`, was
+  opt-in). A large file (≥ `HIPPIUS_CHUNK_THRESHOLD`) uploaded by a 0.6.0 client
+  is stored in the chunked-v2 layout. **Consumers must be on ≥ 0.6.0 to read it**
+  — an older client (≤ v0.5.1) has no layout guard and silently writes the
+  pointer blob as the file. Upgrade readers to ≥ 0.6.0 before pushing large
+  files, or set `HIPPIUS_CHUNKED_WRITE=0` to keep the pre-chunking single-blob
+  layout. Small files and every pre-existing artifact are unchanged.
+- **Whole-file hash verification is now ON by default** (`HIPPIUS_VERIFY_HASH`).
+  The plain/Range download path now verifies the downloaded bytes against the
+  content-addressed digest before caching them, matching the chunked path (which
+  always verified). Set `HIPPIUS_VERIFY_HASH=0` to restore transport-only checks.
+- Both boolean gates above now **reject an unrecognized value** (e.g.
+  `HIPPIUS_CHUNKED_WRITE=enabled`) with a `ValueError` instead of silently
+  falling back to a default — a typo on a layout-changing gate surfaces
+  immediately. Accepted spellings: `1`/`true`/`yes`/`on` and `0`/`false`/`no`/`off`.
+
 ### Added
 
+- **Resumable plain-blob uploads.** A large file below the chunk threshold now
+  streams to the registry in bounded OCI `PATCH` chunks (`HIPPIUS_UPLOAD_CHUNK_SIZE`,
+  default 16 MiB); on any transient failure the client `GET`s the registry's
+  committed offset and resumes from there, so a mid-upload disconnect costs at most
+  one chunk of re-send instead of the whole layer. Falls back to the monolithic
+  streaming `PUT` if a registry rejects `PATCH` (405/501); the chunked-v2 pack path
+  is unchanged.
 - **Chunked-v2 (pack) layout for large files.** Files at or above
   `HIPPIUS_CHUNK_THRESHOLD` (256 MiB) are stored as content-defined chunks
   (FastCDC, ~4 MiB average) packed into ~64 MiB content-addressed *pack* blobs —
@@ -23,9 +50,9 @@ the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 - New Rust extension functions: `chunk_and_hash_native`, `pack_upload_native`,
   `download_packs_native`.
 - New env vars: `HIPPIUS_CHUNK_THRESHOLD`, `HIPPIUS_CDC_AVG_SIZE`,
-  `HIPPIUS_PACK_SIZE`, `HIPPIUS_MAX_INFLIGHT_PACKS`, `HIPPIUS_CHUNKED_WRITE`
-  (rollout escape hatch — the chunked-v2 write path is opt-in this release; unset
-  or `0` keeps the single-blob layout for large files).
+  `HIPPIUS_PACK_SIZE`, `HIPPIUS_MAX_INFLIGHT_PACKS`, `HIPPIUS_BLOB_REUPLOAD_RETRIES`,
+  and `HIPPIUS_CHUNKED_WRITE` (default on; set `0` to keep the single-blob layout
+  for large files).
 - Forward-compatibility guard: a manifest with an unknown `com.hippius.layout`
   is refused with `UnsupportedLayoutError` (new) instead of misread. Malformed
   chunked manifests raise `MalformedManifestError` (new).

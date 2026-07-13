@@ -575,4 +575,23 @@ mod runtime_tests {
             super::run_interruptible(async { 42 }, std::time::Duration::from_millis(20), || None).await;
         assert_eq!(outcome, Ok(42));
     }
+
+    #[tokio::test]
+    async fn run_interruptible_completion_wins_a_same_tick_race() {
+        // The subtle `biased` guarantee (see run_interruptible's select! comment): a
+        // transfer that is ready on the SAME tick the timer fires must win over a
+        // pending interrupt, so a download that just finished is never reported as a
+        // spurious KeyboardInterrupt. A ZERO interval makes the sleep arm immediately
+        // ready too, so both branches are ready at once — only `biased` (fut polled
+        // first) makes completion win deterministically. Inverting the arm order or
+        // dropping `biased` turns this into a coin flip and fails/flakes here, even
+        // though the poll below would ALWAYS interrupt.
+        let outcome: std::result::Result<i32, &str> = super::run_interruptible(
+            async { 99 },
+            std::time::Duration::ZERO,
+            || Some("would interrupt but completion must win"),
+        )
+        .await;
+        assert_eq!(outcome, Ok(99), "a same-tick-ready future must beat the interrupt");
+    }
 }

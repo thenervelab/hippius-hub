@@ -256,3 +256,131 @@ def test_v2_folder_reupload_dedups_unchanged_chunk(monkeypatch, tmp_path):
 
     # Only the NEW chunk "b" (40, 60) was packed; chunk "a" was reused by range.
     assert packs_seen == [[(40, 60)]]
+
+
+def test_build_dedup_index_excludes_a_lost_pack(monkeypatch):
+    # The blob-loss self-heal for a REUSED pack: when the registry reports a pack
+    # gone (BLOB_UNKNOWN), the next commit attempt must drop that pack from the
+    # dedup index so its chunks re-pack, instead of re-referencing the missing pack
+    # and failing identically. Two prior packs P0 (chunk "a") and P1 (chunk "b").
+    import types
+
+    p0 = "sha256:" + "a0" * 32
+    p1 = "sha256:" + "b1" * 32
+    prior_pointer = json.dumps({
+        "version": "chunked-v2",
+        "file": {"size": 80, "digest": "sha256:" + "d" * 64},
+        "chunks": [
+            {"digest": "sha256:" + "a" * 64, "size": 40, "pack": p0, "offset": 0},
+            {"digest": "sha256:" + "b" * 64, "size": 40, "pack": p1, "offset": 0},
+        ],
+    }).encode()
+    prior_ptr_digest = "sha256:" + hashlib.sha256(prior_pointer).hexdigest()
+    manifest = {
+        "schemaVersion": 2,
+        "layers": [
+            {"mediaType": POINTER_MEDIA_TYPE_V2, "digest": prior_ptr_digest,
+             "size": len(prior_pointer),
+             "annotations": {"org.opencontainers.image.title": "big.bin",
+                             "com.hippius.file.size": "80",
+                             "com.hippius.file.digest": "sha256:" + "d" * 64,
+                             "com.hippius.chunk.count": "2"}},
+            {"mediaType": PACK_MEDIA_TYPE, "digest": p0, "size": 40},
+            {"mediaType": PACK_MEDIA_TYPE, "digest": p1, "size": 40},
+        ],
+        "annotations": {LAYOUT_ANNOTATION_KEY: CHUNKED_LAYOUT_V2},
+    }
+    existing = types.SimpleNamespace(manifest=manifest)
+    # Serve the pointer blob from memory so the index builds without a network.
+    monkeypatch.setattr(file_upload, "_fetch_blob", lambda *a, **k: prior_pointer)
+
+    # No exclusion: both chunks are reusable and both pack sizes are known.
+    index, sizes = file_upload._build_dedup_index(existing, MOCK_REGISTRY, REPO, "tok")
+    assert set(sizes) == {p0, p1}
+    assert index["sha256:" + "a" * 64][0] == p0
+    assert index["sha256:" + "b" * 64][0] == p1
+
+    # Exclude the lost pack P1: its chunk "b" drops from the index (so it re-packs)
+    # and its size drops from pack_sizes (so it is not re-listed); P0 is untouched.
+    index2, sizes2 = file_upload._build_dedup_index(
+        existing, MOCK_REGISTRY, REPO, "tok", exclude_packs=frozenset({p1})
+    )
+    assert set(sizes2) == {p0}
+    assert ("sha256:" + "a" * 64) in index2
+    assert ("sha256:" + "b" * 64) not in index2
+
+
+@respx.mock
+def test_lost_reused_pack_heals_to_a_successful_commit(monkeypatch, tmp_path):
+    # End-to-end proof of the self-heal (not just the index unit): the prior revision
+    # stored chunk "a" in pack P0. On re-upload "a" dedups against P0 and only "b" is
+    # packed — but the registry has LOST P0 and rejects any manifest still referencing
+    # it (MANIFEST_BLOB_UNKNOWN). The heal must exclude P0, re-pack "a" into a fresh
+    # pack, and the SECOND commit (no longer naming P0) must SUCCEED.
+    monkeypatch.setenv("HIPPIUS_CHUNK_THRESHOLD", "1")
+    monkeypatch.setenv("HIPPIUS_CHUNKED_WRITE", "1")
+    monkeypatch.setenv("HIPPIUS_PACK_SIZE", "1000")       # both chunks fit one pack
+    monkeypatch.setenv("HIPPIUS_MANIFEST_PUT_RETRIES", "1")  # keep the reject loop short
+    monkeypatch.setattr("hippius_hub.constants.DEFAULT_REGISTRY_URL", MOCK_REGISTRY)
+    monkeypatch.setattr("hippius_hub.auth.DEFAULT_REGISTRY_URL", MOCK_REGISTRY)
+    monkeypatch.setattr("hippius_hub.file_upload.time.sleep", lambda _s: None)
+    monkeypatch.setattr(file_upload, "chunk_and_hash_native", lambda path, avg: (WHOLE_HEX, CHUNK_METAS))
+
+    p0 = "sha256:" + _pack_digest([(0, 40)])
+    prior_pointer = json.dumps({
+        "version": "chunked-v2",
+        "file": {"size": 40, "digest": "sha256:" + "d" * 64},
+        "chunks": [{"digest": "sha256:" + "a" * 64, "size": 40, "pack": p0, "offset": 0}],
+    }).encode()
+    prior_ptr_digest = "sha256:" + hashlib.sha256(prior_pointer).hexdigest()
+    existing = {
+        "schemaVersion": 2,
+        "layers": [
+            {"mediaType": POINTER_MEDIA_TYPE_V2, "digest": prior_ptr_digest, "size": len(prior_pointer),
+             "annotations": {"org.opencontainers.image.title": "big.bin",
+                             "com.hippius.file.size": "40", "com.hippius.file.digest": "sha256:" + "d" * 64,
+                             "com.hippius.chunk.count": "1"}},
+            {"mediaType": PACK_MEDIA_TYPE, "digest": p0, "size": 40},
+        ],
+        "annotations": {LAYOUT_ANNOTATION_KEY: CHUNKED_LAYOUT_V2},
+    }
+
+    token_route(respx.mock)
+    respx.head(url__regex=rf"{MOCK_REGISTRY}/v2/{REPO}/blobs/.*").mock(return_value=httpx.Response(404))
+    respx.post(f"{MOCK_REGISTRY}/v2/{REPO}/blobs/uploads/").mock(
+        return_value=httpx.Response(202, headers={"Location": f"{MOCK_REGISTRY}/v2/{REPO}/blobs/uploads/uuid"}))
+    respx.put(url__startswith=f"{MOCK_REGISTRY}/v2/{REPO}/blobs/uploads/uuid").mock(return_value=httpx.Response(201))
+    respx.get(f"{MOCK_REGISTRY}/v2/{REPO}/manifests/main").mock(
+        return_value=httpx.Response(200, headers={"Docker-Content-Digest": "sha256:" + "e" * 64}, json=existing))
+    respx.get(f"{MOCK_REGISTRY}/v2/{REPO}/blobs/{prior_ptr_digest}").mock(
+        return_value=httpx.Response(200, content=prior_pointer))
+
+    packs_seen = []
+    monkeypatch.setattr(file_upload, "pack_upload_native",
+                        lambda uploads_url, path, ranges, auth_token: (packs_seen.append(list(ranges)) or _pack_digest(ranges)))
+
+    manifests = []
+
+    def _manifest_put(request):
+        m = json.loads(request.content)
+        manifests.append(m)
+        # The registry lost P0: reject while the manifest still references it, accept
+        # once the heal has re-packed "a" elsewhere and dropped the P0 reference.
+        if p0 in {layer["digest"] for layer in m["layers"]}:
+            return httpx.Response(400, json={"errors": [{"code": "MANIFEST_BLOB_UNKNOWN", "detail": p0}]})
+        return httpx.Response(201, headers={"Docker-Content-Digest": "sha256:" + "f" * 64})
+
+    respx.put(f"{MOCK_REGISTRY}/v2/{REPO}/manifests/main").mock(side_effect=_manifest_put)
+
+    src = tmp_path / "big.bin"
+    src.write_bytes(b"x" * 100)
+    info = file_upload.upload_file(path_or_fileobj=str(src), path_in_repo="big.bin", repo_id=REPO, token="tok")
+
+    assert info is not None, "the upload must succeed after the heal, not raise"
+    # First attempt packed only the new chunk "b" (a reused from the now-lost P0);
+    # after exclusion, the retry re-packed "a" too (both chunks into one fresh pack).
+    assert [(40, 60)] in packs_seen, "first attempt packs only the new chunk b"
+    assert [(0, 40), (40, 60)] in packs_seen, "the heal re-packs the lost pack's chunk a"
+    # The committed manifest no longer references the lost pack.
+    assert p0 not in {layer["digest"] for layer in manifests[-1]["layers"]}, \
+        "the healed manifest must drop the lost pack"

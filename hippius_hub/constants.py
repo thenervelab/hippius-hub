@@ -79,9 +79,9 @@ DEFAULT_PACK_SIZE = 64 * 1024 * 1024
 MAX_MANIFEST_BYTES = 4 * 1024 * 1024
 
 # Layout values THIS build can read. The forward-compat guard (_oci._guard_layout)
-# refuses any other value loudly rather than misparsing. chunked WRITES stay opt-in
-# for this release (resolve_chunked_write_enabled defaults off): readers upgrade
-# first, writers flip the default on in a later release.
+# refuses any other value loudly rather than misparsing. chunked WRITES are default
+# ON as of 0.6.0 (resolve_chunked_write_enabled); a reader must be >= 0.6.0 to carry
+# this guard and read a chunked artifact — see resolve_chunked_write_enabled.
 KNOWN_LAYOUTS: frozenset = frozenset({CHUNKED_LAYOUT_V2})
 
 
@@ -129,22 +129,43 @@ def resolve_pack_size() -> int:
 
 
 def resolve_chunked_write_enabled() -> bool:
-    """Whether large files upload chunked, or as one plain blob (default).
+    """Whether large files upload chunked (default), or as one plain blob.
 
-    The rollout gate — opt-in for this release. The forward-compat guard that
-    makes an un-upgraded reader refuse a chunked artifact loudly
-    (UnsupportedLayoutError) ships in this SAME release, so no already-deployed
-    reader (<= v0.5.1) carries it. Such a reader instead matches the pointer
-    layer by its title and silently writes the ~200-byte pointer blob AS the
-    file — undetectable even with HIPPIUS_VERIFY_HASH=1, since it checks the
-    pointer blob against its own digest. Defaulting off keeps large-file uploads
-    byte-identical to the pre-chunking layout until the guard-bearing reader is
-    universally deployed; a later release flips the default on. Set
-    HIPPIUS_CHUNKED_WRITE=1 to opt a producer in now (e.g. on staging)."""
-    raw = os.environ.get("HIPPIUS_CHUNKED_WRITE")
-    if not raw or not raw.strip():
+    Default ON as of 0.6.0: the chunk-aware reader guard (UnsupportedLayoutError
+    on an unknown layout) ships from 0.6.0, so a 0.6.0+ reader handles a chunked
+    artifact correctly. The known cost of turning writes on: a reader still on
+    <= v0.5.1 has no guard — it matches the pointer layer by title and silently
+    writes the ~200-byte pointer blob AS the file (undetectable even with hash
+    verification, since it checks the pointer blob against its own digest). That
+    tradeoff was accepted for 0.6.0; consumers must be on >= 0.6.0 to read any
+    large file uploaded by this client. HIPPIUS_CHUNKED_WRITE=0 is the escape
+    hatch back to the byte-identical pre-chunking single-blob layout."""
+    return _resolve_bool("HIPPIUS_CHUNKED_WRITE", True)
+
+
+_TRUTHY = ("1", "true", "yes", "on")
+_FALSY = ("0", "false", "no", "off")
+
+
+def _resolve_bool(env_var: str, default: bool) -> bool:
+    """Read a boolean env var, falling back to `default` when unset/blank.
+
+    An explicit value must be one of the known truthy/falsy spellings; an
+    unrecognized value raises so a typo (`HIPPIUS_CHUNKED_WRITE=flase`) can't
+    silently take the default and mask a misconfiguration. This is the single
+    parser both rollout gates (chunked-write, verify-hash) share so their
+    on/off spellings stay identical."""
+    raw = os.environ.get(env_var)
+    if raw is None or not raw.strip():
+        return default
+    value = raw.strip().lower()
+    if value in _TRUTHY:
+        return True
+    if value in _FALSY:
         return False
-    return raw.strip().lower() in ("1", "true", "yes", "on")
+    raise ValueError(
+        f"{env_var} must be one of {_TRUTHY + _FALSY}, got {raw!r}"
+    )
 
 
 def _resolve_positive_int(env_var: str, default: int) -> int:
@@ -198,7 +219,15 @@ def resolve_read_timeout() -> Optional[int]:
 
 
 def resolve_verify_hash() -> bool:
-    return os.environ.get("HIPPIUS_VERIFY_HASH", "").lower() in ("1", "true", "yes")
+    """Whether a download verifies its whole-file SHA-256 before it's trusted.
+
+    Default ON as of 0.6.0. The chunked path always verifies its whole-file
+    digest regardless; this gate governs the plain/Range path, which otherwise
+    would store registry bytes under the content-addressed `sha256:` cache name
+    without ever checking them. With chunked writes now default-on, verifying by
+    default closes that asymmetry. HIPPIUS_VERIFY_HASH=0 opts out (transport
+    length/status checks only)."""
+    return _resolve_bool("HIPPIUS_VERIFY_HASH", True)
 
 
 def resolve_snapshot_workers() -> int:

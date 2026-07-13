@@ -126,6 +126,40 @@ def clear_config_blob_cache() -> None:
         _config_blob_present.clear()
 
 
+def _put_blob_with_session(registry: str, repo_id: str, headers: dict, digest: str, data: bytes) -> None:
+    """POST a fresh upload session then monolithic PUT-with-digest `data`, retrying
+    transient failures (audit L3 parity for the small in-memory blobs).
+
+    Each retry re-POSTs a fresh session before re-PUTting — never re-uses a spent
+    one — the same audit-L2 invariant the Rust uploader holds, so a 503 on init or
+    PUT during a rolling redeploy no longer aborts the whole (potentially multi-GB)
+    upload the way a single bare PUT did. A durable non-2xx surfaces via
+    `raise_for_status`; a missing `Location` is a permanent shape error (not retried).
+    """
+    def _attempt() -> httpx.Response:
+        init = _http.client().post(
+            f"{registry}/v2/{repo_id}/blobs/uploads/",
+            headers={**headers, "Content-Length": "0"},
+            timeout=DEFAULT_HTTP_TIMEOUT,
+        )
+        if not init.is_success:
+            return init  # let request_with_retry re-attempt (5xx) or the caller raise
+        loc = init.headers.get("Location")
+        if not loc:
+            raise ValueError("Registry did not return a Location header for upload initiation")
+        if loc.startswith("/"):
+            loc = f"{registry}{loc}"
+        sep = "&" if "?" in loc else "?"
+        return _http.client().put(
+            f"{loc}{sep}digest={digest}",
+            headers={**headers, "Content-Type": "application/octet-stream"},
+            content=data,
+            timeout=DEFAULT_HTTP_TIMEOUT,
+        )
+
+    _http.request_with_retry(_attempt).raise_for_status()
+
+
 def _ensure_config_blob_uploaded(registry: str, repo_id: str, oci_token: str) -> tuple:
     """Push the empty-object config blob if missing. Returns (digest, size).
 
@@ -141,33 +175,13 @@ def _ensure_config_blob_uploaded(registry: str, repo_id: str, oci_token: str) ->
         if cache_key in _config_blob_present:
             return digest, size
     headers = {"Authorization": f"Bearer {oci_token}"}
-    check = _http.client().head(f"{registry}/v2/{repo_id}/blobs/{digest}", headers=headers, timeout=DEFAULT_HTTP_TIMEOUT)
+    check = _http.request_with_retry(
+        lambda: _http.client().head(f"{registry}/v2/{repo_id}/blobs/{digest}", headers=headers, timeout=DEFAULT_HTTP_TIMEOUT)
+    )
     if check.status_code != 200:
-        init = _http.client().post(
-            f"{registry}/v2/{repo_id}/blobs/uploads/",
-            headers={**headers, "Content-Length": "0"},
-            timeout=DEFAULT_HTTP_TIMEOUT,
-        )
-        init.raise_for_status()
-        loc = init.headers.get("Location")
-        # Guard a missing Location (audit L-LOCATION-GUARD): a 2xx init without the
-        # header would make `"?" in loc` raise an opaque TypeError on None. Match the
-        # clear error the sibling helpers (`_ensure_bytes_blob_uploaded`) raise.
-        if not loc:
-            raise ValueError("Registry did not return a Location header for upload initiation")
-        if loc.startswith("/"):
-            loc = f"{registry}{loc}"
-        sep = "&" if "?" in loc else "?"
         # Raise on a failed config PUT: otherwise the manifest PUT that follows
-        # fails later with an opaque MANIFEST_BLOB_UNKNOWN instead of the real
-        # cause (matches _ensure_bytes_blob_uploaded / _upload_blob_single_put).
-        put = _http.client().put(
-            f"{loc}{sep}digest={digest}",
-            headers={**headers, "Content-Type": "application/octet-stream"},
-            content=data,
-            timeout=DEFAULT_HTTP_TIMEOUT,
-        )
-        put.raise_for_status()
+        # fails later with an opaque MANIFEST_BLOB_UNKNOWN instead of the real cause.
+        _put_blob_with_session(registry, repo_id, headers, digest, data)
     # Confirmed present now (the HEAD hit, or we just PUT it) -- skip the HEAD on
     # later uploads to this repo in this process.
     with _config_blob_lock:
@@ -177,21 +191,16 @@ def _ensure_config_blob_uploaded(registry: str, repo_id: str, oci_token: str) ->
 
 def _ensure_bytes_blob_uploaded(registry: str, repo_id: str, oci_token: str, data: bytes, digest: str) -> None:
     """Push an in-memory blob (the pointer blob) if not already present at its
-    digest. HEAD-dedups first, then runs the OCI init + PUT-with-digest dance."""
+    digest. HEAD-dedups first, then runs the retrying OCI init + PUT-with-digest
+    dance (a transient 5xx no longer aborts the whole upload — see
+    `_put_blob_with_session`)."""
     headers = {"Authorization": f"Bearer {oci_token}"}
-    check = _http.client().head(f"{registry}/v2/{repo_id}/blobs/{digest}", headers=headers, timeout=DEFAULT_HTTP_TIMEOUT)
+    check = _http.request_with_retry(
+        lambda: _http.client().head(f"{registry}/v2/{repo_id}/blobs/{digest}", headers=headers, timeout=DEFAULT_HTTP_TIMEOUT)
+    )
     if check.status_code == 200:
         return
-    init = _http.client().post(f"{registry}/v2/{repo_id}/blobs/uploads/", headers={**headers, "Content-Length": "0"}, timeout=DEFAULT_HTTP_TIMEOUT)
-    init.raise_for_status()
-    location = init.headers.get("Location")
-    if not location:
-        raise ValueError("Registry did not return a Location header for upload initiation")
-    if location.startswith("/"):
-        location = f"{registry}{location}"
-    sep = "&" if "?" in location else "?"
-    put = _http.client().put(f"{location}{sep}digest={digest}", headers={**headers, "Content-Type": "application/octet-stream"}, content=data, timeout=DEFAULT_HTTP_TIMEOUT)
-    put.raise_for_status()
+    _put_blob_with_session(registry, repo_id, headers, digest, data)
 
 
 def _fetch_blob(registry: str, oci_repo: str, digest: str, oci_token: str) -> bytes:
@@ -205,7 +214,10 @@ def _fetch_blob(registry: str, oci_repo: str, digest: str, oci_token: str) -> by
     return resp.content
 
 
-def _build_dedup_index(existing, registry: str, oci_repo: str, oci_token: str) -> tuple:
+def _build_dedup_index(
+    existing, registry: str, oci_repo: str, oci_token: str,
+    exclude_packs: frozenset = frozenset(),
+) -> tuple:
     """From the prior revision's manifest, map already-stored chunks to their pack
     location and record each pack's size — the v2 "upload only new chunks" index.
 
@@ -214,6 +226,12 @@ def _build_dedup_index(existing, registry: str, oci_repo: str, oci_token: str) -
     pointer blob), and `pack_sizes[pack_digest] = size` from the manifest's pack
     layers (so a reused pack can be re-listed with its size). A prior plain-blob
     revision contributes nothing — there are no packs to reuse.
+
+    `exclude_packs` (each a `sha256:...` digest) drops any pack the registry has
+    lost: its chunks are omitted from the index so they re-pack into a fresh,
+    re-uploaded pack. Without this the blob-loss self-heal cannot fix a lost
+    *reused* pack — a re-run would rebuild the identical index, re-reference the
+    same missing pack, and fail identically (see `_commit_with_blob_reupload`).
     """
     chunk_index: Dict[str, tuple] = {}
     pack_sizes: Dict[str, int] = {}
@@ -221,7 +239,7 @@ def _build_dedup_index(existing, registry: str, oci_repo: str, oci_token: str) -
         return chunk_index, pack_sizes
     manifest = existing.manifest
     for layer in manifest.get("layers", []):
-        if layer.get("mediaType") == PACK_MEDIA_TYPE:
+        if layer.get("mediaType") == PACK_MEDIA_TYPE and layer["digest"] not in exclude_packs:
             pack_sizes[layer["digest"]] = layer["size"]
     # Fetch every prior chunked file's pointer blob CONCURRENTLY (independent,
     # small, read-only GETs) before the first new byte leaves the machine, then
@@ -241,6 +259,8 @@ def _build_dedup_index(existing, registry: str, oci_repo: str, oci_token: str) -
             ))
         for blob in blobs:
             for ref in parse_pointer_v2(blob):
+                if ref.pack_digest in exclude_packs:
+                    continue  # lost pack — force its chunks to re-pack
                 chunk_index.setdefault(ref.chunk_digest, (ref.pack_digest, ref.pack_offset))
     return chunk_index, pack_sizes
 
@@ -455,7 +475,13 @@ _MANIFEST_PUT_BACKOFF_CAP_SECS = 20.0
 # not lagging. Re-run the whole upload, re-PUTting every referenced blob, at most
 # this many extra times. Small on purpose: a registry that keeps dropping a
 # just-committed blob is an infra fault to surface, not a client-retry target.
-BLOB_REUPLOAD_MAX_RETRIES = _resolve_positive_int("HIPPIUS_BLOB_REUPLOAD_RETRIES", 2)
+def blob_reupload_max_retries() -> int:
+    """Resolve HIPPIUS_BLOB_REUPLOAD_RETRIES at call time (default 2).
+
+    Resolved per call, not frozen at import, so setting the env var actually takes
+    effect — a module-level constant read once at import made the documented knob
+    inert (and untestable via the env)."""
+    return _resolve_positive_int("HIPPIUS_BLOB_REUPLOAD_RETRIES", 2)
 # Transient statuses, matching the Rust uploader's is_retryable (408/429/5xx).
 # 400 is handled separately (only the BLOB_UNKNOWN commit-race variant); 412 is a
 # real concurrent-write conflict, surfaced typed and never retried.
@@ -873,26 +899,35 @@ def _handle_unsupported_kwargs(create_pr, parent_commit, run_as_future):
 def _commit_with_blob_reupload(run_commit, *, repo_id: str, revision: str) -> CommitInfo:
     """Run one full upload+manifest commit; on a durable MANIFEST_BLOB_UNKNOWN, re-run it.
 
-    `run_commit` performs one whole attempt (upload every referenced blob, then PUT the
-    manifest) and must raise `ManifestBlobUnknownError` when a referenced blob is still
-    missing after `_put_manifest`'s own per-PUT retry budget — the durable case a
-    re-await can't fix (a GC reap, or a commit that returned 2xx but never landed).
-    Re-running re-PUTs every blob (packs always re-upload; the `{}`-config cache was
-    evicted at the raise site so it re-confirms too). Bounded by
-    `BLOB_REUPLOAD_MAX_RETRIES`; the final attempt propagates, so a registry that keeps
-    dropping the blob surfaces the infra fault. Shared by `upload_file` and
-    `upload_folder` so both self-heal identically — the folder path pushes more blobs
-    and has the wider GC window, so it needs this at least as much."""
-    for reupload in range(BLOB_REUPLOAD_MAX_RETRIES):
+    `run_commit(exclude_packs)` performs one whole attempt (upload every referenced
+    blob, then PUT the manifest) and must raise `ManifestBlobUnknownError` when a
+    referenced blob is still missing after `_put_manifest`'s own per-PUT retry budget
+    — the durable case a re-await can't fix (a GC reap, or a commit that returned 2xx
+    but never landed). Between attempts the digests the registry named are accumulated
+    into `exclude_packs` and threaded back in, so the dedup index drops any lost
+    *reused* pack and re-packs its chunks into a fresh upload — otherwise an identical
+    plan would re-reference the same missing pack and fail identically. A new pack
+    re-uploads unconditionally; the `{}`-config cache was evicted at the raise site so
+    it re-confirms too. Bounded by `blob_reupload_max_retries()`; the final attempt
+    propagates, so a registry that keeps dropping the blob surfaces the infra fault.
+
+    Note: healing a lost reused pack needs the registry to NAME it in the error body
+    (`exc.missing_digests`); an error that names none can only re-run the same plan —
+    no worse than before, but not self-healing for that case. Shared by `upload_file`
+    and `upload_folder` so both self-heal identically."""
+    max_retries = blob_reupload_max_retries()
+    exclude_packs: set = set()
+    for reupload in range(max_retries):
         try:
-            return run_commit()
+            return run_commit(frozenset(exclude_packs))
         except ManifestBlobUnknownError as exc:
+            exclude_packs.update(exc.missing_digests)
             named = ", ".join(exc.missing_digests) or "a referenced blob"
             tqdm.write(
                 f"↻ {repo_id}:{revision} — registry lost {named} after commit; "
-                f"re-uploading and retrying [{reupload + 1}/{BLOB_REUPLOAD_MAX_RETRIES}]"
+                f"re-uploading and retrying [{reupload + 1}/{max_retries}]"
             )
-    return run_commit()
+    return run_commit(frozenset(exclude_packs))
 
 
 def upload_file(
@@ -948,7 +983,7 @@ def upload_file(
         # `oci_token`, so the whole token-using body runs inside the refresh wrapper.
         # Blob pushes are idempotent (content-addressed HEAD-dedup skips what already
         # landed), so a retry re-HEADs and re-PUTs the manifest rather than re-uploading.
-        def _op(oci_token):
+        def _op(oci_token, exclude_packs=frozenset()):
             # Fetch the prior manifest BEFORE uploading: chunked-v2 needs it to build
             # the dedup index (which chunks already exist, so only new chunks are
             # packed). The same digest guards the PUT via If-Match, so moving the fetch
@@ -964,7 +999,9 @@ def upload_file(
             if resolve_chunked_write_enabled() and (
                 os.path.getsize(file_path) >= resolve_chunk_threshold()
             ):
-                dedup_index, pack_sizes = _build_dedup_index(existing, registry, oci_repo, oci_token)
+                dedup_index, pack_sizes = _build_dedup_index(
+                    existing, registry, oci_repo, oci_token, exclude_packs=exclude_packs
+                )
             new_layers = _upload_file_layers(
                 file_path, path_in_repo, registry, oci_repo, oci_token, dedup_index, pack_sizes
             )
@@ -982,8 +1019,9 @@ def upload_file(
             return _build_commit_info(registry, repo_id, revision, resp, commit_message, commit_description)
 
         return _commit_with_blob_reupload(
-            lambda: call_with_oci_token_refresh(
-                oci_repo, token, push=True, endpoint=endpoint, operation=_op
+            lambda exclude_packs: call_with_oci_token_refresh(
+                oci_repo, token, push=True, endpoint=endpoint,
+                operation=lambda tok: _op(tok, exclude_packs),
             ),
             repo_id=repo_id, revision=revision,
         )
@@ -1063,7 +1101,7 @@ def upload_folder(
     # manifest PUT is deferred until all files succeed, so a re-run re-HEADs the
     # completed blobs and re-commits rather than re-uploading. Folder workers read
     # files from disk by path, so there is no stream-reconsumption hazard.
-    def _op(oci_token):
+    def _op(oci_token, exclude_packs=frozenset()):
         # Build the chunked-v2 dedup index ONCE from the prior revision (as upload_file
         # does) so every large file in the folder references chunks already stored
         # instead of re-packing and re-uploading them. Read-only and taken before the
@@ -1080,7 +1118,9 @@ def upload_folder(
             threshold = resolve_chunk_threshold()
             if any(os.path.getsize(os.path.join(base_dir, rel)) >= threshold for rel in filtered):
                 prior = fetch_manifest(registry, oci_repo, revision, oci_token, missing_ok=True)
-                dedup_index, pack_sizes = _build_dedup_index(prior, registry, oci_repo, oci_token)
+                dedup_index, pack_sizes = _build_dedup_index(
+                    prior, registry, oci_repo, oci_token, exclude_packs=exclude_packs
+                )
 
         new_layers = []
         if filtered:
@@ -1130,7 +1170,10 @@ def upload_folder(
         return commit_info
 
     return _commit_with_blob_reupload(
-        lambda: call_with_oci_token_refresh(oci_repo, token, push=True, endpoint=endpoint, operation=_op),
+        lambda exclude_packs: call_with_oci_token_refresh(
+            oci_repo, token, push=True, endpoint=endpoint,
+            operation=lambda tok: _op(tok, exclude_packs),
+        ),
         repo_id=repo_id, revision=revision,
     )
 
