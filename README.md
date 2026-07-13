@@ -320,6 +320,7 @@ Existing code that catches HF's exceptions keeps working.
 | `HIPPIUS_UPLOAD_WORKERS` | `8` | Concurrent files in a folder upload / concurrent chunk uploads per large file |
 | `HIPPIUS_CHUNK_THRESHOLD` | `268435456` (256 MiB) | Files at or above this size upload as content-defined chunks; below it, one plain blob |
 | `HIPPIUS_CDC_AVG_SIZE` | `4194304` (4 MiB) | FastCDC average chunk size — 4 MiB is fastcdc's max (larger is rejected); part of the layout wire contract |
+| `HIPPIUS_UPLOAD_CHUNK_SIZE` | `16777216` (16 MiB) | Per-`PATCH` chunk size for resumable plain-blob uploads (resume granularity on a transient failure) |
 | `HIPPIUS_PACK_SIZE` | `67108864` (64 MiB) | Target size of a content-addressed pack blob (many CDC chunks per pack) |
 | `HIPPIUS_MAX_INFLIGHT_PACKS` | `HIPPIUS_UPLOAD_WORKERS` (8) | Process-wide cap on concurrent pack uploads (bounds resident memory during folder uploads); defaults to the upload-worker count |
 | `HIPPIUS_BLOB_REUPLOAD_RETRIES` | `2` | Extra whole-upload retries when the registry reports a just-committed blob as missing (`BLOB_UNKNOWN`) |

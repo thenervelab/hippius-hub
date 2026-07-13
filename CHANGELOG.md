@@ -29,6 +29,13 @@ the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 
 ### Added
 
+- **Resumable plain-blob uploads.** A large file below the chunk threshold now
+  streams to the registry in bounded OCI `PATCH` chunks (`HIPPIUS_UPLOAD_CHUNK_SIZE`,
+  default 16 MiB); on any transient failure the client `GET`s the registry's
+  committed offset and resumes from there, so a mid-upload disconnect costs at most
+  one chunk of re-send instead of the whole layer. Falls back to the monolithic
+  streaming `PUT` if a registry rejects `PATCH` (405/501); the chunked-v2 pack path
+  is unchanged.
 - **Chunked-v2 (pack) layout for large files.** Files at or above
   `HIPPIUS_CHUNK_THRESHOLD` (256 MiB) are stored as content-defined chunks
   (FastCDC, ~4 MiB average) packed into ~64 MiB content-addressed *pack* blobs —

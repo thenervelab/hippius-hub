@@ -288,6 +288,7 @@ Multiple parallel `upload_file` calls to the same `repo_id:revision` race on the
 - `HIPPIUS_SNAPSHOT_WORKERS` / `HIPPIUS_UPLOAD_WORKERS` (default `8`) — concurrent files in snapshot download / folder upload (upload workers also bound concurrent chunk uploads per large file)
 - `HIPPIUS_CHUNK_THRESHOLD` (default `268435456` = 256 MiB) — files at/above this size upload chunked-v2 (content-defined chunks packed into content-addressed pack blobs + one titled `pointer.v2` layer); below it, one plain blob
 - `HIPPIUS_CDC_AVG_SIZE` (default `4194304` = 4 MiB) — FastCDC average chunk size; part of the layout wire contract, change with care (4 MiB is fastcdc's AVERAGE_MAX ceiling; larger is rejected)
+- `HIPPIUS_UPLOAD_CHUNK_SIZE` (default `16777216` = 16 MiB) — per-`PATCH` chunk size for resumable plain-blob uploads; a transient failure resumes from the registry's committed offset, so at most one chunk is re-sent
 - `HIPPIUS_PACK_SIZE` (default `67108864` = 64 MiB) — target size of a content-addressed pack blob (many CDC chunks per pack)
 - `HIPPIUS_MAX_INFLIGHT_PACKS` (default = `HIPPIUS_UPLOAD_WORKERS`, i.e. `8`) — process-wide cap on concurrent pack uploads, so a folder upload doesn't multiply resident memory
 - `HIPPIUS_BLOB_REUPLOAD_RETRIES` (default `2`) — extra whole-upload retries when the registry reports a just-committed blob as missing (`BLOB_UNKNOWN`)
