@@ -41,11 +41,11 @@ class MalformedManifestError(ValueError):
     """A manifest declares a known layout but violates its structural contract.
 
     Distinct from `UnsupportedLayoutError` (an *unknown* layout we refuse on
-    principle): here the layout is `chunked-v1` — one we claim to read — but the
+    principle): here the layout is `chunked-v2` — one we claim to read — but the
     bytes don't hold up (a pointer layer missing its whole-file size/digest, a
-    non-integer chunk count, or fewer trailing chunk layers than the count
-    promises). Reassembling from it would silently produce a truncated or wrong
-    file, so we stop. `ValueError` so callers using broad `except ValueError` /
+    non-integer chunk count, or a pointer blob that disagrees with its manifest).
+    Reassembling from it would silently produce a truncated or wrong file, so we
+    stop. `ValueError` so callers using broad `except ValueError` /
     `except Exception` still catch it.
     """
 
