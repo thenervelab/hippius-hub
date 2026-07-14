@@ -69,6 +69,15 @@ PACK_MEDIA_TYPE = "application/vnd.hippius.pack.v1"
 # not use in v1 because fastcdc caps a single CHUNK at 4 MiB; packing lifts that.
 DEFAULT_PACK_SIZE = 64 * 1024 * 1024
 
+# Hard ceiling on a pack. The downloader buffers a pack whole in memory to verify and
+# carve it, so a pack's declared size is attacker-controlled input on the way back in
+# (a malicious registry can claim any layer size); `MAX_PACK_SIZE` in
+# src/chunk_fetcher.rs rejects a declaration above this. Enforcing the SAME bound here
+# means an over-large HIPPIUS_PACK_SIZE fails at upload — where the operator can act on
+# it — instead of silently producing packs that every reader then refuses to fetch.
+# The two constants must stay equal; `pack_size_cap_matches_python` pins them.
+MAX_PACK_SIZE = 512 * 1024 * 1024
+
 # CNCF Distribution hard-caps a manifest PUT body at 4 MiB (maxManifestBodySize).
 # Past it the registry returns an opaque 400 — AFTER every blob is already
 # uploaded. We check the serialized manifest before the PUT and raise a clear
@@ -124,8 +133,20 @@ def resolve_cdc_avg_size() -> int:
 
 
 def resolve_pack_size() -> int:
-    """Target pack size (bytes) for the chunked-v2 layout. Overridable for testing."""
-    return _resolve_positive_int("HIPPIUS_PACK_SIZE", DEFAULT_PACK_SIZE)
+    """Target pack size (bytes) for the chunked-v2 layout. Overridable for testing.
+
+    Bounded above by `MAX_PACK_SIZE`: the reader buffers a pack whole to verify and
+    carve it, and refuses a pack declaring more than that, so a larger value here
+    would write an artifact nothing can read back. Fail at upload, loudly, rather
+    than at every future download.
+    """
+    value = _resolve_positive_int("HIPPIUS_PACK_SIZE", DEFAULT_PACK_SIZE)
+    if value > MAX_PACK_SIZE:
+        raise ValueError(
+            f"HIPPIUS_PACK_SIZE must be at most {MAX_PACK_SIZE} bytes "
+            f"(the reader's per-pack maximum), got {value}"
+        )
+    return value
 
 
 def resolve_chunked_write_enabled() -> bool:

@@ -35,11 +35,16 @@ const VERIFY_READ_BUFFER: usize = 8 * 1024 * 1024;
 /// `PackPlanEntry::size` is the OCI manifest layer's `size` field: the registry
 /// picks it, and the threat model treats the registry as fully untrusted. It is not
 /// legitimately unbounded — `plan_packs` (`hippius_hub/_packing.py`) closes a pack
-/// once it reaches `HIPPIUS_n` (default 64 MiB) and can overshoot only by the last
-/// chunk it added, itself bounded by fastcdc's 16 MiB maximum. So an honestly-built
-/// pack is ~80 MiB. 512 MiB leaves room for a caller running a custom `HIPPIUS_n`
-/// while denying a malicious manifest the ability to turn one entry into an
-/// arbitrary memory demand.
+/// once it reaches `HIPPIUS_PACK_SIZE` (default 64 MiB) and can overshoot only by the
+/// last chunk it added, itself bounded by fastcdc's 16 MiB `MAXIMUM_MAX`. So an
+/// honestly-built pack is ~80 MiB. 512 MiB leaves room for a caller running a custom
+/// `HIPPIUS_PACK_SIZE` while denying a malicious manifest the ability to turn one
+/// entry into an arbitrary memory demand.
+///
+/// Kept in lockstep with `MAX_PACK_SIZE` in `hippius_hub/constants.py`, which rejects
+/// an over-large `HIPPIUS_PACK_SIZE` at upload time so this download-side cap can
+/// never reject a pack our own uploader produced. `pack_size_cap_matches_python`
+/// pins the two together.
 ///
 /// `total_size` deliberately gets NO equivalent cap: a model file legitimately runs
 /// to hundreds of GB, and it drives a sparse `set_len`, not a buffer. Bound what the
@@ -547,6 +552,30 @@ async fn fetch_pack_with_retry(
     }
 }
 
+/// Strip the credential-bearing parts of a blob URL before it reaches an error string.
+///
+/// Pack URLs are not always plain registry paths: a registry may hand back a presigned
+/// redirect whose signature (and sometimes an access-key id) rides in the query string,
+/// and `scheme://user:pass@host` userinfo is legal too. These errors surface to Python
+/// as exception text and land in logs and bug reports, so the raw URL must not appear
+/// there. Keeps scheme/host/path — enough to identify which pack failed — and drops the
+/// query and userinfo.
+///
+/// `@` is only treated as a userinfo separator when it appears in the authority (before
+/// the first `/`); an `@` inside a path is an ordinary character and is preserved.
+fn redact_url(url: &str) -> String {
+    let head = url.split_once('?').map_or(url, |(before, _)| before);
+    let Some((scheme, rest)) = head.split_once("://") else {
+        return head.to_string();
+    };
+    let authority_end = rest.find('/').unwrap_or(rest.len());
+    let (authority, path) = rest.split_at(authority_end);
+    // `rsplit_once` so a `:` or `@` inside the password does not split early.
+    let host = authority.rsplit_once('@').map_or(authority, |(_, host)| host);
+    let query_marker = if url.contains('?') { "?<redacted>" } else { "" };
+    format!("{scheme}://{host}{path}{query_marker}")
+}
+
 /// Grow `buf` by `additional` bytes, surfacing an allocation failure as an error
 /// instead of the allocator's process abort.
 ///
@@ -564,7 +593,7 @@ fn reserve_or_err(buf: &mut Vec<u8>, additional: usize, url: &str) -> Result<(),
     buf.try_reserve(additional).map_err(|e| {
         CoreError::Io(std::io::Error::new(
             std::io::ErrorKind::OutOfMemory,
-            format!("pack {url}: cannot reserve {additional} more bytes: {e}"),
+            format!("pack {}: cannot reserve {additional} more bytes: {e}", redact_url(url)),
         ))
     })
 }
@@ -582,13 +611,29 @@ async fn fetch_pack(
     dest_path: &Path,
     pb: &ProgressBar,
 ) -> Result<(), CoreError> {
+    // Re-check the declared size here, not only in `validate_pack_plan`. The running
+    // over-send check below compares `received > pack_size`, which is vacuous when
+    // `pack_size` is `u64::MAX`: a server that keeps streaming would grow the buffer
+    // until memory ran out. `validate_pack_plan` is the gate that makes that
+    // unreachable in production, but a fetch that is safe only because its caller
+    // checked first is precisely the coupling that produced RESEXHAUST-001. One
+    // comparison buys the function its own guarantee.
+    if pack_size > MAX_PACK_SIZE {
+        return Err(CoreError::Integrity(format!(
+            "pack {}: declares {pack_size} bytes, above the {MAX_PACK_SIZE}-byte per-pack maximum",
+            redact_url(url)
+        )));
+    }
     let mut req = client.get(url).timeout(CHUNK_REQUEST_TIMEOUT);
     if let Some(t) = token {
         req = req.bearer_auth(t);
     }
     let mut res = req.send().await?;
     if !res.status().is_success() {
-        return Err(CoreError::ServerError(res.status().as_u16(), format!("pack GET failed for {url}")));
+        return Err(CoreError::ServerError(
+            res.status().as_u16(),
+            format!("pack GET failed for {}", redact_url(url)),
+        ));
     }
     // Audit L12: read the body under a running cap instead of `res.bytes()`, which
     // buffers an unbounded body BEFORE the length check — a chunked (no
@@ -617,7 +662,8 @@ async fn fetch_pack(
         received = received.saturating_add(chunk.len() as u64);
         if received > pack_size {
             return Err(CoreError::Integrity(format!(
-                "pack {url}: body exceeds expected {pack_size} bytes (over-send)"
+                "pack {}: body exceeds expected {pack_size} bytes (over-send)",
+                redact_url(url)
             )));
         }
         reserve_or_err(&mut bytes, chunk.len(), url)?;
@@ -625,7 +671,8 @@ async fn fetch_pack(
     }
     if bytes.len() as u64 != pack_size {
         return Err(CoreError::Integrity(format!(
-            "pack {url}: expected {pack_size} bytes, got {}",
+            "pack {}: expected {pack_size} bytes, got {}",
+            redact_url(url),
             bytes.len()
         )));
     }
@@ -667,7 +714,8 @@ fn verify_and_scatter(
             .ok_or_else(|| CoreError::Integrity("chunk range overflow".to_string()))?;
         if end > bytes.len() {
             return Err(CoreError::Integrity(format!(
-                "pack {url}: chunk range {start}..{end} exceeds pack length {}",
+                "pack {}: chunk range {start}..{end} exceeds pack length {}",
+                redact_url(url),
                 bytes.len()
             )));
         }
@@ -1220,17 +1268,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fetch_pack_does_not_reserve_from_declared_size() {
+    async fn fetch_pack_rejects_oversized_declaration_on_its_own() {
         // Regression test for RESEXHAUST-001, and the one that actually fails on the old
         // code: `Vec::with_capacity(u64::MAX as usize)` panicked with "capacity overflow"
         // — a stdlib-internal panic the crate's `panic`/`unwrap_used` denials cannot see
-        // — before a single body byte was read. The reservation is now clamped and grows
-        // only with bytes that arrive, so an absurd declaration allocates nothing and
-        // fails cleanly on the length check instead.
+        // — before a single body byte was read.
         //
         // Calls `fetch_pack` directly rather than through `assemble`: `validate_pack_plan`
-        // is the gate, but `fetch_pack` must be safe on its own, not merely by virtue of
-        // its caller checking first.
+        // is the gate, but `fetch_pack` must hold on its own. Without its own check the
+        // `received > pack_size` guard is vacuous at u64::MAX (nothing exceeds it), so a
+        // server that kept streaming would grow the buffer until memory ran out.
+        // Asserting on the message pins that it dies at the size gate — before the GET —
+        // rather than incidentally on the trailing length comparison.
         let mut routes = HashMap::new();
         routes.insert("/pack".to_string(), vec![7u8; 10]);
         let Some(base) = serve_packs(routes).await.ok() else { return };
@@ -1240,8 +1289,108 @@ mod tests {
         let _g = TempFileGuard(dest.clone());
         let res = fetch_pack(client, &format!("{base}/pack"), None, u64::MAX, &[], &dest, &pb).await;
         assert!(
-            matches!(res, Err(CoreError::Integrity(_))),
-            "an absurd declared pack_size must fail cleanly, not allocate: got {res:?}"
+            matches!(res, Err(CoreError::Integrity(ref m)) if m.contains("per-pack maximum")),
+            "an absurd declared pack_size must be refused at the size gate: got {res:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_pack_reserves_against_arrived_bytes_not_the_declaration() {
+        // A pack may declare the maximum (512 MiB) and send almost nothing. The buffer
+        // must track what ARRIVED — reserving the declared size here would mean a half-GB
+        // allocation per pack, x32 concurrent, for a body of 10 bytes. The declaration is
+        // legal (at the cap), so this exercises the reservation clamp specifically, not
+        // the size gate above; it fails on the honest length mismatch instead.
+        let mut routes = HashMap::new();
+        routes.insert("/pack".to_string(), vec![3u8; 10]);
+        let Some(base) = serve_packs(routes).await.ok() else { return };
+        let Ok(client) = download_client(TransportTimeouts::default()) else { return };
+        let pb = ProgressBar::hidden();
+        let dest = scratch_path("resexhaust_reserve");
+        let _g = TempFileGuard(dest.clone());
+        let res = fetch_pack(client, &format!("{base}/pack"), None, MAX_PACK_SIZE, &[], &dest, &pb).await;
+        assert!(
+            matches!(res, Err(CoreError::Integrity(ref m)) if m.contains("expected")),
+            "a short body against a max-size declaration must fail on length: got {res:?}"
+        );
+    }
+
+    // --- redact_url: pack URLs can be presigned and carry credentials ---
+
+    #[test]
+    fn redact_url_strips_query_and_userinfo() {
+        // A presigned redirect: the signature and key id ride in the query string.
+        assert_eq!(
+            redact_url("https://cdn.example.com/blobs/sha256:abc?X-Amz-Signature=deadbeef&X-Amz-Credential=AKIA"),
+            "https://cdn.example.com/blobs/sha256:abc?<redacted>"
+        );
+        // Userinfo in the authority.
+        assert_eq!(
+            redact_url("https://user:hunter2@registry.example.com/v2/blobs/x"),
+            "https://registry.example.com/v2/blobs/x"
+        );
+    }
+
+    #[test]
+    fn redact_url_preserves_at_sign_inside_a_path() {
+        // `@` is only a userinfo separator in the authority. An `@` in the path is an
+        // ordinary character — stripping it would mangle the identifying part of the URL.
+        assert_eq!(
+            redact_url("https://registry.example.com/v2/user@org/blobs/x"),
+            "https://registry.example.com/v2/user@org/blobs/x"
+        );
+    }
+
+    #[test]
+    fn redact_url_passes_through_a_plain_url_and_a_non_url() {
+        assert_eq!(redact_url("https://r.example.com/v2/x"), "https://r.example.com/v2/x");
+        assert_eq!(redact_url("not-a-url"), "not-a-url");
+        assert_eq!(redact_url(""), "");
+    }
+
+    proptest::proptest! {
+        // The property that matters for a redactor: a secret placed in either
+        // credential-bearing position must never survive into the output — for ANY host
+        // and path, not just the ones we thought to write. Idempotence is asserted
+        // alongside it, since these strings get re-formatted through error wrappers.
+        #[test]
+        fn redact_url_never_leaks_a_secret(
+            host in "[a-z][a-z0-9.]{0,20}",
+            path in "[a-zA-Z0-9/_.-]{0,40}",
+            secret in "[a-zA-Z0-9]{8,24}",
+        ) {
+            let in_query = format!("https://{host}/{path}?sig={secret}");
+            let in_userinfo = format!("https://admin:{secret}@{host}/{path}");
+            for url in [&in_query, &in_userinfo] {
+                let out = redact_url(url);
+                proptest::prop_assert!(!out.contains(&secret), "secret leaked into {out}");
+                proptest::prop_assert_eq!(redact_url(&out), out.clone(), "not idempotent");
+            }
+        }
+    }
+
+    #[test]
+    fn pack_size_cap_matches_python() {
+        // The upload side (hippius_hub/constants.py) rejects an HIPPIUS_PACK_SIZE above
+        // its own MAX_PACK_SIZE so it can never write a pack this reader refuses. That
+        // guarantee holds only while the two constants are equal — a drift would either
+        // reopen the hole (Python higher) or make our own uploads unreadable (Python
+        // lower). Parse the Python constant and pin them together.
+        let src = std::fs::read_to_string("hippius_hub/constants.py");
+        let Ok(src) = src else { return }; // not running from the repo root; nothing to pin
+        let declared = src
+            .lines()
+            .find_map(|l| l.strip_prefix("MAX_PACK_SIZE = "))
+            .and_then(|expr| {
+                // Value is written as `512 * 1024 * 1024`; evaluate the product.
+                expr.split('*')
+                    .map(|t| t.trim().parse::<u64>().ok())
+                    .try_fold(1u64, |acc, n| n.map(|n| acc * n))
+            });
+        assert_eq!(
+            declared,
+            Some(MAX_PACK_SIZE),
+            "hippius_hub/constants.py MAX_PACK_SIZE must equal the Rust MAX_PACK_SIZE ({MAX_PACK_SIZE})"
         );
     }
 

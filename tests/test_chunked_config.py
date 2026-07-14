@@ -11,9 +11,12 @@ import pytest
 from hippius_hub.constants import (
     DEFAULT_CDC_AVG_SIZE,
     DEFAULT_CHUNK_THRESHOLD,
+    DEFAULT_PACK_SIZE,
+    MAX_PACK_SIZE,
     resolve_cdc_avg_size,
     resolve_chunk_threshold,
     resolve_chunked_write_enabled,
+    resolve_pack_size,
 )
 
 
@@ -27,6 +30,27 @@ def test_cdc_avg_default_is_fastcdc_ceiling(monkeypatch):
     # A larger default (the original 64 MiB) panics the Rust chunker.
     monkeypatch.delenv("HIPPIUS_CDC_AVG_SIZE", raising=False)
     assert resolve_cdc_avg_size() == DEFAULT_CDC_AVG_SIZE == 4 * 1024 * 1024
+
+
+def test_pack_size_default(monkeypatch):
+    monkeypatch.delenv("HIPPIUS_PACK_SIZE", raising=False)
+    assert resolve_pack_size() == DEFAULT_PACK_SIZE == 64 * 1024 * 1024
+
+
+def test_pack_size_accepts_value_at_the_cap(monkeypatch):
+    # The bound is inclusive — an off-by-one here would reject a legal configuration.
+    monkeypatch.setenv("HIPPIUS_PACK_SIZE", str(MAX_PACK_SIZE))
+    assert resolve_pack_size() == MAX_PACK_SIZE
+
+
+def test_pack_size_above_cap_is_rejected_at_upload(monkeypatch):
+    # The reader buffers a pack whole and refuses one declaring more than MAX_PACK_SIZE
+    # (src/chunk_fetcher.rs). Writing packs above that bound would produce an artifact
+    # nothing can read back, so it must fail here — loudly, at configuration time —
+    # rather than at every future download.
+    monkeypatch.setenv("HIPPIUS_PACK_SIZE", str(MAX_PACK_SIZE + 1))
+    with pytest.raises(ValueError, match="per-pack maximum"):
+        resolve_pack_size()
 
 
 def test_threshold_and_avg_override(monkeypatch):
