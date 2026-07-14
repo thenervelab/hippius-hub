@@ -524,9 +524,55 @@ async fn fetch_pack_with_retry(
     }
 }
 
-/// Fetch one pack blob whole, verify each carved chunk's sha256, and scatter each
-/// slice to its file offset. Buffering the pack (~64 MiB) is bounded by the
-/// semaphore; the length check rejects a server that over-sends before slicing.
+/// A5: range-fetch a pack only when the span its needed chunks occupy is under
+/// this fraction of the whole pack. Below it, a single coalesced `Range` saves
+/// enough bytes to beat the origin round-trip a cold range forces (a range never
+/// warms the ATS edge). At or above it, GET the whole pack as a cacheable `200`.
+/// 3/5 = 60%.
+const RANGE_SPAN_MAX_NUM: u64 = 3;
+const RANGE_SPAN_MAX_DEN: u64 = 5;
+
+/// Format a single RFC 7233 byte-range value over one inclusive `[start, end]`. It
+/// takes two scalars, never a list, so a comma — a multi-range request — is
+/// unrepresentable by construction. Multi-range is forbidden: Arion answers one by
+/// silently serving the whole object with a `200`, and hippius-s3 returns `416`.
+fn single_range_header(start: u64, end_inclusive: u64) -> String {
+    format!("bytes={start}-{end_inclusive}")
+}
+
+/// The `[min offset, max offset+size)` byte span the needed chunks occupy in the
+/// pack, or `None` if there are no targets.
+fn pack_span(targets: &[(u64, u64, u64, String)]) -> Option<(u64, u64)> {
+    let mut iter = targets.iter();
+    let (first_off, first_size, _, _) = iter.next()?;
+    let mut start = *first_off;
+    let mut end = first_off.saturating_add(*first_size);
+    for (off, size, _, _) in iter {
+        start = start.min(*off);
+        end = end.max(off.saturating_add(*size));
+    }
+    Some((start, end))
+}
+
+/// A5 fetch decision for one pack: `Some((start, end_exclusive))` to request that
+/// single byte range, or `None` for a whole-pack GET. Ranges only when the span is
+/// a small enough fraction of the pack (< 60%) to be worth missing the edge cache;
+/// a span that would fetch most of the pack, is empty, or runs past `pack_size` (a
+/// bad plan) falls back to the cacheable whole-object GET.
+fn range_window(targets: &[(u64, u64, u64, String)], pack_size: u64) -> Option<(u64, u64)> {
+    let (start, end) = pack_span(targets)?;
+    let len = end.checked_sub(start)?;
+    let worth_it = len > 0
+        && end <= pack_size
+        && len.saturating_mul(RANGE_SPAN_MAX_DEN) < pack_size.saturating_mul(RANGE_SPAN_MAX_NUM);
+    worth_it.then_some((start, end))
+}
+
+/// Fetch one pack — whole (a cacheable `200`), or a single coalesced `Range` over
+/// the span its needed chunks occupy when that span is a small fraction of the pack
+/// (A5) — then verify each carved chunk's sha256 and scatter it to its file offset.
+/// Buffering is bounded by the semaphore and the running length cap; the length
+/// check rejects a server that over-sends before slicing.
 async fn fetch_pack(
     client: &Client,
     url: &str,
@@ -536,7 +582,11 @@ async fn fetch_pack(
     dest_path: &Path,
     pb: &ProgressBar,
 ) -> Result<(), CoreError> {
+    let window = range_window(targets, pack_size);
     let mut req = client.get(url).timeout(CHUNK_REQUEST_TIMEOUT);
+    if let Some((start, end)) = window {
+        req = req.header(reqwest::header::RANGE, single_range_header(start, end - 1));
+    }
     if let Some(t) = token {
         req = req.bearer_auth(t);
     }
@@ -544,18 +594,25 @@ async fn fetch_pack(
     if !res.status().is_success() {
         return Err(CoreError::ServerError(res.status().as_u16(), format!("pack GET failed for {url}")));
     }
+    // What we got back sets the carve base and the expected length. A ranged request
+    // honored with 206 gives the partial window [start, end); a proxy that strips
+    // Range answers 200 with the whole pack — the documented fallback — so we carve
+    // from offset 0 over the full pack_size. Any other status is treated as a whole
+    // pack and rejected by the length check below if the body disagrees.
+    let (base_offset, expected_len) = match window {
+        Some((start, end)) if res.status() == reqwest::StatusCode::PARTIAL_CONTENT => {
+            (start, end - start)
+        }
+        _ => (0u64, pack_size),
+    };
     // Audit L12: read the body under a running cap instead of `res.bytes()`, which
-    // buffers an unbounded body BEFORE the length check — a chunked (no
-    // Content-Length) response from a misbehaving/compromised registry could
-    // balloon memory well past the intended ~pack_size ceiling (x32 concurrent
-    // packs) before rejection. Abort the moment the accumulated body exceeds
-    // `pack_size`, so peak memory stays bounded to one pack.
-    // Clamp the up-front reservation to MAX_PACK_BYTES so a registry-declared
-    // pack_size (validate_pack_plan rejects > MAX_PACK_BYTES up front, but this is
-    // the defense-in-depth backstop) can never turn `with_capacity` into a
-    // multi-TiB alloc abort. A larger-but-legal pack still grows the Vec on demand,
-    // bounded by the `received > pack_size` check below.
-    let reserve = pack_size.min(MAX_PACK_BYTES);
+    // would buffer an unbounded body BEFORE the length check — a chunked (no
+    // Content-Length) response from a misbehaving/compromised registry could balloon
+    // memory past the intended ceiling (x32 concurrent packs) before rejection.
+    // Reserve to the expected length (a range fetch is smaller than the pack),
+    // clamped to MAX_PACK_BYTES as the defense-in-depth backstop so a registry-
+    // declared size can never turn `with_capacity` into a multi-TiB alloc abort.
+    let reserve = expected_len.min(MAX_PACK_BYTES);
     let cap = usize::try_from(reserve).unwrap_or(usize::MAX);
     let mut bytes: Vec<u8> = Vec::with_capacity(cap);
     let mut received: u64 = 0;
@@ -564,35 +621,36 @@ async fn fetch_pack(
     // of holding the connection until the 5-minute total timeout.
     while let Some(chunk) = read_chunk_bounded(&mut res, download_read_idle()).await? {
         received = received.saturating_add(chunk.len() as u64);
-        if received > pack_size {
+        if received > expected_len {
             // Transport length anomaly, not a wrong-bytes integrity failure — a
             // proxy/CDN that over-sends a self-consistent body can clear on retry,
-            // so classify it retryable (matches the Range path's short/over-length
-            // handling in chunked_downloader). Bounded by pack_size so a runaway
+            // so classify it retryable. Bounded by `expected_len` so a runaway
             // stream is cut here, well under the MAX_PACK_BYTES ceiling.
             return Err(CoreError::BadResponse(format!(
-                "pack {url}: body exceeds expected {pack_size} bytes (over-send)"
+                "pack {url}: body exceeds expected {expected_len} bytes (over-send)"
             )));
         }
         bytes.extend_from_slice(&chunk);
     }
-    if bytes.len() as u64 != pack_size {
+    if bytes.len() as u64 != expected_len {
         return Err(CoreError::BadResponse(format!(
-            "pack {url}: expected {pack_size} bytes, got {}",
+            "pack {url}: expected {expected_len} bytes, got {}",
             bytes.len()
         )));
     }
     // Verify + scatter on the blocking pool (audit L14). The per-chunk sha256 is
     // CPU-bound and the scatter writes are local disk — neither is async work, so
     // running them inline on the runtime starves the other up-to-32 concurrent pack
-    // fetches. `bytes` (the received pack) moves in; the metadata clones are cheap.
+    // fetches. `bytes` (the received window) moves in; the metadata clones are cheap.
     let targets_owned = targets.to_vec();
     let dest = dest_path.to_path_buf();
     let url_owned = url.to_string();
     let pb_owned = pb.clone();
-    tokio::task::spawn_blocking(move || verify_and_scatter(&url_owned, &bytes, &targets_owned, &dest, &pb_owned))
-        .await
-        .map_err(|join_err| CoreError::Io(std::io::Error::other(join_err)))?
+    tokio::task::spawn_blocking(move || {
+        verify_and_scatter(&url_owned, &bytes, base_offset, &targets_owned, &dest, &pb_owned)
+    })
+    .await
+    .map_err(|join_err| CoreError::Io(std::io::Error::other(join_err)))?
 }
 
 /// Verify each carved chunk's sha256 against `bytes` and scatter its slice to the
@@ -606,6 +664,7 @@ async fn fetch_pack(
 fn verify_and_scatter(
     url: &str,
     bytes: &[u8],
+    base_offset: u64,
     targets: &[(u64, u64, u64, String)],
     dest_path: &Path,
     pb: &ProgressBar,
@@ -614,8 +673,17 @@ fn verify_and_scatter(
 
     let mut file = std::fs::OpenOptions::new().write(true).open(dest_path)?;
     for (offset_in_pack, size, file_offset, expected) in targets {
-        let start = usize::try_from(*offset_in_pack)
-            .map_err(|_| CoreError::Integrity(format!("pack offset {offset_in_pack} exceeds usize")))?;
+        // `bytes` starts at `base_offset` in the pack (0 for a whole-pack GET, the
+        // span start for a 206 range), so carve at the offset RELATIVE to it. A
+        // chunk before the fetched window is a plan/response mismatch, caught here
+        // rather than mis-placed.
+        let rel = offset_in_pack.checked_sub(base_offset).ok_or_else(|| {
+            CoreError::Integrity(format!(
+                "pack {url}: chunk offset {offset_in_pack} precedes fetched window start {base_offset}"
+            ))
+        })?;
+        let start = usize::try_from(rel)
+            .map_err(|_| CoreError::Integrity(format!("pack offset {rel} exceeds usize")))?;
         let end = start
             .checked_add(usize::try_from(*size).map_err(|_| {
                 CoreError::Integrity(format!("chunk size {size} exceeds usize"))
@@ -623,7 +691,7 @@ fn verify_and_scatter(
             .ok_or_else(|| CoreError::Integrity("chunk range overflow".to_string()))?;
         if end > bytes.len() {
             return Err(CoreError::Integrity(format!(
-                "pack {url}: chunk range {start}..{end} exceeds pack length {}",
+                "pack {url}: chunk range {start}..{end} exceeds fetched length {}",
                 bytes.len()
             )));
         }
@@ -766,7 +834,7 @@ mod tests {
         let Ok(()) = std::fs::File::create(&path).and_then(|f| f.set_len(6)) else {
             unreachable!("temp file create")
         };
-        let Ok(()) = verify_and_scatter("u", &pack, &good, &path, &pb) else {
+        let Ok(()) = verify_and_scatter("u", &pack, 0, &good, &path, &pb) else {
             unreachable!("valid chunks must scatter")
         };
         let mut got = Vec::new();
@@ -779,7 +847,64 @@ mod tests {
         // error, so a corrupt/mis-placed pack is never accepted.
         let bad = vec![(0u64, 4u64, 0u64, hb)];
         assert!(matches!(
-            verify_and_scatter("u", &pack, &bad, &path, &pb),
+            verify_and_scatter("u", &pack, 0, &bad, &path, &pb),
+            Err(CoreError::Integrity(_))
+        ));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn single_range_header_is_never_multi_range() {
+        // The format is exact, and — the real guarantee — the signature takes two
+        // scalars, so a comma (a forbidden multi-range GET) is unrepresentable.
+        let h = single_range_header(0, 100);
+        assert_eq!(h, "bytes=0-100");
+        assert!(!h.contains(','), "a single-range header must never contain a comma");
+    }
+
+    #[test]
+    fn range_window_decides_partial_vs_whole() {
+        let d = String::new(); // digest is irrelevant to the fetch decision
+        let pack = 1000u64;
+        // One small chunk near the start → a tiny span, worth ranging.
+        assert_eq!(range_window(&[(0, 50, 0, d.clone())], pack), Some((0, 50)));
+        // Two scattered chunks whose SPAN is still < 60% → range the coalesced span.
+        let near = vec![(100, 50, 0, d.clone()), (500, 50, 0, d.clone())];
+        assert_eq!(range_window(&near, pack), Some((100, 550))); // span 450 < 600
+        // A span covering most of the pack → whole GET, even for few bytes needed.
+        let wide = vec![(0, 10, 0, d.clone()), (900, 10, 0, d.clone())];
+        assert_eq!(range_window(&wide, pack), None); // span 910 >= 600
+        // A plan running past the pack is a whole GET (the length check then rejects).
+        assert_eq!(range_window(&[(0, 50, 0, d.clone()), (2000, 10, 0, d.clone())], pack), None);
+        // No targets → whole GET.
+        assert_eq!(range_window(&[], pack), None);
+    }
+
+    #[test]
+    fn verify_and_scatter_carves_from_a_partial_window() {
+        // Simulate a 206 that returned pack[4..10] = "BBCCCC"; base_offset = 4. The
+        // target at ABSOLUTE pack offset 6 (size 4, "CCCC") must carve at rel 2.
+        use std::io::Read;
+        let pb = ProgressBar::hidden();
+        let window = b"BBCCCC".as_slice(); // pack[4..10]
+        let cccc = &window[2..6];
+        let h = hex::encode(Sha256::digest(cccc));
+        let targets = vec![(6u64, 4u64, 0u64, h)];
+        let path = std::env::temp_dir().join(format!("hippius-vsp-{}.bin", std::process::id()));
+        let Ok(()) = std::fs::File::create(&path).and_then(|f| f.set_len(4)) else {
+            unreachable!("temp file create")
+        };
+        let Ok(()) = verify_and_scatter("u", window, 4, &targets, &path, &pb) else {
+            unreachable!("partial-window scatter must succeed")
+        };
+        let mut got = Vec::new();
+        let Ok(_) = std::fs::File::open(&path).and_then(|mut f| f.read_to_end(&mut got)) else {
+            unreachable!("read back")
+        };
+        assert_eq!(got, b"CCCC");
+        // A target before the window start is a clean Integrity error, never a panic.
+        assert!(matches!(
+            verify_and_scatter("u", window, 4, &[(0u64, 2u64, 0u64, String::new())], &path, &pb),
             Err(CoreError::Integrity(_))
         ));
         let _ = std::fs::remove_file(&path);
