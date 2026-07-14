@@ -30,6 +30,35 @@ const CONNECT_TIMEOUT_SECS: u64 = 30;
 const MAX_RETRIES: u32 = 3;
 const VERIFY_READ_BUFFER: usize = 8 * 1024 * 1024;
 
+/// Hard ceiling on a pack's *declared* length.
+///
+/// `PackPlanEntry::size` is the OCI manifest layer's `size` field: the registry
+/// picks it, and the threat model treats the registry as fully untrusted. It is not
+/// legitimately unbounded — `plan_packs` (`hippius_hub/_packing.py`) closes a pack
+/// once it reaches `HIPPIUS_n` (default 64 MiB) and can overshoot only by the last
+/// chunk it added, itself bounded by fastcdc's 16 MiB maximum. So an honestly-built
+/// pack is ~80 MiB. 512 MiB leaves room for a caller running a custom `HIPPIUS_n`
+/// while denying a malicious manifest the ability to turn one entry into an
+/// arbitrary memory demand.
+///
+/// `total_size` deliberately gets NO equivalent cap: a model file legitimately runs
+/// to hundreds of GB, and it drives a sparse `set_len`, not a buffer. Bound what the
+/// format bounds; leave alone what it doesn't.
+const MAX_PACK_SIZE: u64 = 512 * 1024 * 1024;
+
+/// Cap on the buffer reserved UP FRONT for a pack body, independent of the length the
+/// registry declared.
+///
+/// Capping the declaration alone (see [`MAX_PACK_SIZE`]) is not sufficient: up to 32
+/// packs are fetched concurrently, so 32 entries each declaring `MAX_PACK_SIZE` and
+/// then sending nothing would still reserve 16 GiB before a byte arrived. Reserving
+/// `min(declared, 64 MiB)` and letting the buffer grow as bytes actually land makes
+/// the memory cost track real traffic — an attacker must *send* the bytes to make us
+/// hold them, which is bandwidth-bound rather than an amplification. 64 MiB keeps the
+/// common case (a default-sized pack) at exactly one allocation, so the hot path pays
+/// nothing for this.
+const PACK_RESERVE_CEILING: u64 = 64 * 1024 * 1024;
+
 /// Full-request budget for a single chunk-blob GET.
 ///
 /// `connect_timeout` (below) covers only the TCP/TLS handshake; a slow-loris
@@ -418,8 +447,21 @@ impl PackAssembler {
 /// keeps the assembled file exactly `total_size` bytes, which is what both the
 /// incremental hasher and the `compute_sha256` fallback assume. `checked_add` guards
 /// a `file_offset + size` that would itself overflow `u64`.
+///
+/// Also rejects a pack whose *declared* length exceeds [`MAX_PACK_SIZE`]. That size
+/// comes from the untrusted manifest and used to flow straight into the pack buffer's
+/// allocation, so an entry claiming `u64::MAX` crashed the process before a byte was
+/// fetched (RESEXHAUST-001). Catching it here — in the same pre-fetch gate that
+/// already bounds chunk placement — means an adversarial plan costs one comparison,
+/// not one allocation.
 fn validate_pack_plan(packs: &[PackPlanEntry], total_size: u64) -> Result<(), CoreError> {
     for pack in packs {
+        if pack.size > MAX_PACK_SIZE {
+            return Err(CoreError::Integrity(format!(
+                "pack {} declares {} bytes, above the {MAX_PACK_SIZE}-byte per-pack maximum",
+                pack.url, pack.size
+            )));
+        }
         for c in &pack.chunks {
             let end = c.file_offset.checked_add(c.size).ok_or_else(|| {
                 CoreError::Integrity(format!("chunk at file offset {} size {} overflows u64", c.file_offset, c.size))
@@ -505,9 +547,32 @@ async fn fetch_pack_with_retry(
     }
 }
 
+/// Grow `buf` by `additional` bytes, surfacing an allocation failure as an error
+/// instead of the allocator's process abort.
+///
+/// `Vec::with_capacity` / `extend_from_slice` route a failed allocation to
+/// `handle_alloc_error`, which aborts unconditionally: it is not a panic, so
+/// `catch_unwind` cannot see it and pyo3 cannot turn it into a Python exception. One
+/// bad pack would therefore take down the interpreter and every other transfer
+/// sharing the runtime. `try_reserve` is the fallible counterpart, and it still
+/// over-reserves geometrically, so calling it per body chunk is amortized — not a
+/// realloc per read.
+///
+/// Classified as `Io`/`OutOfMemory`, hence retryable: real memory pressure is usually
+/// transient, and the caller's backoff gives the host a chance to recover.
+fn reserve_or_err(buf: &mut Vec<u8>, additional: usize, url: &str) -> Result<(), CoreError> {
+    buf.try_reserve(additional).map_err(|e| {
+        CoreError::Io(std::io::Error::new(
+            std::io::ErrorKind::OutOfMemory,
+            format!("pack {url}: cannot reserve {additional} more bytes: {e}"),
+        ))
+    })
+}
+
 /// Fetch one pack blob whole, verify each carved chunk's sha256, and scatter each
-/// slice to its file offset. Buffering the pack (~64 MiB) is bounded by the
-/// semaphore; the length check rejects a server that over-sends before slicing.
+/// slice to its file offset. Peak memory is bounded by what the server actually sends
+/// (never by what it claims), and the length check rejects an over-sending server
+/// before slicing.
 async fn fetch_pack(
     client: &Client,
     url: &str,
@@ -531,8 +596,19 @@ async fn fetch_pack(
     // balloon memory well past the intended ~pack_size ceiling (x32 concurrent
     // packs) before rejection. Abort the moment the accumulated body exceeds
     // `pack_size`, so peak memory stays bounded to one pack.
-    let cap = usize::try_from(pack_size).unwrap_or(usize::MAX);
-    let mut bytes: Vec<u8> = Vec::with_capacity(cap);
+    //
+    // RESEXHAUST-001: reserve against what has ARRIVED, never against what the
+    // registry merely *claims*. `pack_size` is the manifest's layer size — attacker
+    // chosen — so the previous `Vec::with_capacity(pack_size)` let one manifest entry
+    // demand an arbitrary allocation before a single byte was read: a "capacity
+    // overflow" panic above `isize::MAX`, or a `handle_alloc_error` process abort
+    // below it. `validate_pack_plan` now caps the declaration at `MAX_PACK_SIZE`, and
+    // the reservation is additionally clamped to `PACK_RESERVE_CEILING`, so a pack
+    // that declares much and sends little costs only what it sent. The running
+    // over-send check below still bounds growth against the declared size.
+    let initial = usize::try_from(pack_size.min(PACK_RESERVE_CEILING)).unwrap_or(usize::MAX);
+    let mut bytes: Vec<u8> = Vec::new();
+    reserve_or_err(&mut bytes, initial, url)?;
     let mut received: u64 = 0;
     // Each body read is bounded by the default-on read-idle window (audit M4): a
     // registry that stops streaming mid-pack is cut as a retryable ReadStall instead
@@ -544,6 +620,7 @@ async fn fetch_pack(
                 "pack {url}: body exceeds expected {pack_size} bytes (over-send)"
             )));
         }
+        reserve_or_err(&mut bytes, chunk.len(), url)?;
         bytes.extend_from_slice(&chunk);
     }
     if bytes.len() as u64 != pack_size {
@@ -1090,6 +1167,82 @@ mod tests {
             chunks: vec![chunk_target(0, u64::MAX, 1, String::new())],
         }];
         assert!(matches!(validate_pack_plan(&packs, u64::MAX), Err(CoreError::Integrity(_))));
+    }
+
+    // --- RESEXHAUST-001: a declared pack length is untrusted input ---
+
+    #[test]
+    fn validate_pack_plan_accepts_pack_at_max_size() {
+        // The cap is inclusive. An off-by-one here would reject a pack an honest
+        // uploader running a large `HIPPIUS_n` could legitimately produce.
+        let packs = vec![PackPlanEntry { url: String::new(), size: MAX_PACK_SIZE, chunks: vec![] }];
+        assert!(validate_pack_plan(&packs, MAX_PACK_SIZE).is_ok());
+    }
+
+    #[test]
+    fn validate_pack_plan_rejects_pack_just_above_max_size() {
+        let packs = vec![PackPlanEntry { url: String::new(), size: MAX_PACK_SIZE + 1, chunks: vec![] }];
+        assert!(matches!(validate_pack_plan(&packs, u64::MAX), Err(CoreError::Integrity(_))));
+    }
+
+    #[test]
+    fn validate_pack_plan_rejects_u64_max_pack_size() {
+        // The exact adversarial manifest: a pack claiming u64::MAX bytes. This is what
+        // `Vec::with_capacity` used to turn into a capacity-overflow panic / allocator
+        // abort before a byte was fetched. It must die in the plan gate.
+        let packs = vec![PackPlanEntry { url: String::new(), size: u64::MAX, chunks: vec![] }];
+        assert!(matches!(validate_pack_plan(&packs, u64::MAX), Err(CoreError::Integrity(_))));
+    }
+
+    proptest::proptest! {
+        // The size cap is a pure predicate over the plan, so state it as one: a pack
+        // declaring more than MAX_PACK_SIZE is rejected regardless of what else the plan
+        // holds, and below the cap the verdict is decided purely by chunk placement.
+        // Fixtures pin the boundary; the shrinker covers the combinations nobody wrote.
+        #[test]
+        fn validate_pack_plan_rejects_exactly_when_declared_size_over_cap(
+            size in proptest::prelude::any::<u64>(),
+            chunk_size in 0u64..2000,
+        ) {
+            let total = 1000u64;
+            let packs = vec![PackPlanEntry {
+                url: String::new(),
+                size,
+                chunks: vec![chunk_target(0, chunk_size, 0, String::new())],
+            }];
+            let res = validate_pack_plan(&packs, total);
+            if size > MAX_PACK_SIZE {
+                proptest::prop_assert!(matches!(res, Err(CoreError::Integrity(_))));
+            } else {
+                proptest::prop_assert_eq!(res.is_ok(), chunk_size <= total);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn fetch_pack_does_not_reserve_from_declared_size() {
+        // Regression test for RESEXHAUST-001, and the one that actually fails on the old
+        // code: `Vec::with_capacity(u64::MAX as usize)` panicked with "capacity overflow"
+        // — a stdlib-internal panic the crate's `panic`/`unwrap_used` denials cannot see
+        // — before a single body byte was read. The reservation is now clamped and grows
+        // only with bytes that arrive, so an absurd declaration allocates nothing and
+        // fails cleanly on the length check instead.
+        //
+        // Calls `fetch_pack` directly rather than through `assemble`: `validate_pack_plan`
+        // is the gate, but `fetch_pack` must be safe on its own, not merely by virtue of
+        // its caller checking first.
+        let mut routes = HashMap::new();
+        routes.insert("/pack".to_string(), vec![7u8; 10]);
+        let Some(base) = serve_packs(routes).await.ok() else { return };
+        let Ok(client) = download_client(TransportTimeouts::default()) else { return };
+        let pb = ProgressBar::hidden();
+        let dest = scratch_path("resexhaust_declared");
+        let _g = TempFileGuard(dest.clone());
+        let res = fetch_pack(client, &format!("{base}/pack"), None, u64::MAX, &[], &dest, &pb).await;
+        assert!(
+            matches!(res, Err(CoreError::Integrity(_))),
+            "an absurd declared pack_size must fail cleanly, not allocate: got {res:?}"
+        );
     }
 
     #[test]

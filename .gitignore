@@ -1,4 +1,7 @@
 /target/
+# Security-review run artifacts (findings, SARIF, per-worker coverage) — generated
+# output, not source; regenerate with the rust-review skill rather than committing.
+/.rust-review-results/
 /.venv/
 __pycache__/
 *.pyc
