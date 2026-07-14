@@ -133,6 +133,21 @@ def resolve_pack_size() -> int:
     return _resolve_positive_int("HIPPIUS_PACK_SIZE", DEFAULT_PACK_SIZE)
 
 
+def resolve_dedup_index_url() -> Optional[str]:
+    """Base URL of the global cross-repo chunk-dedup index (C3 / master plan §6.3),
+    or ``None`` when ``HIPPIUS_DEDUP_INDEX_URL`` is unset — in which case cross-repo
+    dedup is OFF and uploads behave exactly as they do today.
+
+    The index is a *cache*, never a source of truth: an unset, slow, or unreachable
+    URL only costs dedup, never correctness (§6.6). The endpoints are
+    ``<url>/v1/chunks/query`` and ``<url>/v1/chunks/announce``. Off by default so the
+    client can ship before the service (in ``hcfs``) and the P3 registry-safety work
+    exist; flipping it on is a deploy-time config change, not a code change.
+    """
+    url = os.environ.get("HIPPIUS_DEDUP_INDEX_URL")
+    return url.rstrip("/") if url else None
+
+
 def resolve_chunked_write_enabled() -> bool:
     """Whether large files upload chunked (default), or as one plain blob.
 
