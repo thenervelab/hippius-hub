@@ -1,0 +1,57 @@
+{
+  "_comment": "Shared key-chunk sampling vectors (frozen contract, storage-efficiency master plan \u00a76.4). Committed byte-identically to BOTH hippius-hub and hcfs; each side pins this file's SHA-256. Regenerate with scripts/gen_key_chunk_vectors.py.",
+  "rule": "int.from_bytes(digest[24:32], 'little') % sample_rate == 0",
+  "sample_rate": 1024,
+  "vectors": [
+    {
+      "digest": "1111111111111111111111111111111111111111111111110000000000000000",
+      "is_key": true,
+      "note": "tail 0 -> hit"
+    },
+    {
+      "digest": "2222222222222222222222222222222222222222222222220004000000000000",
+      "is_key": true,
+      "note": "tail 1024 -> hit"
+    },
+    {
+      "digest": "333333333333333333333333333333333333333333333333001c000000000000",
+      "is_key": true,
+      "note": "tail 7168 -> hit"
+    },
+    {
+      "digest": "4444444444444444444444444444444444444444444444440100000000000000",
+      "is_key": false,
+      "note": "tail 1 -> miss"
+    },
+    {
+      "digest": "555555555555555555555555555555555555555555555555ff03000000000000",
+      "is_key": false,
+      "note": "tail 1023 -> miss"
+    },
+    {
+      "digest": "6666666666666666666666666666666666666666666666660002000000000000",
+      "is_key": false,
+      "note": "tail 512 -> miss"
+    },
+    {
+      "digest": "7777777777777777777777777777777777777777777777770000000000000001",
+      "is_key": true,
+      "note": "endianness trap: LE hit, BE miss"
+    },
+    {
+      "digest": "8888888888888888888888888888888888888888888888880100000000000000",
+      "is_key": false,
+      "note": "endianness trap: LE miss, BE hit"
+    },
+    {
+      "digest": "0000000000000000000000000000000000000000000000000000000000000000",
+      "is_key": true,
+      "note": "all-zero tail -> hit"
+    },
+    {
+      "digest": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+      "is_key": false,
+      "note": "all-0xFF tail (2**64-1) -> miss"
+    }
+  ]
+}
