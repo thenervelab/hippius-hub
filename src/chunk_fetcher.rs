@@ -49,20 +49,13 @@ const VERIFY_READ_BUFFER: usize = 8 * 1024 * 1024;
 /// `total_size` deliberately gets NO equivalent cap: a model file legitimately runs
 /// to hundreds of GB, and it drives a sparse `set_len`, not a buffer. Bound what the
 /// format bounds; leave alone what it doesn't.
-const MAX_PACK_SIZE: u64 = 512 * 1024 * 1024;
-
-/// Cap on the buffer reserved UP FRONT for a pack body, independent of the length the
-/// registry declared.
 ///
-/// Capping the declaration alone (see [`MAX_PACK_SIZE`]) is not sufficient: up to 32
-/// packs are fetched concurrently, so 32 entries each declaring `MAX_PACK_SIZE` and
-/// then sending nothing would still reserve 16 GiB before a byte arrived. Reserving
-/// `min(declared, 64 MiB)` and letting the buffer grow as bytes actually land makes
-/// the memory cost track real traffic — an attacker must *send* the bytes to make us
-/// hold them, which is bandwidth-bound rather than an amplification. 64 MiB keeps the
-/// common case (a default-sized pack) at exactly one allocation, so the hot path pays
-/// nothing for this.
-const PACK_RESERVE_CEILING: u64 = 64 * 1024 * 1024;
+/// This cap is also what bounds the *resident* per-pack buffer, since `fetch_pack`
+/// grows it only with bytes that arrive up to the declared size. So the process-wide
+/// resident ceiling is `packs-in-flight × MAX_PACK_SIZE` worst case (an adversary
+/// sending full-size packs); the honest case stays at the ~64 MiB pack size. See
+/// [`global_pack_gate`] for the concurrency multiplier.
+const MAX_PACK_SIZE: u64 = 512 * 1024 * 1024;
 
 /// Full-request budget for a single chunk-blob GET.
 ///
@@ -222,8 +215,11 @@ pub(crate) fn download_client(timeouts: TransportTimeouts) -> Result<&'static Cl
 
 /// Process-global cap on packs in flight across ALL concurrent downloads (every
 /// file in a snapshot), so the nested snapshot-workers × per-file-concurrency
-/// parallelism cannot multiply resident 64 MiB pack buffers into an OOM
-/// (8 workers × 32 × 64 MiB ≈ 16 GB worst case). Sized from the FIRST call's
+/// parallelism cannot multiply resident pack buffers into an OOM. Each resident
+/// buffer is one honest pack (~64 MiB) in the common case — `8 workers × 32 ×
+/// 64 MiB ≈ 16 GB` — and at most `MAX_PACK_SIZE` (512 MiB) against an adversarial
+/// registry that declares and actually *sends* a full-size pack; this gate is the
+/// count multiplier on that per-pack ceiling. Sized from the FIRST call's
 /// `max_concurrent` (first-caller-wins, like `download_client`): in a uniform
 /// snapshot every file passes the same value, so the total in-flight budget equals
 /// one file's concurrency — a single large file is never throttled, and N files
@@ -555,25 +551,37 @@ async fn fetch_pack_with_retry(
 /// Strip the credential-bearing parts of a blob URL before it reaches an error string.
 ///
 /// Pack URLs are not always plain registry paths: a registry may hand back a presigned
-/// redirect whose signature (and sometimes an access-key id) rides in the query string,
-/// and `scheme://user:pass@host` userinfo is legal too. These errors surface to Python
-/// as exception text and land in logs and bug reports, so the raw URL must not appear
-/// there. Keeps scheme/host/path — enough to identify which pack failed — and drops the
-/// query and userinfo.
+/// redirect whose signature (and sometimes an access-key id) rides in the query string
+/// OR a fragment, and `scheme://user:pass@host` userinfo is legal too. These errors
+/// surface to Python as exception text and land in logs and bug reports, so no such
+/// secret may appear there. Keeps scheme/host/path — enough to identify which pack
+/// failed — and drops userinfo, query, and fragment.
 ///
-/// `@` is only treated as a userinfo separator when it appears in the authority (before
-/// the first `/`); an `@` inside a path is an ordinary character and is preserved.
+/// Parsed in RFC-3986 order so the strip is position-correct rather than delimiter-
+/// order-dependent:
+/// - The authority ends at the first `/`, `?`, or `#`; userinfo is everything up to
+///   the last `@` *within* the authority. An `@` in the path is an ordinary character
+///   and is preserved; a `?`/`#` cannot smuggle userinfo past the authority boundary.
+/// - The remainder is the path plus an optional query/fragment; everything from the
+///   first `?`/`#` is replaced by a redaction marker, so a token in either position is
+///   dropped whichever comes first.
+///
+/// A scheme-less input (`user:pass@host/x`, or a scheme-relative redirect target) is
+/// still parsed as authority+path, so its userinfo is stripped too — the earlier
+/// early-return-on-no-scheme skipped that.
 fn redact_url(url: &str) -> String {
-    let head = url.split_once('?').map_or(url, |(before, _)| before);
-    let Some((scheme, rest)) = head.split_once("://") else {
-        return head.to_string();
+    let (scheme, after_scheme) = match url.split_once("://") {
+        Some((s, rest)) => (format!("{s}://"), rest),
+        None => (String::new(), url),
     };
-    let authority_end = rest.find('/').unwrap_or(rest.len());
-    let (authority, path) = rest.split_at(authority_end);
+    let authority_end = after_scheme.find(['/', '?', '#']).unwrap_or(after_scheme.len());
+    let (authority, remainder) = after_scheme.split_at(authority_end);
     // `rsplit_once` so a `:` or `@` inside the password does not split early.
     let host = authority.rsplit_once('@').map_or(authority, |(_, host)| host);
-    let query_marker = if url.contains('?') { "?<redacted>" } else { "" };
-    format!("{scheme}://{host}{path}{query_marker}")
+    let path_end = remainder.find(['?', '#']).unwrap_or(remainder.len());
+    let path = &remainder[..path_end];
+    let redacted_tail = if path_end < remainder.len() { "?<redacted>" } else { "" };
+    format!("{scheme}{host}{path}{redacted_tail}")
 }
 
 /// Grow `buf` by `additional` bytes, surfacing an allocation failure as an error
@@ -642,18 +650,18 @@ async fn fetch_pack(
     // packs) before rejection. Abort the moment the accumulated body exceeds
     // `pack_size`, so peak memory stays bounded to one pack.
     //
-    // RESEXHAUST-001: reserve against what has ARRIVED, never against what the
-    // registry merely *claims*. `pack_size` is the manifest's layer size — attacker
+    // RESEXHAUST-001: grow the buffer with what has ARRIVED, never reserve against what
+    // the registry merely *claims*. `pack_size` is the manifest's layer size — attacker
     // chosen — so the previous `Vec::with_capacity(pack_size)` let one manifest entry
     // demand an arbitrary allocation before a single byte was read: a "capacity
-    // overflow" panic above `isize::MAX`, or a `handle_alloc_error` process abort
-    // below it. `validate_pack_plan` now caps the declaration at `MAX_PACK_SIZE`, and
-    // the reservation is additionally clamped to `PACK_RESERVE_CEILING`, so a pack
-    // that declares much and sends little costs only what it sent. The running
-    // over-send check below still bounds growth against the declared size.
-    let initial = usize::try_from(pack_size.min(PACK_RESERVE_CEILING)).unwrap_or(usize::MAX);
+    // overflow" panic above `isize::MAX`, or a `handle_alloc_error` process abort below
+    // it. Now the buffer starts empty and each `reserve_or_err` grows it by exactly the
+    // chunk just read (geometrically amortized inside `Vec`), so peak memory equals
+    // bytes actually delivered — an attacker must SEND the bytes to make us hold them,
+    // never merely declare them. Deliberately no up-front reserve sized from the
+    // declaration: that would let N concurrent packs commit N × (declared) before any
+    // body arrived, reintroducing an amplification the running check cannot see.
     let mut bytes: Vec<u8> = Vec::new();
-    reserve_or_err(&mut bytes, initial, url)?;
     let mut received: u64 = 0;
     // Each body read is bounded by the default-on read-idle window (audit M4): a
     // registry that stops streaming mid-pack is cut as a retryable ReadStall instead
@@ -1342,17 +1350,44 @@ mod tests {
     }
 
     #[test]
+    fn redact_url_strips_a_fragment_borne_token() {
+        // A token can ride in the fragment of an odd redirect target. The fragment is
+        // the one credential position the first version ignored entirely.
+        assert_eq!(
+            redact_url("https://cdn.example.com/blobs/x#access_token=SECRET"),
+            "https://cdn.example.com/blobs/x?<redacted>"
+        );
+        // Fragment before an (also-dropped) query — order must not matter.
+        assert_eq!(
+            redact_url("https://cdn.example.com/blobs/x#tok=SECRET?q=1"),
+            "https://cdn.example.com/blobs/x?<redacted>"
+        );
+    }
+
+    #[test]
+    fn redact_url_strips_userinfo_without_a_scheme() {
+        // A scheme-relative or scheme-less redirect target still carries userinfo; the
+        // earlier early-return-on-no-scheme skipped stripping it.
+        assert_eq!(
+            redact_url("user:pass@host.example.com/v2/x"),
+            "host.example.com/v2/x"
+        );
+    }
+
+    #[test]
     fn redact_url_passes_through_a_plain_url_and_a_non_url() {
         assert_eq!(redact_url("https://r.example.com/v2/x"), "https://r.example.com/v2/x");
+        assert_eq!(redact_url("file:///local/pack"), "file:///local/pack");
         assert_eq!(redact_url("not-a-url"), "not-a-url");
         assert_eq!(redact_url(""), "");
     }
 
     proptest::proptest! {
-        // The property that matters for a redactor: a secret placed in either
-        // credential-bearing position must never survive into the output — for ANY host
-        // and path, not just the ones we thought to write. Idempotence is asserted
-        // alongside it, since these strings get re-formatted through error wrappers.
+        // The property that matters for a redactor: a secret placed in ANY of the three
+        // credential-bearing positions — query, userinfo, fragment — must never survive
+        // into the output, for any host and path, not just the ones we thought to write.
+        // The fragment arm is what the first cut leaked. Idempotence is asserted
+        // alongside, since these strings get re-formatted through error wrappers.
         #[test]
         fn redact_url_never_leaks_a_secret(
             host in "[a-z][a-z0-9.]{0,20}",
@@ -1361,7 +1396,8 @@ mod tests {
         ) {
             let in_query = format!("https://{host}/{path}?sig={secret}");
             let in_userinfo = format!("https://admin:{secret}@{host}/{path}");
-            for url in [&in_query, &in_userinfo] {
+            let in_fragment = format!("https://{host}/{path}#tok={secret}");
+            for url in [&in_query, &in_userinfo, &in_fragment] {
                 let out = redact_url(url);
                 proptest::prop_assert!(!out.contains(&secret), "secret leaked into {out}");
                 proptest::prop_assert_eq!(redact_url(&out), out.clone(), "not idempotent");
@@ -1376,21 +1412,37 @@ mod tests {
         // guarantee holds only while the two constants are equal — a drift would either
         // reopen the hole (Python higher) or make our own uploads unreadable (Python
         // lower). Parse the Python constant and pin them together.
-        let src = std::fs::read_to_string("hippius_hub/constants.py");
-        let Ok(src) = src else { return }; // not running from the repo root; nothing to pin
-        let declared = src
+        //
+        // Anchor the path to CARGO_MANIFEST_DIR, not the process cwd: a suite run from
+        // the workspace root (or an IDE/CI harness) would otherwise miss the relative
+        // file and — if this failed open — silently un-pin the invariant. Read via
+        // `unwrap_or_default` + `assert!` rather than `?`/`unwrap` so a moved or
+        // unreadable file fails LOUD while still satisfying the crate's `unwrap_used`
+        // / `panic` denials (which apply to test code here).
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("hippius_hub/constants.py");
+        let src = std::fs::read_to_string(&path).unwrap_or_default();
+        assert!(
+            !src.is_empty(),
+            "cannot read {} — the cross-language pin cannot run",
+            path.display()
+        );
+        // Collect EVERY parseable `MAX_PACK_SIZE = a * b * ...` line and require exactly
+        // one equal to the Rust value. Asserting the whole vector (not the first match)
+        // means a stray decoy line at column 0 fails the pin instead of shadowing the
+        // real assignment.
+        let declared: Vec<u64> = src
             .lines()
-            .find_map(|l| l.strip_prefix("MAX_PACK_SIZE = "))
-            .and_then(|expr| {
-                // Value is written as `512 * 1024 * 1024`; evaluate the product.
+            .filter_map(|l| l.strip_prefix("MAX_PACK_SIZE = "))
+            .filter_map(|expr| {
                 expr.split('*')
                     .map(|t| t.trim().parse::<u64>().ok())
                     .try_fold(1u64, |acc, n| n.map(|n| acc * n))
-            });
+            })
+            .collect();
         assert_eq!(
             declared,
-            Some(MAX_PACK_SIZE),
-            "hippius_hub/constants.py MAX_PACK_SIZE must equal the Rust MAX_PACK_SIZE ({MAX_PACK_SIZE})"
+            vec![MAX_PACK_SIZE],
+            "hippius_hub/constants.py must declare exactly one `MAX_PACK_SIZE = a * b * ...` equal to the Rust MAX_PACK_SIZE ({MAX_PACK_SIZE})"
         );
     }
 
