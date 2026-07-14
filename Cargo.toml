@@ -59,6 +59,18 @@ sha2 = "0.10"
 
 [dev-dependencies]
 proptest = "1.5"
+# A6 microbenchmarks (benches/hashing.rs). criterion + blake3 are bench-only;
+# sha2/zstd are already normal deps but a bench is a separate crate that only sees
+# dev-dependencies, so they are re-declared here. Feature unification carries the
+# normal dep's `asm` on aarch64, so the bench measures the shipped hardware SHA path.
+criterion = "0.5"
+blake3 = "1"
+sha2 = "0.10"
+zstd = "0.13"
+
+[[bench]]
+name = "hashing"
+harness = false
 
 # The extension is CPU-bound on the hash/chunking hot loops, so trade build time
 # for cross-crate inlining of the FastCDC gear-hash, hex::encode, and bytes/reqwest
