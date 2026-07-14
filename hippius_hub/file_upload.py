@@ -17,7 +17,7 @@ import time
 import warnings
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from typing import BinaryIO, Dict, List, Optional, Union
+from typing import BinaryIO, Dict, List, Optional, Tuple, Union
 
 import httpx
 from huggingface_hub import CommitInfo
@@ -265,6 +265,43 @@ def _build_dedup_index(
     return chunk_index, pack_sizes
 
 
+class _LiveDedupIndex:
+    """Thread-safe dedup index shared across a folder's concurrent file uploads so
+    that a chunk packed by one file is reused by LATER files in the SAME push
+    instead of re-uploaded (the intra-batch dedup fix). Seeded from the prior
+    revision (`_build_dedup_index`), then each file publishes its own chunks — and
+    the packs it created — as it completes, via `publish`.
+
+    Reads take a consistent snapshot (`snapshot`); writes are first-writer-wins
+    (`setdefault`). Two files racing on the same novel chunk and both packing it is
+    ACCEPTABLE — one duplicated chunk, never an incorrect result, because chunks are
+    content-addressed. Serialising the uploads to prevent that race would be far
+    worse than the race, so the lock is held only for the O(index) snapshot copy and
+    the small publish merge — never across a network upload.
+    """
+
+    def __init__(self, chunk_index: Dict[str, tuple], pack_sizes: Dict[str, int]):
+        self._lock = threading.Lock()
+        self._chunk_index = dict(chunk_index)
+        self._pack_sizes = dict(pack_sizes)
+
+    def snapshot(self) -> Tuple[Dict[str, tuple], Dict[str, int]]:
+        """A point-in-time copy of the index for one file's `plan_packs`. Copying
+        (rather than sharing the live dict) both gives a consistent view and avoids
+        a "dict changed size during iteration" if another file publishes mid-plan."""
+        with self._lock:
+            return dict(self._chunk_index), dict(self._pack_sizes)
+
+    def publish(self, chunks: Dict[str, tuple], pack_sizes: Dict[str, int]) -> None:
+        """Record a completed file's chunk locations and the packs it created, so a
+        subsequent file's snapshot reuses them. First-writer-wins."""
+        with self._lock:
+            for digest, location in chunks.items():
+                self._chunk_index.setdefault(digest, location)
+            for pack_digest, size in pack_sizes.items():
+                self._pack_sizes.setdefault(pack_digest, size)
+
+
 # Process-wide bound on concurrent pack uploads. Shared across every file in a
 # folder upload so the nested file×pack parallelism cannot multiply resident pack
 # buffers past one ceiling. Rebuilt only when the configured cap changes (between
@@ -292,6 +329,7 @@ def _upload_file_chunked_v2(
     oci_token: str,
     dedup_index: Dict[str, tuple],
     pack_sizes: Dict[str, int],
+    live_index: Optional["_LiveDedupIndex"] = None,
 ) -> List[dict]:
     """Store a large file as a chunked-v2 pointer + ~64 MiB pack blobs.
 
@@ -302,6 +340,11 @@ def _upload_file_chunked_v2(
     last, like v1, so a crash leaves only unreferenced packs for GC."""
     whole_hex, chunk_metas = chunk_and_hash_native(abs_path, resolve_cdc_avg_size())
     chunks = [(f"sha256:{h}", size, offset) for h, offset, size in chunk_metas]
+    # Intra-batch dedup (C2): in a folder upload, plan against a LIVE snapshot that
+    # already includes chunks earlier files in this same push have stored — not just
+    # the prior revision's static index.
+    if live_index is not None:
+        dedup_index, pack_sizes = live_index.snapshot()
     plan = plan_packs(chunks, dedup_index, resolve_pack_size())
     uploads_url = f"{registry}/v2/{oci_repo}/blobs/uploads/"
 
@@ -335,6 +378,19 @@ def _upload_file_chunked_v2(
     all_pack_sizes = dict(pack_sizes)
     for new_pack, digest in zip(plan.new_packs, new_pack_digests):
         all_pack_sizes[digest] = new_pack.size
+
+    # Publish this file's chunk locations and the packs it just created so LATER
+    # files in the same folder upload reuse them instead of re-packing (C2). Reused
+    # chunks are already in the index (setdefault no-ops); the new ones are what a
+    # subsequent file will dedup against.
+    if live_index is not None:
+        live_index.publish(
+            chunks={cd: (pd, off) for cd, _sz, pd, off in pointer_chunks},
+            pack_sizes={
+                digest: new_pack.size
+                for new_pack, digest in zip(plan.new_packs, new_pack_digests)
+            },
+        )
 
     pointer_layer = {
         "mediaType": POINTER_MEDIA_TYPE_V2,
@@ -373,6 +429,7 @@ def _upload_file_layers(
     oci_token: str,
     dedup_index: Optional[Dict[str, tuple]] = None,
     pack_sizes: Optional[Dict[str, int]] = None,
+    live_index: Optional["_LiveDedupIndex"] = None,
 ) -> List[dict]:
     """Upload one file and return its manifest layer(s).
 
@@ -380,12 +437,14 @@ def _upload_file_layers(
     ~64 MiB packs, reusing prior chunks by range via `dedup_index`) unless the
     rollout gate (`HIPPIUS_CHUNKED_WRITE=0`) forces plain uploads. Below the
     threshold, one plain blob — byte-identical to the pre-chunking layout, so
-    small files cross-dedup."""
+    small files cross-dedup. `live_index`, when present (folder uploads), supersedes
+    the static `dedup_index` so a file reuses chunks earlier files in the same push
+    stored (C2)."""
     file_size = os.path.getsize(abs_path)
     if file_size >= resolve_chunk_threshold() and resolve_chunked_write_enabled():
         return _upload_file_chunked_v2(
             abs_path, repo_title, file_size, registry, oci_repo, oci_token,
-            dedup_index or {}, pack_sizes or {},
+            dedup_index or {}, pack_sizes or {}, live_index=live_index,
         )
     sha256_hash, size = hash_file_native(abs_path)
     if not _ensure_blob_uploaded(registry, oci_repo, oci_token, abs_path, sha256_hash):
@@ -810,6 +869,7 @@ def _upload_one_file(
     oci_token: str,
     dedup_index: Optional[Dict[str, tuple]] = None,
     pack_sizes: Optional[Dict[str, int]] = None,
+    live_index: Optional["_LiveDedupIndex"] = None,
 ) -> List[dict]:
     """Upload one file from a folder and return its manifest layer(s).
 
@@ -817,15 +877,17 @@ def _upload_one_file(
     chunk layers (a plain file contributes one). Extracted from the per-file
     closure in `upload_folder` so the thread-pool body is testable in isolation.
 
-    `dedup_index`/`pack_sizes` come from the prior revision (built once by
-    `upload_folder`) so a chunked file references already-stored chunks by range
-    instead of re-uploading them; empty/None for plain uploads.
+    `dedup_index`/`pack_sizes` seed the reuse from the prior revision (built once by
+    `upload_folder`); `live_index` extends it across the batch so a chunked file
+    also references chunks earlier files in this same push stored (C2), instead of
+    re-uploading them. Empty/None for plain uploads.
     """
     abs_path = os.path.join(base_dir, rel_path)
     repo_title = f"{path_in_repo}/{rel_path}" if path_in_repo else rel_path
     tqdm.write(f"🚀 Uploading: {repo_title} ({os.path.getsize(abs_path)} bytes)...")
     layers = _upload_file_layers(
-        abs_path, repo_title, registry, oci_repo, oci_token, dedup_index, pack_sizes
+        abs_path, repo_title, registry, oci_repo, oci_token, dedup_index, pack_sizes,
+        live_index=live_index,
     )
     tqdm.write(f"✅ Uploaded: {repo_title}")
     return layers
@@ -1122,6 +1184,12 @@ def upload_folder(
                     prior, registry, oci_repo, oci_token, exclude_packs=exclude_packs
                 )
 
+        # One live index shared across the fan-out (C2): seeded from the prior
+        # revision above, then each file publishes its own chunks as it completes so
+        # later files in this same push reuse them instead of re-uploading. Cheap and
+        # unused when nothing is chunked.
+        live_index = _LiveDedupIndex(dedup_index, pack_sizes)
+
         new_layers = []
         if filtered:
             print(f"📦 Preparing to upload {len(filtered)} file(s) to {repo_id}:{revision}...")
@@ -1137,6 +1205,7 @@ def upload_folder(
                         oci_token=oci_token,
                         dedup_index=dedup_index,
                         pack_sizes=pack_sizes,
+                        live_index=live_index,
                     )
                     for rel in filtered
                 ]
