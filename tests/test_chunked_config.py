@@ -23,11 +23,11 @@ def test_threshold_default(monkeypatch):
     assert resolve_chunk_threshold() == DEFAULT_CHUNK_THRESHOLD == 256 * 1024 * 1024
 
 
-def test_cdc_avg_default_is_fastcdc_ceiling(monkeypatch):
-    # 4 MiB is fastcdc's AVERAGE_MAX — the largest average the splitter accepts.
-    # A larger default (the original 64 MiB) panics the Rust chunker.
+def test_cdc_avg_default_is_256kib(monkeypatch):
+    # 256 KiB, chosen by the C5 measurement. Inside fastcdc's [256 B, 4 MiB] average
+    # range (derived min=64 KiB, max=1 MiB), so no crate swap. See constants.py.
     monkeypatch.delenv("HIPPIUS_CDC_AVG_SIZE", raising=False)
-    assert resolve_cdc_avg_size() == DEFAULT_CDC_AVG_SIZE == 4 * 1024 * 1024
+    assert resolve_cdc_avg_size() == DEFAULT_CDC_AVG_SIZE == 256 * 1024
 
 
 def test_threshold_and_avg_override(monkeypatch):

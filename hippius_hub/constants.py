@@ -103,14 +103,19 @@ DEFAULT_TRANSFER_WORKERS = 8            # snapshot/upload ThreadPoolExecutor siz
 # splitter) and is part of the wire contract — a change means a new layout
 # version, not a silent retune.
 DEFAULT_CHUNK_THRESHOLD = 256 * 1024 * 1024  # 256 MiB
-# 4 MiB is the LARGEST average fastcdc 3.2.1 can produce: its AVERAGE_MAX cap is
-# 4 MiB, and via min=avg/4 / max=avg*4 the derived 1 MiB min and 16 MiB max are
-# that crate's MINIMUM_MAX / MAXIMUM_MAX ceilings exactly. A larger average — the
-# original 64 MiB "HF value" — panics the splitter (min=16 MiB > MINIMUM_MAX).
-# (HF's 64 MiB is a transfer block aggregating many small CDC chunks, not a CDC
-# average.) Smaller = finer dedup but more blobs; 4 MiB keeps blob counts low
-# while staying inside the caps. src/uploader.rs enforces the same bound.
-DEFAULT_CDC_AVG_SIZE = 4 * 1024 * 1024        # 4 MiB (fastcdc AVERAGE_MAX ceiling)
+# 256 KiB, chosen by the C5 measurement (scripts/phase0/chunk_size_measure.py).
+# fastcdc's accepted average is [256 B, 4 MiB]; at 256 KiB the derived min=avg/4=
+# 64 KiB and max=avg*4=1 MiB are both inside the crate's MINIMUM_MAX / MAXIMUM_MAX,
+# so no crate swap is needed. Smaller = finer dedup but a larger pointer, and the
+# pointer is downloaded on EVERY fetch of the file (~200 B/chunk, so a 4 GB shard
+# is ~16k chunks ≈ ~3 MB pointer at this size). 256 KiB captures nearly all the
+# dedup of the 64 KiB theoretical optimum at a quarter of that pointer overhead.
+#
+# This was 4 MiB — fastcdc's AVERAGE_MAX ceiling, mistaken for a design choice.
+# IRREVERSIBLE: chunks written at 256 KiB never dedup against 4 MiB chunks already
+# stored, so lowering this forks the dedup namespace once, permanently (master plan
+# Decision 3 / C5). src/uploader.rs enforces the same [256 B, 4 MiB] bound.
+DEFAULT_CDC_AVG_SIZE = 256 * 1024             # 256 KiB (C5; within fastcdc's range)
 
 
 def resolve_chunk_threshold() -> int:
