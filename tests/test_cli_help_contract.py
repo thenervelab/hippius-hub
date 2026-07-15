@@ -55,7 +55,7 @@ def test_top_level_help_lists_all_subcommands():
     own listing IS the surface this test pins.
     """
     out = _help()
-    for sub in ("download", "upload", "login", "registry", "models"):
+    for sub in ("download", "upload", "delete", "login", "registry", "models"):
         assert sub in out, f"subcommand {sub!r} missing from `--help`"
 
 
@@ -81,6 +81,15 @@ def test_upload_help_pins_documented_flags():
     out = _help("upload")
     for flag in ("repo_id", "local_path", "--revision"):
         assert flag in out, f"upload flag/arg {flag!r} missing from --help"
+
+
+# ---- delete ----
+
+
+def test_delete_help_pins_documented_flags():
+    out = _help("delete")
+    for flag in ("<project>/<repo>", "--repo-type", "--yes", "--missing-ok"):
+        assert flag in out, f"delete flag/arg {flag!r} missing from --help"
 
 
 # ---- login ----

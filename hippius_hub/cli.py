@@ -1,6 +1,6 @@
 """`hippius-hub` command-line entry point.
 
-Dispatches `download` / `upload` / `login` / `registry` / `models` subcommands
+Dispatches `download` / `upload` / `delete` / `login` / `registry` / `models` subcommands
 to the module-level functions in `hippius_hub.*`. Maps exceptions raised by
 those functions to typed exit codes so CI wrappers can branch on the failure
 mode (see `_format_download_error`).
@@ -597,6 +597,18 @@ def _build_parser() -> argparse.ArgumentParser:
     u.add_argument("repo_id"); u.add_argument("local_path")
     u.add_argument("--revision", default="main")
 
+    # Delete: remove a repository and ALL its revisions via Harbor's native
+    # repository DELETE. This is the only delete path that removes the repo
+    # record itself — the registry console API only cascades artifacts and
+    # leaves an empty repo behind.
+    dl = sub.add_parser("delete", help="Delete a repository and all its revisions")
+    dl.add_argument("repo_id", metavar="<project>/<repo>")
+    dl.add_argument("--repo-type", default=None)
+    dl.add_argument("-y", "--yes", action="store_true",
+                    help="Skip the interactive confirmation (for scripts/CI)")
+    dl.add_argument("--missing-ok", action="store_true",
+                    help="Exit 0 if the repository is already gone")
+
     # Revisions: list a repository's revisions, newest first.
     rev = sub.add_parser("revisions", help="List a repository's revisions, newest first")
     rev.add_argument("repo_id")
@@ -774,6 +786,34 @@ def _cmd_upload(args):
         sys.exit(code)
 
 
+def _cmd_delete(args):
+    # Lazy import mirrors _cmd_upload: the delete path pulls in the Harbor
+    # client, which `download`/`--help` should not pay for.
+    from ._repo_ops import delete_repo
+    # Deleting a repo is irreversible and removes every revision, so a lone
+    # typo would wipe the wrong model. Require an explicit confirmation
+    # unless -y/--yes was passed. EOFError (piped/non-interactive stdin with
+    # no --yes) is treated as "no" rather than crashing.
+    if not args.yes:
+        try:
+            reply = input(
+                f"Delete repository '{args.repo_id}' and ALL its revisions? "
+                f"This cannot be undone [y/N]: "
+            ).strip().lower()
+        except EOFError:
+            reply = ""
+        if reply not in ("y", "yes"):
+            print("Aborted.")
+            return
+    try:
+        delete_repo(args.repo_id, repo_type=args.repo_type, missing_ok=args.missing_ok)
+    except Exception as e:
+        msg, code = _format_download_error(e)
+        print(msg)
+        sys.exit(code)
+    print(f"✅ Deleted repository: {args.repo_id}")
+
+
 def _cmd_diagnose(args):
     # --verbose surfaces per-chunk transport logs (Rust tracing + Python logging).
     # Set before the import so the native layer picks it up on first call.
@@ -858,6 +898,7 @@ def main():
     handlers = {
         "download": _cmd_download,
         "upload": _cmd_upload,
+        "delete": _cmd_delete,
         "login": _cmd_login,
         "revisions": cmd_revisions,
         "diagnose": _cmd_diagnose,

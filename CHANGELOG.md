@@ -7,6 +7,17 @@ the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 
 ## [Unreleased]
 
+### Added
+
+- **`hippius-hub delete <project>/<repo>` CLI command.** Deletes a repository and
+  all its revisions through Harbor's native repository DELETE (the same path as
+  the `delete_repo` library function) — the only delete that removes the
+  repository record, not just its artifacts. Prompts for confirmation before
+  deleting; `-y`/`--yes` skips the prompt for scripts/CI, `--missing-ok` exits 0
+  when the repository is already gone. Previously repo deletion was only reachable
+  as a Python API call, so users scripting against the registry console endpoint
+  were left with empty, artifact-less repositories.
+
 ## [0.6.0] — 2026-07-13
 
 ### Changed (behavioral default — read before upgrading producers)
