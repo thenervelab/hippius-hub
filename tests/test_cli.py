@@ -34,6 +34,78 @@ def test_cli_login_writes_token(tmp_path, monkeypatch):
     )
 
 
+def _delete_args(**over):
+    import argparse
+    ns = argparse.Namespace(repo_id="acme/model", repo_type=None,
+                            yes=False, missing_ok=False)
+    for k, v in over.items():
+        setattr(ns, k, v)
+    return ns
+
+
+def test_cli_delete_aborts_without_confirmation(monkeypatch, capsys):
+    """A bare `delete` without -y must NOT call delete_repo unless the user
+    types 'y' — a typo'd repo_id would otherwise wipe the wrong model."""
+    from hippius_hub import _repo_ops, cli
+
+    called = []
+    monkeypatch.setattr(_repo_ops, "delete_repo", lambda *a, **k: called.append((a, k)))
+    monkeypatch.setattr("builtins.input", lambda _prompt: "n")
+
+    cli._cmd_delete(_delete_args())
+
+    assert called == [], "delete_repo must not run when the user declines"
+    assert "Aborted." in capsys.readouterr().out
+
+
+def test_cli_delete_proceeds_on_yes_confirmation(monkeypatch):
+    from hippius_hub import _repo_ops, cli
+
+    called = []
+    monkeypatch.setattr(_repo_ops, "delete_repo", lambda *a, **k: called.append((a, k)))
+    monkeypatch.setattr("builtins.input", lambda _prompt: "y")
+
+    cli._cmd_delete(_delete_args())
+
+    assert called == [(("acme/model",), {"repo_type": None, "missing_ok": False})]
+
+
+def test_cli_delete_yes_flag_skips_prompt(monkeypatch):
+    """-y is the CI/non-interactive path: it must never touch stdin."""
+    from hippius_hub import _repo_ops, cli
+
+    called = []
+    monkeypatch.setattr(_repo_ops, "delete_repo", lambda *a, **k: called.append((a, k)))
+
+    def _boom(_prompt):
+        raise AssertionError("--yes must not prompt")
+
+    monkeypatch.setattr("builtins.input", _boom)
+
+    cli._cmd_delete(_delete_args(yes=True))
+
+    assert len(called) == 1
+
+
+def test_cli_delete_noninteractive_stdin_aborts(monkeypatch, capsys):
+    """Piped stdin with no --yes raises EOFError on input(); that is treated
+    as 'no' (safe default), not a crash."""
+    from hippius_hub import _repo_ops, cli
+
+    called = []
+    monkeypatch.setattr(_repo_ops, "delete_repo", lambda *a, **k: called.append((a, k)))
+
+    def _eof(_prompt):
+        raise EOFError
+
+    monkeypatch.setattr("builtins.input", _eof)
+
+    cli._cmd_delete(_delete_args())
+
+    assert called == []
+    assert "Aborted." in capsys.readouterr().out
+
+
 @pytest.mark.e2e
 def test_cli_download_smoke(tmp_path, test_repo, creds, revision):
     src = tmp_path / "cli.bin"
