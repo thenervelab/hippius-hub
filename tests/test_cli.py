@@ -148,7 +148,12 @@ def test_cli_delete_smoke(tmp_path, test_repo, creds):
     not-found exit code (11). Skips when the credential is push-only (delete
     hits Harbor's admin API and 403s → exit 14), matching the admin-perm
     handling in test_repo_lifecycle. Uses a uuid-suffixed repo under the
-    existing test namespace so concurrent CI runs never collide."""
+    existing test namespace so concurrent CI runs never collide.
+
+    Note: on a push-only credential the upload succeeds but the delete (and the
+    finally-cleanup) 403 and skip, so the uploaded stub repo is left behind —
+    inherent to testing delete (you must create something first) and consistent
+    with the push-only handling already accepted in test_phase_b's delete e2e."""
     import uuid
 
     repo = f"{test_repo.split('/')[0]}/cli-del-{uuid.uuid4().hex[:8]}"
