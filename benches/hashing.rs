@@ -48,7 +48,7 @@ fn pseudo_random(len: usize) -> Vec<u8> {
     v
 }
 
-/// The keyed-BLAKE3 key is a compile-time constant in Xet (DATA_KEY). Any fixed
+/// The keyed-BLAKE3 key is a compile-time constant in Xet (`DATA_KEY`). Any fixed
 /// 32-byte key exercises the same code path; the value does not affect throughput.
 const KEYED_BLAKE3_KEY: [u8; 32] = [0x42; 32];
 
