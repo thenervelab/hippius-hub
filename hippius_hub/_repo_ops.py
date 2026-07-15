@@ -166,11 +166,11 @@ def delete_repo(repo_id: str, *, token: Union[bool, str, None] = None,
     project, repo = split_repo_id(_oci_repo_path(repo_id, repo_type))
     auth_header = resolve_auth_header(token, endpoint=endpoint)
     if auth_header is None:
-        # Same HfHubHTTPError-needs-a-response requirement as above; without
-        # this the raise itself throws TypeError instead of the intended error.
-        from httpx import Request, Response
-        fake_resp = Response(401, request=Request("GET", resolve_registry(endpoint)))
-        raise RepositoryNotFoundError("delete_repo requires authentication", response=fake_resp)
+        # A missing local credential is a login problem, not a repo-not-found:
+        # raise LocalTokenNotFoundError like create_repo does (same message
+        # shape), so the CLI can route it to "not logged in" rather than the
+        # misleading "repository not found" the old RepositoryNotFoundError gave.
+        raise LocalTokenNotFoundError("Authentication required; run `hippius-hub login` first.")
     harbor_delete_repository(auth_header, project, repo, endpoint=endpoint, missing_ok=missing_ok, )
 
 

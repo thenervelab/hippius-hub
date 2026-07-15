@@ -18,6 +18,19 @@ the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html
   as a Python API call, so users scripting against the registry console endpoint
   were left with empty, artifact-less repositories.
 
+### Fixed
+
+- **`hippius-hub delete` now returns actionable exit codes for HTTP failures.**
+  `delete_repo` reaches Harbor over httpx and raises `httpx.HTTPStatusError`
+  directly, which the CLI's error mapper did not recognize — every delete HTTP
+  failure collapsed to the generic exit 1. A 403 (the token lacks
+  push-delete/admin) now maps to access-denied (14) and a 404 (no such repo) to
+  not-found (11), matching the codes their huggingface_hub-typed siblings get.
+  A missing local credential now raises `LocalTokenNotFoundError` (as
+  `create_repo` already did) and the CLI reports "not logged in" (14) instead of
+  the misleading "repository not found" (11) the previous `RepositoryNotFoundError`
+  produced.
+
 ## [0.6.0] — 2026-07-13
 
 ### Changed (behavioral default — read before upgrading producers)

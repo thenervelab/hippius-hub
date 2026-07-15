@@ -502,6 +502,20 @@ def test_delete_repo_rejects_unknown_repo_type():
         delete_repo("any/repo", repo_type="bogus")
 
 
+def test_delete_repo_missing_token_raises_local_token_not_found(monkeypatch):
+    """No usable credential is a login problem, not repo-not-found. delete_repo
+    raises LocalTokenNotFoundError (mirroring create_repo) so the CLI can route
+    it to 'not logged in' (exit 14) instead of the misleading 'repository not
+    found' the old RepositoryNotFoundError produced. Auth is stubbed to None so
+    the test never touches the network."""
+    from hippius_hub import _repo_ops
+    from hippius_hub.errors import LocalTokenNotFoundError
+
+    monkeypatch.setattr(_repo_ops, "resolve_auth_header", lambda *a, **k: None)
+    with pytest.raises(LocalTokenNotFoundError, match="login"):
+        delete_repo("proj/repo")
+
+
 # ---------- HF-only kwargs: warn vs raise ----------
 
 def test_upload_file_create_pr_warns_and_proceeds_to_validation(tmp_path):

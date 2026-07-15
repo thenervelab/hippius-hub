@@ -139,3 +139,68 @@ def test_cli_download_smoke(tmp_path, test_repo, creds, revision):
     assert "downloaded to" in out.lower()
     expected_file = target_cache / f"models--{test_repo.replace('/', '--')}" / "snapshots" / revision / "cli.bin"
     assert expected_file.is_file()
+
+
+@pytest.mark.e2e
+def test_cli_delete_smoke(tmp_path, test_repo, creds):
+    """End-to-end for the `delete` CLI: create a disposable repo (via upload),
+    delete it with `-y`, then prove it's gone by a second delete returning the
+    not-found exit code (11). Skips when the credential is push-only (delete
+    hits Harbor's admin API and 403s → exit 14), matching the admin-perm
+    handling in test_repo_lifecycle. Uses a uuid-suffixed repo under the
+    existing test namespace so concurrent CI runs never collide.
+
+    Note: on a push-only credential the upload succeeds but the delete (and the
+    finally-cleanup) 403 and skip, so the uploaded stub repo is left behind —
+    inherent to testing delete (you must create something first) and consistent
+    with the push-only handling already accepted in test_phase_b's delete e2e."""
+    import uuid
+
+    repo = f"{test_repo.split('/')[0]}/cli-del-{uuid.uuid4().hex[:8]}"
+    src = tmp_path / "d.bin"
+    src.write_bytes(b"hippius-cli-delete-smoke\n" * 16)
+
+    env = {**os.environ, "HOME": str(tmp_path)}
+    (tmp_path / ".cache" / "hippius" / "hub").mkdir(parents=True)
+
+    if creds.get("user") and creds.get("password"):
+        login_cmd = HIPPIUS_CLI + ["login", "--username", creds["user"], "--password", creds["password"]]
+    else:
+        login_cmd = HIPPIUS_CLI + ["login", "--token", creds["token"]]
+    subprocess.run(login_cmd, env=env, check=True, capture_output=True)
+
+    # Upload materializes the repo under the (already-provisioned) namespace.
+    subprocess.run(
+        HIPPIUS_CLI + ["upload", repo, str(src)],
+        env=env, check=True, capture_output=True,
+    )
+
+    try:
+        deleted = subprocess.run(
+            HIPPIUS_CLI + ["delete", repo, "-y"],
+            env=env, capture_output=True, text=True,
+        )
+        if deleted.returncode == 14:
+            pytest.skip(
+                "delete requires Harbor project_admin perms; credential is "
+                "push-only (mapped to access-denied, exit 14)."
+            )
+        assert deleted.returncode == 0, (
+            f"delete exited {deleted.returncode}\n{deleted.stdout}\n{deleted.stderr}"
+        )
+        assert "Deleted repository" in deleted.stdout
+
+        # Proof of removal: a second delete (no --missing-ok) 404s, which the
+        # CLI maps to the repository-not-found exit code (11).
+        gone = subprocess.run(
+            HIPPIUS_CLI + ["delete", repo, "-y"],
+            env=env, capture_output=True, text=True,
+        )
+        assert gone.returncode == 11, (
+            f"second delete should report not-found (11), got {gone.returncode}\n{gone.stdout}"
+        )
+    finally:
+        subprocess.run(
+            HIPPIUS_CLI + ["delete", repo, "-y", "--missing-ok"],
+            env=env, capture_output=True,
+        )

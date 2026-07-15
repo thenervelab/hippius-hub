@@ -73,14 +73,21 @@ def _format_download_error(e: Exception) -> tuple[str, int]:
         1  generic failure (unknown exception)
         2  reserved — argparse usage error (set elsewhere in cli.py)
         10 file not found in repo (EntryNotFoundError)
-        11 repository not found (RepositoryNotFoundError)
+        11 repository not found (RepositoryNotFoundError, raw httpx 404)
         12 revision not found (RevisionNotFoundError)
         13 local cache miss (LocalEntryNotFoundError)
-        14 access denied (GatedRepoError, DisabledRepoError)
+        14 access denied (GatedRepoError, DisabledRepoError,
+           LocalTokenNotFoundError, raw httpx 401/403)
         15 concurrent manifest write (ConcurrentManifestUpdateError)
-        16 registry HTTP error (HfHubHTTPError)
+        16 registry HTTP error (HfHubHTTPError, other raw httpx status)
         17 registry namespace not available (set by cmd_registry_check)
         18 malformed `<project>/<repo>` CLI argument (set by registry/models)
+
+    `delete_repo` reaches Harbor over httpx and raises `httpx.HTTPStatusError`
+    directly (not the HF-typed hierarchy), so the raw-httpx arm below maps its
+    403 (token lacks push-delete/admin) and 404 (no such repo) to the same
+    actionable codes their HF-typed siblings get — without it, every delete
+    HTTP failure collapsed to the generic code 1.
 
     Codes start at 10 (not 2) to avoid colliding with bash's reserved
     exit code 2 ("misuse of shell builtin") and argparse's default for
@@ -104,6 +111,8 @@ def _format_download_error(e: Exception) -> tuple[str, int]:
     as a generic HTTP error (16) instead of the actionable concurrent-
     write code (15).
     """
+    import httpx
+
     from .errors import (
         ConcurrentManifestUpdateError,
         DisabledRepoError,
@@ -111,9 +120,19 @@ def _format_download_error(e: Exception) -> tuple[str, int]:
         GatedRepoError,
         HfHubHTTPError,
         LocalEntryNotFoundError,
+        LocalTokenNotFoundError,
         RepositoryNotFoundError,
         RevisionNotFoundError,
     )
+    # A missing local credential (no saved token / `--token` that resolves to
+    # nothing) is an OSError subclass, disjoint from the HfHubHTTPError tree, so
+    # order-independent. Route it to "not logged in" with the access-denied code.
+    if isinstance(e, LocalTokenNotFoundError):
+        return (
+            "❌ Not logged in. Run `hippius-hub login --hippius-token <token>` "
+            "(get one from https://console.hippius.com).",
+            14,
+        )
     # Subclass-first: LocalEntryNotFoundError inherits from Entry-
     # NotFoundError. Checking the parent first would route every cache
     # miss to code 10 (file-not-found-in-repo) — wrong actionable hint.
@@ -143,6 +162,16 @@ def _format_download_error(e: Exception) -> tuple[str, int]:
             15,
         )
     if isinstance(e, HfHubHTTPError):
+        return (f"❌ Registry HTTP error: {e}", 16)
+    # Raw httpx errors (delete_repo → Harbor) carry no HF type. Map by status
+    # so `hippius delete` gets the same actionable exit codes as its typed
+    # siblings; anything without a usable status falls through to generic.
+    if isinstance(e, httpx.HTTPStatusError):
+        status = e.response.status_code
+        if status in (401, 403):
+            return (f"❌ Access denied: {e}", 14)
+        if status == 404:
+            return (f"❌ Repository not found: {e}", 11)
         return (f"❌ Registry HTTP error: {e}", 16)
     return (f"❌ Operation failed: {e}", 1)
 

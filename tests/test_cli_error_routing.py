@@ -18,9 +18,18 @@ from hippius_hub.errors import (
     GatedRepoError,
     HfHubHTTPError,
     LocalEntryNotFoundError,
+    LocalTokenNotFoundError,
     RepositoryNotFoundError,
     RevisionNotFoundError,
 )
+
+
+def _httpx_status_error(status_code: int) -> httpx.HTTPStatusError:
+    """A raw `httpx.HTTPStatusError` as `delete_repo` → Harbor raises it —
+    NOT an HF-typed error. `raise_for_status()` produces exactly this."""
+    request = httpx.Request("DELETE", "about:blank")
+    response = httpx.Response(status_code, request=request)
+    return httpx.HTTPStatusError("boom", request=request, response=response)
 
 
 def _synthetic_response(status_code: int = 404) -> httpx.Response:
@@ -50,6 +59,13 @@ def _synthetic_response(status_code: int = 404) -> httpx.Response:
         (GatedRepoError("gated", response=_synthetic_response(403)), 14),
         (DisabledRepoError("disabled", response=_synthetic_response(403)), 14),
         (HfHubHTTPError("generic-http", response=_synthetic_response(500)), 16),
+        # LocalTokenNotFoundError is an OSError (no saved credential): access-denied.
+        (LocalTokenNotFoundError("no token"), 14),
+        # Raw httpx errors from delete_repo → Harbor, mapped by status.
+        (_httpx_status_error(401), 14),
+        (_httpx_status_error(403), 14),
+        (_httpx_status_error(404), 11),
+        (_httpx_status_error(500), 16),
         # Fallback: anything not in the typed hierarchy still gets a code.
         (Exception("opaque"), 1),
     ],
@@ -57,6 +73,30 @@ def _synthetic_response(status_code: int = 404) -> httpx.Response:
 def test_format_download_error_distinguishes_typed_errors(exc, expected_code):
     _, code = _format_download_error(exc)
     assert code == expected_code, f"{type(exc).__name__} should map to {expected_code}, got {code}"
+
+
+def test_missing_local_token_routes_to_14_not_generic():
+    """A missing credential must not collapse to generic exit 1 — the CLI needs
+    to tell the user to log in. delete_repo raises LocalTokenNotFoundError for
+    this (as create_repo does), and the message must point at `login`."""
+    msg, code = _format_download_error(LocalTokenNotFoundError("no token"))
+    assert code == 14
+    assert "login" in msg.lower()
+
+
+def test_raw_httpx_403_is_access_denied_not_generic():
+    """delete_repo raises raw httpx.HTTPStatusError (not HfHubHTTPError). A 403
+    means the token lacks push-delete/admin; it must route to 14, not 1, so a
+    user with a read-only token gets an actionable message."""
+    msg, code = _format_download_error(_httpx_status_error(403))
+    assert code == 14
+    assert "Access denied" in msg
+
+
+def test_raw_httpx_404_is_repository_not_found_not_generic():
+    msg, code = _format_download_error(_httpx_status_error(404))
+    assert code == 11
+    assert "Repository not found" in msg
 
 
 def test_gated_repo_routes_to_14_not_11():
