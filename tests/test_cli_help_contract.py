@@ -115,6 +115,17 @@ def test_registry_subcommands_are_reachable(subcmd):
     _help("registry", subcmd)
 
 
+def test_registry_repos_delete_is_reachable_and_pins_flags():
+    """`registry repos delete` mirrors `hf repos delete`; its flag set is the
+    public contract. A dropped subparser fails the reachability call; a renamed
+    flag fails the membership asserts.
+    """
+    out = _help("registry", "repos", "delete")
+    for flag in ("<project>/<repo>", "--repo-type", "--token",
+                 "--missing-ok", "--yes"):
+        assert flag in out, f"`repos delete` flag {flag!r} missing from --help"
+
+
 @pytest.mark.parametrize("keys_subcmd", [
     "list", "create", "show", "rotate", "revoke",
 ])

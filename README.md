@@ -113,6 +113,7 @@ The full `registry` sub-tree:
 | `registry me` | Plan, quota, status, and robot login of your active project |
 | `registry rotate-token [--docker-login]` | Issue a new docker secret (old one stops working immediately) |
 | `registry repos [--page N --page-size M]` | List your repositories |
+| `registry repos delete <project>/<repo> [--repo-type T] [--missing-ok] [-y]` | Delete a whole repository (irreversible). Mirrors `hf repos delete`; prompts for confirmation unless `-y/--yes`. Requires `admin` (or `push-delete`) rights on the project. |
 | `registry artifacts <repo> [--page N --page-size M]` | List artifacts in one repo |
 | `registry usage` | Storage used + 7-day history |
 | `registry publicity public\|private` | Toggle anonymous-pull access (also resizes quota to the plan's public/private tier) |

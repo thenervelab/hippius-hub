@@ -89,7 +89,8 @@ jobs:
       # Supply-chain gate (Python side). Before auditing we bump the
       # known-vulnerable transitive dev-tool deps (pip itself, pygments
       # via pytest's traceback rendering, idna/urllib3/requests via
-      # huggingface_hub's transitive surface) to current-stable so CVEs
+      # huggingface_hub's transitive surface, setuptools pulled in by the
+      # build/test env) to current-stable so CVEs
       # that affect only our test environment — not shipped users —
       # don't gate merges. New CVEs that survive the upgrade ARE
       # surfaced and DO fail CI: pip-audit returns non-zero on any
@@ -112,6 +113,7 @@ jobs:
             'idna>=3.15' \
             'pygments>=2.20.0' \
             'requests>=2.33.0' \
+            'setuptools>=83.0.0' \
             'urllib3>=2.7.0'
           .venv/bin/pip install pip-audit==2.10.0
           .venv/bin/pip-audit --skip-editable
