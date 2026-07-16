@@ -19,7 +19,7 @@ from . import __version__
 from .auth import get_oci_bearer_token, login, resolve_token_value
 from .constants import resolve_registry
 from .file_download import _oci_repo_path, hippius_hub_download
-from ._repo_ops import _list_tags, _revision_digest_and_created
+from ._repo_ops import _list_tags, _revision_digest_and_created, delete_repo
 from . import console
 from .console import ConsoleError
 
@@ -297,6 +297,57 @@ def cmd_registry_repos(args):
         repo = full.split("/", 1)[1] if "/" in full else full
         print(f"  {repo:40} artifacts={r.get('artifact_count', 0):4} "
               f"pulls={r.get('pull_count', 0):6} updated={r.get('update_time', '—')}")
+
+
+def cmd_registry_repos_delete(args):
+    """Delete a whole repository (`hippius-hub registry repos delete`).
+
+    Mirrors `hf repos delete`: prompts for confirmation unless `--yes`, honors
+    `--repo-type` / `--missing-ok` / `--token`, and prints a "Repo deleted"
+    line on success. Unlike the sibling `registry` commands this hits Harbor's
+    admin API (via `delete_repo`) rather than the console API, so its failures
+    surface as httpx / RepositoryNotFoundError rather than ConsoleError — they
+    are mapped to friendly messages and typed exit codes here instead of by the
+    central ConsoleError handler in `main()`.
+    """
+    repo_type = args.repo_type or "model"
+    if not args.yes:
+        # Same wording as `hf repos delete` so muscle memory carries over.
+        reply = input(
+            f"You are about to permanently delete {repo_type} "
+            f"'{args.repo_id}'. Proceed? [y/N] "
+        ).strip().lower()
+        if reply not in ("y", "yes"):
+            print("Aborted.")
+            return
+
+    import httpx
+    from .errors import RepositoryNotFoundError
+
+    try:
+        delete_repo(
+            args.repo_id,
+            token=args.token,
+            repo_type=args.repo_type,
+            missing_ok=args.missing_ok,
+        )
+    except RepositoryNotFoundError:
+        # delete_repo raises this (not an httpx error) only when no credential
+        # could be resolved for the Harbor admin call.
+        print("❌ Not logged in. Run `hippius-hub login` first.")
+        sys.exit(1)
+    except httpx.HTTPStatusError as e:
+        status = e.response.status_code
+        if status == 403:
+            print("❌ Deleting a repository requires admin permissions on the "
+                  "project; the current credentials can't delete it.")
+            sys.exit(1)
+        if status == 404:
+            print(f"❌ Repository not found: {args.repo_id} "
+                  f"(pass --missing-ok to ignore).")
+            sys.exit(11)
+        raise
+    print(f"✅ Repo deleted: {args.repo_id}")
 
 
 def cmd_registry_artifacts(args):
@@ -647,10 +698,25 @@ def _build_parser() -> argparse.ArgumentParser:
                          "(hippius-hub's own auth is always re-persisted regardless)")
     rr.set_defaults(func=cmd_registry_rotate)
 
-    rrepos = regsub.add_parser("repos", help="List my repositories")
+    rrepos = regsub.add_parser("repos", help="List my repositories (or `repos delete` to remove one)")
     rrepos.add_argument("--page", type=int, default=1)
     rrepos.add_argument("--page-size", type=int, default=50)
     rrepos.set_defaults(func=cmd_registry_repos)
+    # Sub-tree so bare `registry repos` still lists (parent default func) while
+    # `registry repos delete <repo>` mirrors `hf repos delete`.
+    rreposub = rrepos.add_subparsers(dest="repos_cmd")
+    rrd = rreposub.add_parser("delete", help="Delete a whole repository (irreversible)")
+    rrd.add_argument("repo_id", metavar="<project>/<repo>",
+                     help="Repository to delete, e.g. myorg/my-model")
+    rrd.add_argument("--repo-type", default=None,
+                     help="model (default), dataset, or space")
+    rrd.add_argument("--token", default=None,
+                     help="Explicit auth token; defaults to your saved login")
+    rrd.add_argument("--missing-ok", action="store_true",
+                     help="Do not error if the repository does not exist")
+    rrd.add_argument("-y", "--yes", action="store_true",
+                     help="Answer yes to the confirmation prompt automatically")
+    rrd.set_defaults(func=cmd_registry_repos_delete)
 
     rart = regsub.add_parser("artifacts", help="List artifacts in one repo")
     rart.add_argument("repo", metavar="<project>/<repo>",
