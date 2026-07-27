@@ -21,6 +21,19 @@ import hippius_hub
 from hippius_hub import console
 
 
+# How many stale revisions may survive a sweep before we call it broken.
+#
+# The sweep is the one part of this suite that talks to api.hippius.com; every
+# other test is registry-only. That API times out often enough in CI that
+# failing on a single bad DELETE would page the channel most hours and train
+# everyone to ignore it (see the pre-existing `test_artifact_delete` failures
+# in e2e.yml on main). So a transient failure is reported and tolerated, and
+# only a *sustained* one fails: at hourly runs with a 6h retention window,
+# roughly one revision goes stale per run, so a backlog this size means the
+# sweep has been failing for about a day — which is worth waking someone for.
+STALE_BACKLOG_LIMIT = 24
+
+
 def _sha256_of_file(path) -> str:
     digest = hashlib.sha256()
     with open(path, "rb") as f:
@@ -37,6 +50,9 @@ def test_01_cleanup_old_revisions(
     Each run pushes ~100 MiB of fresh, non-dedupable bytes; without this the
     namespace grows ~2.4 GB/day. Only revisions whose name parses as one of
     ours are touched, so e2e revisions in the same repo are never at risk.
+
+    Fails on a sustained backlog, not on one bad DELETE — see
+    STALE_BACKLOG_LIMIT for why.
     """
     try:
         refs = hippius_hub.list_repo_refs(smoke_repo)
@@ -48,26 +64,36 @@ def test_01_cleanup_old_revisions(
         pytest.skip(f"{smoke_repo} does not exist yet — nothing to sweep")
 
     candidates = [r.name for r in refs.tags] + [b.name for b in refs.branches]
+    stale = [r for r in candidates if (ts := _revisions.parse_timestamp(r)) and ts < retention_cutoff]
 
     deleted = 0
-    for revision in candidates:
-        stamp = _revisions.parse_timestamp(revision)
-        if stamp is None or stamp >= retention_cutoff:
-            continue
+    unreachable = []
+    for revision in stale:
         try:
             console.delete_artifact(qualified_repo, revision)
         except console.ConsoleError as e:
-            # A 404 means the model indexer never saw the tag, or a concurrent
-            # run already reaped it. Both are benign; anything else is a real
-            # regression in the delete path and must fail the suite.
+            # 404 = the model indexer never saw this tag, or a previous run
+            # already reaped it. Either way it is not occupying storage.
+            # Anything else (timeout surfaces as status 0, permissions as 403)
+            # leaves the revision in place, so it counts toward the backlog.
             if e.status_code != 404:
-                raise
+                unreachable.append(f"{revision} ({e})")
             continue
         deleted += 1
 
     print(
-        f"Cleanup: deleted {deleted} smoke revisions older than "
-        f"{retention_cutoff.isoformat()} from {smoke_repo}"
+        f"Cleanup: deleted {deleted}/{len(stale)} stale smoke revisions from "
+        f"{smoke_repo} (older than {retention_cutoff.isoformat()})"
+    )
+    if unreachable:
+        print(f"Cleanup could not delete {len(unreachable)}: " + "; ".join(unreachable))
+
+    assert len(unreachable) < STALE_BACKLOG_LIMIT, (
+        f"{len(unreachable)} stale smoke revisions in {smoke_repo} could not be "
+        f"deleted, past the {STALE_BACKLOG_LIMIT} threshold — the sweep has been "
+        f"failing for roughly a day and the namespace is growing ~100 MiB/hour. "
+        f"Check that the console API is up and that HIPPIUS_TEST_CONSOLE_TOKEN "
+        f"still has artifact-delete permission.\n" + "\n".join(unreachable)
     )
 
 
