@@ -2,22 +2,22 @@
 
 > **For Claude:** Design doc + phased implementation plan. Review the design
 > (§Design) before writing code. Supersedes the receiver approach — see
-> §Supersedes. Revised 2026-07-09 after a 3-lens adversarial review (OCI/Harbor
+> §Supersedes. Revised 2026-07-09 after a 3-lens adversarial review (registry
 > validity, client-code breakage, industry-standard alignment) — see §Review —
 > and again 2026-07-09 to adopt content-defined chunking (FastCDC) in v1 for
 > cross-version dedup (§Chunking strategy).
 
 **Goal:** Parallelize large-file upload **and** download, **and dedup
 cross-version re-uploads**, by representing a large file as K content-addressed
-**content-defined** chunk blobs under one OCI artifact, uploaded/pulled
+**content-defined** chunk blobs under one registry artifact, uploaded/pulled
 concurrently as ordinary whole blobs and `HEAD`-skipped when already present —
 eliminating the in-cluster staged receiver and its entire
 data-plane/scaling/ops surface.
 
 **Architecture (Git-LFS/Xet "pointer" shape — "Option B"):** A file ≥ threshold
 is split into K **content-defined** chunk blobs (FastCDC, ~4 MiB average —
-HF-Xet's block/transfer size), each a normal digest-verified OCI blob pushed
-directly to Harbor in parallel
+HF-Xet's block/transfer size), each a normal digest-verified registry object pushed
+directly to the registry in parallel
 (`docker push` semantics). Content-defined boundaries re-sync just past an
 insert/delete, so a re-uploaded, slightly-changed file dedups every unchanged
 chunk (`HEAD`-skip) instead of re-sending the shifted tail. The manifest
@@ -25,11 +25,11 @@ holds **one titled "pointer" layer per file** (carrying the whole-file
 size+digest and the ordered chunk list) plus the K chunks as **untitled** layers.
 Download reads the pointer, pulls the K chunks in parallel, concatenates in
 order, and verifies the whole-file digest. Small files stay one plain titled blob
-(K=1), byte-identical to today. The artifact is typed as an **OCI 1.1 artifact**
-(not an image) so Trivy skips it and `docker pull` refuses it.
+(K=1), byte-identical to today. The artifact is typed as a **generic (non-image) artifact**
+(not an image) so the vulnerability scanner skips it and `docker pull` refuses it.
 
 **Tech stack:** hippius-hub Python client + its Rust extension (`hippius_core`).
-No server component. Harbor + JuiceFS unchanged.
+No server component. Server-side infrastructure unchanged.
 
 ---
 
@@ -40,17 +40,17 @@ Traced 2026-07-09 across the `thenervelab` org:
   place — this client** (`_repo_ops.py:214` siblings; `_oci.py`
   `iter_titled_layers`; `file_download.py` resolve-by-title). Org-wide code
   search: `rfilename` → only hippius-hub. So the layout is ours to change.
-- `hippius-console` renders **artifact-level** `digest`/`size` only (Harbor
+- `hippius-console` renders **artifact-level** `digest`/`size` only (the registry
   facade `RegistryArtifact`); `api.hippius.com/api/registry` confirmed live as a
-  Harbor artifact-level API (`/repositories/` → 401 user-scoped, no per-file
+  artifact-level API (`/repositories/` → 401 user-scoped, no per-file
   shape). `hippius-indexer`/`-api` index **Arion/IPFS** manifests (already
   chunk-aware). `hippius-frontend` is the marketing site.
-- **Battle-tested precedent:** OCI chunked *upload* is strictly sequential and
+- **Battle-tested precedent:** the registry chunked *upload* is strictly sequential and
   broken across registries — real clients push each blob whole and parallelize
   across **independent blobs** (docker's `max-concurrent-uploads`, default 5).
   Object stores use a part-number model with direct-to-storage. **Git-LFS and
   HF-Xet both represent a file as a pointer to content-addressed chunks** — this
-  design is that shape (a pointer layer), adapted to OCI.
+  design is that shape (a pointer layer), adapted to our registry.
 
 Net: chunking is a **self-contained client change**, not a multi-service
 migration.
@@ -85,7 +85,7 @@ min = avg/4 exceeds `MINIMUM_MAX`). The original plan said ~64 MiB to match
 HF-Xet's block/xorb size, but that number was doubly wrong: `fastcdc` cannot
 produce it, and HF's 64 MiB is a *transfer block* aggregating many ~64 KiB CDC
 dedup chunks — not a CDC average. HF-Xet is two-tier (dedup at ~64 KiB inside a
-custom CAS, aggregate into ~64 MiB xorbs); we are single-tier — our OCI blob is
+custom CAS, aggregate into ~64 MiB xorbs); we are single-tier — our registry object is
 *both* the dedup unit and the transfer unit — so neither HF number maps to it
 directly. 4 MiB is the practical ceiling: coarse enough to keep blob counts low,
 fine enough that a changed region re-sends at most one ~4 MiB chunk. For finer
@@ -104,12 +104,12 @@ length-changing cases fixed-size loses.)
 
 **Scope boundary — what we are NOT building.** HF-Xet's ~64 KiB chunks + custom
 CAS + xorb/block aggregation. At 64 KiB a 20 GB file is ~300k chunks — untenable
-as OCI blobs (blows the 4 MiB manifest cap, floods `HEAD`, buries Harbor GC and
-`project_blob` quota). Fine-grained dedup requires an indirection layer OCI does
+as registry objects (blows the 4 MiB manifest cap, floods `HEAD`, buries registry GC and
+`project_blob` quota). Fine-grained dedup requires an indirection layer the registry does
 not provide (a CAS) — that indirection is HF's entire engineering cost. We stay
-at **OCI-native granularity**: each CDC chunk is one ordinary blob, dedup is OCI
+at **registry-native granularity**: each CDC chunk is one ordinary blob, dedup is registry
 `HEAD`-before-PUT, no new service. At ~4 MiB average a 20 GB file is ~5,000 blobs
-— still light on Harbor GC/quota and the manifest budget (~110 B/chunk). Coarser
+— still light on registry GC/quota and the manifest budget (~110 B/chunk). Coarser
 than Xet's 64 KiB dedup unit, so a scattered edit re-sends its whole ~4 MiB chunk
 — acceptable because model fine-tunes change whole tensors (MB–GB), and CDC still
 deduplicates every *unchanged* ~4 MiB region after a length shift, which
@@ -126,7 +126,7 @@ breaks cross-version dedup, so they are versioned with the layout — a change m
 FastCDC implementation. Justified: a rolling-hash chunker is a correctness- and
 determinism-critical primitive we must not hand-roll.
 
-### Manifest layout — pointer + untitled chunks, typed as an OCI artifact
+### Manifest layout — pointer + untitled chunks, typed as a registry artifact
 
 ```json
 {
@@ -165,12 +165,12 @@ determinism-critical primitive we must not hand-roll.
   `application/octet-stream` titled layer, **no** chunk/pointer mediaType or
   annotations — byte-identical, so cross-dedup with pre-chunk uploads holds. The
   uploader **must branch on the threshold before choosing layout.**
-- **OCI-artifact typing** (`artifactType` + the 2-byte empty config, size **2**,
-  never size 0): Harbor classifies it as a generic artifact → Trivy cleanly
+- **registry-artifact typing** (`artifactType` + the 2-byte empty config, size **2**,
+  never size 0): the registry classifies it as a generic artifact → the vulnerability scanner cleanly
   *skips* it instead of erroring on unextractable chunk layers, and `docker pull`
-  refuses it (a migration guard). **Confirmed available: the deployed Harbor is
+  refuses it (a migration guard). **Confirmed available: the deployed registry is
   v2.15.0** (all components; verified from the pod image tags 2026-07-09), well
-  above the ≥ 2.9/2.10 floor for OCI 1.1 `artifactType` + Referrers — the config-
+  above the floor for `artifactType` + Referrers support — the config-
   mediaType fallback is not needed.
 - **`com.hippius.layout: chunked-v1`** is set on the manifest **only when at
   least one file in it is chunked**, so a repo of only small files doesn't trip
@@ -189,7 +189,7 @@ CNCF Distribution hard-caps the manifest PUT body at **4 MiB**
 blobs are already uploaded. Because **all files share one manifest**, the budget
 is per-artifact, not per-file. Controls:
 - **Cap on aggregate manifest bytes**, target ≤ 2 MiB of layer JSON (headroom for
-  Harbor core re-parsing) — **not** a per-file chunk count. Option B already
+  the registry backend re-parsing) — **not** a per-file chunk count. Option B already
   minimizes this: untitled chunk layers carry only mediaType+digest+size
   (~110 B), and file metadata sits once on the pointer.
 - With ~110 B/chunk, ≤ 2 MiB ≈ ~19k chunks ≈ ~75 GB per **revision manifest** at
@@ -199,33 +199,33 @@ is per-artifact, not per-file. Controls:
   total size below it. Still covers every model today. (Dropping the average to 8–16 MiB for finer dedup
   would lower this ceiling proportionally; a real CDC trade if that knob is ever
   turned.) For artifacts past the ceiling, fan out via an
-  **OCI image index / Referrers**
-  (a top manifest referencing per-file sub-manifests) — the only OCI-native way
+  **the registry image index / Referrers**
+  (a top manifest referencing per-file sub-manifests) — the only registry-native way
   past 4 MiB. (v1 may simply cap+error with a clear message; index fan-out is a
   documented follow-up.)
 
 ### Integrity & failure handling
 
-- **Integrity, no weaker than today:** Harbor verifies **each chunk's** digest
+- **Integrity, no weaker than today:** the registry verifies **each chunk's** digest
   inline on push; pull verifies each chunk digest; the client verifies
   `sha256(concat) == com.hippius.file.digest` after assembly, and verifies the
   pointer blob against its own digest.
 - **Atomicity:** download writes to a temp file and atomic-renames; the manifest
   makes the whole fileset visible atomically (one PUT).
 - **Orphaned chunks:** a crash after pushing chunks but before the manifest PUT
-  leaves unreferenced chunk blobs. OCI has no abort primitive → they linger until
-  **Harbor GC** reclaims them (GC only sweeps blobs referenced by no manifest, so
-  this is safe). **Confirm Harbor GC is actually scheduled** (it is stop-the-world
+  leaves unreferenced chunk blobs. the registry has no abort primitive → they linger until
+  **registry GC** reclaims them (GC only sweeps blobs referenced by no manifest, so
+  this is safe). **Confirm registry GC is actually scheduled** (it is stop-the-world
   and sometimes disabled). The `HEAD`-before-`PUT` path makes a retried upload
   cheap (skips already-present chunks).
 
-### Harbor deduplication & caching interaction (verified against `harbor-warmer`)
+### the registry deduplication & caching interaction (verified against the cache warmer)
 
 Both mechanisms operate on **content-addressed blobs** (keyed by `sha256`, pulled
 at `/v2/<repo>/blobs/<digest>`, immutable). A chunk *is* a content-addressed
 blob, so the machinery is unchanged — only granularity changes.
 
-**Deduplication (Harbor, blob-level):**
+**Deduplication (the registry, blob-level):**
 - A byte-identical file → identical chunk digests → **still fully dedups**.
 - Partially-identical files dedup at *chunk* granularity **including after an
   unaligned insert/delete** — FastCDC re-syncs boundaries just past the change, so
@@ -236,21 +236,21 @@ blob, so the machinery is unchanged — only granularity changes.
   (K chunks) won't cross-dedup — different digests. Transient; only large files
   change representation.
 
-**Caching (ATS edge, per-blob-URL):** confirmed from `harbor-warmer` — the warmer
-polls Harbor per artifact, fetches the manifest, and **already loops each layer
-blob**, warming it into the EU/US ATS edges with a full GET.
+**Caching (edge cache, per-blob-URL):** confirmed from the cache warmer — the warmer
+polls the registry per artifact, fetches the manifest, and **already loops each layer
+blob**, warming it into the EU/US the edge cache edges with a full GET.
 - **The warmer needs no change** — it keys on the artifact (manifest) digest and
   discovers layers dynamically; K chunk layers warm like K image layers.
-- **Chunking retires a real workaround.** ATS 9.2.3 won't store `206 Partial
+- **Chunking retires a real workaround.** the edge cache 9.2.3 won't store `206 Partial
   Content` for large blobs, so today a multi-GB blob needs a full-blob warm-GET
   plus `cache.range.lookup=1`. **~4 MiB chunks are each a clean `200 OK`** the
   client pulls in parallel — no Range gymnastics, no 206 bug.
 
 **Costs bounded by chunk size (why ~4 MiB, not 64 KiB):** more blobs → more
-warmer tasks + Harbor blob-metadata/GC rows + edge-cache objects; parallel
-cache-miss pulls burst concurrent JuiceFS reads (same total bytes). ~4 MiB (the
+warmer tasks + registry object-metadata/GC rows + edge-cache objects; parallel
+cache-miss pulls burst concurrent the storage layer reads (same total bytes). ~4 MiB (the
 `fastcdc` ceiling) keeps a 20 GB file at ~5,000 blobs — not the ~300k that 64 KiB
-Xet-style chunks would demand, which OCI blob-per-chunk cannot carry.
+Xet-style chunks would demand, which registry object-per-chunk cannot carry.
 
 ### Guarantee preservation & existing-data compatibility (MUST NOT break client data)
 
@@ -265,7 +265,7 @@ preserved; two requirements make that hold.
   exactly as today. No re-push, no digest change, no manifest rewrite.
 - **Requirement — keep the legacy Range downloader.** Today `src/chunked_downloader.rs`
   already parallelizes a *single whole-file blob* download via N HTTP `Range`
-  requests (206 slices from the ATS-cached full body). Pre-chunk large artifacts
+  requests (206 slices from the edge cache-cached full body). Pre-chunk large artifacts
   depend on this path, so it **must be retained** (Phase 4 must not delete it).
   New chunked artifacts use the chunk-parallel path; legacy single-blob artifacts
   keep the Range-parallel path. Both coexist.
@@ -273,7 +273,7 @@ preserved; two requirements make that hold.
 **Deduplication guarantees — preserved:**
 - Identical file → identical CDC chunks → all `HEAD`-skip (whole-file dedup, now
   at chunk granularity). Cross-repo/revision sharing and quota-by-unique-blob hold
-  (Harbor keys `project_blob` by digest; shared chunks counted once).
+  (the registry keys `project_blob` by digest; shared chunks counted once).
 - **Requirement — deterministic chunking and pointer blob.** Chunk boundaries are
   fixed by the pinned FastCDC params (see §Chunking strategy), and the pointer body
   must contain *only* the ordered chunk-digest+size list + whole-file size/digest —
@@ -284,19 +284,19 @@ preserved; two requirements make that hold.
   ages out. Bounded, large-files-only, not a steady-state loss.
 
 **Caching guarantees — preserved, and one fragile dependency retired:**
-- Immutable content-addressed cache and `harbor-warmer` warm-on-publish are
+- Immutable content-addressed cache and the cache warmer warm-on-publish are
   unchanged (the warmer loops layers → warms every chunk + the pointer).
 - Parallel edge-speed download is preserved: new artifacts pull K full-`200`
-  chunk blobs in parallel — which **removes** the ATS-`206`/Range coupling (and
+  chunk blobs in parallel — which **removes** the edge cache-`206`/Range coupling (and
   the `require_partial_content` fragility) that the whole-file path needs today.
 
-**Integrity guarantee — preserved (trust boundary noted):** today Harbor attests
-one blob == whole-file hash; with chunking Harbor attests each *chunk*, and the
+**Integrity guarantee — preserved (trust boundary noted):** today the registry attests
+one blob == whole-file hash; with chunking the registry attests each *chunk*, and the
 *client* attests the assembly (`sha256(concat) == com.hippius.file.digest`).
 End-to-end identical for a correct client.
 
 **Registry-frontend metadata compatibility — no breaking change (verified in
-`hippius-console`).** The console + `api.hippius.com/api/registry` read Harbor's
+`hippius-console`).** The console + `api.hippius.com/api/registry` read the registry's
 **artifact-level** `RegistryArtifact` (digest, size, tags, annotations, `type`,
 `media_type`, `artifact_type`) — never per-file layers. `RegistryArtifactView.tsx`
 renders these display-only with guards (`data.type || "-"`, optional media types,
@@ -387,7 +387,7 @@ single-blob artifact still downloads via the Range path (existing behavior).
 **Files:** `hippius_hub/file_upload.py`; Rust `src/lib.rs` + a new
 `upload_chunks_native` (split ≥ threshold file with **FastCDC** at the pinned
 params, sha256 each chunk, `HEAD`-dedup, PUT missing chunks concurrently straight
-to Harbor, return chunk descriptors + whole-file digest). Build the pointer blob +
+to the registry, return chunk descriptors + whole-file digest). Build the pointer blob +
 manifest layers. The chunk splitter is the **only** part CDC changes — Phases 0–2
 (guard, pointer grouping, download) are boundary-agnostic and stand as written.
 
@@ -456,8 +456,8 @@ gate.
    `HIPPIUS_CHUNKED_WRITE=1` to opt in (e.g. staging e2e); a later release flips the
    default on once the fleet is upgraded.
 4. Measure large-file upload wall-clock (K-way parallel) and download wall-clock
-   (new parallelism) vs the pre-chunk baseline. No Harbor/JuiceFS change; scaling
-   is Harbor's existing horizontal core replicas.
+   (new parallelism) vs the pre-chunk baseline. No server-side change; scaling
+   is the registry's existing horizontal replicas.
 
 ---
 
@@ -467,7 +467,7 @@ All phases implemented and tested. Deviations from the plan as written, all
 deliberate:
 
 - **`group_files` is pure over the manifest** — chunk digests/sizes come from the
-  untitled chunk layers (positional, OCI-order-preserved), not by fetching the
+  untitled chunk layers (positional, the registry-order-preserved), not by fetching the
   pointer blob. The pointer blob still exists (deterministic, self-identifying)
   for pointer-level dedup and old-client loud-fail, but readers don't fetch it, so
   the read side stays a single round-trip.
@@ -495,7 +495,7 @@ deliberate:
 - **Bounded download concurrency.** `download_chunks_native` caps in-flight chunk
   fetches with a `tokio::Semaphore(max_concurrent)`. Without it, `pool_max_idle_per_host`
   bounds only the *idle* pool, so a many-thousand-chunk file would open one socket
-  per chunk and exhaust FDs / ephemeral ports / trip Harbor 429s. "K parallel pulls"
+  per chunk and exhaust FDs / ephemeral ports / trip registry 429s. "K parallel pulls"
   is therefore *K bounded by `max_concurrent`*.
 - **Whole-file verify is unconditional on chunked assembly** (decoupled from the
   opt-in `HIPPIUS_VERIFY_HASH`): per-chunk digests prove each chunk's bytes but not
@@ -516,7 +516,7 @@ deliberate:
   untitled *chunk* layer still raises: that is our-layout corruption, not third-party
   content.
 
-Open Decision #5 (**Harbor GC scheduled?**) remains an ops confirmation, not a
+Open Decision #5 (**registry GC scheduled?**) remains an ops confirmation, not a
 code item — orphaned chunks from a failed upload are only reclaimed if GC runs.
 
 ## Review (2026-07-09, 3-lens adversarial) — findings incorporated
@@ -526,7 +526,7 @@ code item — orphaned chunks from a failed upload are only reclaimed if GC runs
   and in our own `_merge_layers`/`layer_titles`) and a *silent* migration failure.
   Option B (titled pointer + untitled chunks) fixes all of it and makes migration
   loud. Untitled chunk layers are GC-safe (all manifest `layers` are marked).
-- **OCI-artifact typing** (`artifactType` + 2-byte empty config): fixes a Trivy
+- **registry-artifact typing** (`artifactType` + 2-byte empty config): fixes a vulnerability-scanner
   scan-error regression on custom layer mediaTypes and refuses `docker pull`.
 - **4 MiB manifest cap:** the earlier `MAX_CHUNKS=100_000` was ~10× over; now a
   per-artifact byte budget + Referrers fan-out for the tail.
@@ -542,20 +542,20 @@ code item — orphaned chunks from a failed upload are only reclaimed if GC runs
   length-shifting edits. Fixed-size only deduped
   byte-aligned/in-place edits; the common re-upload (add/remove a layer, repack,
   quantization change) shifts every later boundary and defeated it. Coarse CDC
-  fixes this on the existing Harbor stack (blob-per-chunk, `HEAD`-before-PUT);
+  fixes this on the existing registry stack (blob-per-chunk, `HEAD`-before-PUT);
   fine-grained Xet-style dedup (custom CAS) stays out of scope.
 
 ## Open design decisions to confirm
 
-1. ~~**Harbor version** — confirm ≥ 2.9/2.10 for `artifactType`.~~ **RESOLVED
-   2026-07-09: Harbor v2.15.0** (pod image tags, all components). OCI 1.1
+1. ~~**registry version** — confirm ≥ 2.9/2.10 for `artifactType`.~~ **RESOLVED
+   2026-07-09: registry v2.15.0** (pod image tags, all components). Generic-artifact
    `artifactType` + Referrers fully supported; no fallback needed.
 2. ~~**Manifest-size ceiling behavior**~~ **RESOLVED: v1 cap+error implemented**
    (`_assemble_manifest` → `ManifestTooLargeError` above `MAX_MANIFEST_BYTES`).
    The Referrers/index fan-out for genuinely huge artifacts remains the deferred
    follow-up.
 3. **Client-version floor mechanism** — how the read-capable floor is asserted
-   before enabling writes (a Harbor webhook on `com.hippius.layout` is the only
+   before enabling writes (a registry webhook on `com.hippius.layout` is the only
    true server-side enforcement; otherwise the pointer loud-fail + `artifactType`
    are the safety net).
 4. ~~**CDC later?**~~ **RESOLVED 2026-07-09: CDC (FastCDC ~4 MiB average — the
@@ -564,7 +564,7 @@ code item — orphaned chunks from a failed upload are only reclaimed if GC runs
    slightly-changed models is the
    dominant workload and CDC is a localized change (splitter only). The remaining
    deferral is **fine-grained Xet-style dedup** (~64 KiB chunks + a custom CAS) —
-   that needs an indirection layer OCI cannot carry as blob-per-chunk, so it is a
+   that needs an indirection layer the registry cannot carry as blob-per-chunk, so it is a
    separate future project, not a parameter tweak.
-5. **Harbor GC scheduled?** — confirm GC runs so orphaned chunks from failed
+5. **registry GC scheduled?** — confirm GC runs so orphaned chunks from failed
    uploads are reclaimed.

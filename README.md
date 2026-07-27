@@ -1,6 +1,6 @@
 # hippius_hub
 
-Drop-in replacement for [`huggingface_hub`](https://github.com/huggingface/huggingface_hub) backed by an OCI registry (`registry.hippius.com` by default). Same Python API as the official client — `from hippius_hub import hf_hub_download` works where `from huggingface_hub import hf_hub_download` worked — with byte movement done by a Rust extension.
+Drop-in replacement for [`huggingface_hub`](https://github.com/huggingface/huggingface_hub) backed by the Hippius registry (`registry.hippius.com` by default). Same Python API as the official client — `from hippius_hub import hf_hub_download` works where `from huggingface_hub import hf_hub_download` worked — with byte movement done by a Rust extension.
 
 The CLI also wraps the Hippius console API: register a namespace, manage docker credentials, browse repositories, and search the AI model index without leaving the terminal.
 
@@ -64,19 +64,19 @@ There are **two kinds of credentials**, depending on what you're doing:
 | For… | Use | Where |
 |---|---|---|
 | `registry` and `models` CLI commands (manage your namespace, list models, …) | **API token** from [console.hippius.com/dashboard/settings](https://console.hippius.com/dashboard/settings) | `hippius-hub login --hippius-token <token>` → `~/.cache/hippius/hub/api_token` |
-| `download` / `upload` (raw OCI registry IO) | Docker registry credentials | `hippius-hub login --username <you> --password <secret>` → `~/.cache/hippius/hub/token` |
+| `download` / `upload` (model and artifact transfer) | Registry credentials | `hippius-hub login --username <you> --password <secret>` → `~/.cache/hippius/hub/token` |
 
 In Python:
 
 ```python
 from hippius_hub import login
-login(token="hf_xxx")                  # HF-shape: positional token (docker registry)
-login(username="me", password="pwd")   # Basic auth (docker registry)
+login(token="hf_xxx")                  # HF-shape: positional token (registry creds)
+login(username="me", password="pwd")   # Basic auth (registry creds)
 ```
 
 In practice the API token is all you save by hand. `hippius-hub registry provision <namespace>` mints the docker credentials *and* writes them into `~/.cache/hippius/hub/token` for you, so the next `upload`/`download` works without a second `hippius-hub login` step. Pass `--docker-login` to also run `docker login` so `docker push`/`pull` work; either way, hippius-hub's own auth is persisted.
 
-The robot secret is printed **once** on first provision. If you lose it, rotate with `hippius-hub registry rotate-token` (also re-writes the local cache).
+The registry secret is printed **once** on first provision. If you lose it, rotate with `hippius-hub registry rotate-token` (also re-writes the local cache).
 
 ## Onboard from the terminal (no UI required)
 
@@ -110,7 +110,7 @@ The full `registry` sub-tree:
 | `registry check <name>` | Is a namespace available? |
 | `registry provision <ns> [--docker-login]` | Create your namespace and get docker credentials. New projects are public by default; toggle with `registry publicity`. |
 | `registry status` | Poll while provisioning is in flight |
-| `registry me` | Plan, quota, status, and robot login of your active project |
+| `registry me` | Plan, quota, status, and registry login of your active project |
 | `registry rotate-token [--docker-login]` | Issue a new docker secret (old one stops working immediately) |
 | `registry repos [--page N --page-size M]` | List your repositories |
 | `registry repos delete <project>/<repo> [--repo-type T] [--missing-ok] [-y]` | Delete a whole repository (irreversible). Mirrors `hf repos delete`; prompts for confirmation unless `-y/--yes`. Requires `admin` (or `push-delete`) rights on the project. |
@@ -120,8 +120,8 @@ The full `registry` sub-tree:
 | `registry subscribe <plan> [--pay-upfront N]` | Subscribe to a plan on-chain. `<plan>` is the name (e.g. `Builder`) or numeric id. Debits your own credits — backend is just the whitelisted relayer. |
 | `registry subscriptions` | List your current subscriptions (synced from chain every ~3 min) |
 | `registry unsubscribe <sub-id>` | Cancel a subscription by its on-chain `SubscriptionId`. 30-day grace before the project is hard-deleted; re-subscribe within that window to keep everything. |
-| `registry keys list` | List this project's scoped API keys / robot accounts |
-| `registry keys create <name> --role read\|push\|push-delete\|admin [--expires-days N] [--docker-login]` | Mint a scoped key (`robot$<project>+<name>`); secret shown **once**. Roles: `read`=pull/list, `push`=+push/create, `push-delete`=+delete, `admin`=full project |
+| `registry keys list` | List this project's scoped API keys |
+| `registry keys create <name> --role read\|push\|push-delete\|admin [--expires-days N] [--docker-login]` | Mint a scoped key; login and secret printed **once**. Roles: `read`=pull/list, `push`=+push/create, `push-delete`=+delete, `admin`=full project |
 | `registry keys show <id>` / `rotate <id>` / `revoke <id>` | Inspect a key (no secret) / rotate its secret / delete it (irreversible) |
 
 ## Search the AI model index
@@ -149,7 +149,7 @@ Add `--json` to `models list` / `models show` for machine-readable output.
 
 ```bash
 # Upload an entire model folder (every file under ./qwen-7b/) as `:v1`.
-# Folder uploads merge into the existing manifest at that revision — re-running
+# Folder uploads merge into the existing revision — re-running
 # adds/replaces individual files without wiping the rest.
 hippius-hub upload myorg/qwen-7b ./qwen-7b --revision v1
 
@@ -160,7 +160,7 @@ hippius-hub upload myorg/qwen-7b ./README.md --revision v1
 hippius-hub upload myorg/qwen-7b ./qwen-7b
 ```
 
-Once the push completes, the Harbor webhook fires the model index pipeline — the model shows up in `hippius-hub models list` within a few seconds with format/architecture/parameter-count/quantization parsed out of the bytes server-side.
+Once the push completes, the model index pipeline runs server-side — the model shows up in `hippius-hub models list` within a few seconds with format/architecture/parameter-count/quantization parsed out of the bytes server-side.
 
 ### Mirroring a HuggingFace model to your namespace
 
@@ -184,7 +184,7 @@ hippius-hub models show myorg/qwen-7b v1
 # ~/.cache/hippius/hub/token (set by `provision --docker-login` or `login`).
 hippius-hub download myorg/qwen-7b model-00001-of-00003.safetensors
 
-# Specific revision (= OCI tag)
+# Specific revision (= tag)
 hippius-hub download myorg/qwen-7b config.json --revision v1
 
 # List a repo's revisions, newest first (the newest is marked "(latest)")
@@ -260,7 +260,7 @@ upload_folder(
 )
 ```
 
-`upload_file` and `upload_folder` **merge** into the existing manifest at `revision` — calling them repeatedly adds/replaces individual files without wiping the rest.
+`upload_file` and `upload_folder` **merge** into the existing `revision` — calling them repeatedly adds/replaces individual files without wiping the rest.
 
 ## Repo CRUD & inspection
 
@@ -322,14 +322,14 @@ Existing code that catches HF's exceptions keeps working.
 | `HIPPIUS_READ_TIMEOUT` | unset | Opt-in per-chunk total request timeout (seconds) |
 | `HIPPIUS_SNAPSHOT_WORKERS` | `8` | Concurrent files in `snapshot_download` |
 | `HIPPIUS_UPLOAD_WORKERS` | `8` | Concurrent files in a folder upload / concurrent chunk uploads per large file |
-| `HIPPIUS_CHUNK_THRESHOLD` | `268435456` (256 MiB) | Files at or above this size upload as content-defined chunks; below it, one plain blob |
+| `HIPPIUS_CHUNK_THRESHOLD` | `268435456` (256 MiB) | Files at or above this size upload as content-defined chunks; below it, a single object |
 | `HIPPIUS_CDC_AVG_SIZE` | `4194304` (4 MiB) | FastCDC average chunk size — 4 MiB is fastcdc's max (larger is rejected); part of the layout wire contract |
-| `HIPPIUS_UPLOAD_CHUNK_SIZE` | `16777216` (16 MiB) | Per-`PATCH` chunk size for resumable plain-blob uploads (resume granularity on a transient failure) |
-| `HIPPIUS_PACK_SIZE` | `67108864` (64 MiB) | Target size of a content-addressed pack blob (many CDC chunks per pack) |
+| `HIPPIUS_UPLOAD_CHUNK_SIZE` | `16777216` (16 MiB) | Per-request chunk size for resumable single-object uploads (resume granularity on a transient failure) |
+| `HIPPIUS_PACK_SIZE` | `67108864` (64 MiB) | Target size of a content-addressed pack (many CDC chunks per pack) |
 | `HIPPIUS_MAX_INFLIGHT_PACKS` | `HIPPIUS_UPLOAD_WORKERS` (8) | Process-wide cap on concurrent pack uploads (bounds resident memory during folder uploads); defaults to the upload-worker count |
-| `HIPPIUS_BLOB_REUPLOAD_RETRIES` | `2` | Extra whole-upload retries when the registry reports a just-committed blob as missing (`BLOB_UNKNOWN`) |
-| `HIPPIUS_MANIFEST_PUT_RETRIES` | `12` | Retries for the final manifest PUT — widens the window for the registry's blob-commit-visibility lag (`MANIFEST_BLOB_UNKNOWN` / transient 5xx) without a release |
-| `HIPPIUS_CHUNKED_WRITE` | on | Set `0`/`false` to store large files in the pre-chunking single-blob layout. Default on as of 0.6.0 — a reader must be ≥ 0.6.0 to read a chunked artifact |
+| `HIPPIUS_BLOB_REUPLOAD_RETRIES` | `2` | Extra whole-upload retries when the registry reports a just-committed object as missing (`BLOB_UNKNOWN`) |
+| `HIPPIUS_MANIFEST_PUT_RETRIES` | `12` | Retries for the final commit — widens the window for the registry's write-visibility lag (`MANIFEST_BLOB_UNKNOWN` / transient 5xx) without a release |
+| `HIPPIUS_CHUNKED_WRITE` | on | Set `0`/`false` to store large files in the pre-chunking single-object layout. Default on as of 0.6.0 — a reader must be ≥ 0.6.0 to read a chunked artifact |
 | `HIPPIUS_DEBUG` / `RUST_LOG` | off | Verbose transport logging (per-chunk timings, retries) |
 | `HIPPIUS_HUB_NO_UPDATE_CHECK` | off | Set `1`/`true` to skip the CLI's "newer version available" check (auto-skipped when `CI` is set) |
 | `HIPPIUS_API_URL` | `https://api.hippius.com` | Console API base used by the `registry` + `models` CLI subtrees |
@@ -339,9 +339,9 @@ Programmatic overrides via the `endpoint=` kwarg on any function let you point a
 
 ### Large-file chunking
 
-Files at or above `HIPPIUS_CHUNK_THRESHOLD` (256 MiB) are stored as **content-defined chunks** (FastCDC, ~4 MiB average) packed into ~64 MiB content-addressed **pack** blobs (`HIPPIUS_PACK_SIZE`) rather than one blob. The layout is a Git-LFS-style pointer: one titled `pointer.v2` layer per file — mapping each chunk to its pack, offset, and size — plus the untitled pack blobs it references, marked with `artifactType` and a `com.hippius.layout: chunked-v2` annotation. A re-uploaded, slightly-changed model references unchanged chunks by range into existing packs and uploads only the packs holding new chunks; downloads fetch each pack once (concurrently) and slice its chunks to their file offsets. Packing into ~64 MiB blobs cuts per-file upload round-trips versus one-blob-per-chunk, and a shared cap (`HIPPIUS_MAX_INFLIGHT_PACKS`) bounds concurrent pack uploads so folder uploads don't multiply resident memory. Small files and every pre-existing artifact are unchanged (one plain blob), so nothing already stored is rewritten.
+Files at or above `HIPPIUS_CHUNK_THRESHOLD` (256 MiB) are stored as **content-defined chunks** (FastCDC, ~4 MiB average) packed into ~64 MiB content-addressed **packs** (`HIPPIUS_PACK_SIZE`) rather than one object. The layout is a Git-LFS-style pointer: one `pointer.v2` record per file — mapping each chunk to its pack, offset, and size — plus the packs it references. A re-uploaded, slightly-changed model references unchanged chunks by range into existing packs and uploads only the packs holding new chunks; downloads fetch each pack once (concurrently) and slice its chunks to their file offsets. Packing into ~64 MiB units cuts per-file upload round-trips versus one-object-per-chunk, and a shared cap (`HIPPIUS_MAX_INFLIGHT_PACKS`) bounds concurrent pack uploads so folder uploads don't multiply resident memory. Small files and every pre-existing artifact are unchanged (a single object), so nothing already stored is rewritten.
 
-Chunked **writes are on by default as of 0.6.0** (`HIPPIUS_CHUNKED_WRITE`). The reader-side guard ships from 0.6.0: a 0.6.0+ client refuses an unknown layout loudly (`UnsupportedLayoutError`, with an upgrade hint) instead of misreading it, and reads a chunked-v2 artifact correctly. An already-released client (≤ v0.5.1) has no guard, so it silently writes the pointer blob as the file — **every consumer of large files must be on ≥ 0.6.0** before you push them. Set `HIPPIUS_CHUNKED_WRITE=0` to fall back to the byte-identical single-blob layout while a consumer is still on an older client.
+Chunked **writes are on by default as of 0.6.0** (`HIPPIUS_CHUNKED_WRITE`). The reader-side guard ships from 0.6.0: a 0.6.0+ client refuses an unknown layout loudly (`UnsupportedLayoutError`, with an upgrade hint) instead of misreading it, and reads a chunked-v2 artifact correctly. An already-released client (≤ v0.5.1) has no guard, so it silently writes the pointer as the file — **every consumer of large files must be on ≥ 0.6.0** before you push them. Set `HIPPIUS_CHUNKED_WRITE=0` to fall back to the byte-identical single-object layout while a consumer is still on an older client.
 
 ### Diagnosing slow transfers
 
@@ -357,20 +357,20 @@ It measures the endpoint handshake (DNS/TCP/TLS), the auth + metadata round-trip
 
 ## What's not supported
 
-`hippius_hub` aims to be drop-in for the *download / upload / repo CRUD* surface of `huggingface_hub`. HF-specific features that have no equivalent in an OCI registry raise `NotImplementedError`:
+`hippius_hub` aims to be drop-in for the *download / upload / repo CRUD* surface of `huggingface_hub`. HF-specific features that have no Hippius equivalent raise `NotImplementedError`:
 
 - Inference Endpoints (`create_inference_endpoint`, etc.)
 - Spaces (`request_space_hardware`, `enable_space_dev_mode`, etc.)
 - Webhooks
 - Collections
 - Discussions / PRs
-- HF-typed git refs like `refs/pr/3` — only OCI tags are supported as revisions. `list_repo_refs` reports the `main` revision under `branches` and every other revision under `tags`, with each `target_commit` set to the revision's manifest digest (resolved best-effort).
+- HF-typed git refs like `refs/pr/3` — only tags are supported as revisions. `list_repo_refs` reports the `main` revision under `branches` and every other revision under `tags`, with each `target_commit` set to the revision's digest (resolved best-effort).
 
 Also known semantic divergences:
 
-- `model_info` fills `id`, `sha`, `lastModified`, `siblings`, `private`. Fields with no OCI-registry analog (`pipeline_tag`, `library_name`, `tags`, `downloads`, `likes`) are `None`.
-- `hf_hub_url` returns the OCI manifest URL — usable for inspection but not a direct CDN download URL like HF's.
-- Concurrent `upload_file` calls to the same `repo_id:revision` are protected by an `If-Match` header on the manifest PUT: the first writer wins, the second sees `ConcurrentManifestUpdateError` (subclass of `HfHubHTTPError`) and can retry on a fresh baseline. If the registry omits `Docker-Content-Digest` on the manifest GET (RECOMMENDED-but-not-REQUIRED per OCI Distribution Spec §4.4.1), the PUT proceeds without `If-Match` and a `UserWarning` is emitted so the unprotected write is grep-able in logs.
+- `model_info` fills `id`, `sha`, `lastModified`, `siblings`, `private`. Fields with no Hippius analog (`pipeline_tag`, `library_name`, `tags`, `downloads`, `likes`) are `None`.
+- `hf_hub_url` returns the revision's metadata URL — usable for inspection but not a direct CDN download URL like HF's.
+- Concurrent `upload_file` calls to the same `repo_id:revision` are protected by an `If-Match` header on the commit: the first writer wins, the second sees `ConcurrentManifestUpdateError` (subclass of `HfHubHTTPError`) and can retry on a fresh baseline. If the registry omits the digest header the check relies on, the write proceeds without `If-Match` and a `UserWarning` is emitted so the unprotected write is grep-able in logs.
 
 ## Development
 
@@ -400,18 +400,18 @@ The e2e workflow consumes three repository secrets. The `creds` fixture in `test
 | Secret name           | Status      | Purpose |
 |-----------------------|-------------|---------|
 | `HIPPIUS_TEST_USER`   | recommended | Username for Basic Auth against registry.hippius.com. Paired with HIPPIUS_TEST_PASS. |
-| `HIPPIUS_TEST_PASS`   | recommended | Password / docker robot secret paired with HIPPIUS_TEST_USER. |
-| `HIPPIUS_TEST_TOKEN`  | optional    | Bearer token alternative. Useful when rotating to a role-scoped robot via `hippius-hub registry keys create --role push`. |
+| `HIPPIUS_TEST_PASS`   | recommended | Registry secret paired with HIPPIUS_TEST_USER. |
+| `HIPPIUS_TEST_TOKEN`  | optional    | Bearer token alternative. Useful when rotating to a role-scoped key via `hippius-hub registry keys create --role push`. |
 
 Set them in repo settings under **Settings → Secrets and variables → Actions → Repository secrets**, or via the CLI:
 
 ```bash
-gh secret set HIPPIUS_TEST_USER -b 'robot$your-project+ci'
+gh secret set HIPPIUS_TEST_USER    # the login printed by `registry keys create`
 gh secret set HIPPIUS_TEST_PASS    # interactive prompt; value won't appear in shell history
 gh secret set HIPPIUS_TEST_TOKEN   # only if using the Bearer path
 ```
 
-**Scope the test credentials to `test/e2e-client` only — never to a production namespace.** That keeps the blast radius of any leak limited to test data. For finer-grained scope, create a role-scoped robot:
+**Scope the test credentials to `test/e2e-client` only — never to a production namespace.** That keeps the blast radius of any leak limited to test data. For finer-grained scope, create a role-scoped key:
 
 ```bash
 # On the workstation where you're already logged in:
