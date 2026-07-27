@@ -11,10 +11,17 @@ The `_assert_published_wheel()` guard below is the belt to that suspenders: if
 anything ever re-introduces the shadowing, the suite fails loudly with an
 explanation instead of silently testing the wrong code (or, more likely,
 blowing up on a missing `hippius_core` .so with no hint as to why).
+
+The guard only ASSERTS — it must never mutate `sys.path`. An earlier version
+scrubbed the repo root from `sys.path` here, which broke `pytest` at the repo
+root for the whole project: the editable maturin install (`python-source = "."`)
+resolves `hippius_hub` *through* the repo root, so dropping that entry made all
+76 `tests/` modules fail to import. `testpaths = ["tests"]` in pyproject.toml is
+what actually keeps the two suites apart; this file just refuses to run against
+the wrong client.
 """
 import hashlib
 import os
-import sys
 import uuid
 from datetime import datetime
 from datetime import timedelta
@@ -23,15 +30,11 @@ from pathlib import Path
 
 import pytest
 
+import _revisions
+import hippius_hub
+from hippius_hub import auth, console
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
-
-# Scrub the repo root before the first `import hippius_hub` anywhere in the
-# suite. Ordering matters: conftest is imported before any test module.
-sys.path[:] = [p for p in sys.path if p and Path(p).resolve() != REPO_ROOT]
-
-import _revisions  # noqa: E402
-import hippius_hub  # noqa: E402
-from hippius_hub import auth, console  # noqa: E402
 
 
 def _assert_published_wheel():
@@ -39,9 +42,11 @@ def _assert_published_wheel():
     if installed.is_relative_to(REPO_ROOT):
         raise RuntimeError(
             f"hippius_hub resolved to the repo checkout ({installed}), not an "
-            f"installed wheel. The smoke suite must exercise the published "
-            f"client — run it from outside the repo tree, or `pip install "
-            f"hippius_hub` into the active environment."
+            f"installed wheel — this environment has an editable/in-tree install, "
+            f"so the smoke suite would be testing the working tree instead of what "
+            f"users actually get from PyPI. Run it from a clean venv:\n"
+            f"  python -m venv /tmp/smoke && /tmp/smoke/bin/pip install -r smoke/requirements.txt\n"
+            f"  cd smoke && /tmp/smoke/bin/pytest -v"
         )
     return installed
 

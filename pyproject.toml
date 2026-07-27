@@ -29,6 +29,14 @@ module-name = "hippius_hub.hippius_core"
 python-source = "."
 
 [tool.pytest.ini_options]
+# Bare `pytest` from the repo root collects ONLY `tests/`. Without this it also
+# walks into `smoke/`, the hourly production suite — which is built to run
+# against the wheel published on PyPI, not this working tree, and whose conftest
+# refuses to run against an in-tree install. That refusal aborted collection for
+# all of `tests/` (76 import errors) the first time the two suites met.
+# `smoke/` has its own pytest.ini and is run with `cd smoke && pytest`; see
+# .github/workflows/production-smoke-tests.yml.
+testpaths = ["tests"]
 # Default selection skips `expensive`: those tests mutate prod state that's
 # slow/costly to revert (on-chain subscriptions debit credits, rotate-token
 # invalidates every parallel runner's robot secret, publicity toggle resizes
