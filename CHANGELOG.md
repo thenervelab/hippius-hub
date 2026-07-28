@@ -14,7 +14,7 @@ the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 - **`hippius-hub registry repos delete <project>/<repo>`** — a CLI command to
   delete a whole repository, mirroring `hf repos delete`. Supports
   `--repo-type`, `--token`, `--missing-ok`, and `-y/--yes`, and prompts for
-  confirmation otherwise. Wraps the existing `delete_repo()` (Harbor admin API),
+  confirmation otherwise. Wraps the existing `delete_repo()` (registry admin API),
   which requires `admin`/`push-delete` rights on the project — previously the
   only way to remove a repo was the Python API. Deleting via the console
   artifact endpoint only cleared artifacts and left an empty repo behind; this
@@ -43,7 +43,7 @@ the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 ### Added
 
 - **Resumable plain-blob uploads.** A large file below the chunk threshold now
-  streams to the registry in bounded OCI `PATCH` chunks (`HIPPIUS_UPLOAD_CHUNK_SIZE`,
+  streams to the registry in bounded `PATCH` chunks (`HIPPIUS_UPLOAD_CHUNK_SIZE`,
   default 16 MiB); on any transient failure the client `GET`s the registry's
   committed offset and resumes from there, so a mid-upload disconnect costs at most
   one chunk of re-send instead of the whole layer. Falls back to the monolithic
@@ -76,7 +76,7 @@ the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html
   `Dockerfile.receiver`, `deploy/receiver/`) and the client multipart upload
   route it fronted (`upload_blob_multipart_native`, `HIPPIUS_RECEIVER_URL`,
   `HIPPIUS_MULTIPART_*`, the `diagnose-upload` CLI and its upload throughput
-  probe). Chunking pushes chunk blobs straight to Harbor, so the receiver is
+  probe). Chunking pushes chunks straight to the registry, so the receiver is
   superseded. The download `diagnose` command and its probe are unchanged.
 
 ### Changed
@@ -139,7 +139,7 @@ the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html
   - `diagnose` bounds DNS resolution and tries every resolved address (a dead
     first IPv6 no longer produces a false-negative), and its token fetch honors
     `--endpoint`.
-  - `models list`/`show` no longer crash on a null `format` field; the Harbor
+  - `models list`/`show` no longer crash on a null `format` field; the registry
     whoami/create/delete admin calls use the same 30s timeout as their siblings;
     a wedged `docker login` is bounded to 60s; a folder of only-small files no
     longer builds the chunked-v2 dedup index it never consults.
@@ -156,7 +156,7 @@ the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html
   - Each download body read has a default-on 30s idle timeout (overridable by
     `HIPPIUS_READ_TIMEOUT`), so a peer that dribbles then stalls mid-body is cut
     promptly rather than only after the 5-minute per-chunk total timeout.
-  - The plain blob upload re-initiates its OCI upload session on every retry, so a
+  - The single-object upload re-initiates its upload session on every retry, so a
     transient failure no longer re-PUTs a session the failed attempt consumed.
   - The legacy Range downloader bounds its live chunk tasks to a spawn window
     (drain-as-they-land) instead of eager-spawning one task per chunk; the pack
@@ -176,7 +176,7 @@ the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html
   whole report. The size-probe HEAD also gained a request timeout.
 - A missing upload-init `Location` header now raises a clear error instead of a
   `TypeError`.
-- A non-numeric JWT `exp` claim is rejected instead of poisoning the OCI token
+- A non-numeric JWT `exp` claim is rejected instead of poisoning the registry token
   cache with a persistent `TypeError`.
 - `HippiusApi` no longer drops the constructor token when a call passes
   `token=None` explicitly.
@@ -189,8 +189,8 @@ the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 
 A consolidation release that lands the 45-finding security/correctness audit
 remediation, plus four rounds of post-review hardening (race fixes, supply-chain
-gates, clippy enforcement, ~400 LOC of new respx coverage for `console.py` and
-`_harbor.py`).
+gates, clippy enforcement, ~400 LOC of new respx coverage for the console and
+registry admin clients).
 
 The version jumps from `0.4.x` to `0.5.0` because this release contains breaking
 changes — most are intentional security/correctness fixes, but downstream users
@@ -351,7 +351,7 @@ should expect to update calling code. See **Migration** below.
 
 ### Added
 
-- **OCI `If-Match` header on manifest PUT** (`hippius_hub/file_upload.py`) —
+- **`If-Match` header on the revision commit** (`hippius_hub/file_upload.py`) —
   the registry-side closure of the audit H1 finding.
 - **`ConcurrentManifestUpdateError`** — typed exception in `hippius_hub.errors`.
 - **`TokenInput` typed dispatch** (`hippius_hub/_token.py`) — HF's three-state
@@ -369,8 +369,8 @@ should expect to update calling code. See **Migration** below.
 - **149+ Python tests** (was ~70) covering token-cache key separation,
   anonymous downloads, concurrent uploads, dry-run short-circuit, atomic
   token writes, atomic symlink replacement, the full CLI exit-code matrix
-  via subprocess, and the previously-untested `console.py` (28 functions,
-  38 tests) and `_harbor.py` (10 functions, 21 tests).
+  via subprocess, and the previously-untested console client (28 functions,
+  38 tests) and registry admin client (10 functions, 21 tests).
 - **CI supply-chain gates**:
   - `cargo deny check` (advisories + licenses + bans + sources) — see
     `deny.toml` for the policy.
@@ -412,7 +412,7 @@ should expect to update calling code. See **Migration** below.
 - **H2**: CLI `login` no longer `.strip()`s tokens with embedded whitespace.
 - **L6**: `download_file_native` no longer uses `""` as an in-band "skipped
   verify" sentinel; covered above under Breaking changes.
-- **M3**: OCI bearer-token cache key now hashes the token value, so two
+- **M3**: registry bearer-token cache key now hashes the token value, so two
   users hitting the same repo with different tokens get distinct cache
   entries (previously the second user got the first user's JWT).
 - **M4**: Malformed JWT payloads now emit a typed `UserWarning` instead of
@@ -434,7 +434,7 @@ should expect to update calling code. See **Migration** below.
   observable at a non-`0o600` mode.
 - **`_create_symlink` TOCTOU** closed; concurrent downloaders no longer
   race on the snapshot symlink.
-- **OCI token cache key** now hashes the token before use; raw bearer JWTs
+- **Registry token cache key** now hashes the token before use; raw bearer JWTs
   no longer appear in the in-memory cache as part of the key.
 
 ### Documented deferrals
