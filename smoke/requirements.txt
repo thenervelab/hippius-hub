@@ -1,0 +1,6 @@
+# Deliberately unpinned: the whole point of this suite is to exercise whatever
+# version is CURRENTLY on PyPI against production. Pinning would test a stale
+# client and let a broken release ship unnoticed for a week.
+hippius_hub
+pytest==7.4.4
+pytest-json-report==1.5.0
