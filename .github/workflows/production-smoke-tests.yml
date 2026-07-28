@@ -1,0 +1,105 @@
+name: production-smoke-tests
+
+# Hourly proof that a user who just ran `pip install hippius_hub` can push a
+# 100 MiB model to registry.hippius.com and pull it back byte-for-byte.
+#
+# Deliberately distinct from e2e.yml: that workflow builds the working tree
+# (maturin develop) and runs on PRs. This one installs the LATEST PUBLISHED
+# WHEEL from PyPI and runs on a clock, so a production regression — or a bad
+# release — is caught within the hour rather than at the next PR.
+on:
+  schedule:
+    - cron: '0 * * * *'
+
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  smoke-tests:
+    name: Smoke Tests (registry.hippius.com)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    # Never cancel an in-flight run: each run pushes a uniquely-named revision
+    # and sweeps old ones, and a killed run leaves a half-committed manifest
+    # behind. Queueing instead just delays the next hourly check.
+    concurrency:
+      group: production-smoke-tests
+      cancel-in-progress: false
+
+    # Hoisted to the job so the notify step's `if:` can test it. The `secrets`
+    # context is not available in a step-level `if`; the `env` context is.
+    env:
+      WEBHOOK_URL: ${{ secrets.MATTERMOST_WEBHOOK_URL }}
+
+    steps:
+      # Actions pinned to SHAs (not tags), matching e2e.yml — a hijacked tag
+      # retag cannot silently introduce malicious code. Refresh by re-resolving
+      # with `gh api repos/<owner>/<repo>/git/refs/tags/<tag>`.
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1  # v6.3.0
+        with:
+          python-version: '3.12'
+
+      # `hippius_hub` is intentionally unpinned in smoke/requirements.txt — the
+      # point is to test whatever is on PyPI right now. `--no-cache-dir` stops
+      # a runner-cached wheel from masking a broken fresh publish.
+      - name: Install the published hippius_hub from PyPI
+        run: |
+          python -m venv .venv
+          .venv/bin/pip install --upgrade pip
+          .venv/bin/pip install --no-cache-dir --upgrade -r smoke/requirements.txt
+          echo "Installed: $(.venv/bin/pip show hippius_hub | grep -i '^Version:')"
+
+      # The per-step timeout sits well below the job's 30-minute cap on purpose:
+      # a job-level timeout cancels the remaining steps, so the Mattermost
+      # notification would never fire on a hung suite.
+      #
+      # `working-directory: smoke` is load-bearing, not cosmetic. pytest anchors
+      # its *initial* conftest discovery on the invocation directory, so running
+      # this from the repo root picks up tests/conftest.py — which declares
+      # `pytest_plugins = ["tests.respx_fixtures"]` and prepends the repo root to
+      # sys.path, shadowing the PyPI wheel with the (unbuilt) in-tree source.
+      # Verified: from the repo root this dies with `No module named 'tests'`
+      # even with `-c smoke/pytest.ini`. See smoke/conftest.py for the full story.
+      - name: Run production smoke tests
+        timeout-minutes: 20
+        working-directory: smoke
+        env:
+          HIPPIUS_TEST_USER: ${{ secrets.HIPPIUS_TEST_USER }}
+          HIPPIUS_TEST_PASS: ${{ secrets.HIPPIUS_TEST_PASS }}
+          HIPPIUS_TEST_TOKEN: ${{ secrets.HIPPIUS_TEST_TOKEN }}
+          HIPPIUS_TEST_CONSOLE_TOKEN: ${{ secrets.HIPPIUS_TEST_CONSOLE_TOKEN }}
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/reports"
+          "$GITHUB_WORKSPACE/.venv/bin/pytest" \
+            -v \
+            --tb=short \
+            --json-report \
+            --json-report-file="$GITHUB_WORKSPACE/reports/smoke-production.json"
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: smoke-test-results-${{ github.run_id }}
+          path: reports/
+          retention-days: 90
+
+      # Skipped silently when MATTERMOST_WEBHOOK_URL isn't set, so the job still
+      # goes red in the Actions UI even before the secret is configured.
+      - name: Notify Mattermost on failure
+        if: failure() && env.WEBHOOK_URL != ''
+        env:
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          python scripts/extract_failure_details.py \
+            reports/smoke-production.json \
+            --webhook "$WEBHOOK_URL" \
+            --run-url "$RUN_URL"

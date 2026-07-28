@@ -393,22 +393,61 @@ HIPPIUS_TEST_USER='...' HIPPIUS_TEST_PASS='...' pytest -m hf_parity -v
 
 The CI workflow (`.github/workflows/e2e.yml`) runs fast tests on every PR, the Hippius e2e suite on every PR with credentials, and the full HF-parity nightly.
 
+## Production smoke tests
+
+`.github/workflows/production-smoke-tests.yml` runs hourly and answers one question: can somebody who just ran `pip install hippius_hub` push a 100 MiB model to `registry.hippius.com` and pull it back byte-for-byte?
+
+It is deliberately *not* the e2e suite:
+
+| | `e2e.yml` | `production-smoke-tests.yml` |
+|---|---|---|
+| Trigger | PRs, pushes, tags, releases | hourly cron + manual dispatch |
+| Client under test | the working tree (`maturin develop`) | the **latest wheel on PyPI** |
+| Catches | regressions before merge | production outages, and bad releases |
+
+Because it installs from PyPI, a release that builds fine but is broken in the wild (missing console script, wrong abi3 wheel tag, a server-side change the shipped client can't handle) is caught within the hour instead of at the next PR.
+
+The suite lives in `smoke/`, **not** `tests/`. `tests/` is a Python package whose `conftest.py` makes pytest prepend the repo root to `sys.path`, which shadows the installed wheel with the in-tree source — the exact thing this suite must not do. `smoke/pytest.ini` keeps pytest's rootdir at `smoke/` so that conftest is never loaded.
+
+```bash
+# Run it locally (from inside smoke/, so rootdir resolves correctly)
+pip install -r smoke/requirements.txt
+cd smoke
+HIPPIUS_TEST_USER='...' HIPPIUS_TEST_PASS='...' HIPPIUS_SMOKE_MODEL_MB=5 pytest -v
+```
+
+| Env var | Default | Purpose |
+|---|---|---|
+| `HIPPIUS_SMOKE_REPO` | `$HIPPIUS_TEST_REPO`, else `test/e2e-client` | Namespace the smoke run pushes to. |
+| `HIPPIUS_SMOKE_MODEL_MB` | `100` | Size of the synthetic weights file. Lower it for a quick local run. |
+| `HIPPIUS_SMOKE_RETENTION_HOURS` | `6` | How long `smoke-*` revisions survive before the sweep deletes them. |
+
+Each run pushes **freshly random** bytes at a unique `smoke-<timestamp>-<short>` revision. That's not incidental: OCI blobs are content-addressed, so re-uploading identical bytes would dedup server-side and the "upload" would become a no-op HEAD — the suite would go green without pushing a byte. The cost of that is ~2.4 GB/day of new blobs, which is why `test_01` sweeps revisions older than the retention window before anything else runs. Only revisions whose names parse as `smoke-<YYYYmmdd-HHMMSS>-…` are touched, so e2e revisions sharing the namespace are never at risk.
+
+On failure, `scripts/extract_failure_details.py` (ported from `hippius-s3`, so both smoke suites alert identically) turns the pytest JSON report into a Mattermost message naming the test, a plain-language explanation of the error class, and the traceback frame in our own code.
+
 ## CI secrets
 
-The e2e workflow consumes three repository secrets. The `creds` fixture in `tests/conftest.py:34-45` accepts either the USER+PASS pair (Basic Auth) OR the TOKEN (Bearer) path; if both env vars are empty the `_have_creds()` check returns False and every `@pytest.mark.e2e` test skips cleanly. This is deliberate so PRs from **forks** — which never receive secrets under the `pull_request` trigger by GitHub's default — see the offline suite pass and the live suite skip, rather than a confusing fail.
+Both live workflows draw on the same secrets. The `creds` fixture in `tests/conftest.py:34-45` accepts either the USER+PASS pair (Basic Auth) OR the TOKEN (Bearer) path; if both env vars are empty the `_have_creds()` check returns False and every `@pytest.mark.e2e` test skips cleanly. This is deliberate so PRs from **forks** — which never receive secrets under the `pull_request` trigger by GitHub's default — see the offline suite pass and the live suite skip, rather than a confusing fail.
 
-| Secret name           | Status      | Purpose |
-|-----------------------|-------------|---------|
-| `HIPPIUS_TEST_USER`   | recommended | Username for Basic Auth against registry.hippius.com. Paired with HIPPIUS_TEST_PASS. |
-| `HIPPIUS_TEST_PASS`   | recommended | Password / docker robot secret paired with HIPPIUS_TEST_USER. |
-| `HIPPIUS_TEST_TOKEN`  | optional    | Bearer token alternative. Useful when rotating to a role-scoped robot via `hippius-hub registry keys create --role push`. |
+The smoke suite behaves the opposite way on purpose: missing credentials are a **hard failure**, not a skip. It only ever runs on a cron with secrets available, and a smoke suite that silently skips is indistinguishable from a green one — precisely the failure mode the job exists to prevent.
+
+| Secret name                  | Status      | Used by        | Purpose |
+|------------------------------|-------------|----------------|---------|
+| `HIPPIUS_TEST_USER`          | recommended | e2e + smoke    | Username for Basic Auth against registry.hippius.com. Paired with HIPPIUS_TEST_PASS. |
+| `HIPPIUS_TEST_PASS`          | recommended | e2e + smoke    | Password / docker robot secret paired with HIPPIUS_TEST_USER. |
+| `HIPPIUS_TEST_TOKEN`         | optional    | e2e + smoke    | Bearer token alternative. Useful when rotating to a role-scoped robot via `hippius-hub registry keys create --role push`. |
+| `HIPPIUS_TEST_CONSOLE_TOKEN` | recommended | e2e + smoke    | console.hippius.com API token. The smoke suite needs it to delete a single old revision; without it `test_01` skips and old `smoke-*` revisions accumulate. |
+| `MATTERMOST_WEBHOOK_URL`     | optional    | smoke          | Where the hourly failure alert is posted. Unset means no notification — the run still goes red in the Actions UI. |
 
 Set them in repo settings under **Settings → Secrets and variables → Actions → Repository secrets**, or via the CLI:
 
 ```bash
 gh secret set HIPPIUS_TEST_USER -b 'robot$your-project+ci'
-gh secret set HIPPIUS_TEST_PASS    # interactive prompt; value won't appear in shell history
-gh secret set HIPPIUS_TEST_TOKEN   # only if using the Bearer path
+gh secret set HIPPIUS_TEST_PASS            # interactive prompt; value won't appear in shell history
+gh secret set HIPPIUS_TEST_TOKEN           # only if using the Bearer path
+gh secret set HIPPIUS_TEST_CONSOLE_TOKEN   # console API token, for the smoke suite's revision sweep
+gh secret set MATTERMOST_WEBHOOK_URL       # same webhook hippius-s3 posts its smoke alerts to
 ```
 
 **Scope the test credentials to `test/e2e-client` only — never to a production namespace.** That keeps the blast radius of any leak limited to test data. For finer-grained scope, create a role-scoped robot:
