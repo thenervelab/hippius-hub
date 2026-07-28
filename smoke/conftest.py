@@ -35,13 +35,26 @@ import hippius_hub
 from hippius_hub import auth, console
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
+IN_TREE_PACKAGE = REPO_ROOT / "hippius_hub"
 
 
 def _assert_published_wheel():
+    """Refuse to run against the working tree instead of the published wheel.
+
+    The test is deliberately narrow: does the import resolve to the *source
+    package* at `<repo>/hippius_hub/`? An earlier version asked the broader
+    question "is it anywhere under the repo root?", which is wrong — a venv
+    created inside the checkout puts a perfectly good wheel at
+    `<repo>/.venv/lib/pythonX.Y/site-packages/hippius_hub/`. That is what CI
+    does (`python -m venv .venv` in the workspace) and what the README tells
+    developers to do, so the guard rejected every legitimate run. It only
+    passed pre-merge because the validation venv happened to sit outside the
+    repo.
+    """
     installed = Path(hippius_hub.__file__).resolve()
-    if installed.is_relative_to(REPO_ROOT):
+    if installed.is_relative_to(IN_TREE_PACKAGE):
         raise RuntimeError(
-            f"hippius_hub resolved to the repo checkout ({installed}), not an "
+            f"hippius_hub resolved to the in-tree source at {installed}, not an "
             f"installed wheel — this environment has an editable/in-tree install, "
             f"so the smoke suite would be testing the working tree instead of what "
             f"users actually get from PyPI. Run it from a clean venv:\n"
