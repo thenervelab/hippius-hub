@@ -580,7 +580,12 @@ def cmd_revisions(args):
     tags = _list_tags(registry, oci_repo, oci_token)
     if tags is None:
         print("❌ Repository not found.")
-        sys.exit(1)
+        # 11, not 1: this is exactly the RepositoryNotFoundError condition the
+        # exit-code contract in `_format_download_error` documents. It answered
+        # 1 here, so a wrapper could not tell "this repo is gone" apart from any
+        # other generic failure — and the sibling 401 path (deleted namespace)
+        # exited 1 too, via an uncaught traceback.
+        sys.exit(11)
     if not tags:
         print("No revisions yet.")
         return
@@ -929,7 +934,21 @@ def main():
         "diagnose": _cmd_diagnose,
     }
     if args.command in handlers:
-        handlers[args.command](args)
+        # Backstop so an *expected* registry condition can never reach the user
+        # as a stack trace. `download`/`upload` already route their own failures
+        # through _format_download_error; `revisions`/`diagnose` did not, so a
+        # 401 from a deleted namespace surfaced as a raw httpx.HTTPStatusError
+        # traceback. Deliberately narrow — only huggingface_hub's typed error
+        # families are caught, so a genuine bug (TypeError, KeyError, ...) still
+        # bubbles up with its traceback intact rather than being flattened into
+        # a tidy but undebuggable message.
+        from .errors import EntryNotFoundError, HfHubHTTPError
+        try:
+            handlers[args.command](args)
+        except (HfHubHTTPError, EntryNotFoundError) as e:
+            msg, code = _format_download_error(e)
+            print(msg)
+            sys.exit(code)
         return
     if args.command in ("registry", "models"):
         if not hasattr(args, "func"):
