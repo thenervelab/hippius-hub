@@ -35,6 +35,35 @@ from hippius_hub.console import ConsoleError
 MOCK_API = "https://api.test.invalid"
 
 
+@pytest.fixture(autouse=True)
+def _no_saved_console_token(monkeypatch, tmp_path):
+    """Point `API_TOKEN_PATH` at an empty dir so no real token can leak in.
+
+    `_headers()` resolves as `token or load_api_token()`, and `load_api_token`
+    reads `API_TOKEN_PATH` from disk. The unauthenticated tests below assert
+    `"Authorization" not in ...headers`, but nothing established that there was
+    no saved token — so they passed on clean CI and failed on any machine where
+    someone had run `hippius-hub login`. That is a false negative in the worst
+    direction: green precisely where the credential was absent, red where the
+    behavior actually mattered.
+
+    Redirecting the PATH rather than stubbing `load_api_token` is deliberate.
+    Stubbing the function would make `test_load_api_token_returns_none_when_missing`
+    pass vacuously (asserting None against a lambda that returns None) and break
+    `test_save_and_load_api_token` outright — both exercise that function as the
+    unit under test. Redirecting the path leaves its real logic running; those
+    two tests re-patch `API_TOKEN_PATH` in their own bodies, which lands after
+    this fixture and therefore wins.
+
+    Autouse (not opt-in) because the leak is ambient — a future test that forgot
+    to request the fixture would silently regain the machine-dependence. Tests
+    needing a token take `with_token`, which stubs `load_api_token` directly and
+    so overrides this regardless of path (pinned by
+    `test_request_sends_token_header`).
+    """
+    monkeypatch.setattr(console, "API_TOKEN_PATH", str(tmp_path / "absent_api_token"))
+
+
 @pytest.fixture
 def monkeypatched_console_api(monkeypatch):
     """Point both `DEFAULT_API_URL` bindings at the mock URL.
