@@ -17,7 +17,7 @@ from ._harbor import (harbor_create_project, harbor_delete_repository,
 from ._oci import fetch_manifest, group_files, head_manifest, layer_titles
 from .auth import get_oci_bearer_token, resolve_auth_header
 from .constants import DEFAULT_HTTP_TIMEOUT, resolve_registry
-from .errors import (LocalTokenNotFoundError, RepositoryNotFoundError, )
+from .errors import (GatedRepoError, LocalTokenNotFoundError, RepositoryNotFoundError, )
 from .file_download import _oci_repo_path, _validate_repo_type
 
 
@@ -38,6 +38,17 @@ def _list_tags(registry: str, repo_id: str, oci_token: str) -> Optional[list]:
 
     Robots with `pull` perm can call this. Returns None on 404 (repo doesn't exist),
     a (possibly empty) list otherwise.
+
+    401 and 403 are mapped to HF's typed errors rather than left to
+    `raise_for_status()`. The registry answers 401 — not 404 — when the whole
+    *project* is gone, because it refuses to confirm whether a private namespace
+    exists. Letting that escape as a bare `httpx.HTTPStatusError` made
+    `hippius-hub revisions <repo-in-a-deleted-namespace>` dump a stack trace
+    instead of a diagnosis, which is the single most common way a user finds out
+    their namespace was deleted. Mapping 401 -> RepositoryNotFoundError and
+    403 -> GatedRepoError also matches `huggingface_hub`'s own
+    `hf_raise_for_status`, so drop-in callers catching HF's typed errors keep
+    working against the Hippius registry.
     """
     # The registry's default (no `?n`) page returns only the first tag and omits
     # the Link header, so we MUST request an explicit page size — otherwise
@@ -53,6 +64,17 @@ def _list_tags(registry: str, repo_id: str, oci_token: str) -> Optional[list]:
         resp = _http.client().get(url, headers=headers, timeout=DEFAULT_HTTP_TIMEOUT)
         if resp.status_code == 404:
             return None
+        # Checked explicitly (rather than caught from raise_for_status) so the
+        # real response object rides along on the typed error for callers that
+        # inspect `.response`.
+        if resp.status_code == 401:
+            raise RepositoryNotFoundError(
+                f"Repository {repo_id!r} not found. It may have been deleted, or it "
+                f"may be private — if it is private, run `hippius-hub login` first.",
+                response=resp, )
+        if resp.status_code == 403:
+            raise GatedRepoError(
+                f"Access denied to repository {repo_id!r}.", response=resp, )
         resp.raise_for_status()
         tags.extend(resp.json().get("tags") or [])
         url = _next_link(resp.headers.get("Link"), registry)
@@ -319,11 +341,24 @@ def list_repo_refs(repo_id: str, *, repo_type: Optional[str] = None,
 
 def repo_exists(repo_id: str, *, repo_type: Optional[str] = None,
         token: Union[bool, str, None] = None, endpoint: Optional[str] = None, ) -> bool:
-    """True iff the OCI repository has ever been pushed to (any tag exists)."""
+    """True iff the OCI repository has ever been pushed to (any tag exists).
+
+    Mirrors `huggingface_hub.repo_exists`, which answers the question with a
+    bool rather than an exception: a repo we cannot see is reported False, and
+    a gated repo is reported True (it demonstrably exists — we were told off for
+    asking). The try/except is load-bearing for that contract: since `_list_tags`
+    now raises RepositoryNotFoundError on the 401 a deleted namespace returns,
+    without it `repo_exists("gone/repo")` would raise where HF returns False.
+    """
     _validate_repo_type(repo_type)
     oci_repo = _oci_repo_path(repo_id, repo_type)
     oci_token = get_oci_bearer_token(oci_repo, token, push=False, endpoint=endpoint)
-    tags = _list_tags(resolve_registry(endpoint), oci_repo, oci_token)
+    try:
+        tags = _list_tags(resolve_registry(endpoint), oci_repo, oci_token)
+    except GatedRepoError:
+        return True
+    except RepositoryNotFoundError:
+        return False
     return tags is not None and len(tags) > 0
 
 
