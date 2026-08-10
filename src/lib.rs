@@ -22,7 +22,7 @@ use chunked_downloader::ChunkedDownloader;
 /// underlying cause (e.g. `chunk 7 failed\ncaused by: server returned
 /// 503 (transient)`). Previously the lib.rs callers used
 /// `format!("{:?}", e)` on the bare enum, which printed Debug shape
-/// without walking `source()` — losing the inner reqwest/io message
+/// without walking `source()` - losing the inner reqwest/io message
 /// the audit D8 / U4 findings called out.
 fn core_err_to_py(e: &CoreError) -> PyErr {
     let mut msg = e.to_string();
@@ -33,8 +33,8 @@ fn core_err_to_py(e: &CoreError) -> PyErr {
         // links keeps each layer scannable in a Python traceback.
         // `write!` into the owned `String` avoids the intermediate
         // `format!` allocation on every link in the chain.
-        // The `Result` is infallible — writing to a `String` cannot
-        // fail — so swallowing it is sound; we deliberately do not
+        // The `Result` is infallible - writing to a `String` cannot
+        // fail - so swallowing it is sound; we deliberately do not
         // surface a synthetic error here.
         let _ignored = write!(msg, "\ncaused by: {src}");
         current = src.source();
@@ -45,7 +45,7 @@ fn core_err_to_py(e: &CoreError) -> PyErr {
 /// Process-global multi-threaded tokio runtime, managed by `pyo3-async-runtimes`.
 ///
 /// `pyo3_async_runtimes::tokio::get_runtime()` returns the library's canonical
-/// singleton — an `OnceCell<Pyo3Runtime>` initialized on first call with a
+/// singleton - an `OnceCell<Pyo3Runtime>` initialized on first call with a
 /// multi-thread builder. By routing through it instead of our own `OnceLock`
 /// we gain free interop if a future `#[pyfunction]` ever calls
 /// `pyo3_async_runtimes::tokio::future_into_py`: that helper spawns onto the
@@ -54,7 +54,7 @@ fn core_err_to_py(e: &CoreError) -> PyErr {
 ///
 /// The library's `get_runtime` signature is `pub fn get_runtime<'a>() -> &'a
 /// Runtime`; the `'a` is free elision over the underlying `OnceCell` static, so
-/// coercion to `&'static` is sound — the storage outlives the process.
+/// coercion to `&'static` is sound - the storage outlives the process.
 ///
 /// The previous manual `OnceLock` build with a custom `"hippius-core"` thread
 /// name was replaced here in audit STRUCT-1 (Phase 5.1). The thread name was
@@ -69,7 +69,7 @@ fn shared_runtime() -> &'static tokio::runtime::Runtime {
 const SIGNAL_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
 
 /// Drive `fut` to completion, polling `poll_interrupt` every `interval`; if it
-/// returns `Some(e)`, stop and return `Err(e)`, DROPPING `fut` — which cancels its
+/// returns `Some(e)`, stop and return `Err(e)`, DROPPING `fut` - which cancels its
 /// in-flight work. Cancellation is structural: the download `JoinSet` and the pack
 /// `AbortOnDrop` guard abort their spawned tasks on drop, and a directly-awaited
 /// streamed send is cancelled by dropping its future.
@@ -78,7 +78,7 @@ const SIGNAL_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_mill
 /// entry points run inside `py.detach` (GIL released), so `poll_interrupt` briefly
 /// re-`attach`es and calls `check_signals`, which processes a pending `SIGINT` and
 /// returns the `KeyboardInterrupt`. `check_signals` only acts on the interpreter's
-/// MAIN thread — which is where `block_on` drives this loop for a DIRECT native call
+/// MAIN thread - which is where `block_on` drives this loop for a DIRECT native call
 /// (the case that otherwise hangs on Ctrl-C); a fan-out worker thread no-ops the
 /// check and relies on the main thread's own signal handling plus audit M3.
 ///
@@ -145,7 +145,7 @@ fn poll_ctrl_c() -> Option<PyErr> {
 #[pyo3(signature = (url, dest_path, auth_token=None, chunk_size=None, verify_hash=true, content_length=None, connect_timeout_secs=None, read_timeout_secs=None))]
 #[expect(
     clippy::too_many_arguments,
-    reason = "each parameter is a distinct Python-supplied download argument; the two timeouts are resolved in constants.py and threaded here (audit L9) — bundling would add a wrapper type for no call-site clarity"
+    reason = "each parameter is a distinct Python-supplied download argument; the two timeouts are resolved in constants.py and threaded here (audit L9) - bundling would add a wrapper type for no call-site clarity"
 )]
 fn download_file_native(
     py: Python<'_>,
@@ -165,7 +165,7 @@ fn download_file_native(
     // contract returned `""` as an in-band "skipped" sentinel; callers
     // now match on `is None` instead, which is also free of the
     // theoretical collision with `sha256(b"")` = `e3b0c4...` (a
-    // non-empty 64-hex string — distinct from `""` but still a
+    // non-empty 64-hex string - distinct from `""` but still a
     // sentinel-shaped trap if a future SHA-0-like algorithm ever
     // produced an empty digest).
     let rt = shared_runtime();
@@ -174,8 +174,8 @@ fn download_file_native(
     // Release the GIL so other Python threads can run during the (long)
     // network/disk I/O. pyo3 acquires the GIL automatically on function
     // entry; detach (the post-0.27 name for allow_threads) explicitly
-    // releases it for the closure body. Building the downloader — which now
-    // clones the shared download client rather than constructing a fresh one —
+    // releases it for the closure body. Building the downloader - which now
+    // clones the shared download client rather than constructing a fresh one -
     // happens inside the closure so client access never holds the GIL, matching
     // download_packs_native (where PackAssembler::new already runs detached).
     // Timeouts resolved in Python (constants.resolve_connect_timeout /
@@ -243,11 +243,11 @@ fn hash_file_native(py: Python<'_>, path: String) -> PyResult<(String, u64)> {
 /// # Arguments
 /// - `path`: local file to chunk.
 /// - `avg_size`: `FastCDC` target average chunk size in bytes (min/max derived
-///   as avg/4 .. avg*4). Pinned by the caller — it is part of the layout's wire
+///   as avg/4 .. avg*4). Pinned by the caller - it is part of the layout's wire
 ///   contract, so identical files chunk identically and dedup.
 ///
 /// # Returns
-/// `tuple[str, list[tuple[str, int, int]]]` — the whole-file sha256 hex, and the
+/// `tuple[str, list[tuple[str, int, int]]]` - the whole-file sha256 hex, and the
 /// per-chunk `(sha256_hex, offset, length)` list in file order.
 ///
 /// # Errors
@@ -326,7 +326,7 @@ fn upload_blob_native(
 /// Probe the network path to a single blob URL and return a JSON-encoded
 /// `DiagnosticReport` (see `src/diagnostics.rs`). Python decodes it on the
 /// other side (see `hippius_hub/diagnose.py: report["blob"] = json.loads(raw)`)
-/// so the wire contract is intentionally a string — every new field added to
+/// so the wire contract is intentionally a string - every new field added to
 /// `DiagnosticReport` flows through without changing the pyo3 signature.
 #[pyfunction]
 #[pyo3(signature = (blob_url, auth_token=None, probe_bytes=33_554_432, max_concurrent=None, connect_timeout_secs=None, read_timeout_secs=None))]
@@ -367,14 +367,14 @@ fn diagnose_blob_native(
 ///
 /// # Arguments
 /// - `uploads_url`: the repo's `.../blobs/uploads/` endpoint; this call does the
-///   POST-init + monolithic PUT itself (a new pack is never dedup-HEADed — its
+///   POST-init + monolithic PUT itself (a new pack is never dedup-HEADed - its
 ///   content is new by construction).
 /// - `path`: local source file.
 /// - `ranges`: `(offset, length)` byte ranges to concatenate, in pack order.
 /// - `auth_token`: optional bearer token.
 ///
 /// # Returns
-/// The pack blob's lowercase-hex sha256 (no prefix) — recorded in the v2 pointer.
+/// The pack blob's lowercase-hex sha256 (no prefix) - recorded in the v2 pointer.
 ///
 /// # GIL
 /// Releases the GIL across the blocking read+upload via `py.detach`.
@@ -416,7 +416,7 @@ fn pack_upload_native(
 ///   chunk_sha256_hex)` targets to carve and verify.
 /// - `dest_path`: destination, pre-allocated to `total_size`.
 /// - `total_size`: whole-file byte length (from the pointer's `file.size`).
-/// - `file_digest`: optional whole-file sha256 (hex, no prefix) — always passed
+/// - `file_digest`: optional whole-file sha256 (hex, no prefix) - always passed
 ///   for chunked files; proves chunk ordering across packs.
 ///
 /// # Returns
@@ -528,7 +528,7 @@ mod runtime_tests {
         // migration: the underlying storage moved from our local
         // `OnceLock<Runtime>` to `pyo3_async_runtimes`'s
         // `OnceCell<Pyo3Runtime>`, but pointer equality across two calls is
-        // still the direct expression of "one runtime per process" — and a
+        // still the direct expression of "one runtime per process" - and a
         // regression test that would fire if the library ever broke that
         // contract or we accidentally swapped in a non-singleton wrapper.
         let a: &'static _ = super::shared_runtime();
@@ -539,7 +539,7 @@ mod runtime_tests {
     #[tokio::test]
     async fn run_interruptible_surfaces_the_interrupt_and_drops_the_future() {
         // Audit M1: on an interrupt, run_interruptible must return Err AND drop the
-        // work future — dropping is what cancels its in-flight work (the JoinSet /
+        // work future - dropping is what cancels its in-flight work (the JoinSet /
         // AbortOnDrop guard abort their tasks, a streamed send is cut). A guard held
         // across the never-completing await proves the drop happened.
         use std::sync::atomic::{AtomicBool, Ordering};
@@ -581,7 +581,7 @@ mod runtime_tests {
 
     #[tokio::test]
     async fn run_interruptible_returns_output_when_the_future_finishes_first() {
-        // No pending signal (poll always None) → the work future's own output wins,
+        // No pending signal (poll always None) -> the work future's own output wins,
         // so a normal transfer is untouched by the signal poll.
         let outcome: std::result::Result<i32, &str> =
             super::run_interruptible(async { 42 }, std::time::Duration::from_millis(20), || None)
@@ -595,7 +595,7 @@ mod runtime_tests {
         // transfer that is ready on the SAME tick the timer fires must win over a
         // pending interrupt, so a download that just finished is never reported as a
         // spurious KeyboardInterrupt. A ZERO interval makes the sleep arm immediately
-        // ready too, so both branches are ready at once — only `biased` (fut polled
+        // ready too, so both branches are ready at once - only `biased` (fut polled
         // first) makes completion win deterministically. Inverting the arm order or
         // dropping `biased` turns this into a coin flip and fails/flakes here, even
         // though the poll below would ALWAYS interrupt.

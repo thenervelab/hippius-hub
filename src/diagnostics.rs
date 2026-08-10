@@ -3,7 +3,7 @@
 //! Measures, against a single resolved blob URL, the same signals other tools
 //! surface (`curl -w`, hf-speedtest, rclone `-P`): a per-phase handshake
 //! breakdown (DNS / TCP connect / TLS), a HEAD that reveals any redirect to a
-//! download host, time-to-first-byte, and — the headline signal —
+//! download host, time-to-first-byte, and - the headline signal -
 //! single-stream vs parallel-stream throughput. If single-stream is slow but
 //! parallel recovers, the caller is bandwidth-delay-product limited on a
 //! high-RTT path and our 32-way fan-out is the mitigation working as intended.
@@ -11,7 +11,7 @@
 //! Everything is returned as a serializable struct (the Python layer renders
 //! the report); fatal failures (can't resolve, can't connect, HEAD failed)
 //! bubble up as `DiagError` since an unreachable host IS the diagnosis. Only
-//! the TLS sub-probe is best-effort — a raw-handshake failure is recorded but
+//! the TLS sub-probe is best-effort - a raw-handshake failure is recorded but
 //! does not abort the throughput tests, which are what users care about most.
 
 #![expect(
@@ -184,7 +184,7 @@ fn collect_request_ids(headers: &reqwest::header::HeaderMap, out: &mut BTreeMap<
 
 #[expect(
     clippy::too_many_lines,
-    reason = "linear DNS → TCP → TLS → HEAD → single-stream → parallel pipeline; splitting hides the phase ordering that makes this readable"
+    reason = "linear DNS -> TCP -> TLS -> HEAD -> single-stream -> parallel pipeline; splitting hides the phase ordering that makes this readable"
 )]
 pub async fn probe_blob(
     blob_url: &str,
@@ -215,7 +215,7 @@ pub async fn probe_blob(
         .to_string();
     let port = url.port_or_known_default().unwrap_or(443);
 
-    // --- DNS (bounded — audit L7) ---
+    // --- DNS (bounded - audit L7) ---
     // Bound resolution by the same connect budget: `connect_timeout` covers the
     // reqwest clients and the raw socket below, but NOT this lookup, so a
     // black-holed resolver would otherwise hang the probe for the OS resolver's
@@ -275,7 +275,7 @@ pub async fn probe_blob(
         })));
     };
     let tcp_connect_ms = tcp_start.elapsed().as_millis() as u64;
-    // The IP that actually connected — more useful than the first DNS record.
+    // The IP that actually connected - more useful than the first DNS record.
     let resolved_ip = Some(addr.ip().to_string());
 
     // TLS handshake sub-probe was removed because the only ecosystem option
@@ -284,7 +284,7 @@ pub async fn probe_blob(
     // rustls 0.23 line is API-incompatible and adds a CryptoProvider install
     // dance; the timing it would buy us isn't worth the migration here.
     // `tls_handshake_ms / tls_version / alpn` stay in the report shape but
-    // are always None — `format_report` already renders that gracefully.
+    // are always None - `format_report` already renders that gracefully.
     drop(tcp);
     let tls_handshake_ms: Option<u64> = None;
     let tls_version: Option<String> = None;
@@ -344,7 +344,7 @@ pub async fn probe_blob(
     let mut parallel_chunks: Vec<ChunkTiming> = Vec::new();
     // How many bytes we actually probed. Starts at the (possibly content-length
     // clamped) request target and is corrected down to what the single stream
-    // really transferred — see below.
+    // really transferred - see below.
     let mut effective_bytes = probe;
 
     if probe == 0 {
@@ -361,7 +361,7 @@ pub async fn probe_blob(
         // stream actually transferred as ground truth, NOT the unclamped
         // `probe`: when the blob HEAD was a redirect (no Content-Length) and the
         // file is smaller than `probe`, splitting `probe` would issue ranges
-        // past EOF → HTTP 416 and fail the whole probe. The single stream
+        // past EOF -> HTTP 416 and fail the whole probe. The single stream
         // already stopped at EOF, so `bytes` is the real downloadable size.
         effective_bytes = bytes;
         let ranges = split_ranges(effective_bytes, n);
@@ -386,7 +386,7 @@ pub async fn probe_blob(
         let mut total_bytes = 0u64;
         for r in results {
             // Audit M-DIAG-ABORT: a single failed parallel range (429/503/416, or a
-            // reset on one stream) must NOT discard the whole report — DNS, TCP,
+            // reset on one stream) must NOT discard the whole report - DNS, TCP,
             // HEAD and the single-stream result are already collected, and the
             // rate-limit verdict reads `parallel_chunks`. Record the failure and
             // compute throughput over the survivors so a partial report still returns
@@ -451,14 +451,14 @@ mod tests {
 
     #[test]
     fn split_ranges_covers_exactly() {
-        // 1000 bytes over 4 chunks → 250 each, inclusive ranges, no gaps/overlap.
+        // 1000 bytes over 4 chunks -> 250 each, inclusive ranges, no gaps/overlap.
         let r = split_ranges(1000, 4);
         assert_eq!(r, vec![(0, 249), (250, 499), (500, 749), (750, 999)]);
     }
 
     #[test]
     fn split_ranges_remainder_truncates_last() {
-        // 1001 bytes over 4 → ceil(1001/4)=251-byte chunks; the last range is
+        // 1001 bytes over 4 -> ceil(1001/4)=251-byte chunks; the last range is
         // truncated at the final byte (251*3=753 .. 1000 inclusive).
         let r = split_ranges(1001, 4);
         assert_eq!(r, vec![(0, 250), (251, 501), (502, 752), (753, 1000)]);
@@ -469,7 +469,7 @@ mod tests {
 
     #[test]
     fn split_ranges_fewer_bytes_than_chunks() {
-        // 3 bytes, 8 chunks → at most 3 single-byte ranges, never empty ones.
+        // 3 bytes, 8 chunks -> at most 3 single-byte ranges, never empty ones.
         let r = split_ranges(3, 8);
         assert_eq!(r, vec![(0, 0), (1, 1), (2, 2)]);
     }

@@ -2,8 +2,8 @@
 //!
 //! The chunked-artifact layout (docs/plans/2026-07-09-chunked-artifact-layout.md)
 //! stores a large file as K independent, content-addressed OCI blobs. Unlike
-//! `chunked_downloader.rs` — which parallelises ONE whole-file blob via HTTP
-//! `Range` requests (206 slices) and is kept for pre-chunking artifacts — this
+//! `chunked_downloader.rs` - which parallelises ONE whole-file blob via HTTP
+//! `Range` requests (206 slices) and is kept for pre-chunking artifacts - this
 //! module fetches each chunk as its own ordinary blob (a full `200 OK`) and
 //! writes it to its offset in the pre-allocated destination. Two consequences:
 //! no `Range`/206 dependency (the ATS-edge 206 fragility the plan retires), and
@@ -43,15 +43,15 @@ const CHUNK_REQUEST_TIMEOUT: Duration = Duration::from_mins(5);
 /// Default per-chunk-read idle timeout for downloads (audit M4). Bounds a peer that
 /// completes the handshake then dribbles or stops mid-body: reset on each successful
 /// read, so it fires only on genuine no-progress (a 30s gap with zero bytes), never
-/// on a slow-but-steady transfer. Default-ON — unlike the opt-in client
-/// `read_timeout` — and overridden by `HIPPIUS_READ_TIMEOUT` when set. Scoped per
+/// on a slow-but-steady transfer. Default-ON - unlike the opt-in client
+/// `read_timeout` - and overridden by `HIPPIUS_READ_TIMEOUT` when set. Scoped per
 /// chunk read (an app-level `tokio::time::timeout`), not a global client setting, so
 /// it fixes the slow-loris the 5-minute total timeout would otherwise leave open for
 /// minutes.
 const DOWNLOAD_READ_IDLE: Duration = Duration::from_secs(30);
 
 /// Idle-connection cap for the shared download client. Bounds only *idle*
-/// (kept-alive) connections, not in-flight requests — the per-file `Semaphore`
+/// (kept-alive) connections, not in-flight requests - the per-file `Semaphore`
 /// (`PackAssembler`) and spawn count (`ChunkedDownloader`) are the real concurrency
 /// bounds, so a fixed value is safe regardless of a caller's `max_concurrent`. 32
 /// matches the default `max_concurrent`. This does change the pack path's idle-pool
@@ -63,7 +63,7 @@ const DOWNLOAD_POOL_MAX_IDLE: usize = 32;
 
 /// Absolute ceiling on a single pack blob's declared size, before any of its bytes
 /// are read or reserved. A pack aggregates `FastCDC` chunks toward `HIPPIUS_PACK_SIZE`
-/// (~64 MiB default; 16 MiB max chunk), so no legitimate pack approaches 1 GiB — the
+/// (~64 MiB default; 16 MiB max chunk), so no legitimate pack approaches 1 GiB - the
 /// cap exists solely to bound a hostile or corrupt manifest. Without it, the pack
 /// size comes straight from a registry-controlled OCI layer descriptor: a declared
 /// 1 TiB would make `fetch_pack` reserve 1 TiB up front (an uncatchable alloc abort)
@@ -84,7 +84,7 @@ const MAX_PACK_BYTES: u64 = 1024 * 1024 * 1024;
 /// per-connection ceiling; h1 lets each chunk claim its own connection.
 ///
 /// Construction is fallible (the TLS backend may fail to init), so this returns
-/// `Result` rather than `expect`-ing inside a `get_or_init` closure — the crate
+/// `Result` rather than `expect`-ing inside a `get_or_init` closure - the crate
 /// denies `panic`/`unwrap`. On an init race the loser's freshly built client is
 /// dropped unused (RAII); `OnceLock` is valid in statics and never poisoned.
 /// Connect + read timeouts for the shared download client. Resolved in Python
@@ -95,7 +95,7 @@ const MAX_PACK_BYTES: u64 = 1024 * 1024 * 1024;
 ///
 /// `read` is `Option`: `None` leaves the shared client's *opt-in* `.read_timeout()`
 /// off, so the client is byte-for-byte the pre-audit one. The DEFAULT-ON download
-/// stall guard (audit M4) lives at the app level instead — [`read_chunk_bounded`]
+/// stall guard (audit M4) lives at the app level instead - [`read_chunk_bounded`]
 /// bounds each `res.chunk()` read by [`download_read_idle`] (30s, or
 /// `HIPPIUS_READ_TIMEOUT` when set), scoped per chunk rather than as a global client
 /// setting. So a slow-loris is cut by default; setting `HIPPIUS_READ_TIMEOUT`
@@ -119,7 +119,7 @@ impl Default for TransportTimeouts {
 impl TransportTimeouts {
     /// Build from optional per-operation seconds; `None` keeps the field default
     /// (`connect` -> 30s, `read` -> no client read timeout). Non-positive values
-    /// are unrepresentable — Python's `_resolve_positive_int` rejects them first.
+    /// are unrepresentable - Python's `_resolve_positive_int` rejects them first.
     pub(crate) fn from_secs(connect: Option<u64>, read: Option<u64>) -> Self {
         let d = Self::default();
         Self {
@@ -141,7 +141,7 @@ fn build_download_client(timeouts: TransportTimeouts) -> Result<Client, CoreErro
     if let Some(read) = timeouts.read {
         // Opt-in only (see `TransportTimeouts`): fires on a stalled read (no byte
         // within the window, reset on each successful read), bounding a peer that
-        // handshakes then dribbles/stops mid-body — which `connect_timeout` and
+        // handshakes then dribbles/stops mid-body - which `connect_timeout` and
         // `tcp_keepalive` cannot see and the per-chunk 5-min total `.timeout()`
         // only catches after 5 minutes (audit M4).
         builder = builder.read_timeout(read);
@@ -186,7 +186,7 @@ pub(crate) fn download_client(timeouts: TransportTimeouts) -> Result<&'static Cl
     // First-caller-wins (like `global_pack_gate`): the process-global client is
     // built once with the first download's resolved timeouts. Every file in a
     // snapshot passes the same env-derived values, so the winner is representative;
-    // a later differing value is ignored — the documented tradeoff of one shared
+    // a later differing value is ignored - the documented tradeoff of one shared
     // pool. The loser of an init race drops its freshly built client (RAII).
     let built = build_download_client(timeouts)?;
     let client = CLIENT.get_or_init(|| built);
@@ -197,12 +197,12 @@ pub(crate) fn download_client(timeouts: TransportTimeouts) -> Result<&'static Cl
 }
 
 /// Process-global cap on packs in flight across ALL concurrent downloads (every
-/// file in a snapshot), so the nested snapshot-workers × per-file-concurrency
+/// file in a snapshot), so the nested snapshot-workers x per-file-concurrency
 /// parallelism cannot multiply resident 64 MiB pack buffers into an OOM
-/// (8 workers × 32 × 64 MiB ≈ 16 GB worst case). Sized from the FIRST call's
+/// (8 workers x 32 x 64 MiB ~ 16 GB worst case). Sized from the FIRST call's
 /// `max_concurrent` (first-caller-wins, like `download_client`): in a uniform
 /// snapshot every file passes the same value, so the total in-flight budget equals
-/// one file's concurrency — a single large file is never throttled, and N files
+/// one file's concurrency - a single large file is never throttled, and N files
 /// SHARE that budget rather than each getting the full amount. Mirrors the upload
 /// path's `_pack_upload_gate`.
 fn global_pack_gate(max_concurrent: usize) -> Arc<Semaphore> {
@@ -211,7 +211,7 @@ fn global_pack_gate(max_concurrent: usize) -> Arc<Semaphore> {
 }
 
 /// Extents `(file_offset, size)` one completed pack contributes to the whole-file
-/// hasher — the payload of the incremental-hash channel. One byte of the file
+/// hasher - the payload of the incremental-hash channel. One byte of the file
 /// belongs to exactly one extent, so the extents across all packs tile the file.
 type HashSignal = Vec<(u64, u64)>;
 
@@ -227,10 +227,10 @@ type IncrementalHash = (Option<Sender<HashSignal>>, Option<HasherTask>);
 
 /// Aborts every held task handle when dropped. Fires on BOTH `assemble`'s
 /// early-return error path AND on cancellation (the whole `assemble` future dropped
-/// when Ctrl-C interrupts the native call — audit M1). Without it, dropping the
+/// when Ctrl-C interrupts the native call - audit M1). Without it, dropping the
 /// `FuturesUnordered`/`Vec<AbortHandle>` would DETACH the spawned pack tasks (a
 /// `JoinHandle` drop detaches, not aborts), leaving them writing to `dest` and
-/// holding the pack gate after the caller moved on — the exact hazard the download
+/// holding the pack gate after the caller moved on - the exact hazard the download
 /// path's `JoinSet` avoids structurally (audit D4/L13).
 struct AbortOnDrop(Vec<AbortHandle>);
 
@@ -273,7 +273,7 @@ pub struct PackAssembler {
 
 impl PackAssembler {
     /// Clones the shared process-global `download_client` (warm pool across files);
-    /// the semaphore in `assemble` — not the client's fixed idle pool — is the real
+    /// the semaphore in `assemble` - not the client's fixed idle pool - is the real
     /// concurrency bound. Fallible only on the client's first-time build.
     pub fn new(
         auth_token: Option<String>,
@@ -320,7 +320,7 @@ impl PackAssembler {
             // No `sync_all` (audit L15): the parallel chunk writers and the
             // incremental hasher see the `set_len` size through the page cache
             // without forcing metadata to disk. `sync_all` only bought crash
-            // durability of the pre-allocation, which is discarded anyway — a crash
+            // durability of the pre-allocation, which is discarded anyway - a crash
             // re-downloads the whole file (the dest always opens with `truncate`).
         }
 
@@ -332,7 +332,7 @@ impl PackAssembler {
                 .expect("indicatif template is static and infallible")
                 .progress_chars("#>-"),
         );
-        pb.set_message("📥 Downloading packs");
+        pb.set_message("Downloading packs");
 
         // Verify the whole-file digest incrementally, overlapped with the fetch,
         // instead of a second full read afterwards (see `spawn_incremental_hasher` /
@@ -395,7 +395,7 @@ impl PackAssembler {
                 if res.is_ok() {
                     if let Some(tx) = &hash_tx {
                         // Signal the file-offset extents this pack verified+wrote, once,
-                        // only AFTER the retry loop succeeded — a retried pack must not
+                        // only AFTER the retry loop succeeded - a retried pack must not
                         // double-count. A closed channel means the hasher task already
                         // exited (error/abort), so a dropped signal merely forgoes the
                         // incremental fast path; the whole-file check then re-reads.
@@ -408,7 +408,7 @@ impl PackAssembler {
             abort_handles.push(handle.abort_handle());
             joins.push(handle);
         }
-        // Abort every pack task when this scope unwinds — on the early-return error
+        // Abort every pack task when this scope unwinds - on the early-return error
         // path below AND on cancellation (audit M1): a `_`-prefixed binding keeps the
         // guard alive to scope end (a bare `_` would drop it immediately). It is
         // declared after `joins`, so on unwind it drops FIRST and aborts the tasks
@@ -442,7 +442,7 @@ impl PackAssembler {
                 Ok((_, Ok(()))) => {}
             }
         }
-        pb.finish_with_message("✅ Packs complete");
+        pb.finish_with_message("Packs complete");
 
         if let Some(expected_file) = expected_file_sha256 {
             return Ok(Some(
@@ -509,7 +509,7 @@ fn spawn_incremental_hasher(dest: &Path, total_size: u64, verify: bool) -> Incre
 /// background hasher computed (its work overlapped the download), else fall back to
 /// a full re-read when the incremental pass could not cover the file in order. Both
 /// hash the same on-disk bytes, so the fallback is a slower route to an identical
-/// answer. A `JoinError` means the hasher task panicked — surfaced rather than
+/// answer. A `JoinError` means the hasher task panicked - surfaced rather than
 /// masked (the fn is written not to panic, so it is effectively unreachable, but a
 /// silent fallback would hide a real defect). Errors on a digest mismatch, which is
 /// exactly the cross-pack ordering failure this whole-file check exists to catch.
@@ -585,7 +585,7 @@ async fn fetch_pack(
         ));
     }
     // Audit L12: read the body under a running cap instead of `res.bytes()`, which
-    // buffers an unbounded body BEFORE the length check — a chunked (no
+    // buffers an unbounded body BEFORE the length check - a chunked (no
     // Content-Length) response from a misbehaving/compromised registry could
     // balloon memory well past the intended ~pack_size ceiling (x32 concurrent
     // packs) before rejection. Abort the moment the accumulated body exceeds
@@ -605,7 +605,7 @@ async fn fetch_pack(
     while let Some(chunk) = read_chunk_bounded(&mut res, download_read_idle()).await? {
         received = received.saturating_add(chunk.len() as u64);
         if received > pack_size {
-            // Transport length anomaly, not a wrong-bytes integrity failure — a
+            // Transport length anomaly, not a wrong-bytes integrity failure - a
             // proxy/CDN that over-sends a self-consistent body can clear on retry,
             // so classify it retryable (matches the Range path's short/over-length
             // handling in chunked_downloader). Bounded by pack_size so a runaway
@@ -623,7 +623,7 @@ async fn fetch_pack(
         )));
     }
     // Verify + scatter on the blocking pool (audit L14). The per-chunk sha256 is
-    // CPU-bound and the scatter writes are local disk — neither is async work, so
+    // CPU-bound and the scatter writes are local disk - neither is async work, so
     // running them inline on the runtime starves the other up-to-32 concurrent pack
     // fetches. `bytes` (the received pack) moves in; the metadata clones are cheap.
     let targets_owned = targets.to_vec();
@@ -642,7 +642,7 @@ async fn fetch_pack(
 /// writes are local disk, so this does no async work and must not sit on the async
 /// runtime. A digest mismatch or out-of-range chunk is a PERMANENT `Integrity` error
 /// (a content-addressed blob serves the same wrong bytes on retry, and an
-/// out-of-bounds range is a bad plan) — distinct from the transport length anomalies
+/// out-of-bounds range is a bad plan) - distinct from the transport length anomalies
 /// in `fetch_pack`, which are the retryable `BadResponse`. A corrupt/mis-placed pack
 /// must never be written past its bounds.
 fn verify_and_scatter(
@@ -717,7 +717,7 @@ async fn compute_sha256(path: &Path) -> Result<String, CoreError> {
 ///
 /// Each `recv` carries the `(file_offset, size)` extents one completed pack wrote.
 /// `pending` (keyed by start offset) is the reorder buffer for out-of-order packs;
-/// it holds only metadata — the bytes are already on disk — so it stays a few bytes
+/// it holds only metadata - the bytes are already on disk - so it stays a few bytes
 /// per chunk and can never grow to the file size the way an in-memory byte reorder
 /// buffer would. `watermark` is the end of the region contiguously covered from
 /// offset 0; it advances only when the extent starting exactly at the watermark has
@@ -729,8 +729,8 @@ async fn compute_sha256(path: &Path) -> Result<String, CoreError> {
 ///
 /// Best-effort by contract: returns `Some(digest)` ONLY after consuming exactly
 /// `[0, total_size)` in order AND draining every signalled extent (so no pack wrote
-/// past `total_size`); any shortfall — an abort closing the channel early, a coverage
-/// gap, a read error, or an out-of-bounds extent left in `pending` — yields `None` so
+/// past `total_size`); any shortfall - an abort closing the channel early, a coverage
+/// gap, a read error, or an out-of-bounds extent left in `pending` - yields `None` so
 /// the caller re-reads. It therefore hashes the identical bytes `compute_sha256`
 /// would and can only ever be a faster route to the same digest, never a different
 /// verdict.
@@ -757,7 +757,7 @@ fn incremental_hash(rx: &Receiver<HashSignal>, path: &Path, total_size: u64) -> 
             let want = usize::try_from((watermark - hashed).min(buf.len() as u64)).ok()?;
             let n = file.read(&mut buf[..want]).ok()?;
             if n == 0 {
-                return None; // file shorter than the extents claimed — give up, re-read
+                return None; // file shorter than the extents claimed - give up, re-read
             }
             hasher.update(&buf[..n]);
             hashed += n as u64;
@@ -766,8 +766,8 @@ fn incremental_hash(rx: &Receiver<HashSignal>, path: &Path, total_size: u64) -> 
 
     // Channel closed: every pack task has finished. Require BOTH that the hash
     // covered exactly `total_size` AND that `pending` drained. A leftover extent
-    // means a pack wrote beyond the contiguous [0, total_size) region — an
-    // out-of-bounds placement leaves the on-disk file longer than total_size — so
+    // means a pack wrote beyond the contiguous [0, total_size) region - an
+    // out-of-bounds placement leaves the on-disk file longer than total_size - so
     // returning the prefix digest here would ACCEPT a file the full re-read rejects.
     // Any leftover instead forces None, and the caller re-reads to EOF and catches
     // it. (validate_pack_plan already rejects such plans up front; this is the
@@ -803,7 +803,7 @@ mod tests {
         let pack: Vec<u8> = [a, b].concat();
         let ha = hex::encode(Sha256::digest(a));
         let hb = hex::encode(Sha256::digest(b));
-        // (offset_in_pack, size, file_offset, expected_hex): scatter A→0, B→4.
+        // (offset_in_pack, size, file_offset, expected_hex): scatter A->0, B->4.
         let good = vec![(0u64, 4u64, 0u64, ha), (4u64, 2u64, 4u64, hb.clone())];
 
         let path = std::env::temp_dir().join(format!("hippius-vs-{}.bin", std::process::id()));
@@ -833,7 +833,7 @@ mod tests {
     async fn read_chunk_bounded_trips_readstall_on_a_stalled_body() {
         // Audit M4: a peer that sends the head + a few body bytes then stalls (no
         // more data, socket held open) must be cut by the app-level per-read idle
-        // window as a retryable ReadStall — not left until the 5-minute total
+        // window as a retryable ReadStall - not left until the 5-minute total
         // timeout. The client here has NO client read_timeout (default), so the
         // app-level ReadStall is the sole guard, proving it is default-on.
         let Ok(listener) = tokio::net::TcpListener::bind("127.0.0.1:0").await else {
@@ -909,7 +909,7 @@ mod tests {
     }
 
     // An oversized/short/mis-hashed chunk must surface as the permanent
-    // Integrity variant, not a retryable transport error — otherwise a
+    // Integrity variant, not a retryable transport error - otherwise a
     // corrupt content-addressed blob would burn the whole retry budget.
     #[test]
     fn integrity_error_is_permanent() {
@@ -961,7 +961,7 @@ mod tests {
         };
         let url = format!("http://{addr}/blob");
         // `Ok(Err(_))` = the inner future finished with a reqwest error (read_timeout
-        // fired — correct). `Err(_)` = the test's own 8s bound elapsed, i.e. the read
+        // fired - correct). `Err(_)` = the test's own 8s bound elapsed, i.e. the read
         // hung because `read_timeout` was NOT honored (the regression this guards).
         let outcome = tokio::time::timeout(Duration::from_secs(8), async {
             let resp = client.get(&url).send().await?;
@@ -979,7 +979,7 @@ mod tests {
     //
     // The contract under test: for ANY file content, ANY chunk tiling, and ANY
     // order the completion signals arrive in, `incremental_hash` yields the plain
-    // sequential SHA-256 of the file — or `None` (never a wrong digest) when it
+    // sequential SHA-256 of the file - or `None` (never a wrong digest) when it
     // cannot cover the file. Tests avoid `unwrap`/`expect` (crate-wide `deny`) by
     // returning `io::Result` and using `?`.
     use std::io::Write as _;
@@ -989,7 +989,7 @@ mod tests {
     static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
     /// RAII guard: removes the scratch file on drop so a failing assertion (which
-    /// returns early) still cleans up. Ignoring the remove error is intentional —
+    /// returns early) still cleans up. Ignoring the remove error is intentional -
     /// a leftover temp file is harmless and there is nothing to recover.
     struct TempFileGuard(PathBuf);
     impl Drop for TempFileGuard {
@@ -1009,7 +1009,7 @@ mod tests {
     }
 
     /// A varied (non-constant) byte pattern so a mis-ordering across a chunk
-    /// boundary changes the digest — a constant fill would hide reorder bugs.
+    /// boundary changes the digest - a constant fill would hide reorder bugs.
     fn pattern(n: usize) -> Vec<u8> {
         let seed = b"HIPPIUS-hub-chunked-v2";
         (0..n).map(|i| seed[i % seed.len()]).collect()
@@ -1072,7 +1072,7 @@ mod tests {
     #[test]
     fn incremental_incomplete_coverage_returns_none() {
         // The final [700, 1000) extent never arrives, so the file is never fully
-        // covered: must yield None (→ caller re-reads), not a partial digest.
+        // covered: must yield None (-> caller re-reads), not a partial digest.
         let content = pattern(1000);
         let msgs = vec![vec![(0, 400)], vec![(400, 300)]];
         assert_eq!(drive(&content, &msgs).ok(), Some(None));
@@ -1081,7 +1081,7 @@ mod tests {
     #[test]
     fn incremental_empty_file_hashes_empty() {
         // total_size == 0: no extents, channel closes immediately, hashed == 0 ==
-        // total_size → the SHA-256 of the empty input.
+        // total_size -> the SHA-256 of the empty input.
         let content: Vec<u8> = Vec::new();
         assert_eq!(drive(&content, &[]).ok(), Some(Some(reference(&content))));
     }
@@ -1181,7 +1181,7 @@ mod tests {
     #[test]
     fn validate_pack_plan_rejects_out_of_bounds_chunk() {
         // A chunk at file_offset 1005 in a 1000-byte file would extend the assembled
-        // file past total_size — exactly the over-length false-accept the whole-file
+        // file past total_size - exactly the over-length false-accept the whole-file
         // digest must never miss. It must be rejected before any fetch.
         let packs = vec![PackPlanEntry {
             url: String::new(),
@@ -1213,7 +1213,7 @@ mod tests {
     #[test]
     fn validate_pack_plan_rejects_pack_size_over_ceiling() {
         // A registry-declared pack size above MAX_PACK_BYTES must be refused BEFORE
-        // fetch_pack reserves or streams it — the hostile-manifest DoS the ceiling
+        // fetch_pack reserves or streams it - the hostile-manifest DoS the ceiling
         // exists to bound. The chunks are otherwise in-bounds, so only the declared
         // pack.size trips the guard.
         let packs = vec![PackPlanEntry {
@@ -1366,7 +1366,7 @@ mod tests {
 
     /// A 3000-byte file split into three 1000-byte chunks across two packs, with the
     /// leading and trailing chunks scattered into pack A (non-contiguous file offsets)
-    /// and the middle chunk in pack B — so the plan exercises cross-pack scatter and
+    /// and the middle chunk in pack B - so the plan exercises cross-pack scatter and
     /// out-of-order arrival, not a trivial single-pack copy.
     fn three_pack_plan(base: &str, content: &[u8]) -> Vec<PackPlanEntry> {
         vec![
@@ -1390,7 +1390,7 @@ mod tests {
     async fn fetch_pack_rejects_over_length_body() {
         // Audit L12: a body larger than the declared pack_size must be rejected
         // under a running cap, not buffered whole. Serve 2000 bytes but declare
-        // pack_size=1000 — the over-send guard trips before the carve.
+        // pack_size=1000 - the over-send guard trips before the carve.
         let mut routes = HashMap::new();
         routes.insert("/pack".to_string(), vec![9u8; 2000]);
         let Some(base) = serve_packs(routes).await.ok() else {
@@ -1408,7 +1408,7 @@ mod tests {
             "an over-length pack body must be rejected (bounded), got {res:?}"
         );
         // A transport length anomaly is a plausibly-transient BadResponse, so the
-        // retry loop re-attempts it — distinct from a permanent Integrity mismatch.
+        // retry loop re-attempts it - distinct from a permanent Integrity mismatch.
         assert!(
             res.is_err_and(|e| e.is_retryable()),
             "an over-send is retryable so fetch_pack_with_retry re-attempts it"
