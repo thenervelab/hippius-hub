@@ -602,6 +602,15 @@ in the commit message. Commit:
 
 ### Task B2: SHA backend spike (timeboxed, decision-gated — may conclude "no")
 
+> **OUTCOME (2026-08-10): closed, ring NOT adopted — decided by arithmetic on
+> B1's measured decomposition instead of running the spike.** Post-B1 the 2 GiB
+> producer floor is ~1.5 s StreamCDC scan/copy + ~1.2 s whole-file SHA; ring's
+> best recorded advantage (1.5x, no-SHA-NI Xeon) on the SHA component alone
+> yields ~1.17x phase-1, under this task's own 1.3x gate; Apple Silicon is
+> parity (sha2+asm at the ARMv8 ceiling). Re-open only if the CDC copy cost is
+> eliminated or B3 fails to hide the whole-file hash under network transfer.
+> Team memory: mem_01KZPF3FZ57WKD8YK79MZVEBRN.
+
 **Files:**
 - Create: nothing permanent unless adopted
 
