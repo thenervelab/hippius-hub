@@ -34,8 +34,8 @@ pub type Result<T> = std::result::Result<T, CoreError>;
 ///
 /// # Source chain
 ///
-/// `Reqwest`, `Io`, `ChunkFailed`, and `JoinFailed` preserve the
-/// underlying cause via `std::error::Error::source()` (wired by
+/// `Reqwest`, `Io`, `ChunkFailed`, `JoinFailed`, and `SessionRestart`
+/// preserve the underlying cause via `std::error::Error::source()` (wired by
 /// `thiserror`'s `#[from]` / `#[source]` attributes). Walk the chain
 /// with `let mut cur = err.source(); while let Some(s) = cur { ...; cur
 /// = s.source(); }` - exactly what `lib.rs::core_err_to_py` does at
@@ -170,6 +170,23 @@ pub enum CoreError {
     /// replica is expected to return a well-formed response.
     #[error("malformed server response: {0}")]
     BadResponse(String),
+
+    /// The current OCI upload session is unrecoverable (expired 404, offset
+    /// desync the intra-session GET could not resolve, or a 416 after
+    /// resume). Retryable BY DESIGN: the recovery is a fresh session from
+    /// offset 0 in the outer retry loop - the fabricated-503 workaround this
+    /// variant replaces. `source` carries the real give-up cause (typically a
+    /// `ServerError` such as the 416, or a transport error). Never another
+    /// `SessionRestart`: the only constructor, `uploader::force_retryable`,
+    /// passes retryable errors through untouched, and this variant IS
+    /// retryable, so it can never be re-wrapped.
+    #[error("upload session unrecoverable; restarting")]
+    SessionRestart {
+        /// The real give-up cause - the non-retryable error (e.g. a 416
+        /// `ServerError`) that made the session unrecoverable.
+        #[source]
+        source: Box<CoreError>,
+    },
 }
 
 impl CoreError {
@@ -219,12 +236,17 @@ impl CoreError {
             // Network/transport blips, both stall watchdogs, and a
             // malformed-but-plausibly-transient response (missing Location, a
             // short/over-sent body) all clear on a fresh attempt to a healthy
-            // replica - retryable.
+            // replica - retryable. `SessionRestart` joins them by DESIGN, not
+            // because its cause is transient: the recovery for a dead upload
+            // session is a FRESH session from offset 0 in the uploader's outer
+            // retry loop, even though the wrapped cause (e.g. a 416) is itself
+            // permanent.
             CoreError::Reqwest(_)
             | CoreError::Io(_)
             | CoreError::Stall(_)
             | CoreError::ReadStall(_)
-            | CoreError::BadResponse(_) => true,
+            | CoreError::BadResponse(_)
+            | CoreError::SessionRestart { .. } => true,
             // 5xx server errors are retryable, plus the two retryable 4xx
             // (408 Request Timeout, 429 Too Many Requests). Everything else
             // 4xx is permanent. `(500..600).contains(status)` operates on
@@ -355,6 +377,21 @@ mod tests {
     #[test]
     fn invalid_argument_is_not_retryable() {
         assert!(!CoreError::InvalidArgument("avg out of range".into()).is_retryable());
+    }
+
+    // A dead upload session must classify retryable (the recovery is a fresh
+    // session from offset 0 in the outer loop) while keeping the real cause -
+    // e.g. the 416 that killed the session - reachable via `source()`, unlike
+    // the fabricated-503 workaround this variant replaces, which flattened the
+    // cause into a message string.
+    #[test]
+    fn session_restart_is_retryable_and_chains_cause() {
+        let cause = CoreError::ServerError(416, "range not satisfiable".into());
+        let e = CoreError::SessionRestart {
+            source: Box::new(cause),
+        };
+        assert!(e.is_retryable());
+        assert!(std::error::Error::source(&e).is_some());
     }
 
     #[test]

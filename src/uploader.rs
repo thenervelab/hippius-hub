@@ -573,16 +573,16 @@ fn committed_bytes(range: Option<&str>) -> u64 {
 /// opens a FRESH session (offset 0) - the actual recovery for a session that is
 /// gone, or a `416` offset-desync the intra-session GET could not resolve. `416`
 /// alone is not [`CoreError::is_retryable`], so returning it raw would make the
-/// outer loop give up instead of restarting; map any non-retryable give-up cause
-/// onto a retryable status that still names the real code.
+/// outer loop give up instead of restarting; wrap any non-retryable give-up
+/// cause in [`CoreError::SessionRestart`], which is retryable by design and
+/// keeps the real cause reachable via `source()`.
 fn force_retryable(e: CoreError) -> CoreError {
     if e.is_retryable() {
         e
     } else {
-        CoreError::ServerError(
-            503,
-            format!("upload session unrecoverable ({e}); restarting"),
-        )
+        CoreError::SessionRestart {
+            source: Box::new(e),
+        }
     }
 }
 
@@ -1620,14 +1620,25 @@ mod tests {
         // Review P2: a 416 routed to the resume path is stored as the give-up
         // cause, but 416 is NOT `is_retryable` - returning it raw would make
         // `upload_blob_async` give up instead of restarting a fresh session.
-        // `force_retryable` must turn it into a retryable error that still names
-        // the original code.
+        // `force_retryable` must wrap it in the retryable `SessionRestart`
+        // variant with the original 416 preserved as the `source()` cause.
         let mapped =
             super::force_retryable(CoreError::ServerError(416, "PATCH failed: 416".into()));
         assert!(mapped.is_retryable(), "a 416 give-up must become retryable");
         assert!(
-            format!("{mapped}").contains("416"),
-            "the real code must survive"
+            matches!(
+                mapped,
+                CoreError::SessionRestart { ref source }
+                    if matches!(**source, CoreError::ServerError(416, _))
+            ),
+            "expected SessionRestart wrapping the 416 cause, got {mapped:?}"
+        );
+        // ... and be reachable through the std `source()` chain, so the Python
+        // boundary renders it as a `caused by:` tail.
+        let cause = std::error::Error::source(&mapped);
+        assert!(
+            cause.is_some_and(|c| c.to_string().contains("416")),
+            "the 416 must be reachable via source()"
         );
         // An already-retryable cause passes through untouched.
         let passthrough = super::force_retryable(CoreError::ServerError(503, "x".into()));
