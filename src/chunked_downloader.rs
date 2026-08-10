@@ -404,8 +404,9 @@ impl ChunkedDownloader {
 /// per indicatif docs), so cloning it into the closure for tick updates is
 /// safe - `pb.inc` is thread-safe and now runs from the blocking thread.
 ///
-/// The double `?` mirrors `hash_file_async`: outer `?` flattens
-/// `JoinError -> CoreError::Io`, inner `?` propagates `io::Error` from
+/// The double `?` mirrors `hash_file_async`: outer `?` maps
+/// `JoinError -> CoreError::JoinFailed` (non-retryable - a panicked hash
+/// closure reproduces on retry), inner `?` propagates `io::Error` from
 /// the closure body.
 async fn compute_sha256(path: &Path, pb: &ProgressBar) -> Result<String, CoreError> {
     use std::io::Read;
@@ -429,7 +430,10 @@ async fn compute_sha256(path: &Path, pb: &ProgressBar) -> Result<String, CoreErr
         Ok(hex::encode(hasher.finalize()))
     })
     .await
-    .map_err(|join_err| CoreError::Io(std::io::Error::other(join_err)))?
+    .map_err(|join_err| CoreError::JoinFailed {
+        index: None,
+        source: join_err,
+    })?
 }
 
 // Audit D5 retry classification moved to `CoreError::is_retryable` in
@@ -513,7 +517,7 @@ fn parse_content_range(value: &str) -> Option<(u64, u64)> {
 /// and with hash verification off (the default) the corrupt file is cached forever
 /// under the trusted content digest. A 206 MUST carry a matching `Content-Range`
 /// (RFC 9110 section 15.3.7), so an absent, unparsable, or mismatched header is treated as
-/// a retryable anomaly (`Io`) that re-fetches rather than a silent write.
+/// a retryable anomaly (`BadResponse`) that re-fetches rather than a silent write.
 fn require_content_range_matches(
     headers: &reqwest::header::HeaderMap,
     start: u64,
@@ -525,12 +529,9 @@ fn require_content_range_matches(
     if raw.and_then(parse_content_range) == Some((start, end)) {
         return Ok(());
     }
-    Err(CoreError::Io(std::io::Error::new(
-        std::io::ErrorKind::InvalidData,
-        format!(
-            "chunk bytes={start}-{end}: 206 Content-Range {} does not cover the requested range",
-            raw.unwrap_or("<absent>")
-        ),
+    Err(CoreError::BadResponse(format!(
+        "chunk bytes={start}-{end}: 206 Content-Range {} does not cover the requested range",
+        raw.unwrap_or("<absent>")
     )))
 }
 
@@ -680,14 +681,15 @@ async fn try_download_chunk_to_offset(
     // matched its own advertised length. Without a length check the chunk's tail
     // stays as the file's pre-allocated `set_len` zeros: a silently truncated file
     // cached forever under the trusted content digest. An OVER-length body (bounded
-    // above) is likewise anomalous. Both surface as a retryable `CoreError::Io` so a
-    // transient anomaly re-fetches before failing hard. `require_acceptable_status`
-    // already rejects a range-ignored 200; these close the short/long-206
-    // cases it cannot see.
+    // above) is likewise anomalous. Both surface retryable - the over-send as a
+    // `BadResponse` (protocol-contract violation, matching the pack path's
+    // over-send handling in `chunk_fetcher::fetch_pack`), the short body as an
+    // `Io(UnexpectedEof)` - so a transient anomaly re-fetches before failing hard.
+    // `require_acceptable_status` already rejects a range-ignored 200; these close
+    // the short/long-206 cases it cannot see.
     if over_range {
-        return Err(CoreError::Io(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            format!("chunk bytes={start}-{end}: server sent more than the {expected}-byte range"),
+        return Err(CoreError::BadResponse(format!(
+            "chunk bytes={start}-{end}: server sent more than the {expected}-byte range"
         )));
     }
     if written != expected {
@@ -1008,13 +1010,29 @@ mod partial_content_tests {
     #[test]
     fn content_range_wrong_offset_is_rejected() {
         // Length-correct (100 bytes) but offset-wrong (0- not 100-): the exact
-        // silent-corruption case L1 defends against.
-        assert!(require_content_range_matches(&cr_headers("bytes 0-99/500"), 100, 199).is_err());
+        // silent-corruption case L1 defends against. The rejection is the honest
+        // `BadResponse` (a protocol-contract violation, not a local I/O failure)
+        // and MUST stay retryable - an LB mid-rollout can emit one bad header,
+        // and the pre-BadResponse `Io` shape retried too. This assertion is the
+        // behavior pin for that classification.
+        let res = require_content_range_matches(&cr_headers("bytes 0-99/500"), 100, 199);
+        match res {
+            Err(err @ CoreError::BadResponse(_)) => {
+                assert!(
+                    err.is_retryable(),
+                    "Content-Range mismatch must stay retryable, got permanent: {err}"
+                );
+            }
+            other => unreachable!("expected BadResponse, got {other:?}"),
+        }
     }
 
     #[test]
     fn content_range_absent_is_rejected() {
-        assert!(require_content_range_matches(&reqwest::header::HeaderMap::new(), 0, 99).is_err());
+        assert!(matches!(
+            require_content_range_matches(&reqwest::header::HeaderMap::new(), 0, 99),
+            Err(CoreError::BadResponse(_))
+        ));
     }
 
     #[test]
@@ -1200,8 +1218,8 @@ mod short_206_tests {
             std::fs::read(&dest).is_ok_and(|b| b.len() == 200 && b[100..].iter().all(|&x| x == 0));
         let _ = std::fs::remove_file(&dest);
         assert!(
-            matches!(res, Err(CoreError::Io(_))),
-            "over-length 206 must error, got {res:?}"
+            matches!(res, Err(CoreError::BadResponse(_))),
+            "over-length 206 must error as retryable BadResponse, got {res:?}"
         );
         assert!(
             tail_is_zero,

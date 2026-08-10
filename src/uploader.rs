@@ -115,10 +115,11 @@ fn chunk_and_hash_reader<R: std::io::Read>(
 /// thread.
 ///
 /// The double `?` at the end is load-bearing: `spawn_blocking(...).await`
-/// produces `Result<Result<T, CoreError>, JoinError>`. We collapse the
-/// outer `JoinError` (panic in the closure / runtime shutdown) into our
-/// `CoreError::Io` variant via `io::Error::other` so callers see one
-/// error surface, then `?` unwraps the inner Result.
+/// produces `Result<Result<T, CoreError>, JoinError>`. The outer
+/// `JoinError` (panic in the closure / runtime shutdown) maps to
+/// `CoreError::JoinFailed` - non-retryable, because a panicked hash
+/// closure reproduces identically on retry - then `?` unwraps the inner
+/// Result.
 pub async fn hash_file_async(path: &Path) -> Result<(String, u64), CoreError> {
     use std::io::Read;
 
@@ -141,7 +142,10 @@ pub async fn hash_file_async(path: &Path) -> Result<(String, u64), CoreError> {
         Ok((hex::encode(hasher.finalize()), total_size))
     })
     .await
-    .map_err(|join_err| CoreError::Io(std::io::Error::other(join_err)))?
+    .map_err(|join_err| CoreError::JoinFailed {
+        index: None,
+        source: join_err,
+    })?
 }
 
 /// Mirror of [`crate::chunked_downloader::MAX_RETRIES`] for the upload
@@ -956,10 +960,16 @@ pub async fn pack_upload_async(
     // uploads for the duration. The `Bytes` clone into the closure is a refcount
     // bump, not a copy, so the pack is still buffered exactly once.
     let body_for_hash = body.clone();
+    // A join failure here (panicked digest closure / runtime shutdown) is
+    // `JoinFailed`, not `Io`: it reproduces on retry, so it must classify
+    // permanent rather than burn the pack retry budget below.
     let digest_hex =
         tokio::task::spawn_blocking(move || hex::encode(Sha256::digest(&body_for_hash)))
             .await
-            .map_err(|join_err| CoreError::Io(std::io::Error::other(join_err)))?;
+            .map_err(|join_err| CoreError::JoinFailed {
+                index: None,
+                source: join_err,
+            })?;
     let digest = format!("sha256:{digest_hex}");
     let mut retries: u32 = 0;
     loop {

@@ -509,9 +509,10 @@ fn spawn_incremental_hasher(dest: &Path, total_size: u64, verify: bool) -> Incre
 /// background hasher computed (its work overlapped the download), else fall back to
 /// a full re-read when the incremental pass could not cover the file in order. Both
 /// hash the same on-disk bytes, so the fallback is a slower route to an identical
-/// answer. A `JoinError` means the hasher task panicked - surfaced rather than
-/// masked (the fn is written not to panic, so it is effectively unreachable, but a
-/// silent fallback would hide a real defect). Errors on a digest mismatch, which is
+/// answer. A `JoinError` means the hasher task panicked - surfaced as the
+/// non-retryable `JoinFailed` rather than masked (the fn is written not to panic,
+/// so it is effectively unreachable, but a silent fallback would hide a real
+/// defect, and a panic reproduces on retry). Errors on a digest mismatch, which is
 /// exactly the cross-pack ordering failure this whole-file check exists to catch.
 async fn verify_file_digest(
     hasher_task: Option<HasherTask>,
@@ -522,7 +523,12 @@ async fn verify_file_digest(
         Some(task) => match task.await {
             Ok(Some(digest)) => digest,
             Ok(None) => compute_sha256(dest).await?,
-            Err(join_err) => return Err(CoreError::Io(std::io::Error::other(join_err))),
+            Err(join_err) => {
+                return Err(CoreError::JoinFailed {
+                    index: None,
+                    source: join_err,
+                })
+            }
         },
         None => compute_sha256(dest).await?,
     };
@@ -630,11 +636,18 @@ async fn fetch_pack(
     let dest = dest_path.to_path_buf();
     let url_owned = url.to_string();
     let pb_owned = pb.clone();
+    // A join failure (panicked scatter closure / runtime shutdown) is the
+    // non-retryable `JoinFailed`: it reproduces on retry, so surfacing it as a
+    // retryable `Io` would make `fetch_pack_with_retry` re-download the whole
+    // ~64 MiB pack up to MAX_RETRIES times for a certain failure.
     tokio::task::spawn_blocking(move || {
         verify_and_scatter(&url_owned, &bytes, &targets_owned, &dest, &pb_owned)
     })
     .await
-    .map_err(|join_err| CoreError::Io(std::io::Error::other(join_err)))?
+    .map_err(|join_err| CoreError::JoinFailed {
+        index: None,
+        source: join_err,
+    })?
 }
 
 /// Verify each carved chunk's sha256 against `bytes` and scatter its slice to the
@@ -707,7 +720,10 @@ async fn compute_sha256(path: &Path) -> Result<String, CoreError> {
         Ok(hex::encode(hasher.finalize()))
     })
     .await
-    .map_err(|join_err| CoreError::Io(std::io::Error::other(join_err)))?
+    .map_err(|join_err| CoreError::JoinFailed {
+        index: None,
+        source: join_err,
+    })?
 }
 
 /// Whole-file SHA-256 folded together incrementally from packs as they land, used
@@ -1306,18 +1322,26 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn verify_file_digest_surfaces_hasher_join_error_as_io() {
-        // A JoinError (task cancelled/panicked) surfaces as CoreError::Io rather than
-        // being masked. Aborting a pending task yields the JoinError without a panic!
-        // macro (which the crate denies).
+    async fn verify_file_digest_surfaces_hasher_join_error_as_join_failed() {
+        // A JoinError (task cancelled/panicked) surfaces as the honest
+        // `JoinFailed { index: None }` - NOT `Io`, which `is_retryable` would
+        // classify transient: a panicked hasher closure reproduces identically on
+        // retry, so the error must classify permanent. Aborting a pending task
+        // yields the JoinError without a panic! macro (which the crate denies).
         let missing = scratch_path("verify_join");
         let task: HasherTask =
             tokio::spawn(async { std::future::pending::<Option<String>>().await });
         task.abort();
-        assert!(matches!(
-            verify_file_digest(Some(task), &missing, &"c".repeat(64)).await,
-            Err(CoreError::Io(_))
-        ));
+        let res = verify_file_digest(Some(task), &missing, &"c".repeat(64)).await;
+        match res {
+            Err(err @ CoreError::JoinFailed { index: None, .. }) => {
+                assert!(
+                    !err.is_retryable(),
+                    "a join failure must classify permanent, got retryable: {err}"
+                );
+            }
+            other => unreachable!("expected JoinFailed {{ index: None }}, got {other:?}"),
+        }
     }
 
     // --- assemble (end-to-end orchestration over a local pack server) ---

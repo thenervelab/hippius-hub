@@ -82,12 +82,14 @@ pub enum CoreError {
         source: Box<CoreError>,
     },
 
-    /// A `tokio::spawn`'d chunk task panicked or was aborted before
-    /// completion. `index` is `None` when the join error fired
+    /// A spawned task - a `tokio::spawn`'d chunk/pack task or a
+    /// `spawn_blocking` hash/scatter closure - panicked or was aborted
+    /// before completion. `index` is `None` when the join error fired
     /// before the `(i, res)` tuple was constructed inside the task
     /// body - the chunk identity is then lost in the join layer, and
-    /// no caller can recover it. `Some(i)` is unused today (the
-    /// downloader only sees the chunkless case) but reserved for
+    /// no caller can recover it - and at the `spawn_blocking` sites,
+    /// where no chunk index is in scope. `Some(i)` is unused today
+    /// (every constructor sees the indexless case) but reserved for
     /// future failure modes where the spawn site has the index.
     /// Reserved instead of dropped so the field type encodes the
     /// "identity may be unknown" invariant rather than a sentinel
@@ -214,10 +216,12 @@ impl CoreError {
     ///   terminal failure.
     /// * [`CoreError::ServerError`] with any other status - permanent (4xx
     ///   auth/format or any non-HTTP code), not retryable.
-    /// * [`CoreError::ChunkFailed`] / [`CoreError::JoinFailed`] -
-    ///   constructed by the orchestrator AFTER an inner retry loop has
-    ///   already given up; retrying compounds backoff for failures
-    ///   already declared terminal.
+    /// * [`CoreError::ChunkFailed`] - constructed by the orchestrator
+    ///   AFTER an inner retry loop has already given up; retrying
+    ///   compounds backoff for failures already declared terminal.
+    /// * [`CoreError::JoinFailed`] - a panicked (or shutdown-aborted)
+    ///   task closure reproduces identically on retry, so retrying
+    ///   only burns backoff on a certain failure.
     /// * [`CoreError::MissingContentLength`] - HEAD-response shape
     ///   error, not transient.
     ///
@@ -255,11 +259,16 @@ impl CoreError {
             CoreError::ServerError(status, _) => {
                 matches!(*status, 408 | 429) || (500..600).contains(status)
             }
-            // Three permanent variants:
-            //   - ChunkFailed / JoinFailed are structured terminal errors
-            //     produced after the per-chunk retry loop already did its
-            //     work - retrying compounds backoff for failures the inner
-            //     loop already declared unrecoverable.
+            // The permanent variants:
+            //   - ChunkFailed is a structured terminal error produced after
+            //     the per-chunk retry loop already did its work - retrying
+            //     compounds backoff for a failure the inner loop already
+            //     declared unrecoverable.
+            //   - JoinFailed means our own task closure panicked (or the
+            //     runtime shut down mid-join): the same closure over the
+            //     same input reproduces the same failure, so a retry only
+            //     burns backoff - and during shutdown it would pointlessly
+            //     delay the exit.
             //   - MissingContentLength is a HEAD-response shape error,
             //     not a transient network condition.
             //   - Integrity is a wrong-bytes error on a content-addressed
