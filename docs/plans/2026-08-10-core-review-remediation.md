@@ -369,8 +369,8 @@ Tests: round-trip `from_hex`/`Display`; `from_hex` rejects short/odd/non-hex inp
 `Sha256Digest::from(<sha2 digest array>)` equals `from_hex(hex::encode(...))`.
 
 **Step 2:** `PackChunkTarget.expected_sha256: Sha256Digest`. The FFI construction
-in `lib.rs` parses incoming hex with `from_hex` (error → `PyValueError` via the
-existing error path). `verify_and_scatter` compares
+in `lib.rs` parses incoming hex with `from_hex` (error → `RuntimeError` via
+`core_err_to_py`, keeping the single native error surface). `verify_and_scatter` compares
 `Sha256Digest::from(<[u8;32]>::from(Sha256::digest(slice))) != *expected` — no hex
 allocation per chunk; hex only inside the failure `format!`.
 
