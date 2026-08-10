@@ -16,17 +16,17 @@ mod uploader;
 use chunk_fetcher::{PackAssembler, PackChunkTarget, PackPlanEntry, TransportTimeouts};
 use chunked_downloader::ChunkedDownloader;
 
-/// Render a `CoreError` (plus its full `source()` chain) as a single
-/// `PyRuntimeError`. Each link in the chain is appended after a
-/// `caused by:` line so the Python `__str__` view shows wrapper +
-/// underlying cause (e.g. `chunk 7 failed\ncaused by: server returned
-/// 503 (transient)`). Previously the lib.rs callers used
+/// Render an error plus its full `source()` chain as one string: the top-level
+/// Display message followed by a `\ncaused by:` line per link. Shared by
+/// `core_err_to_py` and the `diagnose_blob_native` error path so the crate has
+/// exactly one Python-facing error shape (e.g. `chunk 7 failed\ncaused by:
+/// server returned 503 (transient)`). Previously the lib.rs callers used
 /// `format!("{:?}", e)` on the bare enum, which printed Debug shape
 /// without walking `source()` - losing the inner reqwest/io message
 /// the audit D8 / U4 findings called out.
-fn core_err_to_py(e: &CoreError) -> PyErr {
+fn error_chain_message(e: &dyn StdError) -> String {
     let mut msg = e.to_string();
-    let mut current: Option<&dyn StdError> = e.source();
+    let mut current = e.source();
     while let Some(src) = current {
         // `caused by:` mirrors `std::error::Report` and the
         // `errors/source_chain_walk` exemplar; the linebreak between
@@ -39,7 +39,12 @@ fn core_err_to_py(e: &CoreError) -> PyErr {
         let _ignored = write!(msg, "\ncaused by: {src}");
         current = src.source();
     }
-    PyRuntimeError::new_err(msg)
+    msg
+}
+
+/// Map a `CoreError` to a `PyRuntimeError` carrying the full source chain.
+fn core_err_to_py(e: &CoreError) -> PyErr {
+    PyRuntimeError::new_err(error_chain_message(e))
 }
 
 /// Process-global multi-threaded tokio runtime, managed by `pyo3-async-runtimes`.
@@ -357,7 +362,7 @@ fn diagnose_blob_native(
                 )
                 .await
             })
-            .map_err(|e| PyRuntimeError::new_err(format!("{e:?}")))?;
+            .map_err(|e| PyRuntimeError::new_err(error_chain_message(&e)))?;
         serde_json::to_string(&report)
             .map_err(|e| PyRuntimeError::new_err(format!("serialize DiagnosticReport: {e}")))
     })
@@ -518,6 +523,63 @@ fn hippius_core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(download_packs_native, m)?)?;
     m.add_function(wrap_pyfunction!(diagnose_blob_native, m)?)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod error_render_tests {
+    use crate::diagnostics::DiagError;
+
+    #[test]
+    fn diag_error_chain_message_includes_outer_message_and_cause() {
+        // The diagnose path must render exactly like core_err_to_py: Display of
+        // the wrapper, then a `caused by:` line per source() link - never Debug.
+        let e = DiagError::Io(std::io::Error::other("connection reset by peer"));
+        let msg = super::error_chain_message(&e);
+        assert_eq!(
+            msg,
+            "diagnostics I/O error\ncaused by: connection reset by peer"
+        );
+    }
+
+    #[test]
+    fn error_chain_message_renders_every_link_of_a_deep_chain() {
+        // Both single-link tests would pass with a renderer that stops after one
+        // source() hop; a 2-deep chain pins the loop itself.
+        #[derive(Debug)]
+        struct Root;
+
+        impl std::fmt::Display for Root {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("root cause")
+            }
+        }
+
+        impl std::error::Error for Root {}
+
+        #[derive(Debug)]
+        struct Mid(Root);
+
+        impl std::fmt::Display for Mid {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("mid layer")
+            }
+        }
+
+        impl std::error::Error for Mid {
+            fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+                Some(&self.0)
+            }
+        }
+
+        // io::Error Displays its custom payload and source()s THROUGH it, so the
+        // rendered chain is wrapper -> Mid -> Root: two `caused by:` lines.
+        let e = DiagError::Io(std::io::Error::other(Mid(Root)));
+        let msg = super::error_chain_message(&e);
+        assert_eq!(
+            msg,
+            "diagnostics I/O error\ncaused by: mid layer\ncaused by: root cause"
+        );
+    }
 }
 
 #[cfg(test)]

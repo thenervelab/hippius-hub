@@ -43,27 +43,17 @@ const REQUEST_ID_HEADERS: &[&str] = &[
     "docker-content-digest",
 ];
 
-#[expect(
-    dead_code,
-    reason = "payloads are surfaced via the Debug formatter in lib.rs (PyRuntimeError formats `{e:?}`), not read directly here"
-)]
-#[derive(Debug)]
+// thiserror rather than a hand-rolled enum so `diagnose` shares the crate's one
+// error surface: Display + source() chains rendered to Python via the same
+// chain-walker as `CoreError` (see `error_chain_message` in lib.rs), not Debug text.
+#[derive(Debug, thiserror::Error)]
 pub enum DiagError {
+    #[error("invalid diagnostics URL: {0}")]
     Url(String),
-    Io(std::io::Error),
-    Reqwest(reqwest::Error),
-}
-
-impl From<std::io::Error> for DiagError {
-    fn from(err: std::io::Error) -> Self {
-        DiagError::Io(err)
-    }
-}
-
-impl From<reqwest::Error> for DiagError {
-    fn from(err: reqwest::Error) -> Self {
-        DiagError::Reqwest(err)
-    }
+    #[error("diagnostics I/O error")]
+    Io(#[from] std::io::Error),
+    #[error("diagnostics HTTP error")]
+    Reqwest(#[from] reqwest::Error),
 }
 
 #[derive(Serialize)]
@@ -239,7 +229,12 @@ pub async fn probe_blob(
     };
     let dns_ms = dns_start.elapsed().as_millis() as u64;
     if addrs.is_empty() {
-        return Err(DiagError::Url("DNS returned no addresses".to_string()));
+        // Io, not Url: the URL parsed fine - resolution succeeded but returned an
+        // empty set, which is a lookup outcome like the timeout arm above.
+        return Err(DiagError::Io(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "DNS returned no addresses",
+        )));
     }
 
     // --- TCP connect (doubles as the RTT estimate) ---
@@ -487,5 +482,16 @@ mod tests {
     fn mbps_basic() {
         // 1_000_000 bytes in 1s = 1 MB/s.
         assert!((mbps(1_000_000, Duration::from_secs(1)) - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn diag_error_displays_cause_not_debug() {
+        let e = DiagError::Url("blob URL has no host".to_string());
+        assert_eq!(
+            e.to_string(),
+            "invalid diagnostics URL: blob URL has no host"
+        );
+        let io = DiagError::Io(std::io::Error::other("boom"));
+        assert!(std::error::Error::source(&io).is_some());
     }
 }
