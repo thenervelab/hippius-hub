@@ -26,7 +26,7 @@ from tqdm import tqdm
 
 from . import _http
 from ._oci import fetch_manifest, group_files, layer_title, parse_pointer_v2
-from ._packing import plan_packs, pointer_v2_bytes, resolve_pointer_chunks
+from ._packing import PackAccumulator, pointer_v2_bytes, resolve_pointer_chunks
 from .auth import call_with_oci_token_refresh
 from .constants import (
     ARTIFACT_TYPE_CHUNKED_V2,
@@ -59,7 +59,7 @@ from .file_download import _oci_repo_path, _validate_repo_type
 
 try:
     from .hippius_core import (
-        chunk_and_hash_native,
+        chunk_stream_native,
         hash_file_native,
         pack_upload_native,
         upload_blob_native,
@@ -299,10 +299,16 @@ def _upload_file_chunked_v2(
     (per `dedup_index`) are referenced by range into their existing packs — only
     NEW chunks are packed and uploaded. The manifest lists the pointer plus every
     pack it references (new and reused) so each stays GC-safe. Pointer written
-    last, like v1, so a crash leaves only unreferenced packs for GC."""
-    whole_hex, chunk_metas = chunk_and_hash_native(abs_path, resolve_cdc_avg_size())
-    chunks = [(f"sha256:{h}", size, offset) for h, offset, size in chunk_metas]
-    plan = plan_packs(chunks, dedup_index, resolve_pack_size())
+    last, like v1, so a crash leaves only unreferenced packs for GC.
+
+    Streaming: chunk metadata is pulled batch-by-batch from the native pipeline
+    (`chunk_stream_native`) and fed straight into a `PackAccumulator`, so each
+    completed pack uploads WHILE later chunks are still being hashed — phase 1
+    (CDC + hashing) overlaps the network instead of preceding it. The plan, and
+    therefore the pointer and manifest, are byte-identical to the former batch
+    path (`plan_packs` IS feed-all-then-finish on the same accumulator)."""
+    stream = chunk_stream_native(abs_path, resolve_cdc_avg_size())
+    acc = PackAccumulator(dedup_index, resolve_pack_size())
     uploads_url = f"{registry}/v2/{oci_repo}/blobs/uploads/"
 
     # Shared across all files: a thread blocks here BEFORE the native call
@@ -321,11 +327,39 @@ def _upload_file_chunked_v2(
         return f"sha256:{hex_digest}"
 
     # Packs are independent blobs → upload in parallel (the round-trip win: ~K/16
-    # pack PUTs instead of K chunk PUTs). Order is preserved so digests line up
-    # with plan.new_packs for resolve_pointer_chunks. The gate above caps the
-    # cross-file total even though this pool is per-file.
+    # pack PUTs instead of K chunk PUTs), submitted AS the accumulator completes
+    # them so uploads overlap the remaining chunking. `futures` stays aligned with
+    # `plan.new_packs`: feed() emits a strict prefix of finish().new_packs, so the
+    # collected digests line up for resolve_pointer_chunks. The gate above caps
+    # the cross-file total even though this pool is per-file.
+    chunk_count = 0
+    futures: List = []
     with ThreadPoolExecutor(max_workers=resolve_upload_workers()) as executor:
-        new_pack_digests = list(executor.map(_upload_pack, plan.new_packs))
+        try:
+            while (batch := stream.next_batch()) is not None:
+                # Native triples are (hex, offset, len); the accumulator consumes
+                # (digest, size, offset) — same reorder the batch path applied.
+                for h, offset, size in batch:
+                    chunk_count += 1
+                    for new_pack in acc.feed((f"sha256:{h}", size, offset)):
+                        futures.append(executor.submit(_upload_pack, new_pack))
+            plan = acc.finish()
+            # Only the final partial pack (if any) was not emitted by feed().
+            for new_pack in plan.new_packs[len(futures):]:
+                futures.append(executor.submit(_upload_pack, new_pack))
+            whole_hex = stream.finish()  # never blocks: producer joined at EOF
+            new_pack_digests = [f.result() for f in futures]
+        except BaseException:
+            # A failed pack upload (f.result()), a poisoned stream (next_batch
+            # raises), or Ctrl-C: cancel whatever hasn't started — the same
+            # early-exit executor.map used to perform — then let the with-block
+            # join the in-flight uploads (bounded by the gate) before the
+            # ORIGINAL exception propagates unchanged. Secondary failures on
+            # already-running packs are dropped, matching the folder fan-out's
+            # fail-fast. Dropping `stream` unwinds the producer thread.
+            for f in futures:
+                f.cancel()
+            raise
 
     pointer_chunks = resolve_pointer_chunks(plan, new_pack_digests)
     pointer_bytes = pointer_v2_bytes(whole_hex, file_size, pointer_chunks)
@@ -344,7 +378,7 @@ def _upload_file_chunked_v2(
             LAYER_TITLE_KEY: repo_title.replace("\\", "/"),
             FILE_SIZE_KEY: str(file_size),
             FILE_DIGEST_KEY: f"sha256:{whole_hex}",
-            CHUNK_COUNT_KEY: str(len(chunk_metas)),
+            CHUNK_COUNT_KEY: str(chunk_count),
         },
     }
     # One pack layer per referenced pack, in first-appearance order (deterministic).

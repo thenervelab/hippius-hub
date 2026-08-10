@@ -253,8 +253,10 @@ fn hash_file_native(py: Python<'_>, path: String) -> PyResult<(String, u64)> {
 
 /// Split a file into content-defined chunks and hash each chunk + the whole file.
 ///
-/// The chunked-v2 upload primitive: chunk once here, then the Python layer plans
-/// packs (`_packing.plan_packs`) and pushes each new pack via `pack_upload_native`.
+/// The chunked-v2 batch primitive. Production (`_upload_file_chunked_v2`) now
+/// streams via [`ChunkStream`] instead; this entry point remains for
+/// `scripts/bench_phase1.py` and as the pipeline's batch reference — both drive
+/// the same `run_chunk_pipeline`, so the measured phase-1 cost is shared.
 ///
 /// # Arguments
 /// - `path`: local file to chunk.

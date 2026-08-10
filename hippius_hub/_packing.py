@@ -71,6 +71,8 @@ class PackAccumulator:
 
     `finish()` flushes the final partial pack and is idempotent; `feed()` after
     `finish()` raises RuntimeError (the plan is already sealed).
+
+    Not thread-safe; feed from one thread.
     """
 
     def __init__(self, dedup_index: Dict[str, DedupEntry], pack_size: int) -> None:
@@ -120,7 +122,14 @@ class PackAccumulator:
         return pack
 
     def finish(self) -> PackPlan:
-        """Flush the final partial pack (if any) and return the sealed plan."""
+        """Flush the final partial pack (if any) and return the sealed plan.
+
+        Prefix property: the packs returned by `feed()` form a prefix of
+        `finish().new_packs`, in order; any final partial pack is
+        `new_packs[-1]` and was never returned by `feed()` — so a streaming
+        caller that already handled `n_emitted` packs from `feed()` must
+        submit exactly `new_packs[n_emitted:]` after `finish()`.
+        """
         if self._plan is None:
             if self._cur_ranges:
                 self._close()

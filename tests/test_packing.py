@@ -136,6 +136,12 @@ def _plan_packs_reference(chunks, dedup_index, pack_size):
     accumulator only against it would be tautological — a boundary mutation
     would change both sides in lockstep. This copy pins the semantics: pack
     closes at cur_offset >= pack_size; dedup index read-only (no self-dedup).
+
+    If a production change makes this test fail, that is the test doing its
+    job — update this reference only as a deliberate, reviewed semantics
+    change, together with the explicit boundary tests. Frozen from plan_packs
+    at 6821e37 (semantically verbatim, condensed: close() inlined,
+    hit[0]/hit[1]).
     """
     planned, new_packs, cur_ranges, cur_offset = [], [], [], 0
     for digest, size, file_offset in chunks:

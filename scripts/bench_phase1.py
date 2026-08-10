@@ -7,6 +7,10 @@ compared before/after without a live registry in the loop. Baseline profile
 (py-spy 2026-07-16): this phase is 34% of upload wall clock, hashing 94% of the
 phase, FastCDC 6%.
 
+Production uploads stream this phase via `chunk_stream_native` (packs upload
+while chunking runs), but both entry points drive the same Rust
+`run_chunk_pipeline`, so the pipeline measured here is the one production uses.
+
 The input file is deterministic: a seeded PRNG (seed 0xB0) generates the bytes,
 so the same size always yields the same content, the same CDC boundaries, and
 comparable runs. Because of that, an existing file of the right size at the
