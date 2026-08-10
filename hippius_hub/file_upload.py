@@ -15,7 +15,7 @@ import tempfile
 import threading
 import time
 import warnings
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import BinaryIO, Dict, List, Optional, Union
 
@@ -333,7 +333,7 @@ def _upload_file_chunked_v2(
     # collected digests line up for resolve_pointer_chunks. The gate above caps
     # the cross-file total even though this pool is per-file.
     chunk_count = 0
-    futures: List = []
+    futures: List[Future[str]] = []
     with ThreadPoolExecutor(max_workers=resolve_upload_workers()) as executor:
         try:
             while (batch := stream.next_batch()) is not None:
