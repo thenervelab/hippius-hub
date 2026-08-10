@@ -8,7 +8,7 @@ use std::io::SeekFrom;
 use std::path::Path;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::{mpsc, Arc, Mutex, OnceLock};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 use tokio::fs::File;
@@ -49,6 +49,20 @@ pub type ChunkList = Vec<(String, u64, u64)>;
 const CDC_MIN_AVG: u64 = 256; // == fastcdc::v2020::AVERAGE_MIN
 const CDC_MAX_AVG: u64 = 4 * 1024 * 1024; // == fastcdc::v2020::AVERAGE_MAX (4 MiB)
 
+/// Cap on per-chunk SHA-256 worker threads in `chunk_and_hash_reader`.
+/// Together with `HASH_QUEUE_DEPTH` this bounds transient memory: at most
+/// `HASH_QUEUE_DEPTH + MAX_HASH_WORKERS` = 8 chunks are in flight off the
+/// producer at once, and a chunk is at most 4x the average (16 MiB at the
+/// 4 MiB default) -> <= 128 MiB worst case, ~32 MiB typical (avg-sized
+/// chunks). Four workers saturate the per-chunk hash side: the producer's
+/// own whole-file SHA-256 pass runs at the same per-core rate, so it - not
+/// the pool - is the pipeline floor beyond that.
+const MAX_HASH_WORKERS: usize = 4;
+
+/// Bounded depth of the producer -> hash-worker queue; see
+/// [`MAX_HASH_WORKERS`] for the combined memory bound.
+const HASH_QUEUE_DEPTH: usize = 4;
+
 /// Chunk a file with `FastCDC` and hash each chunk plus the whole file in one
 /// streaming pass (bounded memory - `StreamCDC` never loads the whole file).
 ///
@@ -66,6 +80,17 @@ pub fn chunk_and_hash(path: &Path, avg_size: u64) -> Result<(String, ChunkList),
 /// an in-memory `Cursor` (no temp file, no I/O `unwrap`). Semantics are
 /// identical: `StreamCDC` yields the same boundaries whether the source is a
 /// file or a cursor over the same bytes.
+///
+/// Per-chunk hashing WAS 94% of the measured phase-1 cost when everything ran
+/// serially, so it fans out to a small scoped worker pool while CDC and the
+/// whole-file hash stay on the calling thread - the gear-hash scan is
+/// sequential by construction and must never be parallelized (its boundaries
+/// are the wire contract). Post-B1 the phase is bound by this producer thread
+/// itself (measured M1 Pro, 2 GiB): `StreamCDC` scan + per-chunk `Vec` copy
+/// ~1.5 s and whole-file SHA + read ~1.2 s, with the per-chunk hashing fully
+/// absorbed by the pool. Output is byte-identical to the serial loop, pinned
+/// by the `parallel_chunk_hash_matches_serial` proptest against
+/// `chunk_and_hash_reader_serial`.
 fn chunk_and_hash_reader<R: std::io::Read>(
     source: R,
     avg_size: u64,
@@ -77,6 +102,131 @@ fn chunk_and_hash_reader<R: std::io::Read>(
     }
     // The range check above guarantees min/avg/max fit u32; try_from keeps that
     // provable to clippy without an unchecked `as` cast.
+    let to_u32 = |v: u64| -> Result<u32, CoreError> {
+        u32::try_from(v)
+            .map_err(|_| CoreError::InvalidArgument(format!("chunk size {v} exceeds u32")))
+    };
+    let (min, max) = (to_u32(avg_size / 4)?, to_u32(avg_size * 4)?);
+    let avg = to_u32(avg_size)?;
+
+    // StreamCDC allocates and memcpys a Vec per chunk on top of the gear-hash
+    // scan; that copy is part of the producer floor (the py-spy "CDC = 6%"
+    // figure counted only gear-hash frames and missed it).
+    let chunker = StreamCDC::new(source, min, avg, max);
+
+    // Leave one core for the producer (CDC + whole-file hash); beyond
+    // MAX_HASH_WORKERS extra workers only add memory, not throughput.
+    let workers = std::thread::available_parallelism()
+        .map_or(1, |n| n.get().saturating_sub(1))
+        .clamp(1, MAX_HASH_WORKERS);
+
+    std::thread::scope(|scope| {
+        // (index, chunk bytes) in; (index, digest) out. The sync_channel's
+        // bound is what caps transient memory (see HASH_QUEUE_DEPTH): a full
+        // queue blocks the producer until a worker frees a slot.
+        let (work_tx, work_rx) = mpsc::sync_channel::<(usize, Vec<u8>)>(HASH_QUEUE_DEPTH);
+        // std-only on purpose: `Receiver` is !Sync, so the Mutex is what makes
+        // it MPMC; at 4 workers pulling ms-scale jobs the lock is uncontended,
+        // and crossbeam/rayon would add a dependency for nothing.
+        let work_rx = Arc::new(Mutex::new(work_rx));
+        let (done_tx, done_rx) = mpsc::channel::<(usize, [u8; 32])>();
+
+        for _ in 0..workers {
+            let rx = Arc::clone(&work_rx);
+            let tx = done_tx.clone();
+            scope.spawn(move || {
+                loop {
+                    // Hold the lock only for the recv so workers hash
+                    // unlocked and overlap. Poisoning is unreachable (workers
+                    // do not panic) but is treated as shutdown, never
+                    // unwrapped.
+                    let job = match rx.lock() {
+                        Ok(guard) => guard.recv(),
+                        Err(_) => break,
+                    };
+                    let Ok((idx, data)) = job else { break };
+                    let digest: [u8; 32] = Sha256::digest(&data).into();
+                    if tx.send((idx, digest)).is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+        // Workers hold the only remaining result senders; dropping ours lets
+        // the drain below terminate once they exit.
+        drop(done_tx);
+
+        // Producer: CDC + the whole-file hash stay on this thread.
+        let mut whole = Sha256::new();
+        let mut metas: Vec<(u64, u64)> = Vec::new();
+        let mut produce_err: Option<CoreError> = None;
+        for (idx, result) in chunker.enumerate() {
+            match result {
+                Ok(cd) => {
+                    whole.update(&cd.data);
+                    metas.push((cd.offset, cd.length as u64));
+                    if work_tx.send((idx, cd.data)).is_err() {
+                        // All workers gone - the missing-digest check below
+                        // surfaces the failure as an Integrity error.
+                        break;
+                    }
+                }
+                Err(e) => {
+                    produce_err = Some(CoreError::Io(std::io::Error::other(e)));
+                    break;
+                }
+            }
+        }
+        drop(work_tx); // workers drain the queue then exit
+
+        // Digests arrive in completion order; slot them back into file order.
+        // Invariant: the producer pushes into `metas` BEFORE sending the same
+        // idx, so every received idx < metas.len(); `get_mut` is belt-and-
+        // braces rather than a reachable branch.
+        let mut digests: Vec<Option<[u8; 32]>> = vec![None; metas.len()];
+        for (idx, digest) in done_rx {
+            if let Some(slot) = digests.get_mut(idx) {
+                *slot = Some(digest);
+            }
+        }
+        if let Some(e) = produce_err {
+            return Err(e);
+        }
+
+        let chunks = metas
+            .into_iter()
+            .zip(digests)
+            .map(|((offset, len), digest)| {
+                digest
+                    .map(|d| (hex::encode(d), offset, len))
+                    .ok_or_else(|| {
+                        CoreError::Integrity("chunk hash worker exited early".to_string())
+                    })
+            })
+            .collect::<Result<ChunkList, CoreError>>()?;
+        Ok((hex::encode(whole.finalize()), chunks))
+    })
+}
+
+/// Serial reference implementation of [`chunk_and_hash_reader`] - the exact
+/// pre-B1 single-threaded loop, kept test-only as the equivalence oracle for
+/// the parallel pipeline (`parallel_chunk_hash_matches_serial`). The output is
+/// a WIRE CONTRACT: identical bytes must produce identical boundaries and
+/// digests across versions or cross-revision dedup breaks, so any pipeline
+/// change must stay byte-identical to this loop. This MUST remain an
+/// independent implementation - never refactor it to delegate to
+/// `chunk_and_hash_reader`, or the equivalence proptest degenerates into a
+/// tautology.
+#[cfg(test)]
+fn chunk_and_hash_reader_serial<R: std::io::Read>(
+    source: R,
+    avg_size: u64,
+) -> Result<(String, ChunkList), CoreError> {
+    if !(CDC_MIN_AVG..=CDC_MAX_AVG).contains(&avg_size) {
+        return Err(CoreError::InvalidArgument(format!(
+            "FastCDC average size {avg_size} out of range [{CDC_MIN_AVG}, {CDC_MAX_AVG}]"
+        )));
+    }
     let to_u32 = |v: u64| -> Result<u32, CoreError> {
         u32::try_from(v)
             .map_err(|_| CoreError::InvalidArgument(format!("chunk size {v} exceeds u32")))
@@ -1199,6 +1349,30 @@ mod cdc_tests {
             let (whole2, chunks2) = chunk(&data);
             proptest::prop_assert_eq!(whole, whole2);
             proptest::prop_assert_eq!(chunks, chunks2);
+        }
+
+        // B1 equivalence oracle: the parallel worker-pool pipeline must stay
+        // BYTE-IDENTICAL to the pre-B1 serial loop - boundaries, digest hex,
+        // ordering, and the whole-file hash are a wire contract (identical
+        // bytes must chunk identically across versions or dedup breaks).
+        // Covers the empty input (0-length vectors) and the full valid small
+        // avg range.
+        #[test]
+        fn parallel_chunk_hash_matches_serial(
+            data in proptest::collection::vec(proptest::prelude::any::<u8>(), 0..262_144usize),
+            avg in CDC_MIN_AVG..8192u64,
+        ) {
+            let serial = super::chunk_and_hash_reader_serial(Cursor::new(&data), avg);
+            let parallel = chunk_and_hash_reader(Cursor::new(&data), avg);
+            match (serial, parallel) {
+                (Ok(s), Ok(p)) => proptest::prop_assert_eq!(s, p),
+                (s, p) => proptest::prop_assert!(
+                    false,
+                    "both paths must succeed on a valid avg; serial={:?} parallel={:?}",
+                    s,
+                    p
+                ),
+            }
         }
 
         // Size bounds: every chunk is <= max, and every chunk except the last is
