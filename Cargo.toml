@@ -27,7 +27,7 @@ bytes = "1"
 indicatif = "0.17.8"
 futures = "0.3"
 hex = "0.4"
-thiserror = "1.0"
+thiserror = "2.0"
 # Content-defined chunking for the chunked-artifact upload path. FastCDC's
 # rolling Gear-hash is a correctness- and determinism-critical primitive (its
 # boundaries are part of the wire contract — identical content must re-chunk
