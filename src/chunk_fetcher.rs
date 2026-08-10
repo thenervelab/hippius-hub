@@ -284,12 +284,21 @@ impl PackAssembler {
         // instead of building a fresh client + empty pool per file. `max_concurrent`
         // still bounds real concurrency via the `Semaphore` in `assemble`.
         let client = download_client(timeouts)?.clone();
-        Ok(Self { client, auth_token, max_concurrent: max_concurrent.max(1) })
+        Ok(Self {
+            client,
+            auth_token,
+            max_concurrent: max_concurrent.max(1),
+        })
     }
 
     /// Fetch every pack into `dest` (pre-allocated to `total_size`), verifying each
     /// carved chunk's digest, then the whole-file digest. `expected_file_sha256`
     /// proves chunk *ordering* across packs (the only thing per-chunk digests can't).
+    #[expect(
+        clippy::too_many_lines,
+        reason = "line count crossed 100 purely through rustfmt line-break expansion; \
+                  the Phase D function-level split of this method removes this expect"
+    )]
     pub async fn assemble(
         &self,
         dest: &Path,
@@ -346,7 +355,14 @@ impl PackAssembler {
             let targets: Vec<(u64, u64, u64, String)> = plan
                 .chunks
                 .iter()
-                .map(|c| (c.offset_in_pack, c.size, c.file_offset, c.expected_sha256.clone()))
+                .map(|c| {
+                    (
+                        c.offset_in_pack,
+                        c.size,
+                        c.file_offset,
+                        c.expected_sha256.clone(),
+                    )
+                })
                 .collect();
             let path = dest.to_path_buf();
             let pack_pb = pb.clone();
@@ -367,7 +383,13 @@ impl PackAssembler {
                     Err(e) => return (i, Err(CoreError::Io(std::io::Error::other(e)))),
                 };
                 let res = fetch_pack_with_retry(
-                    &client, &url, token.as_deref(), pack_size, &targets, &path, &pack_pb,
+                    &client,
+                    &url,
+                    token.as_deref(),
+                    pack_size,
+                    &targets,
+                    &path,
+                    &pack_pb,
                 )
                 .await;
                 if res.is_ok() {
@@ -405,15 +427,27 @@ impl PackAssembler {
                 // On any error we return; `_abort_guard` drops and aborts every
                 // still-running pack task (the old explicit abort loop, now unified
                 // with the cancellation path).
-                Err(join_err) => return Err(CoreError::JoinFailed { index: None, source: join_err }),
-                Ok((i, Err(pack_err))) => return Err(CoreError::ChunkFailed { index: i, source: Box::new(pack_err) }),
+                Err(join_err) => {
+                    return Err(CoreError::JoinFailed {
+                        index: None,
+                        source: join_err,
+                    })
+                }
+                Ok((i, Err(pack_err))) => {
+                    return Err(CoreError::ChunkFailed {
+                        index: i,
+                        source: Box::new(pack_err),
+                    })
+                }
                 Ok((_, Ok(()))) => {}
             }
         }
         pb.finish_with_message("✅ Packs complete");
 
         if let Some(expected_file) = expected_file_sha256 {
-            return Ok(Some(verify_file_digest(hasher_task, dest, expected_file).await?));
+            return Ok(Some(
+                verify_file_digest(hasher_task, dest, expected_file).await?,
+            ));
         }
         Ok(None)
     }
@@ -441,7 +475,10 @@ fn validate_pack_plan(packs: &[PackPlanEntry], total_size: u64) -> Result<(), Co
         }
         for c in &pack.chunks {
             let end = c.file_offset.checked_add(c.size).ok_or_else(|| {
-                CoreError::Integrity(format!("chunk at file offset {} size {} overflows u64", c.file_offset, c.size))
+                CoreError::Integrity(format!(
+                    "chunk at file offset {} size {} overflows u64",
+                    c.file_offset, c.size
+                ))
             })?;
             if end > total_size {
                 return Err(CoreError::Integrity(format!(
@@ -542,7 +579,10 @@ async fn fetch_pack(
     }
     let mut res = req.send().await?;
     if !res.status().is_success() {
-        return Err(CoreError::ServerError(res.status().as_u16(), format!("pack GET failed for {url}")));
+        return Err(CoreError::ServerError(
+            res.status().as_u16(),
+            format!("pack GET failed for {url}"),
+        ));
     }
     // Audit L12: read the body under a running cap instead of `res.bytes()`, which
     // buffers an unbounded body BEFORE the length check — a chunked (no
@@ -590,9 +630,11 @@ async fn fetch_pack(
     let dest = dest_path.to_path_buf();
     let url_owned = url.to_string();
     let pb_owned = pb.clone();
-    tokio::task::spawn_blocking(move || verify_and_scatter(&url_owned, &bytes, &targets_owned, &dest, &pb_owned))
-        .await
-        .map_err(|join_err| CoreError::Io(std::io::Error::other(join_err)))?
+    tokio::task::spawn_blocking(move || {
+        verify_and_scatter(&url_owned, &bytes, &targets_owned, &dest, &pb_owned)
+    })
+    .await
+    .map_err(|join_err| CoreError::Io(std::io::Error::other(join_err)))?
 }
 
 /// Verify each carved chunk's sha256 against `bytes` and scatter its slice to the
@@ -614,13 +656,15 @@ fn verify_and_scatter(
 
     let mut file = std::fs::OpenOptions::new().write(true).open(dest_path)?;
     for (offset_in_pack, size, file_offset, expected) in targets {
-        let start = usize::try_from(*offset_in_pack)
-            .map_err(|_| CoreError::Integrity(format!("pack offset {offset_in_pack} exceeds usize")))?;
-        let end = start
-            .checked_add(usize::try_from(*size).map_err(|_| {
-                CoreError::Integrity(format!("chunk size {size} exceeds usize"))
-            })?)
-            .ok_or_else(|| CoreError::Integrity("chunk range overflow".to_string()))?;
+        let start = usize::try_from(*offset_in_pack).map_err(|_| {
+            CoreError::Integrity(format!("pack offset {offset_in_pack} exceeds usize"))
+        })?;
+        let end =
+            start
+                .checked_add(usize::try_from(*size).map_err(|_| {
+                    CoreError::Integrity(format!("chunk size {size} exceeds usize"))
+                })?)
+                .ok_or_else(|| CoreError::Integrity("chunk range overflow".to_string()))?;
         if end > bytes.len() {
             return Err(CoreError::Integrity(format!(
                 "pack {url}: chunk range {start}..{end} exceeds pack length {}",
@@ -792,8 +836,12 @@ mod tests {
         // window as a retryable ReadStall — not left until the 5-minute total
         // timeout. The client here has NO client read_timeout (default), so the
         // app-level ReadStall is the sole guard, proving it is default-on.
-        let Ok(listener) = tokio::net::TcpListener::bind("127.0.0.1:0").await else { return };
-        let Ok(addr) = listener.local_addr() else { return };
+        let Ok(listener) = tokio::net::TcpListener::bind("127.0.0.1:0").await else {
+            return;
+        };
+        let Ok(addr) = listener.local_addr() else {
+            return;
+        };
         let server = tokio::spawn(async move {
             if let Ok((mut sock, _)) = listener.accept().await {
                 let mut buf = [0u8; 1024];
@@ -810,7 +858,9 @@ mod tests {
         let Ok(client) = build_download_client(TransportTimeouts::default()) else {
             unreachable!("client builds")
         };
-        let Ok(mut res) = client.get(&url).send().await else { unreachable!("GET connects") };
+        let Ok(mut res) = client.get(&url).send().await else {
+            unreachable!("GET connects")
+        };
         let idle = Duration::from_millis(200);
         let outcome = tokio::time::timeout(Duration::from_secs(5), async {
             loop {
@@ -850,7 +900,10 @@ mod tests {
         for h in joins {
             match h.await {
                 Ok(()) => unreachable!("the task must be aborted, not run to completion"),
-                Err(e) => assert!(e.is_cancelled(), "AbortOnDrop must cancel the task, got {e:?}"),
+                Err(e) => assert!(
+                    e.is_cancelled(),
+                    "AbortOnDrop must cancel the task, got {e:?}"
+                ),
             }
         }
     }
@@ -880,13 +933,17 @@ mod tests {
         // `read_timeout`. Without it the body read hangs until the caller's 5-min
         // total timeout; the download plane's whole point is to fail fast and retry.
         use tokio::net::TcpListener;
-        let Ok(listener) = TcpListener::bind("127.0.0.1:0").await else { return };
-        let Ok(addr) = listener.local_addr() else { return };
+        let Ok(listener) = TcpListener::bind("127.0.0.1:0").await else {
+            return;
+        };
+        let Ok(addr) = listener.local_addr() else {
+            return;
+        };
         let server = tokio::spawn(async move {
             if let Ok((mut sock, _)) = listener.accept().await {
                 let mut buf = [0u8; 1024];
                 let _ = sock.read(&mut buf).await; // consume the request line/headers
-                // Promise 1_000_000 bytes, deliver 8, then stall without closing.
+                                                   // Promise 1_000_000 bytes, deliver 8, then stall without closing.
                 let _ = sock
                     .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 1000000\r\n\r\nabcdefgh")
                     .await;
@@ -945,7 +1002,10 @@ mod tests {
     /// tests never collide.
     fn scratch_path(tag: &str) -> PathBuf {
         let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
-        std::env::temp_dir().join(format!("hippius_ihash_{tag}_{}_{seq}.bin", std::process::id()))
+        std::env::temp_dir().join(format!(
+            "hippius_ihash_{tag}_{}_{seq}.bin",
+            std::process::id()
+        ))
     }
 
     /// A varied (non-constant) byte pattern so a mis-ordering across a chunk
@@ -1040,7 +1100,10 @@ mod tests {
         let (tx, rx) = std::sync::mpsc::channel::<Vec<(u64, u64)>>();
         let _ = tx.send(vec![(0, content.len() as u64)]);
         drop(tx);
-        assert_eq!(incremental_hash(&rx, &path, content.len() as u64), authoritative);
+        assert_eq!(
+            incremental_hash(&rx, &path, content.len() as u64),
+            authoritative
+        );
     }
 
     proptest::proptest! {
@@ -1088,8 +1151,18 @@ mod tests {
 
     // --- validate_pack_plan ---
 
-    fn chunk_target(offset_in_pack: u64, size: u64, file_offset: u64, sha: String) -> PackChunkTarget {
-        PackChunkTarget { offset_in_pack, size, file_offset, expected_sha256: sha }
+    fn chunk_target(
+        offset_in_pack: u64,
+        size: u64,
+        file_offset: u64,
+        sha: String,
+    ) -> PackChunkTarget {
+        PackChunkTarget {
+            offset_in_pack,
+            size,
+            file_offset,
+            expected_sha256: sha,
+        }
     }
 
     #[test]
@@ -1097,7 +1170,10 @@ mod tests {
         let packs = vec![PackPlanEntry {
             url: String::new(),
             size: 1000,
-            chunks: vec![chunk_target(0, 400, 0, String::new()), chunk_target(400, 600, 400, String::new())],
+            chunks: vec![
+                chunk_target(0, 400, 0, String::new()),
+                chunk_target(400, 600, 400, String::new()),
+            ],
         }];
         assert!(validate_pack_plan(&packs, 1000).is_ok());
     }
@@ -1110,9 +1186,15 @@ mod tests {
         let packs = vec![PackPlanEntry {
             url: String::new(),
             size: 1100,
-            chunks: vec![chunk_target(0, 1000, 0, String::new()), chunk_target(1000, 100, 1005, String::new())],
+            chunks: vec![
+                chunk_target(0, 1000, 0, String::new()),
+                chunk_target(1000, 100, 1005, String::new()),
+            ],
         }];
-        assert!(matches!(validate_pack_plan(&packs, 1000), Err(CoreError::Integrity(_))));
+        assert!(matches!(
+            validate_pack_plan(&packs, 1000),
+            Err(CoreError::Integrity(_))
+        ));
     }
 
     #[test]
@@ -1122,7 +1204,10 @@ mod tests {
             size: 10,
             chunks: vec![chunk_target(0, u64::MAX, 1, String::new())],
         }];
-        assert!(matches!(validate_pack_plan(&packs, u64::MAX), Err(CoreError::Integrity(_))));
+        assert!(matches!(
+            validate_pack_plan(&packs, u64::MAX),
+            Err(CoreError::Integrity(_))
+        ));
     }
 
     #[test]
@@ -1136,7 +1221,9 @@ mod tests {
             size: MAX_PACK_BYTES + 1,
             chunks: vec![chunk_target(0, 10, 0, String::new())],
         }];
-        assert!(matches!(validate_pack_plan(&packs, 10), Err(CoreError::Integrity(ref m)) if m.contains("ceiling")));
+        assert!(
+            matches!(validate_pack_plan(&packs, 10), Err(CoreError::Integrity(ref m)) if m.contains("ceiling"))
+        );
         // Exactly at the ceiling is still accepted (boundary, not a hostile value).
         let ok = vec![PackPlanEntry {
             url: String::new(),
@@ -1166,7 +1253,12 @@ mod tests {
         let expected = reference(b"payload");
         let e = expected.clone();
         let task = tokio::spawn(async move { Some(e) });
-        assert_eq!(verify_file_digest(Some(task), &missing, &expected).await.ok(), Some(expected));
+        assert_eq!(
+            verify_file_digest(Some(task), &missing, &expected)
+                .await
+                .ok(),
+            Some(expected)
+        );
     }
 
     #[tokio::test]
@@ -1177,7 +1269,12 @@ mod tests {
         let wrote = std::fs::File::create(&path).and_then(|mut f| f.write_all(&content));
         assert!(wrote.is_ok());
         let task = tokio::spawn(async { None });
-        assert_eq!(verify_file_digest(Some(task), &path, &reference(&content)).await.ok(), Some(reference(&content)));
+        assert_eq!(
+            verify_file_digest(Some(task), &path, &reference(&content))
+                .await
+                .ok(),
+            Some(reference(&content))
+        );
     }
 
     #[tokio::test]
@@ -1187,7 +1284,12 @@ mod tests {
         let _g = TempFileGuard(path.clone());
         let wrote = std::fs::File::create(&path).and_then(|mut f| f.write_all(&content));
         assert!(wrote.is_ok());
-        assert_eq!(verify_file_digest(None, &path, &reference(&content)).await.ok(), Some(reference(&content)));
+        assert_eq!(
+            verify_file_digest(None, &path, &reference(&content))
+                .await
+                .ok(),
+            Some(reference(&content))
+        );
     }
 
     #[tokio::test]
@@ -1197,7 +1299,10 @@ mod tests {
         let missing = scratch_path("verify_mismatch");
         let task = tokio::spawn(async { Some("a".repeat(64)) });
         let expected = "b".repeat(64);
-        assert!(matches!(verify_file_digest(Some(task), &missing, &expected).await, Err(CoreError::Integrity(_))));
+        assert!(matches!(
+            verify_file_digest(Some(task), &missing, &expected).await,
+            Err(CoreError::Integrity(_))
+        ));
     }
 
     #[tokio::test]
@@ -1206,9 +1311,13 @@ mod tests {
         // being masked. Aborting a pending task yields the JoinError without a panic!
         // macro (which the crate denies).
         let missing = scratch_path("verify_join");
-        let task: HasherTask = tokio::spawn(async { std::future::pending::<Option<String>>().await });
+        let task: HasherTask =
+            tokio::spawn(async { std::future::pending::<Option<String>>().await });
         task.abort();
-        assert!(matches!(verify_file_digest(Some(task), &missing, &"c".repeat(64)).await, Err(CoreError::Io(_))));
+        assert!(matches!(
+            verify_file_digest(Some(task), &missing, &"c".repeat(64)).await,
+            Err(CoreError::Io(_))
+        ));
     }
 
     // --- assemble (end-to-end orchestration over a local pack server) ---
@@ -1233,12 +1342,19 @@ mod tests {
                         }
                     }
                     let head = String::from_utf8_lossy(&req);
-                    let path = head.lines().next().and_then(|l| l.split(' ').nth(1)).unwrap_or("/");
+                    let path = head
+                        .lines()
+                        .next()
+                        .and_then(|l| l.split(' ').nth(1))
+                        .unwrap_or("/");
                     let (status, body): (&str, &[u8]) = match routes.get(path) {
                         Some(b) => ("200 OK", b.as_slice()),
                         None => ("404 Not Found", b"".as_slice()),
                     };
-                    let resp = format!("HTTP/1.1 {status}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n", body.len());
+                    let resp = format!(
+                        "HTTP/1.1 {status}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                        body.len()
+                    );
                     let _ = sock.write_all(resp.as_bytes()).await;
                     let _ = sock.write_all(body).await;
                     let _ = sock.shutdown().await;
@@ -1277,8 +1393,12 @@ mod tests {
         // pack_size=1000 — the over-send guard trips before the carve.
         let mut routes = HashMap::new();
         routes.insert("/pack".to_string(), vec![9u8; 2000]);
-        let Some(base) = serve_packs(routes).await.ok() else { return };
-        let Ok(client) = download_client(TransportTimeouts::default()) else { return };
+        let Some(base) = serve_packs(routes).await.ok() else {
+            return;
+        };
+        let Ok(client) = download_client(TransportTimeouts::default()) else {
+            return;
+        };
         let pb = ProgressBar::hidden();
         let dest = scratch_path("l12_overlen");
         let _g = TempFileGuard(dest.clone());
@@ -1303,10 +1423,14 @@ mod tests {
         let mut routes = HashMap::new();
         routes.insert("/packA".to_string(), pack_a);
         routes.insert("/packB".to_string(), pack_b);
-        let Some(base) = serve_packs(routes).await.ok() else { return };
+        let Some(base) = serve_packs(routes).await.ok() else {
+            return;
+        };
         let dest = scratch_path("asm_ok");
         let _g = TempFileGuard(dest.clone());
-        let Some(assembler) = PackAssembler::new(None, 4, TransportTimeouts::default()).ok() else { return };
+        let Some(assembler) = PackAssembler::new(None, 4, TransportTimeouts::default()).ok() else {
+            return;
+        };
         let packs = three_pack_plan(&base, &content);
         // Timeout-guarded: a channel-lifecycle regression (e.g. dropping `drop(hash_tx)`)
         // would hang the hasher's recv forever, surfacing here as a failure not a hang.
@@ -1327,10 +1451,14 @@ mod tests {
         let mut routes = HashMap::new();
         routes.insert("/packA".to_string(), pack_a);
         routes.insert("/packB".to_string(), pack_b);
-        let Some(base) = serve_packs(routes).await.ok() else { return };
+        let Some(base) = serve_packs(routes).await.ok() else {
+            return;
+        };
         let dest = scratch_path("asm_bad");
         let _g = TempFileGuard(dest.clone());
-        let Some(assembler) = PackAssembler::new(None, 4, TransportTimeouts::default()).ok() else { return };
+        let Some(assembler) = PackAssembler::new(None, 4, TransportTimeouts::default()).ok() else {
+            return;
+        };
         let packs = three_pack_plan(&base, &content);
         // The bytes assemble correctly, but the declared whole-file digest disagrees:
         // the cross-pack ordering check must reject with Integrity.

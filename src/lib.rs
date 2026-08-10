@@ -185,8 +185,9 @@ fn download_file_native(
     let timeouts = TransportTimeouts::from_secs(connect_timeout_secs, read_timeout_secs);
 
     py.detach(|| {
-        let downloader = ChunkedDownloader::new(url, auth_token, chunk_size, content_length, timeouts)
-            .map_err(|e| core_err_to_py(&e))?;
+        let downloader =
+            ChunkedDownloader::new(url, auth_token, chunk_size, content_length, timeouts)
+                .map_err(|e| core_err_to_py(&e))?;
         // Interruptible by Ctrl-C (audit M1): on a pending SIGINT the download future
         // is dropped, whose JoinSet aborts the in-flight chunk tasks.
         match rt.block_on(run_interruptible(
@@ -458,14 +459,20 @@ fn download_packs_native(
     for ((url, size), chunks) in pack_urls.into_iter().zip(pack_sizes).zip(pack_chunks) {
         let targets = chunks
             .into_iter()
-            .map(|(offset_in_pack, csize, file_offset, expected_sha256)| PackChunkTarget {
-                offset_in_pack,
-                size: csize,
-                file_offset,
-                expected_sha256,
-            })
+            .map(
+                |(offset_in_pack, csize, file_offset, expected_sha256)| PackChunkTarget {
+                    offset_in_pack,
+                    size: csize,
+                    file_offset,
+                    expected_sha256,
+                },
+            )
             .collect();
-        packs.push(PackPlanEntry { url, size, chunks: targets });
+        packs.push(PackPlanEntry {
+            url,
+            size,
+            chunks: targets,
+        });
     }
 
     let rt = shared_runtime();
@@ -476,7 +483,8 @@ fn download_packs_native(
     let timeouts = TransportTimeouts::from_secs(connect_timeout_secs, read_timeout_secs);
 
     py.detach(|| {
-        let assembler = PackAssembler::new(auth_token, concurrency, timeouts).map_err(|e| core_err_to_py(&e))?;
+        let assembler = PackAssembler::new(auth_token, concurrency, timeouts)
+            .map_err(|e| core_err_to_py(&e))?;
         // Interruptible by Ctrl-C (audit M1): on a pending SIGINT the assemble future
         // is dropped, whose AbortOnDrop guard aborts the in-flight pack tasks.
         match rt.block_on(run_interruptible(
@@ -534,8 +542,8 @@ mod runtime_tests {
         // work future — dropping is what cancels its in-flight work (the JoinSet /
         // AbortOnDrop guard abort their tasks, a streamed send is cut). A guard held
         // across the never-completing await proves the drop happened.
-        use std::sync::Arc;
         use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
 
         struct Guard(Arc<AtomicBool>);
         impl Drop for Guard {
@@ -553,18 +561,22 @@ mod runtime_tests {
 
         // Fire the interrupt on the 2nd poll; a short interval keeps the test fast.
         let mut polls = 0u32;
-        let outcome: std::result::Result<(), &str> = super::run_interruptible(
-            never,
-            std::time::Duration::from_millis(20),
-            || {
+        let outcome: std::result::Result<(), &str> =
+            super::run_interruptible(never, std::time::Duration::from_millis(20), || {
                 polls += 1;
                 (polls >= 2).then_some("interrupted")
-            },
-        )
-        .await;
+            })
+            .await;
 
-        assert_eq!(outcome, Err("interrupted"), "the interrupt must be surfaced");
-        assert!(dropped.load(Ordering::SeqCst), "the cancelled work future must be dropped");
+        assert_eq!(
+            outcome,
+            Err("interrupted"),
+            "the interrupt must be surfaced"
+        );
+        assert!(
+            dropped.load(Ordering::SeqCst),
+            "the cancelled work future must be dropped"
+        );
     }
 
     #[tokio::test]
@@ -572,7 +584,8 @@ mod runtime_tests {
         // No pending signal (poll always None) → the work future's own output wins,
         // so a normal transfer is untouched by the signal poll.
         let outcome: std::result::Result<i32, &str> =
-            super::run_interruptible(async { 42 }, std::time::Duration::from_millis(20), || None).await;
+            super::run_interruptible(async { 42 }, std::time::Duration::from_millis(20), || None)
+                .await;
         assert_eq!(outcome, Ok(42));
     }
 
@@ -586,12 +599,15 @@ mod runtime_tests {
         // first) makes completion win deterministically. Inverting the arm order or
         // dropping `biased` turns this into a coin flip and fails/flakes here, even
         // though the poll below would ALWAYS interrupt.
-        let outcome: std::result::Result<i32, &str> = super::run_interruptible(
-            async { 99 },
-            std::time::Duration::ZERO,
-            || Some("would interrupt but completion must win"),
-        )
-        .await;
-        assert_eq!(outcome, Ok(99), "a same-tick-ready future must beat the interrupt");
+        let outcome: std::result::Result<i32, &str> =
+            super::run_interruptible(async { 99 }, std::time::Duration::ZERO, || {
+                Some("would interrupt but completion must win")
+            })
+            .await;
+        assert_eq!(
+            outcome,
+            Ok(99),
+            "a same-tick-ready future must beat the interrupt"
+        );
     }
 }

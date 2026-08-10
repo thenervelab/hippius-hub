@@ -268,7 +268,10 @@ pub async fn probe_blob(
     }
     let Some((tcp, addr)) = connected else {
         return Err(DiagError::Io(last_err.unwrap_or_else(|| {
-            std::io::Error::new(std::io::ErrorKind::AddrNotAvailable, "no resolved address was reachable")
+            std::io::Error::new(
+                std::io::ErrorKind::AddrNotAvailable,
+                "no resolved address was reachable",
+            )
         })));
     };
     let tcp_connect_ms = tcp_start.elapsed().as_millis() as u64;
@@ -363,22 +366,21 @@ pub async fn probe_blob(
         effective_bytes = bytes;
         let ranges = split_ranges(effective_bytes, n);
         let par_start = Instant::now();
-        let results: Vec<Result<(usize, u64, Duration), DiagError>> = stream::iter(
-            ranges.into_iter().enumerate(),
-        )
-        .map(|(i, (start, end))| {
-            let client = transfer_client.clone();
-            let url = blob_url.to_string();
-            let token = auth_token.map(ToString::to_string);
-            async move {
-                let (bytes, elapsed, _) =
-                    timed_get_range(&client, &url, token.as_deref(), start, end).await?;
-                Ok((i, bytes, elapsed))
-            }
-        })
-        .buffer_unordered(n)
-        .collect()
-        .await;
+        let results: Vec<Result<(usize, u64, Duration), DiagError>> =
+            stream::iter(ranges.into_iter().enumerate())
+                .map(|(i, (start, end))| {
+                    let client = transfer_client.clone();
+                    let url = blob_url.to_string();
+                    let token = auth_token.map(ToString::to_string);
+                    async move {
+                        let (bytes, elapsed, _) =
+                            timed_get_range(&client, &url, token.as_deref(), start, end).await?;
+                        Ok((i, bytes, elapsed))
+                    }
+                })
+                .buffer_unordered(n)
+                .collect()
+                .await;
         let par_elapsed = par_start.elapsed();
 
         let mut total_bytes = 0u64;
@@ -473,7 +475,10 @@ mod tests {
     }
 
     #[test]
-    #[expect(clippy::float_cmp, reason = "mbps short-circuits to literal 0.0 for zero-duration; testing exact equality is the contract")]
+    #[expect(
+        clippy::float_cmp,
+        reason = "mbps short-circuits to literal 0.0 for zero-duration; testing exact equality is the contract"
+    )]
     fn mbps_zero_duration_is_zero() {
         assert_eq!(mbps(1000, Duration::from_secs(0)), 0.0);
     }

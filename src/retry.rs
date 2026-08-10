@@ -68,7 +68,10 @@ mod tests {
             // is in nanoseconds — see `jittered_backoff`), and it must stay
             // strictly below the ms cap.
             let d = jittered_backoff(attempt, cap * 1_000_000 - 1);
-            assert!(d < Duration::from_millis(cap), "attempt {attempt} exceeded cap {cap}");
+            assert!(
+                d < Duration::from_millis(cap),
+                "attempt {attempt} exceeded cap {cap}"
+            );
             assert_eq!(BACKOFF_BASE_MS * 2u64.pow(attempt), cap);
         }
     }
@@ -99,7 +102,10 @@ mod tests {
         );
         // ...while still never exceeding the attempt's cap (200 ms for attempt 1).
         let cap = Duration::from_millis(BACKOFF_BASE_MS * 2);
-        assert!(delays.iter().all(|d| *d < cap), "a jittered draw exceeded the cap");
+        assert!(
+            delays.iter().all(|d| *d < cap),
+            "a jittered draw exceeded the cap"
+        );
     }
 
     proptest::proptest! {

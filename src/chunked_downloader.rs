@@ -1,15 +1,15 @@
+use indicatif::{ProgressBar, ProgressStyle};
 use reqwest::{header, Client};
 use sha2::{Digest, Sha256};
 use std::path::Path;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
-use indicatif::{ProgressBar, ProgressStyle};
 use tokio::fs::OpenOptions;
 // `AsyncReadExt` was used by the old in-tokio sha256 loop; Phase 2.8
 // moved that work onto `spawn_blocking` with the sync `std::io::Read`
 // trait inside `compute_sha256`, so the async-read trait is no longer
 // needed at module scope.
-use tokio::io::{AsyncSeekExt, AsyncWriteExt, SeekFrom, BufWriter};
+use tokio::io::{AsyncSeekExt, AsyncWriteExt, BufWriter, SeekFrom};
 use tokio::sync::Semaphore;
 
 use crate::error::CoreError;
@@ -82,7 +82,10 @@ fn num_chunks(content_length: u64, chunk_size: u64) -> usize {
     // than `usize::MAX` chunks (each chunk has its own `tokio::spawn`,
     // backing JoinHandle, and reqwest pool slot — saturating means "as
     // many chunks as the platform can spawn", not silent truncation).
-    content_length.div_ceil(chunk_size).try_into().unwrap_or(usize::MAX)
+    content_length
+        .div_ceil(chunk_size)
+        .try_into()
+        .unwrap_or(usize::MAX)
 }
 
 /// Inclusive `(start, end)` byte range for chunk index `i` in a Range header.
@@ -151,7 +154,16 @@ impl ChunkedDownloader {
     /// instead of comparing against the empty string. The empty-file
     /// branch still returns `Some(sha256_of_empty_bytes)` because the
     /// file exists and has a defined (non-skipped) digest.
-    pub async fn download(&self, dest_path: &Path, verify_hash: bool) -> Result<Option<String>, CoreError> {
+    #[expect(
+        clippy::too_many_lines,
+        reason = "line count crossed 100 purely through rustfmt line-break expansion; \
+                  the Phase D function-level split of this method removes this expect"
+    )]
+    pub async fn download(
+        &self,
+        dest_path: &Path,
+        verify_hash: bool,
+    ) -> Result<Option<String>, CoreError> {
         // 1. Total blob size: use the manifest-supplied size when Python passed it
         //    (the common path), else HEAD for Content-Length. Skipping the HEAD
         //    removes one control-plane RTT per plain-file download — meaningful for
@@ -236,8 +248,10 @@ impl ChunkedDownloader {
         let base_token = self.auth_token.clone();
         let chunk_size = self.chunk_size;
         let spawn_pb = pb.clone();
-        let mut set: tokio::task::JoinSet<(usize, Result<(), CoreError>)> = tokio::task::JoinSet::new();
-        let spawn_chunk = |set: &mut tokio::task::JoinSet<(usize, Result<(), CoreError>)>, i: usize| {
+        let mut set: tokio::task::JoinSet<(usize, Result<(), CoreError>)> =
+            tokio::task::JoinSet::new();
+        let spawn_chunk = |set: &mut tokio::task::JoinSet<(usize, Result<(), CoreError>)>,
+                           i: usize| {
             let (start, end) = chunk_bounds(content_length, chunk_size, i);
             let client = base_client.clone();
             let url = base_url.clone();
@@ -252,7 +266,18 @@ impl ChunkedDownloader {
                     Ok(p) => p,
                     Err(e) => return (i, Err(CoreError::Io(std::io::Error::other(e)))),
                 };
-                let res = download_chunk_with_retry(client, url, token, start, end, content_length, i, path, chunk_pb).await;
+                let res = download_chunk_with_retry(
+                    client,
+                    url,
+                    token,
+                    start,
+                    end,
+                    content_length,
+                    i,
+                    path,
+                    chunk_pb,
+                )
+                .await;
                 (i, res)
             });
         };
@@ -276,10 +301,16 @@ impl ChunkedDownloader {
         while let Some(joined) = set.join_next().await {
             match joined {
                 Err(join_err) => {
-                    return Err(CoreError::JoinFailed { index: None, source: join_err });
+                    return Err(CoreError::JoinFailed {
+                        index: None,
+                        source: join_err,
+                    });
                 }
                 Ok((i, Err(chunk_err))) => {
-                    return Err(CoreError::ChunkFailed { index: i, source: Box::new(chunk_err) });
+                    return Err(CoreError::ChunkFailed {
+                        index: i,
+                        source: Box::new(chunk_err),
+                    });
                 }
                 Ok((_, Ok(()))) => {
                     if next < num_chunks {
@@ -323,7 +354,10 @@ impl ChunkedDownloader {
 
         let res = req.send().await?;
         if !res.status().is_success() {
-            return Err(CoreError::ServerError(res.status().as_u16(), format!("Failed HEAD request: {:?}", res.status())));
+            return Err(CoreError::ServerError(
+                res.status().as_u16(),
+                format!("Failed HEAD request: {:?}", res.status()),
+            ));
         }
 
         // Audit D3: a missing/unparseable Content-Length previously fell through
@@ -331,7 +365,8 @@ impl ChunkedDownloader {
         // — silently truncating the destination and returning sha256 of empty.
         // We now surface a typed error; the empty-file path in `download()` is
         // reached only when the server explicitly sent `Content-Length: 0`.
-        let content_length = res.headers()
+        let content_length = res
+            .headers()
             .get(header::CONTENT_LENGTH)
             .and_then(|val| val.to_str().ok())
             .and_then(|val| val.parse::<u64>().ok())
@@ -430,7 +465,18 @@ async fn download_chunk_with_retry(
     let mut retries = 0;
 
     loop {
-        match try_download_chunk_to_offset(&client, &url, token.as_deref(), start, end, content_length, &dest_path, &pb).await {
+        match try_download_chunk_to_offset(
+            &client,
+            &url,
+            token.as_deref(),
+            start,
+            end,
+            content_length,
+            &dest_path,
+            &pb,
+        )
+        .await
+        {
             Ok(()) => return Ok(()),
             Err(e) => {
                 retries += 1;
@@ -555,9 +601,10 @@ async fn try_download_chunk_to_offset(
     // the runtime forever. `RequestBuilder::timeout` overrides any client-level
     // value per the reqwest 0.12 docs; we keep it per-request so other client
     // uses (e.g. the HEAD in `get_content_length`) pick their own budget.
-    let mut req = client.get(url)
+    let mut req = client
+        .get(url)
         .header(header::RANGE, format!("bytes={start}-{end}"))
-        .timeout(CHUNK_REQUEST_TIMEOUT);  // audit D6 — see const docs
+        .timeout(CHUNK_REQUEST_TIMEOUT); // audit D6 — see const docs
 
     if let Some(t) = token {
         req = req.bearer_auth(t);
@@ -576,10 +623,7 @@ async fn try_download_chunk_to_offset(
     }
 
     // Open this task's own handle on the pre-allocated final file, seek to start.
-    let mut file = OpenOptions::new()
-        .write(true)
-        .open(dest_path)
-        .await?;
+    let mut file = OpenOptions::new().write(true).open(dest_path).await?;
     file.seek(SeekFrom::Start(start)).await?;
 
     // Wrap the file handle in a 2MB BufWriter to avoid thousands of small unbuffered write syscalls
@@ -594,7 +638,12 @@ async fn try_download_chunk_to_offset(
     // that dribbles the head then stalls mid-body is cut as a retryable ReadStall,
     // rather than held open until the per-chunk 5-minute total timeout.
     loop {
-        match crate::chunk_fetcher::read_chunk_bounded(&mut res, crate::chunk_fetcher::download_read_idle()).await {
+        match crate::chunk_fetcher::read_chunk_bounded(
+            &mut res,
+            crate::chunk_fetcher::download_read_idle(),
+        )
+        .await
+        {
             Ok(Some(buf)) => {
                 // Bound each write to the bytes still owed for this range (audit
                 // M-SHORT206 follow-up): a 206 whose body RUNS PAST the requested
@@ -649,7 +698,6 @@ async fn try_download_chunk_to_offset(
     }
     Ok(())
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -1039,11 +1087,15 @@ mod short_206_tests {
         // remove_file unlinked the other's dest mid-download): a CI flake this fixes.
         static SEQ: AtomicU64 = AtomicU64::new(0);
         let seq = SEQ.fetch_add(1, Ordering::Relaxed);
-        let path = std::env::temp_dir().join(format!(
-            "hippius_short206_{}_{seq}.bin",
-            std::process::id(),
-        ));
-        let f = OpenOptions::new().create(true).write(true).truncate(true).open(&path).await.ok()?;
+        let path =
+            std::env::temp_dir().join(format!("hippius_short206_{}_{seq}.bin", std::process::id()));
+        let f = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&path)
+            .await
+            .ok()?;
         f.set_len(size).await.ok()?;
         Some(path)
     }
@@ -1054,11 +1106,29 @@ mod short_206_tests {
         // Content-Length, so hyper sees a clean EOF and raises nothing). The
         // byte-count guard must surface a retryable Io error instead of leaving the
         // chunk's tail as pre-allocated zeros.
-        let Some(base) = serve_short_206(100, 50).await.ok() else { return };
-        let Ok(client) = crate::chunk_fetcher::download_client(crate::chunk_fetcher::TransportTimeouts::default()) else { return };
-        let Some(dest) = prealloc(100).await else { return };
+        let Some(base) = serve_short_206(100, 50).await.ok() else {
+            return;
+        };
+        let Ok(client) = crate::chunk_fetcher::download_client(
+            crate::chunk_fetcher::TransportTimeouts::default(),
+        ) else {
+            return;
+        };
+        let Some(dest) = prealloc(100).await else {
+            return;
+        };
         let pb = ProgressBar::hidden();
-        let res = try_download_chunk_to_offset(client, &format!("{base}/blob"), None, 0, 99, 100, &dest, &pb).await;
+        let res = try_download_chunk_to_offset(
+            client,
+            &format!("{base}/blob"),
+            None,
+            0,
+            99,
+            100,
+            &dest,
+            &pb,
+        )
+        .await;
         let _ = std::fs::remove_file(&dest);
         assert!(
             matches!(res, Err(CoreError::Io(_))),
@@ -1070,11 +1140,29 @@ mod short_206_tests {
     async fn full_length_206_is_accepted() {
         // Control: a 206 whose body fills the requested range must succeed, so the
         // guard rejects only genuine short reads.
-        let Some(base) = serve_short_206(100, 100).await.ok() else { return };
-        let Ok(client) = crate::chunk_fetcher::download_client(crate::chunk_fetcher::TransportTimeouts::default()) else { return };
-        let Some(dest) = prealloc(100).await else { return };
+        let Some(base) = serve_short_206(100, 100).await.ok() else {
+            return;
+        };
+        let Ok(client) = crate::chunk_fetcher::download_client(
+            crate::chunk_fetcher::TransportTimeouts::default(),
+        ) else {
+            return;
+        };
+        let Some(dest) = prealloc(100).await else {
+            return;
+        };
         let pb = ProgressBar::hidden();
-        let res = try_download_chunk_to_offset(client, &format!("{base}/blob"), None, 0, 99, 100, &dest, &pb).await;
+        let res = try_download_chunk_to_offset(
+            client,
+            &format!("{base}/blob"),
+            None,
+            0,
+            99,
+            100,
+            &dest,
+            &pb,
+        )
+        .await;
         let _ = std::fs::remove_file(&dest);
         assert!(res.is_ok(), "full-length 206 must be accepted, got {res:?}");
     }
@@ -1085,16 +1173,40 @@ mod short_206_tests {
         // 100 bytes — bytes [100, 200) of the shared file (the next chunk's region)
         // must stay the pre-allocated zeros, not the surplus — and the over-send must
         // surface as an error rather than a silent cross-chunk corruption.
-        let Some(base) = serve_short_206(100, 150).await.ok() else { return };
-        let Ok(client) = crate::chunk_fetcher::download_client(crate::chunk_fetcher::TransportTimeouts::default()) else { return };
-        let Some(dest) = prealloc(200).await else { return };
+        let Some(base) = serve_short_206(100, 150).await.ok() else {
+            return;
+        };
+        let Ok(client) = crate::chunk_fetcher::download_client(
+            crate::chunk_fetcher::TransportTimeouts::default(),
+        ) else {
+            return;
+        };
+        let Some(dest) = prealloc(200).await else {
+            return;
+        };
         let pb = ProgressBar::hidden();
-        let res = try_download_chunk_to_offset(client, &format!("{base}/blob"), None, 0, 99, 100, &dest, &pb).await;
-        let tail_is_zero = std::fs::read(&dest)
-            .is_ok_and(|b| b.len() == 200 && b[100..].iter().all(|&x| x == 0));
+        let res = try_download_chunk_to_offset(
+            client,
+            &format!("{base}/blob"),
+            None,
+            0,
+            99,
+            100,
+            &dest,
+            &pb,
+        )
+        .await;
+        let tail_is_zero =
+            std::fs::read(&dest).is_ok_and(|b| b.len() == 200 && b[100..].iter().all(|&x| x == 0));
         let _ = std::fs::remove_file(&dest);
-        assert!(matches!(res, Err(CoreError::Io(_))), "over-length 206 must error, got {res:?}");
-        assert!(tail_is_zero, "surplus bytes must not clobber the neighbouring chunk region");
+        assert!(
+            matches!(res, Err(CoreError::Io(_))),
+            "over-length 206 must error, got {res:?}"
+        );
+        assert!(
+            tail_is_zero,
+            "surplus bytes must not clobber the neighbouring chunk region"
+        );
     }
 }
 
@@ -1221,7 +1333,10 @@ mod retry_classification_tests {
     // refactor that drops `Option` cannot regress without breaking here.
     #[test]
     fn join_failed_is_not_retryable() {
-        let Ok(rt) = tokio::runtime::Builder::new_current_thread().enable_all().build() else {
+        let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        else {
             unreachable!("current-thread runtime build is infallible in this environment")
         };
         let join_err = rt.block_on(async {
@@ -1254,7 +1369,10 @@ mod retry_classification_tests {
     // `panic = "deny"` (`expect_used` is also warned, see Cargo.toml).
     #[test]
     fn join_failed_display_renders_index_correctly() {
-        let Ok(rt) = tokio::runtime::Builder::new_current_thread().enable_all().build() else {
+        let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        else {
             unreachable!("current-thread runtime build is infallible in this environment")
         };
         let (join_err_none, join_err_some) = rt.block_on(async {
@@ -1300,14 +1418,22 @@ mod retry_classification_tests {
         use tokio::net::TcpListener;
 
         let total: usize = (MAX_INFLIGHT_CHUNKS + 20) * 4; // 52 chunks of 4 bytes
-        let body: Vec<u8> = (0..total).map(|i| u8::try_from(i % 251).unwrap_or(0)).collect();
+        let body: Vec<u8> = (0..total)
+            .map(|i| u8::try_from(i % 251).unwrap_or(0))
+            .collect();
 
-        let Ok(listener) = TcpListener::bind("127.0.0.1:0").await else { return };
-        let Ok(addr) = listener.local_addr() else { return };
+        let Ok(listener) = TcpListener::bind("127.0.0.1:0").await else {
+            return;
+        };
+        let Ok(addr) = listener.local_addr() else {
+            return;
+        };
         let body_srv = body.clone();
         let server = tokio::spawn(async move {
             loop {
-                let Ok((mut sock, _)) = listener.accept().await else { return };
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    return;
+                };
                 let body = body_srv.clone();
                 tokio::spawn(async move {
                     // Read until the end of the request head (hyper may split it across
@@ -1316,7 +1442,9 @@ mod retry_classification_tests {
                     let mut acc: Vec<u8> = Vec::new();
                     let mut buf = [0u8; 1024];
                     loop {
-                        let Ok(n) = sock.read(&mut buf).await else { return };
+                        let Ok(n) = sock.read(&mut buf).await else {
+                            return;
+                        };
                         if n == 0 {
                             break;
                         }
@@ -1327,10 +1455,13 @@ mod retry_classification_tests {
                     }
                     let req = String::from_utf8_lossy(&acc).to_ascii_lowercase();
                     // Echo exactly the requested inclusive byte range as a 206.
-                    let Some(rng) = req.lines().find_map(|l| l.strip_prefix("range: bytes=")) else {
+                    let Some(rng) = req.lines().find_map(|l| l.strip_prefix("range: bytes="))
+                    else {
                         return;
                     };
-                    let Some((s, e)) = rng.trim().split_once('-') else { return };
+                    let Some((s, e)) = rng.trim().split_once('-') else {
+                        return;
+                    };
                     let (Ok(start), Ok(end)) = (s.parse::<usize>(), e.parse::<usize>()) else {
                         return;
                     };
@@ -1363,9 +1494,16 @@ mod retry_classification_tests {
         let dest = std::env::temp_dir().join(format!("hippius-l13-{}.bin", std::process::id()));
         let out = tokio::time::timeout(Duration::from_secs(20), dl.download(&dest, false)).await;
         server.abort();
-        let Ok(Ok(_)) = out else { unreachable!("52-chunk download must complete, got {out:?}") };
-        let Ok(got) = tokio::fs::read(&dest).await else { unreachable!("read dest") };
-        assert_eq!(got, body, "every chunk past the window must have been refilled and written");
+        let Ok(Ok(_)) = out else {
+            unreachable!("52-chunk download must complete, got {out:?}")
+        };
+        let Ok(got) = tokio::fs::read(&dest).await else {
+            unreachable!("read dest")
+        };
+        assert_eq!(
+            got, body,
+            "every chunk past the window must have been refilled and written"
+        );
         let _ = std::fs::remove_file(&dest);
     }
 
@@ -1383,7 +1521,8 @@ mod retry_classification_tests {
         ) else {
             unreachable!("downloader builds")
         };
-        let dest = std::env::temp_dir().join(format!("hippius-zerochunk-{}.bin", std::process::id()));
+        let dest =
+            std::env::temp_dir().join(format!("hippius-zerochunk-{}.bin", std::process::id()));
         let res = dl.download(&dest, false).await;
         assert!(
             matches!(res, Err(CoreError::InvalidArgument(ref m)) if m.contains("all-zero")),
@@ -1391,7 +1530,10 @@ mod retry_classification_tests {
         );
         // The guard must return BEFORE the set_len pre-allocation runs, so no
         // zero-filled file is left behind.
-        assert!(!dest.exists(), "no destination file may be created on the zero-chunk-size path");
+        assert!(
+            !dest.exists(),
+            "no destination file may be created on the zero-chunk-size path"
+        );
         let _ = std::fs::remove_file(&dest);
     }
 }
