@@ -24,6 +24,7 @@ use tokio::io::SeekFrom;
 use tokio::sync::Semaphore;
 use tokio::task::AbortHandle;
 
+use crate::digest::Sha256Digest;
 use crate::error::CoreError;
 
 const CONNECT_TIMEOUT_SECS: u64 = 30;
@@ -243,12 +244,13 @@ impl Drop for AbortOnDrop {
 }
 
 /// One chunk to carve out of a fetched pack: where it sits in the pack, its size,
-/// where it lands in the assembled file, and its content digest (hex, no prefix).
+/// where it lands in the assembled file, and its content digest (binary; hex is
+/// parsed once at the FFI boundary via [`Sha256Digest::from_hex`]).
 pub struct PackChunkTarget {
     pub offset_in_pack: u64,
     pub size: u64,
     pub file_offset: u64,
-    pub expected_sha256: String,
+    pub expected_sha256: Sha256Digest,
 }
 
 /// One pack blob to fetch (a full `200 OK`) and the chunks to slice out of it.
@@ -352,17 +354,11 @@ impl PackAssembler {
             let token = self.auth_token.clone();
             let url = plan.url.clone();
             let pack_size = plan.size;
-            let targets: Vec<(u64, u64, u64, String)> = plan
+            // `Sha256Digest` is `Copy`, so this fan-out clones no heap strings.
+            let targets: Vec<(u64, u64, u64, Sha256Digest)> = plan
                 .chunks
                 .iter()
-                .map(|c| {
-                    (
-                        c.offset_in_pack,
-                        c.size,
-                        c.file_offset,
-                        c.expected_sha256.clone(),
-                    )
-                })
+                .map(|c| (c.offset_in_pack, c.size, c.file_offset, c.expected_sha256))
                 .collect();
             let path = dest.to_path_buf();
             let pack_pb = pb.clone();
@@ -545,7 +541,7 @@ async fn fetch_pack_with_retry(
     url: &str,
     token: Option<&str>,
     pack_size: u64,
-    targets: &[(u64, u64, u64, String)],
+    targets: &[(u64, u64, u64, Sha256Digest)],
     dest_path: &Path,
     pb: &ProgressBar,
 ) -> Result<(), CoreError> {
@@ -575,7 +571,7 @@ async fn fetch_pack(
     url: &str,
     token: Option<&str>,
     pack_size: u64,
-    targets: &[(u64, u64, u64, String)],
+    targets: &[(u64, u64, u64, Sha256Digest)],
     dest_path: &Path,
     pb: &ProgressBar,
 ) -> Result<(), CoreError> {
@@ -661,7 +657,7 @@ async fn fetch_pack(
 fn verify_and_scatter(
     url: &str,
     bytes: &[u8],
-    targets: &[(u64, u64, u64, String)],
+    targets: &[(u64, u64, u64, Sha256Digest)],
     dest_path: &Path,
     pb: &ProgressBar,
 ) -> Result<(), CoreError> {
@@ -685,8 +681,10 @@ fn verify_and_scatter(
             )));
         }
         let slice = &bytes[start..end];
-        let got = hex::encode(Sha256::digest(slice));
-        if &got != expected {
+        // Binary 32-byte compare on the hot path; hex renders (via Display) only
+        // inside the failure message, so the match arm allocates nothing.
+        let got = Sha256Digest::of(slice);
+        if got != *expected {
             return Err(CoreError::Integrity(format!(
                 "chunk at pack offset {offset_in_pack}: expected sha256 {expected}, got {got}"
             )));
@@ -817,10 +815,10 @@ mod tests {
         let pb = ProgressBar::hidden();
         let (a, b) = (b"AAAA".as_slice(), b"BB".as_slice()); // 4 + 2 bytes
         let pack: Vec<u8> = [a, b].concat();
-        let ha = hex::encode(Sha256::digest(a));
-        let hb = hex::encode(Sha256::digest(b));
-        // (offset_in_pack, size, file_offset, expected_hex): scatter A->0, B->4.
-        let good = vec![(0u64, 4u64, 0u64, ha), (4u64, 2u64, 4u64, hb.clone())];
+        let ha = Sha256Digest::of(a);
+        let hb = Sha256Digest::of(b);
+        // (offset_in_pack, size, file_offset, expected_digest): scatter A->0, B->4.
+        let good = vec![(0u64, 4u64, 0u64, ha), (4u64, 2u64, 4u64, hb)];
 
         let path = std::env::temp_dir().join(format!("hippius-vs-{}.bin", std::process::id()));
         let Ok(()) = std::fs::File::create(&path).and_then(|f| f.set_len(6)) else {
@@ -1171,7 +1169,7 @@ mod tests {
         offset_in_pack: u64,
         size: u64,
         file_offset: u64,
-        sha: String,
+        sha: Sha256Digest,
     ) -> PackChunkTarget {
         PackChunkTarget {
             offset_in_pack,
@@ -1181,14 +1179,20 @@ mod tests {
         }
     }
 
+    /// Placeholder digest for plan-validation tests, which never reach the
+    /// verify step - only offsets and sizes matter there.
+    fn any_digest() -> Sha256Digest {
+        Sha256Digest::from([0u8; 32])
+    }
+
     #[test]
     fn validate_pack_plan_accepts_in_bounds_tiling() {
         let packs = vec![PackPlanEntry {
             url: String::new(),
             size: 1000,
             chunks: vec![
-                chunk_target(0, 400, 0, String::new()),
-                chunk_target(400, 600, 400, String::new()),
+                chunk_target(0, 400, 0, any_digest()),
+                chunk_target(400, 600, 400, any_digest()),
             ],
         }];
         assert!(validate_pack_plan(&packs, 1000).is_ok());
@@ -1203,8 +1207,8 @@ mod tests {
             url: String::new(),
             size: 1100,
             chunks: vec![
-                chunk_target(0, 1000, 0, String::new()),
-                chunk_target(1000, 100, 1005, String::new()),
+                chunk_target(0, 1000, 0, any_digest()),
+                chunk_target(1000, 100, 1005, any_digest()),
             ],
         }];
         assert!(matches!(
@@ -1218,7 +1222,7 @@ mod tests {
         let packs = vec![PackPlanEntry {
             url: String::new(),
             size: 10,
-            chunks: vec![chunk_target(0, u64::MAX, 1, String::new())],
+            chunks: vec![chunk_target(0, u64::MAX, 1, any_digest())],
         }];
         assert!(matches!(
             validate_pack_plan(&packs, u64::MAX),
@@ -1235,7 +1239,7 @@ mod tests {
         let packs = vec![PackPlanEntry {
             url: "reg/packHuge".to_string(),
             size: MAX_PACK_BYTES + 1,
-            chunks: vec![chunk_target(0, 10, 0, String::new())],
+            chunks: vec![chunk_target(0, 10, 0, any_digest())],
         }];
         assert!(
             matches!(validate_pack_plan(&packs, 10), Err(CoreError::Integrity(ref m)) if m.contains("ceiling"))
@@ -1244,7 +1248,7 @@ mod tests {
         let ok = vec![PackPlanEntry {
             url: String::new(),
             size: MAX_PACK_BYTES,
-            chunks: vec![chunk_target(0, 10, 0, String::new())],
+            chunks: vec![chunk_target(0, 10, 0, any_digest())],
         }];
         assert!(validate_pack_plan(&ok, 10).is_ok());
     }
@@ -1398,14 +1402,19 @@ mod tests {
                 url: format!("{base}/packA"),
                 size: 2000,
                 chunks: vec![
-                    chunk_target(0, 1000, 0, reference(&content[0..1000])),
-                    chunk_target(1000, 1000, 2000, reference(&content[2000..3000])),
+                    chunk_target(0, 1000, 0, Sha256Digest::of(&content[0..1000])),
+                    chunk_target(1000, 1000, 2000, Sha256Digest::of(&content[2000..3000])),
                 ],
             },
             PackPlanEntry {
                 url: format!("{base}/packB"),
                 size: 1000,
-                chunks: vec![chunk_target(0, 1000, 1000, reference(&content[1000..2000]))],
+                chunks: vec![chunk_target(
+                    0,
+                    1000,
+                    1000,
+                    Sha256Digest::of(&content[1000..2000]),
+                )],
             },
         ]
     }

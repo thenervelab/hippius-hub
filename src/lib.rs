@@ -10,11 +10,13 @@ pub use error::{CoreError, Result};
 mod chunk_fetcher;
 mod chunked_downloader;
 mod diagnostics;
+mod digest;
 mod retry;
 mod uploader;
 
 use chunk_fetcher::{PackAssembler, PackChunkTarget, PackPlanEntry, TransportTimeouts};
 use chunked_downloader::ChunkedDownloader;
+use digest::Sha256Digest;
 
 /// Render an error plus its full `source()` chain as one string: the top-level
 /// Display message followed by a `\ncaused by:` line per link. Shared by
@@ -412,13 +414,30 @@ fn pack_upload_native(
     })
 }
 
+/// Parse one chunk's digest hex, naming the pack URL and chunk index that carried
+/// a bad value - the pointer coordinate a user needs to locate the corruption.
+/// The context is folded into the `InvalidArgument` payload (rather than wrapping
+/// the error) so the rendered message carries a single `invalid argument:` prefix.
+fn parse_chunk_digest(pack_url: &str, index: usize, digest_hex: &str) -> Result<Sha256Digest> {
+    match Sha256Digest::from_hex(digest_hex) {
+        Ok(digest) => Ok(digest),
+        Err(CoreError::InvalidArgument(msg)) => Err(CoreError::InvalidArgument(format!(
+            "pack {pack_url} chunk {index}: {msg}"
+        ))),
+        // `from_hex` only constructs InvalidArgument today; forward anything a
+        // future variant might add unchanged rather than mislabel it.
+        Err(other) => Err(other),
+    }
+}
+
 /// Assemble a chunked-v2 file by pulling its pack blobs in parallel and slicing
 /// each chunk to its file offset (the download companion to `pack_upload_native`).
 ///
 /// # Arguments
 /// - `pack_urls` / `pack_sizes`: per-pack blob URL and byte length (equal length).
 /// - `pack_chunks`: per pack, a list of `(offset_in_pack, size, file_offset,
-///   chunk_sha256_hex)` targets to carve and verify.
+///   chunk_sha256_hex)` targets to carve and verify. A malformed digest
+///   (non-hex or wrong length - a corrupted pointer) raises before any fetch.
 /// - `dest_path`: destination, pre-allocated to `total_size`.
 /// - `total_size`: whole-file byte length (from the pointer's `file.size`).
 /// - `file_digest`: optional whole-file sha256 (hex, no prefix) - always passed
@@ -462,17 +481,23 @@ fn download_packs_native(
     }
     let mut packs: Vec<PackPlanEntry> = Vec::with_capacity(pack_urls.len());
     for ((url, size), chunks) in pack_urls.into_iter().zip(pack_sizes).zip(pack_chunks) {
+        // Parse each chunk digest ONCE here, before any fetch: a non-hex digest
+        // (a corrupted pointer) fails fast as InvalidArgument instead of surfacing
+        // later as a verify mismatch that could never have passed anyway. Hex stays
+        // at this FFI boundary; the verify path compares 32 binary bytes.
         let targets = chunks
             .into_iter()
-            .map(
-                |(offset_in_pack, csize, file_offset, expected_sha256)| PackChunkTarget {
+            .enumerate()
+            .map(|(i, (offset_in_pack, csize, file_offset, expected_hex))| {
+                Ok(PackChunkTarget {
                     offset_in_pack,
                     size: csize,
                     file_offset,
-                    expected_sha256,
-                },
-            )
-            .collect();
+                    expected_sha256: parse_chunk_digest(&url, i, &expected_hex)?,
+                })
+            })
+            .collect::<Result<Vec<PackChunkTarget>>>()
+            .map_err(|e| core_err_to_py(&e))?;
         packs.push(PackPlanEntry {
             url,
             size,
@@ -528,6 +553,24 @@ fn hippius_core(m: &Bound<'_, PyModule>) -> PyResult<()> {
 #[cfg(test)]
 mod error_render_tests {
     use crate::diagnostics::DiagError;
+
+    #[test]
+    fn parse_chunk_digest_failure_names_pack_and_chunk() {
+        // A corrupted pointer's bad digest must be locatable: the message names
+        // the pack URL and chunk index alongside from_hex's offending-string
+        // detail, under a single `invalid argument:` prefix (no nested wrapping).
+        let err = match super::parse_chunk_digest("http://reg/v2/r/blobs/p", 3, "nope") {
+            Err(e) => e,
+            Ok(d) => unreachable!("non-hex digest must not parse, got {d}"),
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("pack http://reg/v2/r/blobs/p chunk 3:")
+                && msg.contains("bad sha256 hex \"nope\"")
+                && msg.matches("invalid argument:").count() == 1,
+            "unexpected message: {msg}"
+        );
+    }
 
     #[test]
     fn diag_error_chain_message_includes_outer_message_and_cause() {
