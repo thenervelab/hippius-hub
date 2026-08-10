@@ -11,6 +11,7 @@ use pyo3::prelude::*;
 use std::error::Error as StdError;
 use std::fmt::Write as _;
 use std::path::PathBuf;
+use std::sync::Mutex;
 
 mod error;
 pub use error::{CoreError, Result};
@@ -282,6 +283,131 @@ fn chunk_and_hash_native(
     py.detach(|| uploader::chunk_and_hash(&dest, avg_size).map_err(|e| core_err_to_py(&e)))
 }
 
+/// Pull-based streaming handle over the chunk pipeline (chunked-v2 upload):
+/// Python drives with `next_batch`, so there is no Rust->Python reentrancy
+/// and the GIL is held only between batches.
+///
+/// State machine (see `uploader::ChunkStreamCore`): Streaming until
+/// `next_batch` returns `None` (EOF - the producer thread is joined there and
+/// `finish` returns the whole-file hex) or an error/Ctrl-C poisons the stream
+/// (every subsequent call then raises a clear error naming the failure
+/// instead of hanging). Dropping the object mid-stream drops the receiver, which
+/// unwinds the producer through the pipeline's acyclic shutdown.
+#[pyclass]
+struct ChunkStream {
+    /// Single mutex around the whole state machine: pymethods take `&self`
+    /// (Python may share the object across threads) but the core needs
+    /// `&mut`. The lock is ONLY taken with the GIL released (inside
+    /// `py.detach`) - a thread blocking here while holding the GIL would
+    /// deadlock the peer that re-attaches for `check_signals`.
+    core: Mutex<uploader::ChunkStreamCore>,
+}
+
+/// Lock the stream core, absorbing mutex poisoning: the state machine keeps
+/// its own `Failed` poison (a panic mid-call leaves it `Streaming`, where the
+/// receiver still answers), so the lock-level poison adds nothing.
+fn lock_stream(
+    core: &Mutex<uploader::ChunkStreamCore>,
+) -> std::sync::MutexGuard<'_, uploader::ChunkStreamCore> {
+    core.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+#[pymethods]
+impl ChunkStream {
+    /// Next file-ordered batch of `(sha256_hex, offset, length)` triples, or
+    /// `None` at end of stream (repeat calls keep returning `None`).
+    ///
+    /// # Returns
+    /// `Optional[list[tuple[str, int, int]]]` - up to 64 triples per batch,
+    /// offsets contiguous with the previous batch.
+    ///
+    /// # Errors
+    /// Raises `PyRuntimeError` on any pipeline failure - including a file
+    /// that could not be opened (`chunk_stream_native` cannot itself fail on
+    /// I/O; the open happens on the producer thread) and an out-of-range
+    /// `avg_size`. After a failure the stream is poisoned: every subsequent
+    /// call raises a clear error naming the failure. `KeyboardInterrupt`
+    /// aborts the stream (the pipeline unwinds) and then propagates.
+    ///
+    /// # GIL
+    /// Releases the GIL while blocked waiting for the pipeline, re-attaching
+    /// every `SIGNAL_POLL_INTERVAL` to poll Ctrl-C via `check_signals` - the
+    /// same cadence `run_interruptible`/`poll_ctrl_c` use for the transfers.
+    fn next_batch(&self, py: Python<'_>) -> PyResult<Option<Vec<(String, u64, u64)>>> {
+        py.detach(|| {
+            let mut core = lock_stream(&self.core);
+            loop {
+                match core.next_msg(SIGNAL_POLL_INTERVAL) {
+                    Ok(uploader::StreamStep::Batch(batch)) => return Ok(Some(batch)),
+                    Ok(uploader::StreamStep::Eof) => return Ok(None),
+                    Ok(uploader::StreamStep::TimedOut) => {
+                        if let Some(interrupt) = poll_ctrl_c() {
+                            // Drop the receiver so the pipeline unwinds; the
+                            // producer thread exits on its own (proved by the
+                            // abort-terminates test), so the interrupt
+                            // propagates without waiting on a join.
+                            drop(core.abort());
+                            return Err(interrupt);
+                        }
+                    }
+                    Err(e) => return Err(core_err_to_py(&e)),
+                }
+            }
+        })
+    }
+
+    /// Whole-file sha256 hex (lowercase, no prefix).
+    ///
+    /// # Errors
+    /// Raises `PyRuntimeError` if called before `next_batch` returned `None`
+    /// ("chunk stream not finished") - the stream is never silently drained -
+    /// or if the stream failed/was interrupted. The producer thread was
+    /// already joined at the EOF transition, so this never blocks.
+    ///
+    /// # GIL
+    /// Releases the GIL for the (brief) state lock; see `next_batch`.
+    fn finish(&self, py: Python<'_>) -> PyResult<String> {
+        py.detach(|| {
+            lock_stream(&self.core)
+                .finish()
+                .map_err(|e| core_err_to_py(&e))
+        })
+    }
+}
+
+/// Start the streaming chunk pipeline over `path` and return a pull-based
+/// [`ChunkStream`] - the incremental counterpart of `chunk_and_hash_native`
+/// for the chunked-v2 upload (same boundaries, digests, and whole-file hex).
+///
+/// # Arguments
+/// - `path`: local file to chunk.
+/// - `avg_size`: `FastCDC` target average chunk size in bytes (min/max
+///   derived as avg/4 .. avg*4). Pinned by the caller - part of the layout's
+///   wire contract, so identical files chunk identically and dedup.
+///
+/// # Returns
+/// A `ChunkStream`; call `next_batch` until `None`, then `finish`.
+///
+/// # Errors
+/// Never raises here by design: the file open and the `avg_size` validation
+/// run on the producer thread, so their failures surface on the FIRST
+/// `next_batch` call.
+///
+/// # GIL
+/// Non-blocking - spawns the producer thread and returns immediately, so no
+/// `py.detach` is needed.
+#[pyfunction]
+#[pyo3(signature = (path, avg_size))]
+fn chunk_stream_native(path: String, avg_size: u64) -> ChunkStream {
+    ChunkStream {
+        core: Mutex::new(uploader::ChunkStreamCore::spawn(
+            PathBuf::from(path),
+            avg_size,
+        )),
+    }
+}
+
 /// Upload a local file to `url` as the body of a chunked HTTP PUT.
 ///
 /// # Arguments
@@ -551,6 +677,8 @@ fn hippius_core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(download_file_native, m)?)?;
     m.add_function(wrap_pyfunction!(hash_file_native, m)?)?;
     m.add_function(wrap_pyfunction!(chunk_and_hash_native, m)?)?;
+    m.add_class::<ChunkStream>()?;
+    m.add_function(wrap_pyfunction!(chunk_stream_native, m)?)?;
     m.add_function(wrap_pyfunction!(upload_blob_native, m)?)?;
     m.add_function(wrap_pyfunction!(pack_upload_native, m)?)?;
     m.add_function(wrap_pyfunction!(download_packs_native, m)?)?;
