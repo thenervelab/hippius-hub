@@ -1,3 +1,11 @@
+//! Native transfer engine for `hippius_hub` (downloads, pack uploads, hashing,
+//! diagnostics), exposed to Python via `PyO3`.
+//!
+//! Every native entry point drives its async work with `block_on` on the shared
+//! tokio runtime, inside `py.detach` (GIL released). Never invoke an entry point
+//! from inside a tokio task: that nests `block_on` on the same runtime, which
+//! panics or deadlocks.
+
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use std::error::Error as StdError;
