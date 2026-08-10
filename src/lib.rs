@@ -255,7 +255,7 @@ fn hash_file_native(py: Python<'_>, path: String) -> PyResult<(String, u64)> {
 ///
 /// The chunked-v2 batch primitive. Production (`_upload_file_chunked_v2`) now
 /// streams via [`ChunkStream`] instead; this entry point remains for
-/// `scripts/bench_phase1.py` and as the pipeline's batch reference — both drive
+/// `scripts/bench_phase1.py` and as the pipeline's batch reference - both drive
 /// the same `run_chunk_pipeline`, so the measured phase-1 cost is shared.
 ///
 /// # Arguments

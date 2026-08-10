@@ -753,6 +753,12 @@ Then check remaining callers of `chunk_and_hash_native`
 its only production caller, remove the pyfunction and port its tests to the
 stream (replace, don't deprecate); keep it only if the v1/legacy path still calls it.
 
+> **OUTCOME (2026-08-10): retained.** The v2 path was its only production
+> caller, but `chunk_and_hash_native` stays: it is `scripts/bench_phase1.py`'s
+> entry point and the pipeline's batch reference, and it routes through the
+> same `run_chunk_pipeline` machinery production streams through — live code,
+> not a deprecated shim.
+
 **B3.5 — Integration + failure tests.** Extend the existing mock-registry upload
 tests (find them: `rg -ln "pack_upload_native|_upload_file_chunked_v2" tests/`):
 (a) multi-pack file uploads correctly with digests/pointer identical to the
