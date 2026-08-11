@@ -32,22 +32,6 @@ const DOWNLOAD_READ_IDLE: Duration = Duration::from_secs(30);
 /// real (semaphore-bounded) concurrency.
 const DOWNLOAD_POOL_MAX_IDLE: usize = 32;
 
-/// Process-global HTTP/1 client shared by both download paths (pack assembly here
-/// and the legacy Range downloader). Mirrors `uploader::upload_client`: building a
-/// `Client` per native call starts with an empty pool and forces a fresh
-/// DNS+TCP+TLS handshake to the registry host on every file; the `OnceLock` hoists
-/// construction out of the per-file path so warm connections survive across files
-/// (the win for many-small-file snapshots). Auth is applied per request, so the
-/// shared client carries no per-file credential across origins.
-///
-/// HTTP/1-only for the same reason the per-call clients were: h2 would multiplex
-/// every parallel chunk onto one TCP and cap aggregate throughput at the
-/// per-connection ceiling; h1 lets each chunk claim its own connection.
-///
-/// Construction is fallible (the TLS backend may fail to init), so this returns
-/// `Result` rather than `expect`-ing inside a `get_or_init` closure - the crate
-/// denies `panic`/`unwrap`. On an init race the loser's freshly built client is
-/// dropped unused (RAII); `OnceLock` is valid in statics and never poisoned.
 /// Connect + read timeouts for the shared download client. Resolved in Python
 /// (`constants.resolve_connect_timeout` / `resolve_read_timeout`) and threaded
 /// down so `HIPPIUS_CONNECT_TIMEOUT` / `HIPPIUS_READ_TIMEOUT` reach real
@@ -139,6 +123,22 @@ pub(crate) async fn read_chunk_bounded(
     }
 }
 
+/// Process-global HTTP/1 client shared by both download paths (pack assembly here
+/// and the legacy Range downloader). Mirrors `uploader::upload_client`: building a
+/// `Client` per native call starts with an empty pool and forces a fresh
+/// DNS+TCP+TLS handshake to the registry host on every file; the `OnceLock` hoists
+/// construction out of the per-file path so warm connections survive across files
+/// (the win for many-small-file snapshots). Auth is applied per request, so the
+/// shared client carries no per-file credential across origins.
+///
+/// HTTP/1-only for the same reason the per-call clients were: h2 would multiplex
+/// every parallel chunk onto one TCP and cap aggregate throughput at the
+/// per-connection ceiling; h1 lets each chunk claim its own connection.
+///
+/// Construction is fallible (the TLS backend may fail to init), so this returns
+/// `Result` rather than `expect`-ing inside a `get_or_init` closure - the crate
+/// denies `panic`/`unwrap`. On an init race the loser's freshly built client is
+/// dropped unused (RAII); `OnceLock` is valid in statics and never poisoned.
 pub(crate) fn download_client(timeouts: TransportTimeouts) -> Result<&'static Client, CoreError> {
     static CLIENT: OnceLock<Client> = OnceLock::new();
     if let Some(client) = CLIENT.get() {

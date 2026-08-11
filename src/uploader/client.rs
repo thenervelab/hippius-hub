@@ -10,12 +10,6 @@ use crate::error::CoreError;
 /// independently tunable.
 const CONNECT_TIMEOUT_SECS: u64 = 30;
 
-/// Single upload attempt. Extracted from `upload_blob_async` in audit
-/// U3 (Phase 3.11) so the surrounding retry loop has a unit to call
-/// repeatedly. Each call opens its own `File` handle, builds its own
-/// `FramedRead` stream, and sends one PUT - so the retry loop above
-/// gets a fresh body on every attempt (the previous `Body::wrap_stream`
-/// is consumed once the request future completes or errors).
 /// Process-global HTTP client for blob uploads.
 ///
 /// Mirrors the downloader, which builds its `reqwest::Client` once in

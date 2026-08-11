@@ -477,6 +477,12 @@ async fn close_chunked_upload(
     }
 }
 
+/// Single upload attempt. Extracted from `upload_blob_async` in audit
+/// U3 (Phase 3.11) so the surrounding retry loop has a unit to call
+/// repeatedly. Each call opens its own `File` handle, builds its own
+/// `FramedRead` stream, and sends one PUT - so the retry loop above
+/// gets a fresh body on every attempt (the previous `Body::wrap_stream`
+/// is consumed once the request future completes or errors).
 async fn try_upload_blob_once(
     uploads_url: &str,
     path: &Path,
@@ -620,29 +626,59 @@ mod tests {
     /// edit needs a known length, it must hash-and-stat the bytes it is
     /// about to send (e.g. read the file into memory once), not re-stat
     /// the disk file.
+    ///
+    /// blob.rs itself has exactly two LEGITIMATE uses - the zero-body session
+    /// init POST (`post_upload_session`) and the zero-body finalize PUT
+    /// (`close_chunked_upload`) - so a whole-tree "never appears" scan would
+    /// false-fail. Instead: every occurrence in blob.rs must be the literal
+    /// `, "0")` zero-body form (a constant zero cannot carry the TOCTOU), the
+    /// occurrence count is pinned to those two known sites, and every OTHER
+    /// uploader source must not contain the token at all.
     #[test]
     fn upload_does_not_set_content_length_header() {
         // Needle assembled at runtime so this test source does not itself
-        // match. The forbidden pattern is the literal `header::` + the
-        // reqwest constant name for the Content-Length header.
-        let needle = ["header", "CONTENT", "LENGTH"].join("::");
-        // The uploader is now a module directory; scan every submodule so the
-        // guard keeps the coverage the single-file `include_str!` had.
+        // contain the forbidden token: `header::` + the reqwest constant name
+        // for the Content-Length header, underscore and all. (An earlier
+        // needle joined THREE parts with "::", yielding the never-occurring
+        // `header::CONTENT::LENGTH` - a vacuous guard.)
+        let needle = ["header", "CONTENT_LENGTH"].join("::");
+
+        let blob = include_str!("blob.rs");
+        let mut zero_body_sites = 0usize;
+        for (i, _) in blob.match_indices(&needle) {
+            zero_body_sites += 1;
+            let after = &blob[i + needle.len()..];
+            assert!(
+                after.starts_with(", \"0\")"),
+                "blob.rs sets Content-Length with a non-constant-zero value - \
+                 a computed length re-creates the U2 TOCTOU race vs the file's \
+                 actual size at stream time"
+            );
+        }
+        assert_eq!(
+            zero_body_sites, 2,
+            "expected exactly the two known zero-body Content-Length sites in \
+             blob.rs (session-init POST + finalize PUT); a new site needs review \
+             against the U2 TOCTOU rationale before this pin is updated"
+        );
+
+        // The streamed-body paths (and everything else in the uploader) must
+        // never set the header at all.
         let sources = [
-            include_str!("mod.rs"),
-            include_str!("blob.rs"),
-            include_str!("cdc.rs"),
-            include_str!("client.rs"),
-            include_str!("hash.rs"),
-            include_str!("pack.rs"),
-            include_str!("stream.rs"),
-            include_str!("watchdog.rs"),
+            ("mod.rs", include_str!("mod.rs")),
+            ("cdc.rs", include_str!("cdc.rs")),
+            ("client.rs", include_str!("client.rs")),
+            ("hash.rs", include_str!("hash.rs")),
+            ("pack.rs", include_str!("pack.rs")),
+            ("stream.rs", include_str!("stream.rs")),
+            ("watchdog.rs", include_str!("watchdog.rs")),
         ];
-        for src in sources {
+        for (name, src) in sources {
             assert!(
                 !src.contains(&needle),
-                "uploader must NOT set the Content-Length header on the streaming PUT \
-                 - that creates a TOCTOU race vs the file's actual size at stream time"
+                "uploader/{name} must NOT set the Content-Length header - on the \
+                 streaming paths that creates a TOCTOU race vs the file's actual \
+                 size at stream time"
             );
         }
     }
