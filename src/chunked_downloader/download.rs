@@ -1,3 +1,7 @@
+//! The `ChunkedDownloader` orchestration: content-length resolution, the
+//! bounded chunk fan-out over Range GETs, and the per-chunk task machinery
+//! (retry loop + streaming write-to-offset).
+
 use indicatif::{ProgressBar, ProgressStyle};
 use reqwest::{header, Client};
 use sha2::{Digest, Sha256};
@@ -12,8 +16,13 @@ use tokio::fs::OpenOptions;
 use tokio::io::{AsyncSeekExt, AsyncWriteExt, BufWriter, SeekFrom};
 use tokio::sync::Semaphore;
 
+use crate::chunked_downloader::plan::{
+    chunk_bounds, num_chunks, require_acceptable_status, require_content_range_matches,
+};
+use crate::chunked_downloader::verify::{record_verify_route, resolve_verified_digest};
 use crate::error::CoreError;
-use crate::incremental_hash::{spawn_incremental_hasher, HasherTask};
+use crate::incremental_hash::{spawn_incremental_hasher, HashSignal};
+use std::sync::mpsc::Sender;
 
 const DEFAULT_CHUNK_SIZE: u64 = 100 * 1024 * 1024; // 100 MB default
 const MAX_RETRIES: u32 = 3;
@@ -21,7 +30,6 @@ const MAX_RETRIES: u32 = 3;
 /// small caller-set `HIPPIUS_CHUNK_SIZE` on a huge file can't open O(file/chunk)
 /// connections at once. 32 mirrors the pack path's default concurrency.
 const MAX_INFLIGHT_CHUNKS: usize = 32;
-const VERIFY_READ_BUFFER: usize = 8 * 1024 * 1024; // 8 MB read buffer for SHA256 verification
 
 /// Per-chunk request timeout (audit D6).
 ///
@@ -61,41 +69,6 @@ const HEAD_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 fn global_range_gate() -> Arc<Semaphore> {
     static GATE: OnceLock<Arc<Semaphore>> = OnceLock::new();
     Arc::clone(GATE.get_or_init(|| Arc::new(Semaphore::new(MAX_INFLIGHT_CHUNKS))))
-}
-
-/// Number of HTTP Range requests needed to cover `content_length` bytes when
-/// each chunk is `chunk_size` bytes. Returns 0 for empty files (caller is
-/// expected to handle that as a special case). Returns 0 for `chunk_size == 0`
-/// to avoid a division-by-zero panic; `download` turns that degenerate case into
-/// a loud `InvalidArgument` for a non-empty file rather than writing zeros (the
-/// Python layer also rejects a non-positive `HIPPIUS_CHUNK_SIZE`, but the pyo3
-/// entry point can bypass it - defense-in-depth).
-fn num_chunks(content_length: u64, chunk_size: u64) -> usize {
-    if content_length == 0 || chunk_size == 0 {
-        return 0;
-    }
-    // Integer ceiling division - `div_ceil` (stable since Rust 1.73) avoids
-    // both the f64 round-trip the original code used AND the `+ chunk_size
-    // - 1` overflow that the manual form would hit at `u64::MAX`.
-    //
-    // `try_into().unwrap_or(usize::MAX)` saturates the u64->usize conversion
-    // on 32-bit targets. The downloader cannot realistically address more
-    // than `usize::MAX` chunks (each chunk has its own `tokio::spawn`,
-    // backing JoinHandle, and reqwest pool slot - saturating means "as
-    // many chunks as the platform can spawn", not silent truncation).
-    content_length
-        .div_ceil(chunk_size)
-        .try_into()
-        .unwrap_or(usize::MAX)
-}
-
-/// Inclusive `(start, end)` byte range for chunk index `i` in a Range header.
-/// The last chunk is truncated at `content_length - 1` rather than running
-/// past EOF. Caller must ensure `i < num_chunks(content_length, chunk_size)`.
-fn chunk_bounds(content_length: u64, chunk_size: u64, i: usize) -> (u64, u64) {
-    let start = i as u64 * chunk_size;
-    let end = std::cmp::min(start + chunk_size - 1, content_length - 1);
-    (start, end)
 }
 
 // Phase 3.8 (audit D8): the local DownloadError + UploadError enums
@@ -158,11 +131,6 @@ impl ChunkedDownloader {
     /// instead of comparing against the empty string. The empty-file
     /// branch still returns `Some(sha256_of_empty_bytes)` because the
     /// file exists and has a defined (non-skipped) digest.
-    #[expect(
-        clippy::too_many_lines,
-        reason = "rustfmt line-break expansion plus the C1 incremental-hasher wiring; \
-                  the Phase D function-level split of this method removes this expect"
-    )]
     pub async fn download(
         &self,
         dest_path: &Path,
@@ -184,15 +152,7 @@ impl ChunkedDownloader {
             return Ok(Some(self.create_empty_file(dest_path).await?));
         }
 
-        let pb = ProgressBar::new(content_length);
-        // The template string is a compile-time string literal - `indicatif` only
-        // returns `Err` here for malformed format directives, which we control.
-        #[expect(clippy::expect_used, reason = "infallible static template")]
-        pb.set_style(ProgressStyle::default_bar()
-            .template("{msg} {spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({bytes_per_sec}, {eta})")
-            .expect("indicatif template is static and infallible")
-            .progress_chars("#>-"));
-        pb.set_message("Downloading");
+        let pb = download_progress_bar(content_length);
 
         let num_chunks = num_chunks(content_length, self.chunk_size);
 
@@ -209,31 +169,8 @@ impl ChunkedDownloader {
             )));
         }
 
-        // Prepare the destination directory
-        let parent_dir = dest_path.parent().unwrap_or_else(|| Path::new("."));
-        tokio::fs::create_dir_all(parent_dir).await?;
-
-        // 2. Pre-allocate the final file at the exact size (sparse OK).
-        //    Each chunk task opens its own file handle and seeks to its offset.
-        //    Concurrent writes via distinct handles to disjoint ranges are
-        //    OS-safe (each handle has its own file pointer).
-        {
-            let f = OpenOptions::new()
-                .create(true)
-                .write(true)
-                .truncate(true)
-                .open(dest_path)
-                .await?;
-            f.set_len(content_length).await?;
-            // No `sync_all` (audit L15): the parallel chunk writers see the
-            // `set_len` size through the page cache without forcing metadata to
-            // disk. It only bought crash durability of the pre-allocation, which is
-            // discarded anyway - a crash re-downloads (the dest opens `truncate`).
-        }
-
-        // `Arc<Path>` built once so every chunk task's capture is a pointer bump,
-        // not a fresh `PathBuf` heap copy (Task C2).
-        let dest_shared: Arc<Path> = Arc::from(dest_path);
+        // 2. Prepare the destination directory and pre-allocate the final file.
+        prepare_destination(dest_path, content_length).await?;
 
         // Overlap whole-file verification with the download (Task C1, mirroring the
         // pack path in `chunk_fetcher::PackAssembler::assemble`): the background
@@ -247,119 +184,28 @@ impl ChunkedDownloader {
             spawn_incremental_hasher(dest_path, content_length, verify_hash);
 
         // 3. Launch concurrent downloads - each streams directly to its
-        //    correct offset in the final file.
-        //
-        // Bounded-spawn window (audit L13): keep at most MAX_INFLIGHT_CHUNKS tasks
-        // live and spawn the next only as one lands, instead of eager-spawning one
-        // task per chunk (which, for a huge file under a small HIPPIUS_CHUNK_SIZE,
-        // meant O(file/chunk) live tasks plus an O(num_chunks) abort-handle Vec -
-        // `pool_max_idle_per_host` caps only IDLE connections, not in-flight GETs).
-        // A `JoinSet` owns the live tasks; dropping it on an early error return
-        // ABORTS every survivor (audit D4 - a detached `tokio::spawn` would keep
-        // writing to `dest_path` and holding sockets after we bubbled the error up),
-        // so no manual `AbortHandle` bookkeeping is needed. The window is this file's
-        // in-flight cap; `global_range_gate` (audit M-RANGE-GATE) still bounds TOTAL
-        // Range GETs across every concurrent legacy download.
-        let base_client = self.client.clone();
-        let base_url = Arc::clone(&self.url);
-        let base_token = self.auth_token.clone();
-        let chunk_size = self.chunk_size;
-        let spawn_pb = pb.clone();
-        let mut set: tokio::task::JoinSet<(usize, Result<(), CoreError>)> =
-            tokio::task::JoinSet::new();
-        let spawn_chunk = |set: &mut tokio::task::JoinSet<(usize, Result<(), CoreError>)>,
-                           i: usize| {
-            let (start, end) = chunk_bounds(content_length, chunk_size, i);
-            // `Client`/`ProgressBar` are Arc-backed handles; the url/token/path
-            // clones below are `Arc` pointer bumps (Task C2), not heap copies.
-            let client = base_client.clone();
-            let url = Arc::clone(&base_url);
-            let token = base_token.clone();
-            let chunk_pb = spawn_pb.clone();
-            let path = Arc::clone(&dest_shared);
-            set.spawn(async move {
-                // Global permit (RAII-released on completion or abort) bounds TOTAL
-                // in-flight Range GETs across every concurrent legacy download so a
-                // snapshot fan-out cannot open workers x MAX_INFLIGHT_CHUNKS at once.
-                let _global_permit = match global_range_gate().acquire_owned().await {
-                    Ok(p) => p,
-                    Err(e) => return (i, Err(CoreError::Io(std::io::Error::other(e)))),
-                };
-                let res = download_chunk_with_retry(
-                    client,
-                    url,
-                    token,
-                    start,
-                    end,
-                    content_length,
-                    i,
-                    path,
-                    chunk_pb,
-                )
-                .await;
-                (i, res)
-            });
+        //    correct offset in the final file. The shared per-task captures live
+        //    in a `ChunkTaskContext`; `run_chunk_fanout` owns the bounded spawn
+        //    window and the join-drain loop (audits L13 / D4 / M-RANGE-GATE).
+        let ctx = ChunkTaskContext {
+            client: self.client.clone(),
+            url: Arc::clone(&self.url),
+            token: self.auth_token.clone(),
+            // `Arc<Path>` built once so every chunk task's capture is a pointer
+            // bump, not a fresh `PathBuf` heap copy (Task C2).
+            dest: Arc::from(dest_path),
+            pb: pb.clone(),
+            content_length,
+            chunk_size: self.chunk_size,
         };
+        run_chunk_fanout(&ctx, num_chunks, hash_tx.as_ref()).await?;
 
-        // Prime the window; the drain loop below refills it one-for-one.
-        let mut next = 0usize;
-        while next < num_chunks && set.len() < MAX_INFLIGHT_CHUNKS {
-            spawn_chunk(&mut set, next);
-            next += 1;
-        }
-
-        // Drain the JoinSet, refilling the window as each chunk lands. Exhaustive
-        // match preserves both the spawn-side (`JoinError`) and the download-layer
-        // cause: previously both collapsed into a bare `ChunkFailed(usize)`, hiding
-        // which chunk failed AND why. `JoinFailed.index` is `None` because the chunk
-        // index lives inside the future's return tuple, and a `JoinError` escaping
-        // before the tuple is built has lost that identity (`Display` -> `<unknown>`).
-        //
-        // On any error we return immediately; dropping `set` aborts every still-
-        // running task (audit D4) so no survivor keeps writing to `dest_path`.
-        while let Some(joined) = set.join_next().await {
-            match joined {
-                Err(join_err) => {
-                    return Err(CoreError::JoinFailed {
-                        index: None,
-                        source: join_err,
-                    });
-                }
-                Ok((i, Err(chunk_err))) => {
-                    return Err(CoreError::ChunkFailed {
-                        index: i,
-                        source: Box::new(chunk_err),
-                    });
-                }
-                Ok((i, Ok(()))) => {
-                    // Signal the chunk's extent to the hasher ONLY here, on final
-                    // success: the retry loop lives inside the task, so `Ok` means
-                    // the write+flush landed and the exact-length check passed -
-                    // a retried chunk can never double-count. Sent from this drain
-                    // loop rather than inside each task so ONE sender suffices (no
-                    // per-task clones) and the extent is recomputed from the same
-                    // bounds math that formed the Range request: `chunk_bounds`
-                    // tiles [0, content_length) exactly (coverage/contiguity/span
-                    // proptests above), which IS the hasher's coverage invariant.
-                    if let Some(tx) = &hash_tx {
-                        let (start, end) = chunk_bounds(content_length, chunk_size, i);
-                        // A closed channel means the hasher already exited; losing
-                        // the signal merely forgoes the fast path (re-read fallback).
-                        let _ = tx.send(vec![(start, end - start + 1)]);
-                    }
-                    if next < num_chunks {
-                        spawn_chunk(&mut set, next);
-                        next += 1;
-                    }
-                }
-            }
-        }
         // Close the hash channel so the hasher task finalizes (or bails with
-        // `None`). On the early-return error paths above `hash_tx` drops with the
-        // stack frame, which likewise closes the channel: the blocking hasher task
-        // (unabortable by design) then exits promptly instead of leaking on
-        // `recv` - the same sender-drop lifecycle the pack path relies on when its
-        // aborted pack tasks drop their sender clones.
+        // `None`). On the error path the `?` above returns and `hash_tx` drops
+        // with the stack frame, which likewise closes the channel: the blocking
+        // hasher task (unabortable by design) then exits promptly instead of
+        // leaking on `recv` - the same sender-drop lifecycle the pack path relies
+        // on when its aborted pack tasks drop their sender clones.
         drop(hash_tx);
 
         pb.finish_with_message("Download complete");
@@ -429,114 +275,167 @@ impl ChunkedDownloader {
     }
 }
 
-/// Which route produced the verified whole-file digest. The digest value is
-/// identical either way (both hash the same on-disk bytes); the route exists so
-/// `download` can record - and tests can observe - whether the overlapped
-/// incremental pass actually replaced the full re-read.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum DigestRoute {
-    /// The background incremental hasher covered the file during the download.
-    Incremental,
-    /// The hasher could not cover the file; a full sequential re-read produced it.
-    FullReread,
+/// Progress bar for the download phase. The template string is a compile-time
+/// string literal - `indicatif` only returns `Err` here for malformed format
+/// directives, which we control.
+fn download_progress_bar(content_length: u64) -> ProgressBar {
+    let pb = ProgressBar::new(content_length);
+    #[expect(clippy::expect_used, reason = "infallible static template")]
+    pb.set_style(ProgressStyle::default_bar()
+        .template("{msg} {spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({bytes_per_sec}, {eta})")
+        .expect("indicatif template is static and infallible")
+        .progress_chars("#>-"));
+    pb.set_message("Downloading");
+    pb
 }
 
-/// Resolve the whole-file digest after every chunk has landed: prefer the digest
-/// the background hasher computed (its work overlapped the download), else fall
-/// back to the full sequential re-read - the mirror of the pack path's
-/// `chunk_fetcher::verify_file_digest`, minus the expected-digest comparison
-/// (this path RETURNS the digest; Python compares it). A `JoinError` means the
-/// hasher task panicked - surfaced as the non-retryable `JoinFailed` rather than
-/// masked by a silent fallback, exactly as the pack path argues. `None` for
-/// `hasher_task` (unreachable from `download`, which spawns the hasher whenever
-/// it verifies) also re-reads, keeping the function total without a panic.
-async fn resolve_verified_digest(
-    hasher_task: Option<HasherTask>,
-    dest_path: &Path,
+/// Create the destination's parent directory and pre-allocate the final file at
+/// the exact size (sparse OK). Each chunk task opens its own file handle and
+/// seeks to its offset; concurrent writes via distinct handles to disjoint
+/// ranges are OS-safe (each handle has its own file pointer).
+async fn prepare_destination(dest_path: &Path, content_length: u64) -> Result<(), CoreError> {
+    let parent_dir = dest_path.parent().unwrap_or_else(|| Path::new("."));
+    tokio::fs::create_dir_all(parent_dir).await?;
+
+    let f = OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(dest_path)
+        .await?;
+    f.set_len(content_length).await?;
+    // No `sync_all` (audit L15): the parallel chunk writers see the
+    // `set_len` size through the page cache without forcing metadata to
+    // disk. It only bought crash durability of the pre-allocation, which is
+    // discarded anyway - a crash re-downloads (the dest opens `truncate`).
+    Ok(())
+}
+
+/// The per-download state every spawned chunk task captures, built once by
+/// `download` so each spawn is a set of `Arc` pointer bumps (Task C2), not heap
+/// copies (`Client`/`ProgressBar` are Arc-backed handles too).
+struct ChunkTaskContext {
+    client: Client,
+    url: Arc<str>,
+    token: Option<Arc<str>>,
+    dest: Arc<Path>,
+    pb: ProgressBar,
     content_length: u64,
-) -> Result<(String, DigestRoute), CoreError> {
-    if let Some(task) = hasher_task {
-        match task.await {
-            Ok(Some(digest)) => return Ok((digest, DigestRoute::Incremental)),
-            Ok(None) => {}
+    chunk_size: u64,
+}
+
+impl ChunkTaskContext {
+    /// Spawn the download task for chunk `i` into `set`.
+    fn spawn_chunk(
+        &self,
+        set: &mut tokio::task::JoinSet<(usize, Result<(), CoreError>)>,
+        i: usize,
+    ) {
+        let (start, end) = chunk_bounds(self.content_length, self.chunk_size, i);
+        let client = self.client.clone();
+        let url = Arc::clone(&self.url);
+        let token = self.token.clone();
+        let chunk_pb = self.pb.clone();
+        let path = Arc::clone(&self.dest);
+        let content_length = self.content_length;
+        set.spawn(async move {
+            // Global permit (RAII-released on completion or abort) bounds TOTAL
+            // in-flight Range GETs across every concurrent legacy download so a
+            // snapshot fan-out cannot open workers x MAX_INFLIGHT_CHUNKS at once.
+            let _global_permit = match global_range_gate().acquire_owned().await {
+                Ok(p) => p,
+                Err(e) => return (i, Err(CoreError::Io(std::io::Error::other(e)))),
+            };
+            let res = download_chunk_with_retry(
+                client,
+                url,
+                token,
+                start,
+                end,
+                content_length,
+                i,
+                path,
+                chunk_pb,
+            )
+            .await;
+            (i, res)
+        });
+    }
+}
+
+/// Bounded-window fan-out over all `num_chunks` chunk tasks (audit L13): keep at
+/// most `MAX_INFLIGHT_CHUNKS` tasks live and spawn the next only as one lands,
+/// instead of eager-spawning one task per chunk (which, for a huge file under a
+/// small `HIPPIUS_CHUNK_SIZE`, meant `O(file/chunk)` live tasks plus an
+/// `O(num_chunks)` abort-handle Vec - `pool_max_idle_per_host` caps only IDLE
+/// connections, not in-flight GETs). A `JoinSet` owns the live tasks; dropping
+/// it on an early error return ABORTS every survivor (audit D4 - a detached
+/// `tokio::spawn` would keep writing to the destination and holding sockets
+/// after we bubbled the error up), so no manual `AbortHandle` bookkeeping is
+/// needed. The window is this file's in-flight cap; `global_range_gate`
+/// (audit M-RANGE-GATE) still bounds TOTAL Range GETs across every concurrent
+/// legacy download.
+async fn run_chunk_fanout(
+    ctx: &ChunkTaskContext,
+    num_chunks: usize,
+    hash_tx: Option<&Sender<HashSignal>>,
+) -> Result<(), CoreError> {
+    let mut set: tokio::task::JoinSet<(usize, Result<(), CoreError>)> = tokio::task::JoinSet::new();
+
+    // Prime the window; the drain loop below refills it one-for-one.
+    let mut next = 0usize;
+    while next < num_chunks && set.len() < MAX_INFLIGHT_CHUNKS {
+        ctx.spawn_chunk(&mut set, next);
+        next += 1;
+    }
+
+    // Drain the JoinSet, refilling the window as each chunk lands. Exhaustive
+    // match preserves both the spawn-side (`JoinError`) and the download-layer
+    // cause: previously both collapsed into a bare `ChunkFailed(usize)`, hiding
+    // which chunk failed AND why. `JoinFailed.index` is `None` because the chunk
+    // index lives inside the future's return tuple, and a `JoinError` escaping
+    // before the tuple is built has lost that identity (`Display` -> `<unknown>`).
+    //
+    // On any error we return immediately; dropping `set` aborts every still-
+    // running task (audit D4) so no survivor keeps writing to the destination.
+    while let Some(joined) = set.join_next().await {
+        match joined {
             Err(join_err) => {
                 return Err(CoreError::JoinFailed {
                     index: None,
                     source: join_err,
-                })
+                });
+            }
+            Ok((i, Err(chunk_err))) => {
+                return Err(CoreError::ChunkFailed {
+                    index: i,
+                    source: Box::new(chunk_err),
+                });
+            }
+            Ok((i, Ok(()))) => {
+                // Signal the chunk's extent to the hasher ONLY here, on final
+                // success: the retry loop lives inside the task, so `Ok` means
+                // the write+flush landed and the exact-length check passed -
+                // a retried chunk can never double-count. Sent from this drain
+                // loop rather than inside each task so ONE sender suffices (no
+                // per-task clones) and the extent is recomputed from the same
+                // bounds math that formed the Range request: `chunk_bounds`
+                // tiles [0, content_length) exactly (coverage/contiguity/span
+                // proptests in `plan`), which IS the hasher's coverage invariant.
+                if let Some(tx) = hash_tx {
+                    let (start, end) = chunk_bounds(ctx.content_length, ctx.chunk_size, i);
+                    // A closed channel means the hasher already exited; losing
+                    // the signal merely forgoes the fast path (re-read fallback).
+                    let _ = tx.send(vec![(start, end - start + 1)]);
+                }
+                if next < num_chunks {
+                    ctx.spawn_chunk(&mut set, next);
+                    next += 1;
+                }
             }
         }
     }
-
-    // Fallback: the pre-C1 verify pass, bar and all. Both routes hash the same
-    // on-disk bytes, so this is a slower path to an identical answer.
-    let pb_hash = ProgressBar::new(content_length);
-    // Same rationale as the download-phase bar: static literal template.
-    #[expect(clippy::expect_used, reason = "infallible static template")]
-    pb_hash.set_style(ProgressStyle::default_bar()
-        .template("{msg} {spinner:.green} [{elapsed_precise}] [{bar:40.magenta/red}] {bytes}/{total_bytes} ({bytes_per_sec}, {eta})")
-        .expect("indicatif template is static and infallible")
-        .progress_chars("=>-"));
-    pb_hash.set_message("Verifying SHA256");
-
-    let hash = compute_sha256(dest_path, &pb_hash).await?;
-    pb_hash.finish_with_message("Verified");
-    Ok((hash, DigestRoute::FullReread))
-}
-
-/// Test-build route probe: bump the incremental counter so the E2E verify test
-/// can assert the overlap path ran (see `INCREMENTAL_VERIFIES`).
-#[cfg(test)]
-fn record_verify_route(route: DigestRoute) {
-    if route == DigestRoute::Incremental {
-        INCREMENTAL_VERIFIES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    }
-}
-
-/// Production builds carry no probe; the route is informational only.
-#[cfg(not(test))]
-fn record_verify_route(_route: DigestRoute) {}
-
-/// Compute the SHA256 of the final file in a single sequential read-pass.
-///
-/// Audit U1: same justification as `uploader::hash_file_async` - sha2's
-/// digest loop is CPU-bound and would block a tokio worker for seconds on a
-/// multi-GB verify, starving the parallel download tasks the runtime is
-/// trying to drain. `spawn_blocking` parks the work on the dedicated
-/// blocking pool instead. The `ProgressBar` is `Send + Sync` (Arc-internal
-/// per indicatif docs), so cloning it into the closure for tick updates is
-/// safe - `pb.inc` is thread-safe and now runs from the blocking thread.
-///
-/// The double `?` mirrors `hash_file_async`: outer `?` maps
-/// `JoinError -> CoreError::JoinFailed` (non-retryable - a panicked hash
-/// closure reproduces on retry), inner `?` propagates `io::Error` from
-/// the closure body.
-async fn compute_sha256(path: &Path, pb: &ProgressBar) -> Result<String, CoreError> {
-    use std::io::Read;
-
-    let path = path.to_path_buf();
-    let pb = pb.clone(); // indicatif::ProgressBar clones cheaply via internal Arc.
-    tokio::task::spawn_blocking(move || -> Result<String, CoreError> {
-        let mut file = std::fs::File::open(&path)?;
-        let mut hasher = Sha256::new();
-        let mut buf = vec![0u8; VERIFY_READ_BUFFER];
-
-        loop {
-            let n = file.read(&mut buf)?;
-            if n == 0 {
-                break;
-            }
-            hasher.update(&buf[..n]);
-            pb.inc(n as u64);
-        }
-
-        Ok(hex::encode(hasher.finalize()))
-    })
-    .await
-    .map_err(|join_err| CoreError::JoinFailed {
-        index: None,
-        source: join_err,
-    })?
+    Ok(())
 }
 
 // Audit D5 retry classification moved to `CoreError::is_retryable` in
@@ -600,80 +499,6 @@ async fn download_chunk_with_retry(
                 tokio::time::sleep(crate::retry::backoff_delay(retries)).await;
             }
         }
-    }
-}
-
-/// Parse a `Content-Range: bytes START-END/TOTAL` (or `.../*`) value into its
-/// `(start, end)` byte bounds. Returns `None` for anything that is not a
-/// well-formed byte range - wrong unit, missing `-` or `/`, or non-numeric
-/// bounds. The TOTAL is intentionally not validated (a proxy may legitimately
-/// send `*`); only the offsets matter for the alignment check below.
-fn parse_content_range(value: &str) -> Option<(u64, u64)> {
-    let range = value.trim().strip_prefix("bytes ")?.split('/').next()?;
-    let (start, end) = range.split_once('-')?;
-    Some((start.trim().parse().ok()?, end.trim().parse().ok()?))
-}
-
-/// Reject a 206 whose `Content-Range` does not cover exactly `bytes={start}-{end}`
-/// (audit L1). A range-aliasing edge/proxy can return a length-correct 206 for the
-/// WRONG offset; the chunk write then `seek(start)`s and lands the misplaced bytes,
-/// and with hash verification off (the default) the corrupt file is cached forever
-/// under the trusted content digest. A 206 MUST carry a matching `Content-Range`
-/// (RFC 9110 section 15.3.7), so an absent, unparsable, or mismatched header is treated as
-/// a retryable anomaly (`BadResponse`) that re-fetches rather than a silent write.
-fn require_content_range_matches(
-    headers: &reqwest::header::HeaderMap,
-    start: u64,
-    end: u64,
-) -> Result<(), CoreError> {
-    let raw = headers
-        .get(reqwest::header::CONTENT_RANGE)
-        .and_then(|v| v.to_str().ok());
-    if raw.and_then(parse_content_range) == Some((start, end)) {
-        return Ok(());
-    }
-    Err(CoreError::BadResponse(format!(
-        "chunk bytes={start}-{end}: 206 Content-Range {} does not cover the requested range",
-        raw.unwrap_or("<absent>")
-    )))
-}
-
-/// Verify that a chunk GET produced exactly HTTP 206 Partial Content.
-///
-/// Audit D2: a server that ignores `Range` and returns 200 + the FULL body would,
-/// if `seek(start)`-written, overwrite everything past `end + 1` and corrupt the
-/// file - so a 200 is rejected, its diagnostic naming the ignored range (distinct
-/// from a "wrong bytes" error). This rejects a 200 even for a single-chunk
-/// whole-file request.
-///
-/// Audit L5: the one accepted 200 is a single-chunk small-file download whose
-/// range covers the WHOLE object (`start == 0 && end == content_length - 1`) - a
-/// `200 OK` with the full body is then RFC 9110 section 15.3.7-legal and correct (the
-/// over-length write guard already bounds a stray full body). A multi-chunk
-/// download that got a range-ignored 200 still fails loudly, because its range is
-/// not the whole object. A 200 carries no `Content-Range`, so the caller runs
-/// [`require_content_range_matches`] only for a 206.
-fn require_acceptable_status(
-    status: reqwest::StatusCode,
-    start: u64,
-    end: u64,
-    content_length: u64,
-) -> Result<(), CoreError> {
-    use reqwest::StatusCode;
-    match status {
-        StatusCode::PARTIAL_CONTENT => Ok(()),
-        StatusCode::OK if start == 0 && content_length > 0 && end == content_length - 1 => Ok(()),
-        StatusCode::OK => Err(CoreError::ServerError(
-            status.as_u16(),
-            format!(
-                "server ignored Range bytes={start}-{end} (returned 200 OK instead of 206); \
-                 writing the full body at offset {start} would corrupt the file"
-            ),
-        )),
-        other => Err(CoreError::ServerError(
-            other.as_u16(),
-            format!("Failed chunk bytes {start}-{end}"),
-        )),
     }
 }
 
@@ -804,284 +629,9 @@ async fn try_download_chunk_to_offset(
     Ok(())
 }
 
-/// Count of downloads whose whole-file digest came from the INCREMENTAL hasher
-/// (not the full re-read fallback). Test-only observability: the E2E verify test
-/// asserts this advanced across its download, proving the overlap path actually
-/// ran rather than silently falling back and still producing the right digest.
-#[cfg(test)]
-// INVARIANT: the `> before` assertion in the e2e test below is sound only while
-// exactly one test drives a verify=true `download()`; a second concurrent such
-// test could mask a fallback. Keep new verify-route tests on `resolve_verified_digest`.
-static INCREMENTAL_VERIFIES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
-// Task C1: overlap the Range path's whole-file verify with the download, mirroring
-// the pack path (`chunk_fetcher::PackAssembler::assemble`). Kept in its own test
-// module: these tests drive real HTTP 206 sockets plus the hasher lifecycle,
-// distinct from the pure chunk-math tests above.
-#[cfg(test)]
-mod incremental_verify_tests {
-    use super::*;
-    use crate::incremental_hash::test_support::{pattern, reference, scratch_path, TempFileGuard};
-    use std::sync::atomic::Ordering;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio::net::TcpListener;
-
-    /// Serve `body` over HTTP/1, answering each Range GET with the exact 206 slice
-    /// (Content-Range echoed, `connection: close`). Same shape as the L13 refill
-    /// test's server; returns the base URL plus the accept-loop handle to abort.
-    async fn serve_ranges(body: Vec<u8>) -> std::io::Result<(String, tokio::task::JoinHandle<()>)> {
-        let listener = TcpListener::bind("127.0.0.1:0").await?;
-        let addr = listener.local_addr()?;
-        let server = tokio::spawn(async move {
-            loop {
-                let Ok((mut sock, _)) = listener.accept().await else {
-                    return;
-                };
-                let body = body.clone();
-                tokio::spawn(async move {
-                    let mut acc: Vec<u8> = Vec::new();
-                    let mut buf = [0u8; 1024];
-                    loop {
-                        let Ok(n) = sock.read(&mut buf).await else {
-                            return;
-                        };
-                        if n == 0 {
-                            break;
-                        }
-                        acc.extend_from_slice(&buf[..n]);
-                        if acc.windows(4).any(|w| w == b"\r\n\r\n") {
-                            break;
-                        }
-                    }
-                    let req = String::from_utf8_lossy(&acc).to_ascii_lowercase();
-                    let Some(rng) = req.lines().find_map(|l| l.strip_prefix("range: bytes="))
-                    else {
-                        return;
-                    };
-                    let Some((s, e)) = rng.trim().split_once('-') else {
-                        return;
-                    };
-                    let (Ok(start), Ok(end)) = (s.parse::<usize>(), e.parse::<usize>()) else {
-                        return;
-                    };
-                    let end = end.min(body.len().saturating_sub(1));
-                    if start > end {
-                        return;
-                    }
-                    let slice = &body[start..=end];
-                    let head = format!(
-                        "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes {}-{}/{}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                        start, end, body.len(), slice.len()
-                    );
-                    let _ = sock.write_all(head.as_bytes()).await;
-                    let _ = sock.write_all(slice).await;
-                    let _ = sock.shutdown().await;
-                });
-            }
-        });
-        Ok((format!("http://{addr}"), server))
-    }
-
-    #[tokio::test]
-    async fn download_verify_overlaps_hash_incrementally() {
-        // A multi-chunk verify download must yield the correct whole-file digest
-        // FROM THE INCREMENTAL HASHER - not via the fallback full re-read. The
-        // digest alone cannot distinguish the two routes (the fallback is also
-        // correct), so the route counter is the observation: it advances only when
-        // `download` used the incremental digest. 100 bytes at chunk_size 8 = 13
-        // chunks (last one short), exercising out-of-order completion + refill.
-        let body = pattern(100);
-        let Ok((base, server)) = serve_ranges(body.clone()).await else {
-            unreachable!("loopback range server binds on an ephemeral port");
-        };
-        let Ok(dl) = ChunkedDownloader::new(
-            format!("{base}/blob"),
-            None,
-            Some(8),
-            Some(body.len() as u64),
-            crate::chunk_fetcher::TransportTimeouts::default(),
-        ) else {
-            unreachable!("downloader builds")
-        };
-        let dest = scratch_path("dl_verify_e2e");
-        let _g = TempFileGuard(dest.clone());
-
-        let before = INCREMENTAL_VERIFIES.load(Ordering::Relaxed);
-        let out = tokio::time::timeout(Duration::from_secs(20), dl.download(&dest, true)).await;
-        server.abort();
-
-        let Ok(Ok(digest)) = out else {
-            unreachable!("13-chunk verify download must complete, got {out:?}")
-        };
-        assert_eq!(digest, Some(reference(&body)));
-        let got = std::fs::read(&dest).ok();
-        assert_eq!(got.as_deref(), Some(body.as_slice()));
-        assert!(
-            INCREMENTAL_VERIFIES.load(Ordering::Relaxed) > before,
-            "the whole-file digest must come from the incremental hasher \
-             overlapped with the download, not a second sequential read"
-        );
-    }
-
-    #[tokio::test]
-    async fn resolve_prefers_incremental_without_reread() {
-        // Some(digest) from the hasher is returned directly, tagged Incremental.
-        // `missing` never exists, so a stray fallback re-read would error and
-        // fail this assertion - the same observation trick as the pack path's
-        // `verify_file_digest_prefers_incremental_without_reread`.
-        let missing = scratch_path("dl_verify_fast");
-        let digest = reference(b"payload");
-        let d = digest.clone();
-        let task = tokio::spawn(async move { Some(d) });
-        assert_eq!(
-            resolve_verified_digest(Some(task), &missing, 7).await.ok(),
-            Some((digest, DigestRoute::Incremental))
-        );
-    }
-
-    #[tokio::test]
-    async fn resolve_falls_back_to_reread_when_hasher_bails() {
-        // Drive the REAL hasher into its documented bail: signal only [0, 50) of a
-        // 100-byte file, then close the channel. The coverage shortfall yields
-        // `None`, and the fallback full re-read must still produce the correct
-        // digest - proving the fallback is reachable and correct end to end.
-        let content = pattern(100);
-        let path = scratch_path("dl_verify_fallback");
-        let _g = TempFileGuard(path.clone());
-        let wrote = std::fs::write(&path, &content);
-        assert!(wrote.is_ok());
-
-        let (tx, task) = spawn_incremental_hasher(&path, content.len() as u64, true);
-        if let Some(sender) = &tx {
-            let _ = sender.send(vec![(0, 50)]); // the [50, 100) extent never arrives
-        }
-        drop(tx);
-
-        assert_eq!(
-            resolve_verified_digest(task, &path, content.len() as u64)
-                .await
-                .ok(),
-            Some((reference(&content), DigestRoute::FullReread))
-        );
-    }
-
-    #[tokio::test]
-    async fn resolve_none_task_reads_from_disk() {
-        // No hasher task at all (the total-function arm): the digest comes from
-        // the full re-read, mirroring `verify_file_digest_none_task_reads_from_disk`.
-        let content = pattern(2048);
-        let path = scratch_path("dl_verify_notask");
-        let _g = TempFileGuard(path.clone());
-        let wrote = std::fs::write(&path, &content);
-        assert!(wrote.is_ok());
-        assert_eq!(
-            resolve_verified_digest(None, &path, content.len() as u64)
-                .await
-                .ok(),
-            Some((reference(&content), DigestRoute::FullReread))
-        );
-    }
-
-    #[tokio::test]
-    async fn resolve_surfaces_hasher_join_error_as_join_failed() {
-        // A JoinError (hasher task panicked/cancelled) surfaces as the honest,
-        // non-retryable JoinFailed - never masked by a silent fallback re-read
-        // (mirror of the pack path's classification). Aborting a pending task
-        // yields the JoinError without a panic! macro (which the crate denies).
-        let missing = scratch_path("dl_verify_join");
-        let task: HasherTask =
-            tokio::spawn(async { std::future::pending::<Option<String>>().await });
-        task.abort();
-        let res = resolve_verified_digest(Some(task), &missing, 1).await;
-        match res {
-            Err(err @ CoreError::JoinFailed { index: None, .. }) => {
-                assert!(
-                    !err.is_retryable(),
-                    "a hasher join failure must classify permanent, got retryable: {err}"
-                );
-            }
-            other => unreachable!("expected JoinFailed {{ index: None }}, got {other:?}"),
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn num_chunks_empty_file_is_zero() {
-        assert_eq!(num_chunks(0, 100), 0);
-    }
-
-    #[test]
-    fn num_chunks_smaller_than_chunk_is_one() {
-        assert_eq!(num_chunks(50, 100), 1);
-        assert_eq!(num_chunks(1, 100), 1);
-    }
-
-    #[test]
-    fn num_chunks_exact_multiple() {
-        assert_eq!(num_chunks(100, 100), 1);
-        assert_eq!(num_chunks(300, 100), 3);
-    }
-
-    #[test]
-    fn num_chunks_with_remainder() {
-        assert_eq!(num_chunks(101, 100), 2);
-        assert_eq!(num_chunks(301, 100), 4);
-    }
-
-    #[test]
-    fn num_chunks_zero_chunk_size_does_not_panic() {
-        // Defense in depth: Python validates this, but keep the Rust side safe.
-        assert_eq!(num_chunks(1000, 0), 0);
-    }
-
-    #[test]
-    fn num_chunks_handles_default_size_at_default_proportions() {
-        // 100 MiB chunk, 250 MiB file -> 3 chunks (100+100+50)
-        let mib = 1024 * 1024;
-        assert_eq!(num_chunks(250 * mib, 100 * mib), 3);
-    }
-
-    #[test]
-    fn chunk_bounds_first_chunk_is_zero_based() {
-        assert_eq!(chunk_bounds(1000, 100, 0), (0, 99));
-    }
-
-    #[test]
-    fn chunk_bounds_middle_chunk_is_full_size() {
-        assert_eq!(chunk_bounds(1000, 100, 5), (500, 599));
-    }
-
-    #[test]
-    fn chunk_bounds_last_chunk_truncates_at_eof() {
-        // 1024 bytes, 1000-byte chunks -> chunk 0 is 0-999, chunk 1 is 1000-1023.
-        assert_eq!(chunk_bounds(1024, 1000, 0), (0, 999));
-        assert_eq!(chunk_bounds(1024, 1000, 1), (1000, 1023));
-    }
-
-    #[test]
-    fn chunk_bounds_exact_multiple_full_last_chunk() {
-        // 300 bytes, 100-byte chunks -> final chunk fills exactly.
-        assert_eq!(chunk_bounds(300, 100, 2), (200, 299));
-    }
-
-    #[test]
-    fn chunk_bounds_off_by_one_at_boundary() {
-        // The classic off-by-one: file size exactly equal to one chunk_size + 1.
-        // Should produce 2 chunks: 0..=99 and 100..=100.
-        assert_eq!(num_chunks(101, 100), 2);
-        assert_eq!(chunk_bounds(101, 100, 0), (0, 99));
-        assert_eq!(chunk_bounds(101, 100, 1), (100, 100));
-    }
-
-    #[test]
-    fn chunk_bounds_one_byte_file_one_chunk() {
-        assert_eq!(num_chunks(1, 100), 1);
-        assert_eq!(chunk_bounds(1, 100, 0), (0, 0));
-    }
 
     // Regression for audit D1: previously `ChunkFailed(usize)` discarded the
     // underlying cause, so a user saw "chunk 5 failed" with no clue whether
@@ -1165,198 +715,6 @@ mod tests {
             |d, p, v| Box::pin(d.download(p, v));
         // Use `typed` as a value so the binding has an observed effect.
         assert!(std::ptr::fn_addr_eq(typed, typed));
-    }
-
-    // Phase 7.1 backfill: hand-picked fixtures above cover the boundary cases
-    // a human would think of (off-by-one, exact multiples, one-byte file). The
-    // proptest block below pins the STRUCTURAL invariants over the full u64
-    // input space - the shrinker surfaces edges the author didn't enumerate.
-    // Five properties together specify what `num_chunks` + `chunk_bounds`
-    // MUST produce for any valid input, independent of implementation:
-    //   - coverage: chunk sizes sum to content_length
-    //   - contiguity: no gaps, no overlaps between consecutive chunks
-    //   - full span: first chunk starts at 0, last ends at content_length - 1
-    //   - chunk_size == 0 -> 0 chunks (defense-in-depth no-panic guarantee)
-    //   - content_length == 0 -> 0 chunks (empty-file guarantee)
-    // Input bounds are deliberately small enough (<= 1 GB / 200 MB) to keep
-    // the default 256-case run under a second while still spanning realistic
-    // file sizes. `proptest::prop_assert!` / `prop_assert_eq!` are used in
-    // place of `assert!` so the shrinker reports the minimal failing case
-    // instead of aborting the test runner on the first failure.
-    proptest::proptest! {
-        /// Sum of `(end - start + 1)` across all chunks equals `content_length`.
-        #[test]
-        fn proptest_chunks_cover_exactly_content_length(
-            content_length in 1u64..1_000_000_000,
-            chunk_size in 1u64..200_000_000,
-        ) {
-            let n = num_chunks(content_length, chunk_size);
-            proptest::prop_assert!(n > 0, "non-empty file must have >=1 chunk");
-            let mut total = 0u64;
-            for i in 0..n {
-                let (s, e) = chunk_bounds(content_length, chunk_size, i);
-                proptest::prop_assert!(s <= e, "chunk {} has start > end: {} > {}", i, s, e);
-                total += e - s + 1;
-            }
-            proptest::prop_assert_eq!(total, content_length);
-        }
-
-        /// Consecutive chunks are disjoint and contiguous: chunk i ends one
-        /// byte before chunk i+1 begins.
-        #[test]
-        fn proptest_chunks_are_contiguous(
-            content_length in 1u64..1_000_000_000,
-            chunk_size in 1u64..200_000_000,
-        ) {
-            let n = num_chunks(content_length, chunk_size);
-            for i in 1..n {
-                let (_, prev_end) = chunk_bounds(content_length, chunk_size, i - 1);
-                let (cur_start, _) = chunk_bounds(content_length, chunk_size, i);
-                proptest::prop_assert_eq!(
-                    cur_start, prev_end + 1,
-                    "gap or overlap between chunk {} and {}", i - 1, i
-                );
-            }
-        }
-
-        /// First chunk starts at byte 0; last chunk ends at `content_length - 1`.
-        #[test]
-        fn proptest_chunks_span_full_file(
-            content_length in 1u64..1_000_000_000,
-            chunk_size in 1u64..200_000_000,
-        ) {
-            let n = num_chunks(content_length, chunk_size);
-            let (first_start, _) = chunk_bounds(content_length, chunk_size, 0);
-            let (_, last_end) = chunk_bounds(content_length, chunk_size, n - 1);
-            proptest::prop_assert_eq!(first_start, 0);
-            proptest::prop_assert_eq!(last_end, content_length - 1);
-        }
-
-        /// `chunk_size == 0` returns 0 chunks (no panic via div-by-zero).
-        #[test]
-        fn proptest_num_chunks_handles_zero_chunk_size(
-            content_length in 0u64..1_000_000_000,
-        ) {
-            proptest::prop_assert_eq!(num_chunks(content_length, 0), 0);
-        }
-
-        /// `content_length == 0` returns 0 chunks (empty file -> no Range GETs).
-        #[test]
-        fn proptest_num_chunks_handles_zero_content(
-            chunk_size in 0u64..200_000_000,
-        ) {
-            proptest::prop_assert_eq!(num_chunks(0, chunk_size), 0);
-        }
-    }
-}
-
-// Kept separate from the chunk-math `tests` module so the two test
-// categories don't bleed into each other: chunk math is pure-arithmetic,
-// this module is about HTTP status discipline. Audit D2.
-#[cfg(test)]
-mod partial_content_tests {
-    use super::*;
-    use reqwest::StatusCode;
-
-    #[test]
-    fn accepts_206() {
-        assert!(require_acceptable_status(StatusCode::PARTIAL_CONTENT, 0, 99, 100).is_ok());
-    }
-
-    // Audit L5: a 200 OK is accepted ONLY when the request covers the whole object
-    // (a single-chunk small-file download) - the full body written at offset 0 is
-    // then correct and RFC 9110 section 15.3.7-legal.
-    #[test]
-    fn accepts_whole_file_200() {
-        assert!(require_acceptable_status(StatusCode::OK, 0, 99, 100).is_ok());
-    }
-
-    // A range-ignored 200 on a MULTI-chunk download (the range is not the whole
-    // object) still fails loudly, and the diagnostic names the ignored range - the
-    // only signal distinguishing "server ignored Range" from "wrong bytes".
-    // `let ... else { unreachable!() }` instead of `.unwrap_err()`/`panic!()`
-    // because the project denies `unwrap_used` and `panic` cluster-wide.
-    #[test]
-    fn rejects_range_ignored_200_with_diagnostic() {
-        // range 0-99 of a 1000-byte object is NOT the whole file -> must reject.
-        let Err(err) = require_acceptable_status(StatusCode::OK, 0, 99, 1000) else {
-            unreachable!("a non-whole-file 200 must be rejected")
-        };
-        let msg = format!("{err:?}");
-        assert!(
-            msg.contains("ignored Range"),
-            "diagnostic must name the ignored Range header, got: {msg}"
-        );
-    }
-
-    #[test]
-    fn rejects_other_4xx_5xx() {
-        assert!(require_acceptable_status(StatusCode::NOT_FOUND, 0, 99, 100).is_err());
-        assert!(require_acceptable_status(StatusCode::INTERNAL_SERVER_ERROR, 0, 99, 100).is_err());
-    }
-
-    fn cr_headers(value: &str) -> reqwest::header::HeaderMap {
-        let mut h = reqwest::header::HeaderMap::new();
-        // Test values are ASCII, so `from_str` succeeds; `if let` avoids a denied
-        // `unwrap` while leaving the map empty on the (unreachable) error path.
-        if let Ok(v) = reqwest::header::HeaderValue::from_str(value) {
-            h.insert(reqwest::header::CONTENT_RANGE, v);
-        }
-        h
-    }
-
-    // Audit L1: the 206 Content-Range must cover exactly the requested bytes.
-    #[test]
-    fn content_range_matching_is_accepted() {
-        assert!(require_content_range_matches(&cr_headers("bytes 100-199/500"), 100, 199).is_ok());
-    }
-
-    #[test]
-    fn content_range_wrong_offset_is_rejected() {
-        // Length-correct (100 bytes) but offset-wrong (0- not 100-): the exact
-        // silent-corruption case L1 defends against. The rejection is the honest
-        // `BadResponse` (a protocol-contract violation, not a local I/O failure)
-        // and MUST stay retryable - an LB mid-rollout can emit one bad header,
-        // and the pre-BadResponse `Io` shape retried too. This assertion is the
-        // behavior pin for that classification.
-        let res = require_content_range_matches(&cr_headers("bytes 0-99/500"), 100, 199);
-        match res {
-            Err(err @ CoreError::BadResponse(_)) => {
-                assert!(
-                    err.is_retryable(),
-                    "Content-Range mismatch must stay retryable, got permanent: {err}"
-                );
-            }
-            other => unreachable!("expected BadResponse, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn content_range_absent_is_rejected() {
-        assert!(matches!(
-            require_content_range_matches(&reqwest::header::HeaderMap::new(), 0, 99),
-            Err(CoreError::BadResponse(_))
-        ));
-    }
-
-    #[test]
-    fn parse_content_range_reads_bounds() {
-        assert_eq!(parse_content_range("bytes 5-17/42"), Some((5, 17)));
-        assert_eq!(parse_content_range("bytes 0-0/*"), Some((0, 0)));
-        assert_eq!(parse_content_range("bogus"), None);
-        assert_eq!(parse_content_range("bytes 5/42"), None);
-    }
-
-    proptest::proptest! {
-        // Round-trip: any (start, end) formatted as a byte Content-Range parses
-        // back to the same bounds, so the parser agrees with the wire format the
-        // alignment check relies on - for offsets a hand-picked fixture would miss.
-        #[test]
-        fn parse_content_range_round_trips(start in 0u64.., extra in 0u64..) {
-            let end = start.saturating_add(extra);
-            let header = format!("bytes {start}-{end}/{}", end.saturating_add(1));
-            proptest::prop_assert_eq!(parse_content_range(&header), Some((start, end)));
-        }
     }
 }
 
@@ -1736,74 +1094,18 @@ mod retry_classification_tests {
         // tail chunks never spawned (hang / short file); this asserts every byte
         // lands by driving 52 four-byte chunks (> the 32 window) through a real 206
         // Range server.
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        use tokio::net::TcpListener;
-
         let total: usize = (MAX_INFLIGHT_CHUNKS + 20) * 4; // 52 chunks of 4 bytes
         let body: Vec<u8> = (0..total)
             .map(|i| u8::try_from(i % 251).unwrap_or(0))
             .collect();
 
-        let Ok(listener) = TcpListener::bind("127.0.0.1:0").await else {
+        let Ok((base, server)) =
+            crate::chunked_downloader::test_server::serve_ranges(body.clone()).await
+        else {
             return;
         };
-        let Ok(addr) = listener.local_addr() else {
-            return;
-        };
-        let body_srv = body.clone();
-        let server = tokio::spawn(async move {
-            loop {
-                let Ok((mut sock, _)) = listener.accept().await else {
-                    return;
-                };
-                let body = body_srv.clone();
-                tokio::spawn(async move {
-                    // Read until the end of the request head (hyper may split it across
-                    // segments). Match the Range header case-insensitively: hyper writes
-                    // HTTP/1 header names lowercase (`range:`), not `Range:`.
-                    let mut acc: Vec<u8> = Vec::new();
-                    let mut buf = [0u8; 1024];
-                    loop {
-                        let Ok(n) = sock.read(&mut buf).await else {
-                            return;
-                        };
-                        if n == 0 {
-                            break;
-                        }
-                        acc.extend_from_slice(&buf[..n]);
-                        if acc.windows(4).any(|w| w == b"\r\n\r\n") {
-                            break;
-                        }
-                    }
-                    let req = String::from_utf8_lossy(&acc).to_ascii_lowercase();
-                    // Echo exactly the requested inclusive byte range as a 206.
-                    let Some(rng) = req.lines().find_map(|l| l.strip_prefix("range: bytes="))
-                    else {
-                        return;
-                    };
-                    let Some((s, e)) = rng.trim().split_once('-') else {
-                        return;
-                    };
-                    let (Ok(start), Ok(end)) = (s.parse::<usize>(), e.parse::<usize>()) else {
-                        return;
-                    };
-                    let end = end.min(body.len().saturating_sub(1));
-                    if start > end {
-                        return;
-                    }
-                    let slice = &body[start..=end];
-                    let head = format!(
-                        "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes {}-{}/{}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                        start, end, body.len(), slice.len()
-                    );
-                    let _ = sock.write_all(head.as_bytes()).await;
-                    let _ = sock.write_all(slice).await;
-                    let _ = sock.shutdown().await;
-                });
-            }
-        });
 
-        let url = format!("http://{addr}/blob");
+        let url = format!("{base}/blob");
         let Ok(dl) = ChunkedDownloader::new(
             url,
             None,
