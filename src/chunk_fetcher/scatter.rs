@@ -10,8 +10,7 @@ use crate::chunk_fetcher::assemble::PackChunkTarget;
 use crate::digest::Sha256Digest;
 use crate::error::CoreError;
 use crate::incremental_hash::HasherTask;
-
-pub(crate) const VERIFY_READ_BUFFER: usize = 8 * 1024 * 1024;
+use crate::transport::IO_READ_BUFFER;
 
 /// Resolve the whole-file digest once every pack has landed: prefer the digest the
 /// background hasher computed (its work overlapped the download), else fall back to
@@ -115,7 +114,7 @@ pub(crate) async fn compute_sha256(path: &Path) -> Result<String, CoreError> {
     tokio::task::spawn_blocking(move || -> Result<String, CoreError> {
         let mut file = std::fs::File::open(&path)?;
         let mut hasher = Sha256::new();
-        let mut buf = vec![0u8; VERIFY_READ_BUFFER];
+        let mut buf = vec![0u8; IO_READ_BUFFER];
         loop {
             let n = file.read(&mut buf)?;
             if n == 0 {

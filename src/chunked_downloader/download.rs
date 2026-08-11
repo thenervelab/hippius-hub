@@ -22,6 +22,7 @@ use crate::chunked_downloader::plan::{
 use crate::chunked_downloader::verify::{record_verify_route, resolve_verified_digest};
 use crate::error::CoreError;
 use crate::incremental_hash::{spawn_incremental_hasher, HashSignal};
+use crate::transport::CHUNK_REQUEST_TIMEOUT;
 use std::sync::mpsc::Sender;
 
 const DEFAULT_CHUNK_SIZE: u64 = 100 * 1024 * 1024; // 100 MB default
@@ -30,25 +31,6 @@ const MAX_RETRIES: u32 = 3;
 /// small caller-set `HIPPIUS_CHUNK_SIZE` on a huge file can't open O(file/chunk)
 /// connections at once. 32 mirrors the pack path's default concurrency.
 const MAX_INFLIGHT_CHUNKS: usize = 32;
-
-/// Per-chunk request timeout (audit D6).
-///
-/// The shared `chunk_fetcher::download_client`'s `connect_timeout(30s)` covers the
-/// TCP handshake; this constant is the FULL-REQUEST budget applied
-/// per chunk GET via `.timeout(...)`. A slow-loris server that
-/// completes the handshake then dribbles bytes can hold a connection
-/// open indefinitely without ever tripping `connect_timeout` - this
-/// per-request limit forecloses that.
-///
-/// Held in a const (not inline) so the regression test below can
-/// assert the VALUE - a self-referential `include_str!` match on
-/// `.timeout(Duration::from_mins(5))` would trivially pass when the
-/// assertion text itself is the only occurrence. With a const, the
-/// test asserts the value; removing the const's only call site at
-/// `try_download_chunk_to_offset` makes it `dead_code`, which
-/// `cargo clippy -- -D warnings` already promotes to a CI failure.
-/// Three-layer defense without self-reference.
-const CHUNK_REQUEST_TIMEOUT: Duration = Duration::from_mins(5);
 
 /// Read/total request budget for the size-probe HEAD (audit L-HEAD-TIMEOUT). The
 /// shared `download_client` sets only `connect_timeout(30s)`, which covers the
@@ -533,7 +515,7 @@ async fn try_download_chunk_to_offset(
     let mut req = client
         .get(url)
         .header(header::RANGE, format!("bytes={start}-{end}"))
-        .timeout(CHUNK_REQUEST_TIMEOUT); // audit D6 - see const docs
+        .timeout(CHUNK_REQUEST_TIMEOUT); // audit D6 - see `crate::transport`
 
     if let Some(t) = token {
         req = req.bearer_auth(t);
@@ -653,31 +635,6 @@ mod tests {
         };
         assert_eq!(index, 3);
         assert!(matches!(*source, CoreError::ServerError(404, _)));
-    }
-
-    // Regression for audit D6: pin the per-chunk request timeout on the
-    // chunk GET. Asserts the VALUE of the named const (300 seconds = 5
-    // minutes). The const itself is enforced by `cargo clippy -D warnings`:
-    // if a future refactor removes its only call site at
-    // `try_download_chunk_to_offset`, the const becomes `dead_code` and CI
-    // fails before this test even runs. Two complementary guards:
-    //   1. clippy: const must be used -> production code must reference it
-    //   2. this test: const must equal 300s -> value can't drift accidentally
-    //
-    // An earlier shape of this test used `include_str!` to grep the file
-    // for the literal timeout call. That was vacuous: the assertion text
-    // itself contained the substring it was searching for, so any source
-    // file containing the test passed regardless of what production did.
-    // The named-const approach removes the self-reference.
-    #[test]
-    fn try_download_chunk_to_offset_sets_request_timeout() {
-        assert_eq!(
-            CHUNK_REQUEST_TIMEOUT,
-            Duration::from_mins(5),
-            "CHUNK_REQUEST_TIMEOUT must be 5 minutes; a slow-loris server \
-             could otherwise hold a TCP connection open indefinitely after \
-             a fast handshake (connect_timeout covers only the handshake).",
-        );
     }
 
     // Regression for audit D3: pin the variant shape so the missing-header

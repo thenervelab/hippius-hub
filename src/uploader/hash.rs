@@ -2,12 +2,7 @@ use sha2::{Digest, Sha256};
 use std::path::Path;
 
 use crate::error::CoreError;
-
-/// Read-buffer size for `hash_file_async` (audit L16). Matches
-/// `chunk_fetcher`/`chunked_downloader`'s `VERIFY_READ_BUFFER` (8 MiB): the
-/// previous 64 KiB buffer did ~128x more `read(2)` syscalls (~82k vs ~640 for a
-/// 5 GiB blob) for no benefit - the hash is bandwidth-bound, not latency-bound.
-const HASH_READ_BUFFER: usize = 8 * 1024 * 1024;
+use crate::transport::IO_READ_BUFFER;
 
 /// Compute the SHA256 and total size of a local file.
 ///
@@ -33,7 +28,7 @@ pub async fn hash_file_async(path: &Path) -> Result<(String, u64), CoreError> {
     tokio::task::spawn_blocking(move || -> Result<(String, u64), CoreError> {
         let mut file = std::fs::File::open(&path)?;
         let mut hasher = Sha256::new();
-        let mut buffer = vec![0u8; HASH_READ_BUFFER];
+        let mut buffer = vec![0u8; IO_READ_BUFFER];
         let mut total_size = 0u64;
 
         loop {

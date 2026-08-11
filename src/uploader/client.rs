@@ -3,12 +3,7 @@ use std::sync::OnceLock;
 use std::time::Duration;
 
 use crate::error::CoreError;
-
-/// TCP/TLS handshake budget for `upload_client`, matching
-/// `chunk_fetcher::CONNECT_TIMEOUT_SECS` on the download side (audit
-/// M-UPLOAD-CONNECT). Kept local rather than re-exported so the two clients stay
-/// independently tunable.
-const CONNECT_TIMEOUT_SECS: u64 = 30;
+use crate::transport::CONNECT_TIMEOUT_SECS;
 
 /// Process-global HTTP client for blob uploads.
 ///

@@ -14,7 +14,7 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::mpsc::{Receiver, Sender};
 
-use crate::chunk_fetcher::VERIFY_READ_BUFFER;
+use crate::transport::IO_READ_BUFFER;
 
 /// Extents `(file_offset, size)` one completed unit of download work - a pack on
 /// the pack path, a chunk on the Range path - contributes to the whole-file
@@ -87,7 +87,7 @@ pub(crate) fn incremental_hash(
 
     let mut file = std::fs::File::open(path).ok()?;
     let mut hasher = Sha256::new();
-    let mut buf = vec![0u8; VERIFY_READ_BUFFER];
+    let mut buf = vec![0u8; IO_READ_BUFFER];
     let mut pending: HashMap<u64, u64> = HashMap::new();
     // Invariant: `hashed` == the file read position == bytes folded into `hasher`,
     // and `hashed <= watermark <= total_size` holds throughout.

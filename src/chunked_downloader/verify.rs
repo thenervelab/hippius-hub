@@ -8,8 +8,7 @@ use std::path::Path;
 
 use crate::error::CoreError;
 use crate::incremental_hash::HasherTask;
-
-const VERIFY_READ_BUFFER: usize = 8 * 1024 * 1024; // 8 MB read buffer for SHA256 verification
+use crate::transport::IO_READ_BUFFER;
 
 /// Which route produced the verified whole-file digest. The digest value is
 /// identical either way (both hash the same on-disk bytes); the route exists so
@@ -101,7 +100,7 @@ async fn compute_sha256(path: &Path, pb: &ProgressBar) -> Result<String, CoreErr
     tokio::task::spawn_blocking(move || -> Result<String, CoreError> {
         let mut file = std::fs::File::open(&path)?;
         let mut hasher = Sha256::new();
-        let mut buf = vec![0u8; VERIFY_READ_BUFFER];
+        let mut buf = vec![0u8; IO_READ_BUFFER];
 
         loop {
             let n = file.read(&mut buf)?;

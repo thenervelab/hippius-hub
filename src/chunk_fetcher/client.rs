@@ -8,8 +8,7 @@ use std::time::Duration;
 use tokio::sync::Semaphore;
 
 use crate::error::CoreError;
-
-const CONNECT_TIMEOUT_SECS: u64 = 30;
+use crate::transport::CONNECT_TIMEOUT_SECS;
 
 /// Default per-chunk-read idle timeout for downloads (audit M4). Bounds a peer that
 /// completes the handshake then dribbles or stops mid-body: reset on each successful

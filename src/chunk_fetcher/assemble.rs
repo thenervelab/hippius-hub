@@ -7,7 +7,6 @@ use indicatif::{ProgressBar, ProgressStyle};
 use reqwest::Client;
 use std::path::Path;
 use std::sync::Arc;
-use std::time::Duration;
 use tokio::fs::OpenOptions;
 use tokio::sync::Semaphore;
 use tokio::task::AbortHandle;
@@ -19,18 +18,9 @@ use crate::chunk_fetcher::scatter::{verify_and_scatter, verify_file_digest};
 use crate::digest::Sha256Digest;
 use crate::error::CoreError;
 use crate::incremental_hash::{spawn_incremental_hasher, HashSignal};
+use crate::transport::CHUNK_REQUEST_TIMEOUT;
 
 const MAX_RETRIES: u32 = 3;
-
-/// Full-request budget for a single chunk-blob GET.
-///
-/// `connect_timeout` (below) covers only the TCP/TLS handshake; a slow-loris
-/// server that handshakes then dribbles bytes would otherwise hold a connection
-/// open forever. 5 minutes per ~64 MiB chunk is generous (a ~220 KB/s floor)
-/// yet forecloses an indefinitely-stuck fetch. Held in a named const so the
-/// regression test can pin the value and clippy's dead-code lint enforces its
-/// call site.
-const CHUNK_REQUEST_TIMEOUT: Duration = Duration::from_mins(5);
 
 /// Absolute ceiling on a single pack blob's declared size, before any of its bytes
 /// are read or reserved. A pack aggregates `FastCDC` chunks toward `HIPPIUS_PACK_SIZE`
@@ -433,15 +423,10 @@ mod tests {
     use crate::chunk_fetcher::test_support::{any_digest, chunk_target};
     use crate::incremental_hash::test_support::{pattern, reference, scratch_path, TempFileGuard};
     use std::collections::HashMap;
+    // Production `assemble` no longer names `Duration` directly (the request
+    // timeout moved to `crate::transport`); only the test bodies below do.
+    use std::time::Duration;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-    // Pin the per-chunk request timeout value (same guard shape as the legacy
-    // path): clippy's dead-code lint enforces the const is USED at the call
-    // site; this test enforces its VALUE can't silently drift.
-    #[test]
-    fn chunk_request_timeout_is_five_minutes() {
-        assert_eq!(CHUNK_REQUEST_TIMEOUT, Duration::from_mins(5));
-    }
 
     #[tokio::test]
     async fn abort_on_drop_aborts_held_tasks() {

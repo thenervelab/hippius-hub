@@ -873,6 +873,18 @@ Single `src/transport.rs` holding the shared named constants
 clients import. Do NOT merge the clients themselves — the upload/download timeout
 philosophies differ deliberately (`src/uploader.rs:269-281`).
 
+> **OUTCOME (2026-08-11): done, with two adjustments.** The three 8 MiB read
+> buffers (`HASH_READ_BUFFER` + two `VERIFY_READ_BUFFER` copies — same value,
+> same syscall-count rationale, audit L16) merged into ONE constant,
+> `IO_READ_BUFFER`, rather than re-exporting two names for one number; per-side
+> doc comments were merged (audit refs M-UPLOAD-CONNECT, L9, L16, D6 all
+> preserved), not kept verbatim. `HEAD_REQUEST_TIMEOUT` (and
+> `DOWNLOAD_READ_IDLE`/`DOWNLOAD_POOL_MAX_IDLE`) stayed local — single
+> consumer each, nothing shared to consolidate. The two per-side
+> `CHUNK_REQUEST_TIMEOUT` value-pin tests merged into one in `transport.rs`
+> (cargo test 153 - 2 + 1 = 152). All values byte-identical before/after.
+> The clients themselves remain separate, as specified.
+
 ---
 
 ## Definition of done (whole plan)

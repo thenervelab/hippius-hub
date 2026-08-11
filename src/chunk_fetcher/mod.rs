@@ -23,7 +23,6 @@ mod scatter;
 pub use assemble::{PackAssembler, PackChunkTarget, PackPlanEntry};
 pub(crate) use client::TransportTimeouts;
 pub(crate) use client::{download_client, download_read_idle, read_chunk_bounded};
-pub(crate) use scatter::VERIFY_READ_BUFFER;
 // The only cross-module caller of `compute_sha256` via this path is the
 // `incremental_hash` test module; production callers live inside `scatter`.
 #[cfg(test)]
