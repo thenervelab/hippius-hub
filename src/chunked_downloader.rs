@@ -13,6 +13,7 @@ use tokio::io::{AsyncSeekExt, AsyncWriteExt, BufWriter, SeekFrom};
 use tokio::sync::Semaphore;
 
 use crate::error::CoreError;
+use crate::incremental_hash::{spawn_incremental_hasher, HasherTask};
 
 const DEFAULT_CHUNK_SIZE: u64 = 100 * 1024 * 1024; // 100 MB default
 const MAX_RETRIES: u32 = 3;
@@ -156,7 +157,7 @@ impl ChunkedDownloader {
     /// file exists and has a defined (non-skipped) digest.
     #[expect(
         clippy::too_many_lines,
-        reason = "line count crossed 100 purely through rustfmt line-break expansion; \
+        reason = "rustfmt line-break expansion plus the C1 incremental-hasher wiring; \
                   the Phase D function-level split of this method removes this expect"
     )]
     pub async fn download(
@@ -228,6 +229,17 @@ impl ChunkedDownloader {
         }
 
         let dest_path_buf = dest_path.to_path_buf();
+
+        // Overlap whole-file verification with the download (Task C1, mirroring the
+        // pack path in `chunk_fetcher::PackAssembler::assemble`): the background
+        // hasher folds each completed chunk's extent in offset order while later
+        // chunks are still in flight, so the verify pass normally costs no second
+        // sequential read. Best-effort by contract - it yields `None` if it cannot
+        // cover the file, and `resolve_verified_digest` then falls back to the full
+        // re-read, so correctness never depends on this fast path. `(None, None)`
+        // when `verify_hash` is false, making the fan-out below uniform either way.
+        let (hash_tx, hasher_task) =
+            spawn_incremental_hasher(dest_path, content_length, verify_hash);
 
         // 3. Launch concurrent downloads - each streams directly to its
         //    correct offset in the final file.
@@ -312,7 +324,22 @@ impl ChunkedDownloader {
                         source: Box::new(chunk_err),
                     });
                 }
-                Ok((_, Ok(()))) => {
+                Ok((i, Ok(()))) => {
+                    // Signal the chunk's extent to the hasher ONLY here, on final
+                    // success: the retry loop lives inside the task, so `Ok` means
+                    // the write+flush landed and the exact-length check passed -
+                    // a retried chunk can never double-count. Sent from this drain
+                    // loop rather than inside each task so ONE sender suffices (no
+                    // per-task clones) and the extent is recomputed from the same
+                    // bounds math that formed the Range request: `chunk_bounds`
+                    // tiles [0, content_length) exactly (coverage/contiguity/span
+                    // proptests above), which IS the hasher's coverage invariant.
+                    if let Some(tx) = &hash_tx {
+                        let (start, end) = chunk_bounds(content_length, chunk_size, i);
+                        // A closed channel means the hasher already exited; losing
+                        // the signal merely forgoes the fast path (re-read fallback).
+                        let _ = tx.send(vec![(start, end - start + 1)]);
+                    }
                     if next < num_chunks {
                         spawn_chunk(&mut set, next);
                         next += 1;
@@ -320,23 +347,23 @@ impl ChunkedDownloader {
                 }
             }
         }
+        // Close the hash channel so the hasher task finalizes (or bails with
+        // `None`). On the early-return error paths above `hash_tx` drops with the
+        // stack frame, which likewise closes the channel: the blocking hasher task
+        // (unabortable by design) then exits promptly instead of leaking on
+        // `recv` - the same sender-drop lifecycle the pack path relies on when its
+        // aborted pack tasks drop their sender clones.
+        drop(hash_tx);
 
         pb.finish_with_message("Download complete");
 
-        // 4. Optional SHA256 - a single sequential read-pass over the final file.
-        //    Much faster than the old assembly phase (no rewrite).
+        // 4. Optional SHA256: prefer the digest the background hasher folded
+        //    together during the download; fall back to the single sequential
+        //    read-pass when the hasher could not cover the file.
         if verify_hash {
-            let pb_hash = ProgressBar::new(content_length);
-            // Same rationale as the download-phase bar above: static literal template.
-            #[expect(clippy::expect_used, reason = "infallible static template")]
-            pb_hash.set_style(ProgressStyle::default_bar()
-                .template("{msg} {spinner:.green} [{elapsed_precise}] [{bar:40.magenta/red}] {bytes}/{total_bytes} ({bytes_per_sec}, {eta})")
-                .expect("indicatif template is static and infallible")
-                .progress_chars("=>-"));
-            pb_hash.set_message("Verifying SHA256");
-
-            let hash = compute_sha256(dest_path, &pb_hash).await?;
-            pb_hash.finish_with_message("Verified");
+            let (hash, route) =
+                resolve_verified_digest(hasher_task, dest_path, content_length).await?;
+            record_verify_route(route);
             Ok(Some(hash))
         } else {
             // Audit L6: typed "skipped" - was `Ok(String::new())` before
@@ -393,6 +420,74 @@ impl ChunkedDownloader {
         Ok(hex::encode(hasher.finalize()))
     }
 }
+
+/// Which route produced the verified whole-file digest. The digest value is
+/// identical either way (both hash the same on-disk bytes); the route exists so
+/// `download` can record - and tests can observe - whether the overlapped
+/// incremental pass actually replaced the full re-read.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DigestRoute {
+    /// The background incremental hasher covered the file during the download.
+    Incremental,
+    /// The hasher could not cover the file; a full sequential re-read produced it.
+    FullReread,
+}
+
+/// Resolve the whole-file digest after every chunk has landed: prefer the digest
+/// the background hasher computed (its work overlapped the download), else fall
+/// back to the full sequential re-read - the mirror of the pack path's
+/// `chunk_fetcher::verify_file_digest`, minus the expected-digest comparison
+/// (this path RETURNS the digest; Python compares it). A `JoinError` means the
+/// hasher task panicked - surfaced as the non-retryable `JoinFailed` rather than
+/// masked by a silent fallback, exactly as the pack path argues. `None` for
+/// `hasher_task` (unreachable from `download`, which spawns the hasher whenever
+/// it verifies) also re-reads, keeping the function total without a panic.
+async fn resolve_verified_digest(
+    hasher_task: Option<HasherTask>,
+    dest_path: &Path,
+    content_length: u64,
+) -> Result<(String, DigestRoute), CoreError> {
+    if let Some(task) = hasher_task {
+        match task.await {
+            Ok(Some(digest)) => return Ok((digest, DigestRoute::Incremental)),
+            Ok(None) => {}
+            Err(join_err) => {
+                return Err(CoreError::JoinFailed {
+                    index: None,
+                    source: join_err,
+                })
+            }
+        }
+    }
+
+    // Fallback: the pre-C1 verify pass, bar and all. Both routes hash the same
+    // on-disk bytes, so this is a slower path to an identical answer.
+    let pb_hash = ProgressBar::new(content_length);
+    // Same rationale as the download-phase bar: static literal template.
+    #[expect(clippy::expect_used, reason = "infallible static template")]
+    pb_hash.set_style(ProgressStyle::default_bar()
+        .template("{msg} {spinner:.green} [{elapsed_precise}] [{bar:40.magenta/red}] {bytes}/{total_bytes} ({bytes_per_sec}, {eta})")
+        .expect("indicatif template is static and infallible")
+        .progress_chars("=>-"));
+    pb_hash.set_message("Verifying SHA256");
+
+    let hash = compute_sha256(dest_path, &pb_hash).await?;
+    pb_hash.finish_with_message("Verified");
+    Ok((hash, DigestRoute::FullReread))
+}
+
+/// Test-build route probe: bump the incremental counter so the E2E verify test
+/// can assert the overlap path ran (see `INCREMENTAL_VERIFIES`).
+#[cfg(test)]
+fn record_verify_route(route: DigestRoute) {
+    if route == DigestRoute::Incremental {
+        INCREMENTAL_VERIFIES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Production builds carry no probe; the route is informational only.
+#[cfg(not(test))]
+fn record_verify_route(_route: DigestRoute) {}
 
 /// Compute the SHA256 of the final file in a single sequential read-pass.
 ///
@@ -699,6 +794,207 @@ async fn try_download_chunk_to_offset(
         )));
     }
     Ok(())
+}
+
+/// Count of downloads whose whole-file digest came from the INCREMENTAL hasher
+/// (not the full re-read fallback). Test-only observability: the E2E verify test
+/// asserts this advanced across its download, proving the overlap path actually
+/// ran rather than silently falling back and still producing the right digest.
+#[cfg(test)]
+// INVARIANT: the `> before` assertion in the e2e test below is sound only while
+// exactly one test drives a verify=true `download()`; a second concurrent such
+// test could mask a fallback. Keep new verify-route tests on `resolve_verified_digest`.
+static INCREMENTAL_VERIFIES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+// Task C1: overlap the Range path's whole-file verify with the download, mirroring
+// the pack path (`chunk_fetcher::PackAssembler::assemble`). Kept in its own test
+// module: these tests drive real HTTP 206 sockets plus the hasher lifecycle,
+// distinct from the pure chunk-math tests above.
+#[cfg(test)]
+mod incremental_verify_tests {
+    use super::*;
+    use crate::incremental_hash::test_support::{pattern, reference, scratch_path, TempFileGuard};
+    use std::sync::atomic::Ordering;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    /// Serve `body` over HTTP/1, answering each Range GET with the exact 206 slice
+    /// (Content-Range echoed, `connection: close`). Same shape as the L13 refill
+    /// test's server; returns the base URL plus the accept-loop handle to abort.
+    async fn serve_ranges(body: Vec<u8>) -> std::io::Result<(String, tokio::task::JoinHandle<()>)> {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let addr = listener.local_addr()?;
+        let server = tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    return;
+                };
+                let body = body.clone();
+                tokio::spawn(async move {
+                    let mut acc: Vec<u8> = Vec::new();
+                    let mut buf = [0u8; 1024];
+                    loop {
+                        let Ok(n) = sock.read(&mut buf).await else {
+                            return;
+                        };
+                        if n == 0 {
+                            break;
+                        }
+                        acc.extend_from_slice(&buf[..n]);
+                        if acc.windows(4).any(|w| w == b"\r\n\r\n") {
+                            break;
+                        }
+                    }
+                    let req = String::from_utf8_lossy(&acc).to_ascii_lowercase();
+                    let Some(rng) = req.lines().find_map(|l| l.strip_prefix("range: bytes="))
+                    else {
+                        return;
+                    };
+                    let Some((s, e)) = rng.trim().split_once('-') else {
+                        return;
+                    };
+                    let (Ok(start), Ok(end)) = (s.parse::<usize>(), e.parse::<usize>()) else {
+                        return;
+                    };
+                    let end = end.min(body.len().saturating_sub(1));
+                    if start > end {
+                        return;
+                    }
+                    let slice = &body[start..=end];
+                    let head = format!(
+                        "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes {}-{}/{}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        start, end, body.len(), slice.len()
+                    );
+                    let _ = sock.write_all(head.as_bytes()).await;
+                    let _ = sock.write_all(slice).await;
+                    let _ = sock.shutdown().await;
+                });
+            }
+        });
+        Ok((format!("http://{addr}"), server))
+    }
+
+    #[tokio::test]
+    async fn download_verify_overlaps_hash_incrementally() {
+        // A multi-chunk verify download must yield the correct whole-file digest
+        // FROM THE INCREMENTAL HASHER - not via the fallback full re-read. The
+        // digest alone cannot distinguish the two routes (the fallback is also
+        // correct), so the route counter is the observation: it advances only when
+        // `download` used the incremental digest. 100 bytes at chunk_size 8 = 13
+        // chunks (last one short), exercising out-of-order completion + refill.
+        let body = pattern(100);
+        let Ok((base, server)) = serve_ranges(body.clone()).await else {
+            unreachable!("loopback range server binds on an ephemeral port");
+        };
+        let Ok(dl) = ChunkedDownloader::new(
+            format!("{base}/blob"),
+            None,
+            Some(8),
+            Some(body.len() as u64),
+            crate::chunk_fetcher::TransportTimeouts::default(),
+        ) else {
+            unreachable!("downloader builds")
+        };
+        let dest = scratch_path("dl_verify_e2e");
+        let _g = TempFileGuard(dest.clone());
+
+        let before = INCREMENTAL_VERIFIES.load(Ordering::Relaxed);
+        let out = tokio::time::timeout(Duration::from_secs(20), dl.download(&dest, true)).await;
+        server.abort();
+
+        let Ok(Ok(digest)) = out else {
+            unreachable!("13-chunk verify download must complete, got {out:?}")
+        };
+        assert_eq!(digest, Some(reference(&body)));
+        let got = std::fs::read(&dest).ok();
+        assert_eq!(got.as_deref(), Some(body.as_slice()));
+        assert!(
+            INCREMENTAL_VERIFIES.load(Ordering::Relaxed) > before,
+            "the whole-file digest must come from the incremental hasher \
+             overlapped with the download, not a second sequential read"
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_prefers_incremental_without_reread() {
+        // Some(digest) from the hasher is returned directly, tagged Incremental.
+        // `missing` never exists, so a stray fallback re-read would error and
+        // fail this assertion - the same observation trick as the pack path's
+        // `verify_file_digest_prefers_incremental_without_reread`.
+        let missing = scratch_path("dl_verify_fast");
+        let digest = reference(b"payload");
+        let d = digest.clone();
+        let task = tokio::spawn(async move { Some(d) });
+        assert_eq!(
+            resolve_verified_digest(Some(task), &missing, 7).await.ok(),
+            Some((digest, DigestRoute::Incremental))
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_falls_back_to_reread_when_hasher_bails() {
+        // Drive the REAL hasher into its documented bail: signal only [0, 50) of a
+        // 100-byte file, then close the channel. The coverage shortfall yields
+        // `None`, and the fallback full re-read must still produce the correct
+        // digest - proving the fallback is reachable and correct end to end.
+        let content = pattern(100);
+        let path = scratch_path("dl_verify_fallback");
+        let _g = TempFileGuard(path.clone());
+        let wrote = std::fs::write(&path, &content);
+        assert!(wrote.is_ok());
+
+        let (tx, task) = spawn_incremental_hasher(&path, content.len() as u64, true);
+        if let Some(sender) = &tx {
+            let _ = sender.send(vec![(0, 50)]); // the [50, 100) extent never arrives
+        }
+        drop(tx);
+
+        assert_eq!(
+            resolve_verified_digest(task, &path, content.len() as u64)
+                .await
+                .ok(),
+            Some((reference(&content), DigestRoute::FullReread))
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_none_task_reads_from_disk() {
+        // No hasher task at all (the total-function arm): the digest comes from
+        // the full re-read, mirroring `verify_file_digest_none_task_reads_from_disk`.
+        let content = pattern(2048);
+        let path = scratch_path("dl_verify_notask");
+        let _g = TempFileGuard(path.clone());
+        let wrote = std::fs::write(&path, &content);
+        assert!(wrote.is_ok());
+        assert_eq!(
+            resolve_verified_digest(None, &path, content.len() as u64)
+                .await
+                .ok(),
+            Some((reference(&content), DigestRoute::FullReread))
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_surfaces_hasher_join_error_as_join_failed() {
+        // A JoinError (hasher task panicked/cancelled) surfaces as the honest,
+        // non-retryable JoinFailed - never masked by a silent fallback re-read
+        // (mirror of the pack path's classification). Aborting a pending task
+        // yields the JoinError without a panic! macro (which the crate denies).
+        let missing = scratch_path("dl_verify_join");
+        let task: HasherTask =
+            tokio::spawn(async { std::future::pending::<Option<String>>().await });
+        task.abort();
+        let res = resolve_verified_digest(Some(task), &missing, 1).await;
+        match res {
+            Err(err @ CoreError::JoinFailed { index: None, .. }) => {
+                assert!(
+                    !err.is_retryable(),
+                    "a hasher join failure must classify permanent, got retryable: {err}"
+                );
+            }
+            other => unreachable!("expected JoinFailed {{ index: None }}, got {other:?}"),
+        }
+    }
 }
 
 #[cfg(test)]
