@@ -20,6 +20,7 @@ mod chunk_fetcher;
 mod chunked_downloader;
 mod diagnostics;
 mod digest;
+mod incremental_hash;
 mod retry;
 mod uploader;
 
