@@ -7,6 +7,61 @@ the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 
 ## [Unreleased]
 
+## [0.7.0] — 2026-08-11
+
+No API, CLI, or environment-variable changes. Artifacts are byte-identical to
+0.6.1 and both versions read each other's uploads (see Compatibility).
+
+### Changed
+
+- **Faster large-file uploads.** Chunks are hashed on a worker pool instead of
+  serially, and packs upload while the rest of the file is still being chunked —
+  previously nothing was sent until the whole file had been read and hashed.
+  Chunk+hash 551 → 762 MiB/s (1.38x); e2e at a throttled 200 MiB/s 13.87 s →
+  10.68 s. Against production the gain is smaller since transfer dominates:
+  1 GiB 39.5 s → 36.7 s, 200 MiB 55.0 s → 43.4 s.
+- **Faster verified downloads.** With `HIPPIUS_VERIFY_HASH` on (default), the
+  whole-file digest is now computed as chunks land instead of by re-reading the
+  finished file. Same digest and guarantee, no second pass.
+- **Progress messages are plain ASCII** — emoji prefixes removed.
+- **Errors carry their full cause chain** (`message` + `caused by: ...`), instead
+  of a debug dump that dropped the underlying reason.
+
+### Fixed
+
+- `hippius-hub revisions` no longer prints a traceback for a missing, deleted, or
+  private repository — one actionable line, non-zero exit.
+- A crashed hashing task no longer retries. It was treated as transient I/O and
+  retried three times, re-downloading up to three ~64 MiB packs before failing.
+- Unrecoverable upload sessions report the real cause instead of a fabricated
+  `503`. Recovery behaviour (fresh session per retry) is unchanged.
+- Malformed `Content-Range` is reported as a bad server response, not a local I/O
+  error. Retry behaviour unchanged.
+- Invalid chunk digests fail immediately, naming the pack and chunk.
+
+### Security
+
+- `quinn-proto` bumped past **RUSTSEC-2026-0185**. It was never in this crate's
+  build graph (no HTTP/3), so shipped wheels were unaffected; this keeps the
+  advisory scanner clean.
+- `thiserror` bumped to 2.x.
+
+### Internal
+
+- The three largest Rust transfer modules were split into module directories and
+  shared transport constants consolidated; verified pure moves.
+- Added enforced Rust formatting, `unsafe_code = "forbid"`, upload benchmark
+  harnesses, and hourly production smoke tests against the published wheel.
+
+### Compatibility
+
+- **Wire format unchanged.** Verified against production: the same file uploaded
+  by 0.6.1 and 0.7.0 produced identical pointer and pack digests, on both a 1 GiB
+  chunked-v2 upload and a 200 MiB plain blob. Both directions round-trip
+  byte-identically.
+- No changes to CLI commands or flags, to any `HIPPIUS_*` variable or its
+  default, or to the Python API. Cache layout remains `huggingface_hub`-identical.
+
 ## [0.6.1] — 2026-07-16
 
 ### Added
