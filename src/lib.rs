@@ -655,7 +655,9 @@ fn download_packs_native(
         // Interruptible by Ctrl-C (audit M1): on a pending SIGINT the assemble future
         // is dropped, whose AbortOnDrop guard aborts the in-flight pack tasks.
         match rt.block_on(run_interruptible(
-            assembler.assemble(&dest, &packs, file_digest.as_deref(), total_size),
+            // `packs` moves into `assemble` (Task C2): each entry is consumed by
+            // its pack task, so the fan-out clones no URLs or target vectors.
+            assembler.assemble(&dest, packs, file_digest.as_deref(), total_size),
             SIGNAL_POLL_INTERVAL,
             poll_ctrl_c,
         )) {

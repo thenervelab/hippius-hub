@@ -106,8 +106,11 @@ fn chunk_bounds(content_length: u64, chunk_size: u64, i: usize) -> (u64, u64) {
 
 pub struct ChunkedDownloader {
     client: Client,
-    url: String,
-    auth_token: Option<String>,
+    // `Arc<str>` (not `String`): the URL and token are captured by every spawned
+    // chunk task, so per-chunk clones are pointer bumps instead of heap copies
+    // (Task C2). Converted once from the constructor's owned `String`s.
+    url: Arc<str>,
+    auth_token: Option<Arc<str>>,
     chunk_size: u64,
     // Pre-known whole-file size from the OCI manifest layer descriptor
     // (byte-accurate == the blob's Content-Length), threaded from Python so the
@@ -135,8 +138,8 @@ impl ChunkedDownloader {
         let client = crate::chunk_fetcher::download_client(timeouts)?.clone();
         Ok(Self {
             client,
-            url,
-            auth_token,
+            url: url.into(),
+            auth_token: auth_token.map(Arc::from),
             chunk_size: chunk_size_bytes.unwrap_or(DEFAULT_CHUNK_SIZE),
             content_length,
         })
@@ -228,7 +231,9 @@ impl ChunkedDownloader {
             // discarded anyway - a crash re-downloads (the dest opens `truncate`).
         }
 
-        let dest_path_buf = dest_path.to_path_buf();
+        // `Arc<Path>` built once so every chunk task's capture is a pointer bump,
+        // not a fresh `PathBuf` heap copy (Task C2).
+        let dest_shared: Arc<Path> = Arc::from(dest_path);
 
         // Overlap whole-file verification with the download (Task C1, mirroring the
         // pack path in `chunk_fetcher::PackAssembler::assemble`): the background
@@ -256,7 +261,7 @@ impl ChunkedDownloader {
         // in-flight cap; `global_range_gate` (audit M-RANGE-GATE) still bounds TOTAL
         // Range GETs across every concurrent legacy download.
         let base_client = self.client.clone();
-        let base_url = self.url.clone();
+        let base_url = Arc::clone(&self.url);
         let base_token = self.auth_token.clone();
         let chunk_size = self.chunk_size;
         let spawn_pb = pb.clone();
@@ -265,11 +270,13 @@ impl ChunkedDownloader {
         let spawn_chunk = |set: &mut tokio::task::JoinSet<(usize, Result<(), CoreError>)>,
                            i: usize| {
             let (start, end) = chunk_bounds(content_length, chunk_size, i);
+            // `Client`/`ProgressBar` are Arc-backed handles; the url/token/path
+            // clones below are `Arc` pointer bumps (Task C2), not heap copies.
             let client = base_client.clone();
-            let url = base_url.clone();
+            let url = Arc::clone(&base_url);
             let token = base_token.clone();
             let chunk_pb = spawn_pb.clone();
-            let path = dest_path_buf.clone();
+            let path = Arc::clone(&dest_shared);
             set.spawn(async move {
                 // Global permit (RAII-released on completion or abort) bounds TOTAL
                 // in-flight Range GETs across every concurrent legacy download so a
@@ -374,7 +381,8 @@ impl ChunkedDownloader {
 
     /// Issue a HEAD request to obtain Content-Length
     async fn get_content_length(&self) -> Result<u64, CoreError> {
-        let mut req = self.client.head(&self.url).timeout(HEAD_REQUEST_TIMEOUT);
+        // `&*self.url` re-borrows the `Arc<str>` as the `&str` that `IntoUrl` wants.
+        let mut req = self.client.head(&*self.url).timeout(HEAD_REQUEST_TIMEOUT);
         if let Some(ref token) = self.auth_token {
             req = req.bearer_auth(token);
         }
@@ -540,25 +548,25 @@ async fn compute_sha256(path: &Path, pb: &ProgressBar) -> Result<String, CoreErr
 /// Wrapper with exponential-backoff retry for a single chunk download.
 ///
 /// The eight parameters are the data captured by `tokio::spawn` for one
-/// chunk task: the reqwest client + URL + bearer token (cloned per chunk
-/// so the spawn body is `'static`), the inclusive byte range, the
-/// destination path (each chunk writes its own slice), the progress bar
-/// handle, and a chunk index reserved for future error reporting.
-/// Bundling into a struct would require an extra clone per chunk for no
-/// readability gain.
+/// chunk task: the reqwest client + URL + bearer token (`Arc`-shared per
+/// chunk so the spawn body is `'static` without heap copies - Task C2),
+/// the inclusive byte range, the destination path (each chunk writes its
+/// own slice), the progress bar handle, and a chunk index reserved for
+/// future error reporting. Bundling into a struct would require an extra
+/// clone per chunk for no readability gain.
 #[expect(
     clippy::too_many_arguments,
     reason = "spawn-captured chunk state; bundling into a struct adds a clone per chunk"
 )]
 async fn download_chunk_with_retry(
     client: Client,
-    url: String,
-    token: Option<String>,
+    url: Arc<str>,
+    token: Option<Arc<str>>,
     start: u64,
     end: u64,
     content_length: u64,
     _chunk_index: usize,
-    dest_path: std::path::PathBuf,
+    dest_path: Arc<Path>,
     pb: ProgressBar,
 ) -> Result<(), CoreError> {
     let mut retries = 0;

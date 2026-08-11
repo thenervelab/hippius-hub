@@ -253,7 +253,10 @@ pub struct PackPlanEntry {
 /// digest-verified as it lands at its file offset.
 pub struct PackAssembler {
     client: Client,
-    auth_token: Option<String>,
+    // `Arc<str>` (not `String`): the token is captured by every spawned pack
+    // task, so the per-pack clone is a pointer bump, not a heap copy (Task C2).
+    // Converted once from the constructor's owned `String`.
+    auth_token: Option<Arc<str>>,
     max_concurrent: usize,
 }
 
@@ -272,7 +275,7 @@ impl PackAssembler {
         let client = download_client(timeouts)?.clone();
         Ok(Self {
             client,
-            auth_token,
+            auth_token: auth_token.map(Arc::from),
             max_concurrent: max_concurrent.max(1),
         })
     }
@@ -280,19 +283,22 @@ impl PackAssembler {
     /// Fetch every pack into `dest` (pre-allocated to `total_size`), verifying each
     /// carved chunk's digest, then the whole-file digest. `expected_file_sha256`
     /// proves chunk *ordering* across packs (the only thing per-chunk digests can't).
-    #[expect(
-        clippy::too_many_lines,
-        reason = "line count crossed 100 purely through rustfmt line-break expansion; \
-                  the Phase D function-level split of this method removes this expect"
-    )]
+    ///
+    /// `packs` is consumed by value (Task C2): each `PackPlanEntry` moves into its
+    /// spawned task, so the fan-out clones no URL strings and rebuilds no per-task
+    /// target `Vec`s. The sole caller (`download_packs_native`) builds the plan
+    /// specifically for this call and never reuses it.
+    // The C2 fan-out restructure brought this method back under clippy's
+    // 100-line bound, so the A1-era `#[expect(clippy::too_many_lines)]` is gone
+    // (`unfulfilled_lint_expectations` enforced its removal).
     pub async fn assemble(
         &self,
         dest: &Path,
-        packs: &[PackPlanEntry],
+        packs: Vec<PackPlanEntry>,
         expected_file_sha256: Option<&str>,
         total_size: u64,
     ) -> Result<Option<String>, CoreError> {
-        validate_pack_plan(packs, total_size)?;
+        validate_pack_plan(&packs, total_size)?;
         let parent = dest.parent().unwrap_or_else(|| Path::new("."));
         tokio::fs::create_dir_all(parent).await?;
         {
@@ -332,19 +338,21 @@ impl PackAssembler {
         let mut abort_handles: Vec<AbortHandle> = Vec::with_capacity(packs.len());
         let permits = Arc::new(Semaphore::new(self.max_concurrent));
         let global = global_pack_gate(self.max_concurrent);
+        // `Arc<Path>` built once so every pack task's capture is a pointer bump,
+        // not a fresh `PathBuf` heap copy (Task C2).
+        let dest_shared: Arc<Path> = Arc::from(dest);
 
-        for (i, plan) in packs.iter().enumerate() {
+        for (i, plan) in packs.into_iter().enumerate() {
             let client = self.client.clone();
             let token = self.auth_token.clone();
-            let url = plan.url.clone();
-            let pack_size = plan.size;
-            // `Sha256Digest` is `Copy`, so this fan-out clones no heap strings.
-            let targets: Vec<(u64, u64, u64, Sha256Digest)> = plan
-                .chunks
-                .iter()
-                .map(|c| (c.offset_in_pack, c.size, c.file_offset, c.expected_sha256))
-                .collect();
-            let path = dest.to_path_buf();
+            // The plan entry MOVES into its task (Task C2): the URL becomes a
+            // shared `Arc<str>` and the chunk `Vec` becomes an `Arc<[_]>` once,
+            // so retries and the `spawn_blocking` scatter clone pointers instead
+            // of rebuilding a per-attempt targets `Vec` + URL `String`.
+            let PackPlanEntry { url, size, chunks } = plan;
+            let url: Arc<str> = url.into();
+            let targets: Arc<[PackChunkTarget]> = chunks.into();
+            let path = Arc::clone(&dest_shared);
             let pack_pb = pb.clone();
             let permits = Arc::clone(&permits);
             let global = Arc::clone(&global);
@@ -366,7 +374,7 @@ impl PackAssembler {
                     &client,
                     &url,
                     token.as_deref(),
-                    pack_size,
+                    size,
                     &targets,
                     &path,
                     &pack_pb,
@@ -379,7 +387,8 @@ impl PackAssembler {
                         // double-count. A closed channel means the hasher task already
                         // exited (error/abort), so a dropped signal merely forgoes the
                         // incremental fast path; the whole-file check then re-reads.
-                        let done: HashSignal = targets.iter().map(|t| (t.2, t.1)).collect();
+                        let done: HashSignal =
+                            targets.iter().map(|t| (t.file_offset, t.size)).collect();
                         let _ = tx.send(done);
                     }
                 }
@@ -506,13 +515,16 @@ async fn verify_file_digest(
     Ok(got)
 }
 
+/// `url`/`targets`/`dest_path` are borrowed `Arc`s (Task C2): each retry attempt
+/// re-uses the same shared allocations, and `fetch_pack` clones only the pointers
+/// its `spawn_blocking` closure needs to be `'static`.
 async fn fetch_pack_with_retry(
     client: &Client,
-    url: &str,
+    url: &Arc<str>,
     token: Option<&str>,
     pack_size: u64,
-    targets: &[(u64, u64, u64, Sha256Digest)],
-    dest_path: &Path,
+    targets: &Arc<[PackChunkTarget]>,
+    dest_path: &Arc<Path>,
     pb: &ProgressBar,
 ) -> Result<(), CoreError> {
     let mut retries = 0;
@@ -538,14 +550,15 @@ async fn fetch_pack_with_retry(
 /// semaphore; the length check rejects a server that over-sends before slicing.
 async fn fetch_pack(
     client: &Client,
-    url: &str,
+    url: &Arc<str>,
     token: Option<&str>,
     pack_size: u64,
-    targets: &[(u64, u64, u64, Sha256Digest)],
-    dest_path: &Path,
+    targets: &Arc<[PackChunkTarget]>,
+    dest_path: &Arc<Path>,
     pb: &ProgressBar,
 ) -> Result<(), CoreError> {
-    let mut req = client.get(url).timeout(CHUNK_REQUEST_TIMEOUT);
+    // `&**url` re-borrows the shared `Arc<str>` as the `&str` that `IntoUrl` wants.
+    let mut req = client.get(&**url).timeout(CHUNK_REQUEST_TIMEOUT);
     if let Some(t) = token {
         req = req.bearer_auth(t);
     }
@@ -597,17 +610,18 @@ async fn fetch_pack(
     // Verify + scatter on the blocking pool (audit L14). The per-chunk sha256 is
     // CPU-bound and the scatter writes are local disk - neither is async work, so
     // running them inline on the runtime starves the other up-to-32 concurrent pack
-    // fetches. `bytes` (the received pack) moves in; the metadata clones are cheap.
-    let targets_owned = targets.to_vec();
-    let dest = dest_path.to_path_buf();
-    let url_owned = url.to_string();
+    // fetches. `bytes` (the received pack) moves in; the `Arc` clones that make the
+    // closure `'static` are pointer bumps (Task C2), not per-attempt heap copies.
+    let targets = Arc::clone(targets);
+    let dest = Arc::clone(dest_path);
+    let url = Arc::clone(url);
     let pb_owned = pb.clone();
     // A join failure (panicked scatter closure / runtime shutdown) is the
     // non-retryable `JoinFailed`: it reproduces on retry, so surfacing it as a
     // retryable `Io` would make `fetch_pack_with_retry` re-download the whole
     // ~64 MiB pack up to MAX_RETRIES times for a certain failure.
     tokio::task::spawn_blocking(move || {
-        verify_and_scatter(&url_owned, &bytes, &targets_owned, &dest, &pb_owned)
+        verify_and_scatter(&url, &bytes, &targets, &dest, &pb_owned)
     })
     .await
     .map_err(|join_err| CoreError::JoinFailed {
@@ -627,14 +641,20 @@ async fn fetch_pack(
 fn verify_and_scatter(
     url: &str,
     bytes: &[u8],
-    targets: &[(u64, u64, u64, Sha256Digest)],
+    targets: &[PackChunkTarget],
     dest_path: &Path,
     pb: &ProgressBar,
 ) -> Result<(), CoreError> {
     use std::io::{Seek, Write};
 
     let mut file = std::fs::OpenOptions::new().write(true).open(dest_path)?;
-    for (offset_in_pack, size, file_offset, expected) in targets {
+    for PackChunkTarget {
+        offset_in_pack,
+        size,
+        file_offset,
+        expected_sha256: expected,
+    } in targets
+    {
         let start = usize::try_from(*offset_in_pack).map_err(|_| {
             CoreError::Integrity(format!("pack offset {offset_in_pack} exceeds usize"))
         })?;
@@ -721,7 +741,7 @@ mod tests {
         let ha = Sha256Digest::of(a);
         let hb = Sha256Digest::of(b);
         // (offset_in_pack, size, file_offset, expected_digest): scatter A->0, B->4.
-        let good = vec![(0u64, 4u64, 0u64, ha), (4u64, 2u64, 4u64, hb)];
+        let good = vec![chunk_target(0, 4, 0, ha), chunk_target(4, 2, 4, hb)];
 
         let path = std::env::temp_dir().join(format!("hippius-vs-{}.bin", std::process::id()));
         let Ok(()) = std::fs::File::create(&path).and_then(|f| f.set_len(6)) else {
@@ -738,7 +758,7 @@ mod tests {
 
         // A wrong expected digest (hb over the "AAAA" slice) is a permanent Integrity
         // error, so a corrupt/mis-placed pack is never accepted.
-        let bad = vec![(0u64, 4u64, 0u64, hb)];
+        let bad = vec![chunk_target(0, 4, 0, hb)];
         assert!(matches!(
             verify_and_scatter("u", &pack, &bad, &path, &pb),
             Err(CoreError::Integrity(_))
@@ -1156,7 +1176,12 @@ mod tests {
         let pb = ProgressBar::hidden();
         let dest = scratch_path("l12_overlen");
         let _g = TempFileGuard(dest.clone());
-        let res = fetch_pack(client, &format!("{base}/pack"), None, 1000, &[], &dest, &pb).await;
+        // Construction plumbing for the Arc-shared fetch_pack signature (Task C2);
+        // the assertions below are unchanged.
+        let url: Arc<str> = format!("{base}/pack").into();
+        let no_targets: Arc<[PackChunkTarget]> = Vec::new().into();
+        let dest_arc: Arc<Path> = dest.as_path().into();
+        let res = fetch_pack(client, &url, None, 1000, &no_targets, &dest_arc, &pb).await;
         assert!(
             matches!(res, Err(CoreError::BadResponse(ref m)) if m.contains("over-send")),
             "an over-length pack body must be rejected (bounded), got {res:?}"
@@ -1189,7 +1214,7 @@ mod tests {
         // Timeout-guarded: a channel-lifecycle regression (e.g. dropping `drop(hash_tx)`)
         // would hang the hasher's recv forever, surfacing here as a failure not a hang.
         let expected = reference(&content);
-        let fut = assembler.assemble(&dest, &packs, Some(&expected), content.len() as u64);
+        let fut = assembler.assemble(&dest, packs, Some(&expected), content.len() as u64);
         let digest = match tokio::time::timeout(Duration::from_secs(30), fut).await {
             Ok(Ok(Some(d))) => Some(d),
             _ => None,
@@ -1217,7 +1242,7 @@ mod tests {
         // The bytes assemble correctly, but the declared whole-file digest disagrees:
         // the cross-pack ordering check must reject with Integrity.
         let wrong = "f".repeat(64);
-        let fut = assembler.assemble(&dest, &packs, Some(&wrong), content.len() as u64);
+        let fut = assembler.assemble(&dest, packs, Some(&wrong), content.len() as u64);
         let got = tokio::time::timeout(Duration::from_secs(30), fut).await;
         assert!(matches!(got, Ok(Err(CoreError::Integrity(_)))));
     }
