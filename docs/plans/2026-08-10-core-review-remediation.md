@@ -602,6 +602,15 @@ in the commit message. Commit:
 
 ### Task B2: SHA backend spike (timeboxed, decision-gated — may conclude "no")
 
+> **OUTCOME (2026-08-10): closed, ring NOT adopted — decided by arithmetic on
+> B1's measured decomposition instead of running the spike.** Post-B1 the 2 GiB
+> producer floor is ~1.5 s StreamCDC scan/copy + ~1.2 s whole-file SHA; ring's
+> best recorded advantage (1.5x, no-SHA-NI Xeon) on the SHA component alone
+> yields ~1.17x phase-1, under this task's own 1.3x gate; Apple Silicon is
+> parity (sha2+asm at the ARMv8 ceiling). Re-open only if the CDC copy cost is
+> eliminated or B3 fails to hide the whole-file hash under network transfer.
+> Team memory: mem_01KZPF3FZ57WKD8YK79MZVEBRN.
+
 **Files:**
 - Create: nothing permanent unless adopted
 
@@ -743,6 +752,12 @@ Then check remaining callers of `chunk_and_hash_native`
 (`rg -n "chunk_and_hash_native" hippius_hub/ tests/ smoke/`): if the v2 path was
 its only production caller, remove the pyfunction and port its tests to the
 stream (replace, don't deprecate); keep it only if the v1/legacy path still calls it.
+
+> **OUTCOME (2026-08-10): retained.** The v2 path was its only production
+> caller, but `chunk_and_hash_native` stays: it is `scripts/bench_phase1.py`'s
+> entry point and the pipeline's batch reference, and it routes through the
+> same `run_chunk_pipeline` machinery production streams through — live code,
+> not a deprecated shim.
 
 **B3.5 — Integration + failure tests.** Extend the existing mock-registry upload
 tests (find them: `rg -ln "pack_upload_native|_upload_file_chunked_v2" tests/`):

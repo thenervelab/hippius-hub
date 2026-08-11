@@ -13,6 +13,10 @@ from hypothesis import strategies as st
 
 from hippius_hub._oci import parse_pointer_v2
 from hippius_hub._packing import (
+    NewPack,
+    PackAccumulator,
+    PackPlan,
+    PlannedChunk,
     plan_packs,
     pointer_v2_bytes,
     resolve_pointer_chunks,
@@ -121,3 +125,137 @@ def test_resolve_rejects_wrong_digest_count():
     plan = plan_packs(_file([10]), {}, pack_size=1000)
     with pytest.raises(ValueError):
         resolve_pointer_chunks(plan, [])  # 1 new pack, 0 digests
+
+
+# ---- PackAccumulator: incremental feed must equal batch plan_packs ----
+
+def _plan_packs_reference(chunks, dedup_index, pack_size):
+    """Independent oracle: the original batch plan_packs loop, verbatim.
+
+    Production plan_packs now DELEGATES to PackAccumulator, so comparing the
+    accumulator only against it would be tautological — a boundary mutation
+    would change both sides in lockstep. This copy pins the semantics: pack
+    closes at cur_offset >= pack_size; dedup index read-only (no self-dedup).
+
+    If a production change makes this test fail, that is the test doing its
+    job — update this reference only as a deliberate, reviewed semantics
+    change, together with the explicit boundary tests. Frozen from plan_packs
+    at 6821e37 (semantically verbatim, condensed: close() inlined,
+    hit[0]/hit[1]).
+    """
+    planned, new_packs, cur_ranges, cur_offset = [], [], [], 0
+    for digest, size, file_offset in chunks:
+        hit = dedup_index.get(digest)
+        if hit is not None:
+            planned.append(PlannedChunk(digest, size, hit[1], pack_digest=hit[0]))
+            continue
+        planned.append(PlannedChunk(digest, size, cur_offset, new_pack_index=len(new_packs)))
+        cur_ranges.append((file_offset, size))
+        cur_offset += size
+        if cur_offset >= pack_size:
+            new_packs.append(tuple(cur_ranges))
+            cur_ranges, cur_offset = [], 0
+    if cur_ranges:
+        new_packs.append(tuple(cur_ranges))
+    return PackPlan(tuple(planned), tuple(NewPack(r) for r in new_packs))
+
+
+def _file_from_spec(spec):
+    chunks, off = [], 0
+    for did, size in spec:
+        chunks.append((_digest(f"d{did}".encode()), size, off))
+        off += size
+    return chunks
+
+
+@given(st.data())
+def test_accumulator_equals_plan_packs(data):
+    pack_size = data.draw(st.integers(min_value=1, max_value=8000))
+    # Sizes biased toward pack_size-1 / pack_size / pack_size+1 so cumulative
+    # sums actually land ON the close boundary — plain uniform sizes almost
+    # never do, which lets off-by-one close conditions survive.
+    size_strat = st.one_of(
+        st.integers(min_value=1, max_value=4000),
+        st.sampled_from(sorted({max(1, pack_size - 1), pack_size, pack_size + 1})),
+    )
+    # (digest_id, size) pairs: repeated digest_ids model the same chunk digest
+    # occurring twice WITHIN one file — plan_packs does not self-dedup those
+    # (the dedup index is never mutated mid-plan), and neither may the accumulator.
+    spec = data.draw(
+        st.lists(st.tuples(st.integers(min_value=0, max_value=5), size_strat), max_size=40)
+    )
+    chunks = _file_from_spec(spec)
+    # Mark a random subset of DIGESTS (not positions) as reused, so a duplicated
+    # digest is consistently reused-or-new — matching a real dedup index.
+    digests = sorted({c[0] for c in chunks})
+    reused = data.draw(st.sets(st.sampled_from(digests))) if digests else set()
+    dedup = {d: (_digest(b"pack" + d.encode()), 100 + i) for i, d in enumerate(reused)}
+
+    acc = PackAccumulator(dedup, pack_size)
+    packs = [p for c in chunks for p in acc.feed(c)]
+    plan = acc.finish()
+
+    assert plan == _plan_packs_reference(chunks, dedup, pack_size)
+    assert plan == plan_packs(chunks, dedup, pack_size)  # delegation wiring
+    # feed() emitted exactly the completed packs, in order; only the final
+    # partial pack (if any) is deferred to finish().
+    assert tuple(packs) == plan.new_packs[: len(packs)]
+    assert len(plan.new_packs) - len(packs) <= 1
+
+
+def test_accumulator_completes_pack_at_exact_boundary():
+    chunks = _file([50, 50, 10])  # 50+50 == pack_size → pack closes on 2nd feed
+    acc = PackAccumulator({}, pack_size=100)
+    assert acc.feed(chunks[0]) == []
+    assert [p.ranges for p in acc.feed(chunks[1])] == [((0, 50), (50, 50))]
+    assert acc.feed(chunks[2]) == []
+    plan = acc.finish()
+    assert plan.new_packs[1].ranges == ((100, 10),)
+
+
+def test_accumulator_stays_open_one_byte_below_bound():
+    chunks = _file([99, 1])  # 99 < pack_size=100 must NOT close; +1 hits it
+    acc = PackAccumulator({}, pack_size=100)
+    assert acc.feed(chunks[0]) == []
+    assert [p.ranges for p in acc.feed(chunks[1])] == [((0, 99), (99, 1))]
+
+
+def test_accumulator_oversize_chunk_completes_immediately():
+    (chunk,) = _file([500])  # single chunk > pack_size → its own pack, at once
+    acc = PackAccumulator({}, pack_size=100)
+    assert [p.ranges for p in acc.feed(chunk)] == [((0, 500),)]
+    assert acc.finish().new_packs == (NewPack(((0, 500),)),)
+
+
+def test_duplicate_digest_within_file_is_packed_twice():
+    # Same digest at two file offsets, absent from the dedup index: plan_packs
+    # packs BOTH occurrences (no self-dedup), so the accumulator must too.
+    d = _digest(b"dup")
+    chunks = [(d, 10, 0), (d, 10, 10)]
+    for plan in (plan_packs(chunks, {}, 1000), _feed_all(chunks, {}, 1000)):
+        assert plan.new_packs[0].ranges == ((0, 10), (10, 10))
+        assert [p.new_pack_index for p in plan.planned] == [0, 0]
+        assert [p.pack_offset for p in plan.planned] == [0, 10]
+
+
+def _feed_all(chunks, dedup, pack_size):
+    acc = PackAccumulator(dedup, pack_size)
+    for c in chunks:
+        acc.feed(c)
+    return acc.finish()
+
+
+def test_accumulator_finish_is_idempotent_and_feed_after_finish_raises():
+    acc = PackAccumulator({}, pack_size=100)
+    acc.feed(_file([10])[0])
+    plan = acc.finish()
+    assert acc.finish() == plan
+    with pytest.raises(RuntimeError):
+        acc.feed((_digest(b"late"), 5, 10))
+
+
+def test_accumulator_rejects_nonpositive_pack_size():
+    with pytest.raises(ValueError):
+        PackAccumulator({}, pack_size=0)
+    with pytest.raises(ValueError):
+        plan_packs([], {}, pack_size=-1)

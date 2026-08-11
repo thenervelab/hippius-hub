@@ -11,11 +11,12 @@ from __future__ import annotations
 
 import hashlib
 import json
+import random
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 
 import httpx
-import pytest
 import respx
 
 from hippius_hub import file_upload
@@ -38,16 +39,55 @@ CHUNK_METAS = [("a" * 64, 0, 40), ("b" * 64, 40, 60)]
 WHOLE_HEX = "c" * 64
 
 
+class _FakeChunkStream:
+    """Stub of the native ChunkStream: replays canned (hex, offset, len) batches.
+
+    Honors the real drain-before-finish contract (finish() before next_batch
+    returned None raises) so orchestration bugs in the streaming upload loop
+    surface here rather than only against the real extension. `raise_at` models
+    Ctrl-C landing inside the native call: the Nth next_batch call (1-based)
+    raises KeyboardInterrupt instead of returning.
+
+    NOT modeled: abort-on-drop / producer-unwind semantics. Abort-path tests
+    belong against the real extension (tests/test_chunk_stream.py and
+    test_v2_consumer_abandoning_stream_mid_drain_is_exception_free below)."""
+
+    def __init__(self, batches, whole_hex, raise_at=None):
+        self._batches = [list(b) for b in batches]
+        self._whole = whole_hex
+        self._drained = False
+        self._raise_at = raise_at
+        self._calls = 0
+
+    def next_batch(self):
+        self._calls += 1
+        if self._calls == self._raise_at:
+            raise KeyboardInterrupt
+        if self._batches:
+            return self._batches.pop(0)
+        self._drained = True
+        return None
+
+    def finish(self):
+        if not self._drained:
+            raise RuntimeError("chunk stream not finished; drain next_batch to None first")
+        return self._whole
+
+
 def _pack_digest(ranges) -> str:
     # Deterministic stand-in for the real content digest so the pointer/manifest
     # are stable; the mock never reads bytes, only records which ranges packed.
     return hashlib.sha256(repr(list(ranges)).encode()).hexdigest()
 
 
-def _wire_registry(monkeypatch, captured, *, existing_manifest=None):
+def _wire_registry(monkeypatch, captured, *, existing_manifest=None, stub_chunks=True):
     monkeypatch.setattr("hippius_hub.constants.DEFAULT_REGISTRY_URL", MOCK_REGISTRY)
     monkeypatch.setattr("hippius_hub.auth.DEFAULT_REGISTRY_URL", MOCK_REGISTRY)
-    monkeypatch.setattr(file_upload, "chunk_and_hash_native", lambda path, avg: (WHOLE_HEX, CHUNK_METAS))
+    if stub_chunks:
+        monkeypatch.setattr(
+            file_upload, "chunk_stream_native",
+            lambda path, avg: _FakeChunkStream([CHUNK_METAS], WHOLE_HEX),
+        )
 
     packs_seen = []
 
@@ -324,7 +364,10 @@ def test_lost_reused_pack_heals_to_a_successful_commit(monkeypatch, tmp_path):
     monkeypatch.setattr("hippius_hub.constants.DEFAULT_REGISTRY_URL", MOCK_REGISTRY)
     monkeypatch.setattr("hippius_hub.auth.DEFAULT_REGISTRY_URL", MOCK_REGISTRY)
     monkeypatch.setattr("hippius_hub.file_upload.time.sleep", lambda _s: None)
-    monkeypatch.setattr(file_upload, "chunk_and_hash_native", lambda path, avg: (WHOLE_HEX, CHUNK_METAS))
+    monkeypatch.setattr(
+        file_upload, "chunk_stream_native",
+        lambda path, avg: _FakeChunkStream([CHUNK_METAS], WHOLE_HEX),
+    )
 
     p0 = "sha256:" + _pack_digest([(0, 40)])
     prior_pointer = json.dumps({
@@ -384,3 +427,234 @@ def test_lost_reused_pack_heals_to_a_successful_commit(monkeypatch, tmp_path):
     # The committed manifest no longer references the lost pack.
     assert p0 not in {layer["digest"] for layer in manifests[-1]["layers"]}, \
         "the healed manifest must drop the lost pack"
+
+
+# ---- streaming pipeline (B3.4): packs upload while chunking runs ----
+
+@respx.mock
+def test_v2_streaming_pipeline_matches_batch_plan(monkeypatch, tmp_path):
+    """The streamed path (REAL native ChunkStream feeding PackAccumulator) must
+    pack and point identically to the batch reference (chunk_and_hash_native +
+    plan_packs): multiple packs completed mid-stream, multiple 64-chunk batches,
+    a final partial pack from finish(), digests aligned pack-for-pack."""
+    from hippius_hub._packing import plan_packs
+    from hippius_hub.hippius_core import chunk_and_hash_native
+
+    avg, pack_size = 32 * 1024, 512 * 1024
+    monkeypatch.setenv("HIPPIUS_CHUNK_THRESHOLD", "1")
+    monkeypatch.setenv("HIPPIUS_CHUNKED_WRITE", "1")
+    monkeypatch.setenv("HIPPIUS_CDC_AVG_SIZE", str(avg))
+    monkeypatch.setenv("HIPPIUS_PACK_SIZE", str(pack_size))
+    captured = {}
+    packs_seen, put_bodies = _wire_registry(monkeypatch, captured, stub_chunks=False)
+
+    src = tmp_path / "big.bin"
+    src.write_bytes(random.Random(11).randbytes(5 * 1024 * 1024))
+    upload_file(path_or_fileobj=str(src), path_in_repo="big.bin", repo_id=REPO, token="tok")
+
+    whole_hex, metas = chunk_and_hash_native(str(src), avg)
+    ref = plan_packs([(f"sha256:{h}", s, o) for h, o, s in metas], {}, pack_size)
+    # Fixture sanity: the streaming machinery is actually exercised.
+    assert len(ref.new_packs) >= 3, "fixture must span multiple packs"
+    assert len(metas) > 64, "fixture must span multiple stream batches"
+
+    # Every planned pack uploaded exactly once (completion order may vary).
+    assert sorted(map(tuple, packs_seen)) == sorted(np.ranges for np in ref.new_packs)
+
+    # The pointer pins digest<->pack alignment: chunk i references the digest of
+    # ITS planned pack at its planned offset — order-independent of upload timing.
+    ptr_blob = next(b for b in put_bodies if b'"chunked-v2"' in b)
+    refs = parse_pointer_v2(ptr_blob)
+    assert [r.chunk_digest for r in refs] == [f"sha256:{h}" for h, _o, _s in metas]
+    expected_digests = ["sha256:" + _pack_digest(list(np.ranges)) for np in ref.new_packs]
+    assert [r.pack_digest for r in refs] == [
+        expected_digests[pc.new_pack_index] for pc in ref.planned
+    ]
+    assert [r.pack_offset for r in refs] == [pc.pack_offset for pc in ref.planned]
+
+    # Manifest annotations come from streamed counters, not a materialized list.
+    ptr_layer = next(
+        m for m in captured["manifest"]["layers"] if m["mediaType"] == POINTER_MEDIA_TYPE_V2
+    )
+    assert ptr_layer["annotations"]["com.hippius.chunk.count"] == str(len(metas))
+    assert ptr_layer["annotations"]["com.hippius.file.digest"] == f"sha256:{whole_hex}"
+
+
+@respx.mock
+def test_v2_failed_pack_upload_propagates_without_hanging(monkeypatch, tmp_path):
+    """A pack-upload failure must surface as the ORIGINAL exception (callers see
+    the same shape the batch path raised) and must not deadlock the executor or
+    the stream — bounded here by a hard deadline on a worker thread."""
+    monkeypatch.setenv("HIPPIUS_CHUNK_THRESHOLD", "1")
+    monkeypatch.setenv("HIPPIUS_CHUNKED_WRITE", "1")
+    monkeypatch.setenv("HIPPIUS_PACK_SIZE", "40")  # chunk "a" closes pack 0 -> two packs
+    # Gate isolation: a distinct cap makes _pack_upload_gate build THIS test its
+    # own semaphore (it rebuilds on cap change), so a hypothetical hang here can't
+    # leave the process-wide default-cap semaphore short of permits for later tests.
+    monkeypatch.setenv("HIPPIUS_MAX_INFLIGHT_PACKS", "3")
+    captured = {}
+    _wire_registry(monkeypatch, captured)
+
+    def _boom(uploads_url, path, ranges, auth_token):
+        raise RuntimeError("pack exploded")
+
+    monkeypatch.setattr(file_upload, "pack_upload_native", _boom)
+
+    src = tmp_path / "big.bin"
+    src.write_bytes(b"x" * 100)
+
+    outcome = {}
+
+    def _target():
+        try:
+            upload_file(path_or_fileobj=str(src), path_in_repo="big.bin", repo_id=REPO, token="tok")
+            outcome["value"] = "unexpected success"
+        except BaseException as exc:  # the assertion below pins the exact type
+            outcome["error"] = exc
+
+    t = threading.Thread(target=_target, daemon=True)
+    t.start()
+    t.join(30)
+    assert not t.is_alive(), "a failed pack upload must not hang the upload"
+    assert isinstance(outcome.get("error"), RuntimeError)
+    assert "pack exploded" in str(outcome["error"])
+    assert "manifest" not in captured, "no manifest may be committed after a failed pack"
+
+
+def test_v2_consumer_abandoning_stream_mid_drain_is_exception_free(tmp_path):
+    """Deterministic stand-in for Ctrl-C at the ChunkStream level (the B3.2
+    deferral): the consumer walks away after the first batch — breaks out of the
+    drain loop and drops the REAL native stream — while an upload is still in
+    flight on a real executor. The Rust producer unwind (termination proof in
+    uploader::chunk_stream_tests) must make that abandonment exception-free on
+    the Python side, and the executor must still join its in-flight work."""
+    from hippius_hub.hippius_core import chunk_stream_native
+
+    # ~130 chunks at avg 32 KiB -> several 64-chunk batches, so breaking after
+    # the first batch genuinely abandons undelivered batches mid-stream.
+    src = tmp_path / "big.bin"
+    src.write_bytes(random.Random(13).randbytes(5 * 1024 * 1024))
+
+    inflight = threading.Event()
+    release = threading.Event()
+
+    def _inflight_upload():
+        inflight.set()
+        assert release.wait(30), "abandonment must not strand the in-flight upload"
+        return "uploaded"
+
+    stream = chunk_stream_native(str(src), 32 * 1024)
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        future = executor.submit(_inflight_upload)
+        assert inflight.wait(10), "the in-flight upload never started"
+
+        drained = 0
+        while (batch := stream.next_batch()) is not None:
+            assert batch, "an empty batch must never be emitted"
+            drained += 1
+            break  # consumer abandons the drain here
+        assert drained == 1
+
+        # Drop the stream while the upload is in flight: the producer thread
+        # unwinds through the pipeline's acyclic shutdown, no exception raised.
+        del stream
+        release.set()
+        assert future.result(timeout=30) == "uploaded"
+
+
+@respx.mock
+def test_v2_keyboard_interrupt_mid_stream_aborts_without_commit(monkeypatch, tmp_path):
+    """Ctrl-C landing inside next_batch (modeled via `raise_at` — a real SIGINT
+    test is flaky cross-platform) must propagate as KeyboardInterrupt from the
+    streaming upload with the in-flight pack futures cancelled-or-completed (no
+    hang, bounded by the 30s deadline) and NOTHING committed: no pointer blob
+    PUT, no manifest PUT."""
+    monkeypatch.setenv("HIPPIUS_CHUNK_THRESHOLD", "1")
+    monkeypatch.setenv("HIPPIUS_CHUNKED_WRITE", "1")
+    monkeypatch.setenv("HIPPIUS_PACK_SIZE", "40")  # chunk "a" (40) closes a pack at feed()
+    # Gate isolation, as in the failed-pack test above: a distinct cap gives this
+    # test its own _pack_upload_gate semaphore so a hypothetical hang can't poison
+    # the process-wide one for later tests.
+    monkeypatch.setenv("HIPPIUS_MAX_INFLIGHT_PACKS", "5")
+    captured = {}
+    _packs_seen, put_bodies = _wire_registry(monkeypatch, captured, stub_chunks=False)
+
+    started = threading.Event()
+    finished = threading.Event()
+
+    class _InterruptOnceInFlight(_FakeChunkStream):
+        """Hold the raise_at interrupt until a pack upload is genuinely running,
+        so "the interrupt fires with an upload in flight" is deterministic."""
+
+        def next_batch(self):
+            if self._raise_at is not None and self._calls + 1 == self._raise_at:
+                assert started.wait(10), "pack upload never started before the interrupt"
+            return super().next_batch()
+
+    monkeypatch.setattr(
+        file_upload, "chunk_stream_native",
+        lambda path, avg: _InterruptOnceInFlight([CHUNK_METAS[:1]], WHOLE_HEX, raise_at=2),
+    )
+
+    def _slow_pack(uploads_url, path, ranges, auth_token):
+        started.set()
+        time.sleep(0.2)  # keep the upload in flight across the interrupt
+        finished.set()
+        return _pack_digest(ranges)
+
+    monkeypatch.setattr(file_upload, "pack_upload_native", _slow_pack)
+
+    src = tmp_path / "big.bin"
+    src.write_bytes(b"x" * 100)
+
+    outcome = {}
+
+    def _target():
+        try:
+            upload_file(path_or_fileobj=str(src), path_in_repo="big.bin", repo_id=REPO, token="tok")
+            outcome["value"] = "unexpected success"
+        except BaseException as exc:  # KeyboardInterrupt is a BaseException
+            outcome["error"] = exc
+
+    t = threading.Thread(target=_target, daemon=True)
+    t.start()
+    t.join(30)
+    assert not t.is_alive(), "a mid-stream interrupt must not hang the upload"
+    assert type(outcome.get("error")) is KeyboardInterrupt
+    # The in-flight pack was joined to completion by the executor with-block
+    # (cancelled-or-completed — here it had already started, so: completed).
+    assert finished.is_set(), "the executor must join the in-flight pack, not strand it"
+    # No-commit proof: neither the pointer blob nor the manifest was PUT.
+    assert not put_bodies, "no blob may be PUT after a mid-stream interrupt"
+    assert "manifest" not in captured, "no manifest may be committed after an interrupt"
+
+
+@respx.mock
+def test_v2_streaming_duplicate_chunks_pack_twice(monkeypatch, tmp_path):
+    """No self-dedup, held end-to-end through the stream: a digest occurring twice
+    within one file (absent from the dedup index) is packed twice. Split across
+    two batches, with the pack under HIPPIUS_PACK_SIZE, this also pins the
+    final-partial-pack path (submitted from new_packs[n_emitted:] after finish)."""
+    dup_metas = [("a" * 64, 0, 40), ("a" * 64, 40, 40)]
+    monkeypatch.setenv("HIPPIUS_CHUNK_THRESHOLD", "1")
+    monkeypatch.setenv("HIPPIUS_CHUNKED_WRITE", "1")
+    monkeypatch.setenv("HIPPIUS_PACK_SIZE", "1000")
+    captured = {}
+    packs_seen, put_bodies = _wire_registry(monkeypatch, captured, stub_chunks=False)
+    monkeypatch.setattr(
+        file_upload, "chunk_stream_native",
+        lambda path, avg: _FakeChunkStream([dup_metas[:1], dup_metas[1:]], WHOLE_HEX),
+    )
+
+    src = tmp_path / "big.bin"
+    src.write_bytes(b"x" * 80)
+    upload_file(path_or_fileobj=str(src), path_in_repo="big.bin", repo_id=REPO, token="tok")
+
+    # Both occurrences packed, in file order, into the one (partial) pack.
+    assert packs_seen == [[(0, 40), (40, 40)]]
+    ptr_blob = next(b for b in put_bodies if b'"chunked-v2"' in b)
+    refs = parse_pointer_v2(ptr_blob)
+    assert [(r.chunk_digest, r.pack_offset) for r in refs] == [
+        ("sha256:" + "a" * 64, 0),
+        ("sha256:" + "a" * 64, 40),
+    ]
