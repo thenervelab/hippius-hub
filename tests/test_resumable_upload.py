@@ -344,6 +344,25 @@ def test_session_gone_restarts_fresh(registry):
     assert st.post_count == 2  # restarted with a brand-new session
 
 
+def test_416_with_session_gone_restarts_fresh(registry):
+    """A 416 give-up cause with the session gone (GET 404) → fresh POST from 0.
+
+    Distinct from `test_session_gone_restarts_fresh`, whose 503 cause is already
+    retryable and passes through `force_retryable` unwrapped: a 416 is NOT
+    retryable on its own, so this restart only happens because `force_retryable`
+    wraps it in the retryable `SessionRestart` variant. A regression that
+    returned the raw 416 would surface it as a terminal exception here instead
+    of restarting.
+    """
+    _, st = registry
+    st.patch_script = ["ok", "416"]  # chunk 2 rejected; give-up cause is the 416
+    st.get_404 = True  # ...and the resume GET reports the session vanished
+    data = _payload(3)
+    _upload(registry, data)
+    assert st.final_content == data
+    assert st.post_count == 2  # restarted with a brand-new session
+
+
 def test_patch_unsupported_falls_back_to_monolithic(registry):
     """A registry that rejects PATCH (405) on chunk 1 → monolithic PUT."""
     _, st = registry

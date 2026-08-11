@@ -247,8 +247,10 @@ def resolve_max_inflight_packs() -> int:
     defaults (and higher once per-pack I/O and HTTP buffers count). This bounds the
     product to one ceiling. Defaults to `resolve_upload_workers()` so a single-file
     upload keeps its current concurrency; only the multiplying folder case is
-    reined in. Raising it buys nothing when the link is bandwidth-bound (the
-    Harbor-flow probe measures ~0.9× throughput scaling from 1→16 connections)."""
+    reined in. Raising it has a certain memory cost — each in-flight pack holds a
+    ~64 MiB body resident — and an unvalidated throughput benefit: the one probe
+    run against higher concurrency shrank object size as it raised workers, so it
+    never isolated parallelism."""
     return _resolve_positive_int("HIPPIUS_MAX_INFLIGHT_PACKS", resolve_upload_workers())
 
 

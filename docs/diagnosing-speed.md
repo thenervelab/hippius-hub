@@ -49,11 +49,27 @@ All overridable via env (also `--chunk-size` on `download`):
 | `HIPPIUS_CONNECT_TIMEOUT` | 30 | TCP connect timeout (s) |
 | `HIPPIUS_READ_TIMEOUT` | unset | per-chunk total timeout (s); opt-in |
 | `HIPPIUS_SNAPSHOT_WORKERS` | 8 | concurrent files in `snapshot_download` |
-| `HIPPIUS_UPLOAD_WORKERS` | 8 | concurrent files in folder upload |
+| `HIPPIUS_UPLOAD_WORKERS` | 8 | concurrent pack uploads per large file (per-file thread pool) |
+| `HIPPIUS_MAX_INFLIGHT_PACKS` | `HIPPIUS_UPLOAD_WORKERS` (8) | process-wide cap on in-flight packs (memory ceiling) |
 | `HIPPIUS_DEBUG=1` / `RUST_LOG` | off | verbose transport logging |
 
 Quick experiment to confirm a BDP-limited link: `HIPPIUS_MAX_CONCURRENT=1`
 versus the default 32 — the single-vs-parallel gap should be obvious.
+
+### Tuning uploads
+
+For a single large (chunked) file, effective pack-upload concurrency is
+`min(pack count, HIPPIUS_UPLOAD_WORKERS, HIPPIUS_MAX_INFLIGHT_PACKS)`.
+Because the in-flight cap defaults to the worker count, raising
+`HIPPIUS_MAX_INFLIGHT_PACKS` alone is a no-op for one file — the per-file
+pool stays at `HIPPIUS_UPLOAD_WORKERS` (8); raise both to go wider. Pack
+count caps useful workers: 1 GiB at the 64 MiB pack size is 16 packs, so
+more than 16 workers sit idle. Each in-flight pack is held in memory
+(~64 MiB), so peak resident memory scales as in-flight packs × pack size —
+that is the ceiling `HIPPIUS_MAX_INFLIGHT_PACKS` exists to bound, especially
+on folder uploads where several files upload packs at once. Past 32
+concurrent packs, connections beyond the upload client's 32 idle-per-host
+pool re-handshake per pack.
 
 ## Client-side deep dive (when the report isn't enough)
 
