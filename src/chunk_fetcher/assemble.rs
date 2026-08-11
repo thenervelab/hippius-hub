@@ -1,34 +1,26 @@
-//! Parallel pull + assemble of a chunked artifact's content-defined chunk blobs.
-//!
-//! The chunked-artifact layout (docs/plans/2026-07-09-chunked-artifact-layout.md)
-//! stores a large file as K independent, content-addressed OCI blobs. Unlike
-//! `chunked_downloader.rs` - which parallelises ONE whole-file blob via HTTP
-//! `Range` requests (206 slices) and is kept for pre-chunking artifacts - this
-//! module fetches each chunk as its own ordinary blob (a full `200 OK`) and
-//! writes it to its offset in the pre-allocated destination. Two consequences:
-//! no `Range`/206 dependency (the ATS-edge 206 fragility the plan retires), and
-//! each chunk verifies against its own digest as it streams, so the assembled
-//! file's integrity is proven chunk-by-chunk rather than trusted.
+//! The pack fan-out: plan validation, the bounded parallel pack fetch with
+//! retry, and the `PackAssembler` orchestration that ties fetch, verify, and
+//! scatter together.
 
 use futures::stream::{FuturesUnordered, StreamExt};
 use indicatif::{ProgressBar, ProgressStyle};
 use reqwest::Client;
-use sha2::{Digest, Sha256};
 use std::path::Path;
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::fs::OpenOptions;
-use tokio::io::SeekFrom;
 use tokio::sync::Semaphore;
 use tokio::task::AbortHandle;
 
+use crate::chunk_fetcher::client::{
+    download_client, download_read_idle, global_pack_gate, read_chunk_bounded, TransportTimeouts,
+};
+use crate::chunk_fetcher::scatter::{verify_and_scatter, verify_file_digest};
 use crate::digest::Sha256Digest;
 use crate::error::CoreError;
-use crate::incremental_hash::{spawn_incremental_hasher, HashSignal, HasherTask};
+use crate::incremental_hash::{spawn_incremental_hasher, HashSignal};
 
-const CONNECT_TIMEOUT_SECS: u64 = 30;
 const MAX_RETRIES: u32 = 3;
-pub(crate) const VERIFY_READ_BUFFER: usize = 8 * 1024 * 1024;
 
 /// Full-request budget for a single chunk-blob GET.
 ///
@@ -40,27 +32,6 @@ pub(crate) const VERIFY_READ_BUFFER: usize = 8 * 1024 * 1024;
 /// call site.
 const CHUNK_REQUEST_TIMEOUT: Duration = Duration::from_mins(5);
 
-/// Default per-chunk-read idle timeout for downloads (audit M4). Bounds a peer that
-/// completes the handshake then dribbles or stops mid-body: reset on each successful
-/// read, so it fires only on genuine no-progress (a 30s gap with zero bytes), never
-/// on a slow-but-steady transfer. Default-ON - unlike the opt-in client
-/// `read_timeout` - and overridden by `HIPPIUS_READ_TIMEOUT` when set. Scoped per
-/// chunk read (an app-level `tokio::time::timeout`), not a global client setting, so
-/// it fixes the slow-loris the 5-minute total timeout would otherwise leave open for
-/// minutes.
-const DOWNLOAD_READ_IDLE: Duration = Duration::from_secs(30);
-
-/// Idle-connection cap for the shared download client. Bounds only *idle*
-/// (kept-alive) connections, not in-flight requests - the per-file `Semaphore`
-/// (`PackAssembler`) and spawn count (`ChunkedDownloader`) are the real concurrency
-/// bounds, so a fixed value is safe regardless of a caller's `max_concurrent`. 32
-/// matches the default `max_concurrent`. This does change the pack path's idle-pool
-/// sizing (previously `pool_max_idle_per_host(max_concurrent)`) to a fixed cap; a
-/// caller running `HIPPIUS_MAX_CONCURRENT` above 32 keeps up to 32 warm idle
-/// connections rather than `max_concurrent`, which only affects idle reuse, not the
-/// real (semaphore-bounded) concurrency.
-const DOWNLOAD_POOL_MAX_IDLE: usize = 32;
-
 /// Absolute ceiling on a single pack blob's declared size, before any of its bytes
 /// are read or reserved. A pack aggregates `FastCDC` chunks toward `HIPPIUS_PACK_SIZE`
 /// (~64 MiB default; 16 MiB max chunk), so no legitimate pack approaches 1 GiB - the
@@ -70,145 +41,6 @@ const DOWNLOAD_POOL_MAX_IDLE: usize = 32;
 /// and accept up to 1 TiB of body before the length check fires. Both the up-front
 /// reservation and the streaming cap are clamped to this value.
 const MAX_PACK_BYTES: u64 = 1024 * 1024 * 1024;
-
-/// Process-global HTTP/1 client shared by both download paths (pack assembly here
-/// and the legacy Range downloader). Mirrors `uploader::upload_client`: building a
-/// `Client` per native call starts with an empty pool and forces a fresh
-/// DNS+TCP+TLS handshake to the registry host on every file; the `OnceLock` hoists
-/// construction out of the per-file path so warm connections survive across files
-/// (the win for many-small-file snapshots). Auth is applied per request, so the
-/// shared client carries no per-file credential across origins.
-///
-/// HTTP/1-only for the same reason the per-call clients were: h2 would multiplex
-/// every parallel chunk onto one TCP and cap aggregate throughput at the
-/// per-connection ceiling; h1 lets each chunk claim its own connection.
-///
-/// Construction is fallible (the TLS backend may fail to init), so this returns
-/// `Result` rather than `expect`-ing inside a `get_or_init` closure - the crate
-/// denies `panic`/`unwrap`. On an init race the loser's freshly built client is
-/// dropped unused (RAII); `OnceLock` is valid in statics and never poisoned.
-/// Connect + read timeouts for the shared download client. Resolved in Python
-/// (`constants.resolve_connect_timeout` / `resolve_read_timeout`) and threaded
-/// down so `HIPPIUS_CONNECT_TIMEOUT` / `HIPPIUS_READ_TIMEOUT` reach real
-/// transfers, not only `hippius-hub diagnose` (audit L9). `connect` bounds the
-/// handshake; `read` is a *stalled-read* bound (reset on each successful read).
-///
-/// `read` is `Option`: `None` leaves the shared client's *opt-in* `.read_timeout()`
-/// off, so the client is byte-for-byte the pre-audit one. The DEFAULT-ON download
-/// stall guard (audit M4) lives at the app level instead - [`read_chunk_bounded`]
-/// bounds each `res.chunk()` read by [`download_read_idle`] (30s, or
-/// `HIPPIUS_READ_TIMEOUT` when set), scoped per chunk rather than as a global client
-/// setting. So a slow-loris is cut by default; setting `HIPPIUS_READ_TIMEOUT`
-/// additionally arms the client's per-request `.read_timeout()` and lowers the
-/// app-level window to the same value.
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct TransportTimeouts {
-    pub connect: Duration,
-    pub read: Option<Duration>,
-}
-
-impl Default for TransportTimeouts {
-    fn default() -> Self {
-        Self {
-            connect: Duration::from_secs(CONNECT_TIMEOUT_SECS),
-            read: None,
-        }
-    }
-}
-
-impl TransportTimeouts {
-    /// Build from optional per-operation seconds; `None` keeps the field default
-    /// (`connect` -> 30s, `read` -> no client read timeout). Non-positive values
-    /// are unrepresentable - Python's `_resolve_positive_int` rejects them first.
-    pub(crate) fn from_secs(connect: Option<u64>, read: Option<u64>) -> Self {
-        let d = Self::default();
-        Self {
-            connect: connect.map_or(d.connect, Duration::from_secs),
-            read: read.map(Duration::from_secs),
-        }
-    }
-}
-
-/// Pure client builder, split from `download_client` so a test can assert the
-/// read-timeout behavior on a fresh client without racing the process-global
-/// singleton (whose first caller fixes its config for the whole process).
-fn build_download_client(timeouts: TransportTimeouts) -> Result<Client, CoreError> {
-    let mut builder = Client::builder()
-        .connect_timeout(timeouts.connect)
-        .http1_only()
-        .pool_max_idle_per_host(DOWNLOAD_POOL_MAX_IDLE)
-        .tcp_keepalive(Duration::from_secs(30));
-    if let Some(read) = timeouts.read {
-        // Opt-in only (see `TransportTimeouts`): fires on a stalled read (no byte
-        // within the window, reset on each successful read), bounding a peer that
-        // handshakes then dribbles/stops mid-body - which `connect_timeout` and
-        // `tcp_keepalive` cannot see and the per-chunk 5-min total `.timeout()`
-        // only catches after 5 minutes (audit M4).
-        builder = builder.read_timeout(read);
-    }
-    Ok(builder.build()?)
-}
-
-/// The resolved per-chunk-read idle timeout (audit M4), fixed by the first
-/// `download_client` caller (first-caller-wins, like the client itself): every file
-/// in a snapshot passes the same env-derived value. `HIPPIUS_READ_TIMEOUT` overrides
-/// the `DOWNLOAD_READ_IDLE` default. Read via [`download_read_idle`].
-static READ_IDLE: OnceLock<Duration> = OnceLock::new();
-
-/// The default-on download read-idle timeout (audit M4). Falls back to
-/// `DOWNLOAD_READ_IDLE` if no download has started yet; in practice the read loops
-/// only run after `download_client` has fixed it, so the fallback is belt-and-braces.
-pub(crate) fn download_read_idle() -> Duration {
-    READ_IDLE.get().copied().unwrap_or(DOWNLOAD_READ_IDLE)
-}
-
-/// One response-body read bounded by `idle` (audit M4): a `res.chunk()` yielding no
-/// data within `idle` is a retryable [`CoreError::ReadStall`], so a peer that stops
-/// mid-body is cut promptly instead of running out the per-chunk 5-minute total
-/// timeout. `idle` applies per call (per successful read resets it), so a slow-but-
-/// steady transfer is never tripped. Shared by both download read loops. `idle` is a
-/// parameter (not read from the global) so tests can drive a short window.
-pub(crate) async fn read_chunk_bounded(
-    res: &mut reqwest::Response,
-    idle: Duration,
-) -> Result<Option<bytes::Bytes>, CoreError> {
-    match tokio::time::timeout(idle, res.chunk()).await {
-        Ok(chunk) => Ok(chunk?),
-        Err(_elapsed) => Err(CoreError::ReadStall(idle)),
-    }
-}
-
-pub(crate) fn download_client(timeouts: TransportTimeouts) -> Result<&'static Client, CoreError> {
-    static CLIENT: OnceLock<Client> = OnceLock::new();
-    if let Some(client) = CLIENT.get() {
-        return Ok(client);
-    }
-    // First-caller-wins (like `global_pack_gate`): the process-global client is
-    // built once with the first download's resolved timeouts. Every file in a
-    // snapshot passes the same env-derived values, so the winner is representative;
-    // a later differing value is ignored - the documented tradeoff of one shared
-    // pool. The loser of an init race drops its freshly built client (RAII).
-    let built = build_download_client(timeouts)?;
-    let client = CLIENT.get_or_init(|| built);
-    // Fix the default-on read-idle window (audit M4) alongside the client, same
-    // first-caller-wins discipline; HIPPIUS_READ_TIMEOUT overrides the default.
-    let _ = READ_IDLE.get_or_init(|| timeouts.read.unwrap_or(DOWNLOAD_READ_IDLE));
-    Ok(client)
-}
-
-/// Process-global cap on packs in flight across ALL concurrent downloads (every
-/// file in a snapshot), so the nested snapshot-workers x per-file-concurrency
-/// parallelism cannot multiply resident 64 MiB pack buffers into an OOM
-/// (8 workers x 32 x 64 MiB ~ 16 GB worst case). Sized from the FIRST call's
-/// `max_concurrent` (first-caller-wins, like `download_client`): in a uniform
-/// snapshot every file passes the same value, so the total in-flight budget equals
-/// one file's concurrency - a single large file is never throttled, and N files
-/// SHARE that budget rather than each getting the full amount. Mirrors the upload
-/// path's `_pack_upload_gate`.
-fn global_pack_gate(max_concurrent: usize) -> Arc<Semaphore> {
-    static GATE: OnceLock<Arc<Semaphore>> = OnceLock::new();
-    Arc::clone(GATE.get_or_init(|| Arc::new(Semaphore::new(max_concurrent))))
-}
 
 /// Aborts every held task handle when dropped. Fires on BOTH `assemble`'s
 /// early-return error path AND on cancellation (the whole `assemble` future dropped
@@ -480,41 +312,6 @@ fn validate_pack_plan(packs: &[PackPlanEntry], total_size: u64) -> Result<(), Co
     Ok(())
 }
 
-/// Resolve the whole-file digest once every pack has landed: prefer the digest the
-/// background hasher computed (its work overlapped the download), else fall back to
-/// a full re-read when the incremental pass could not cover the file in order. Both
-/// hash the same on-disk bytes, so the fallback is a slower route to an identical
-/// answer. A `JoinError` means the hasher task panicked - surfaced as the
-/// non-retryable `JoinFailed` rather than masked (the fn is written not to panic,
-/// so it is effectively unreachable, but a silent fallback would hide a real
-/// defect, and a panic reproduces on retry). Errors on a digest mismatch, which is
-/// exactly the cross-pack ordering failure this whole-file check exists to catch.
-async fn verify_file_digest(
-    hasher_task: Option<HasherTask>,
-    dest: &Path,
-    expected_file: &str,
-) -> Result<String, CoreError> {
-    let got = match hasher_task {
-        Some(task) => match task.await {
-            Ok(Some(digest)) => digest,
-            Ok(None) => compute_sha256(dest).await?,
-            Err(join_err) => {
-                return Err(CoreError::JoinFailed {
-                    index: None,
-                    source: join_err,
-                })
-            }
-        },
-        None => compute_sha256(dest).await?,
-    };
-    if got != expected_file {
-        return Err(CoreError::Integrity(format!(
-            "assembled file: expected sha256 {expected_file}, got {got}"
-        )));
-    }
-    Ok(got)
-}
-
 /// `url`/`targets`/`dest_path` are borrowed `Arc`s (Task C2): each retry attempt
 /// re-uses the same shared allocations, and `fetch_pack` clones only the pointers
 /// its `spawn_blocking` closure needs to be `'static`.
@@ -630,93 +427,10 @@ async fn fetch_pack(
     })?
 }
 
-/// Verify each carved chunk's sha256 against `bytes` and scatter its slice to the
-/// file offset. Runs on the blocking pool (audit L14): hashing is CPU-bound and the
-/// writes are local disk, so this does no async work and must not sit on the async
-/// runtime. A digest mismatch or out-of-range chunk is a PERMANENT `Integrity` error
-/// (a content-addressed blob serves the same wrong bytes on retry, and an
-/// out-of-bounds range is a bad plan) - distinct from the transport length anomalies
-/// in `fetch_pack`, which are the retryable `BadResponse`. A corrupt/mis-placed pack
-/// must never be written past its bounds.
-fn verify_and_scatter(
-    url: &str,
-    bytes: &[u8],
-    targets: &[PackChunkTarget],
-    dest_path: &Path,
-    pb: &ProgressBar,
-) -> Result<(), CoreError> {
-    use std::io::{Seek, Write};
-
-    let mut file = std::fs::OpenOptions::new().write(true).open(dest_path)?;
-    for PackChunkTarget {
-        offset_in_pack,
-        size,
-        file_offset,
-        expected_sha256: expected,
-    } in targets
-    {
-        let start = usize::try_from(*offset_in_pack).map_err(|_| {
-            CoreError::Integrity(format!("pack offset {offset_in_pack} exceeds usize"))
-        })?;
-        let end =
-            start
-                .checked_add(usize::try_from(*size).map_err(|_| {
-                    CoreError::Integrity(format!("chunk size {size} exceeds usize"))
-                })?)
-                .ok_or_else(|| CoreError::Integrity("chunk range overflow".to_string()))?;
-        if end > bytes.len() {
-            return Err(CoreError::Integrity(format!(
-                "pack {url}: chunk range {start}..{end} exceeds pack length {}",
-                bytes.len()
-            )));
-        }
-        let slice = &bytes[start..end];
-        // Binary 32-byte compare on the hot path; hex renders (via Display) only
-        // inside the failure message, so the match arm allocates nothing.
-        let got = Sha256Digest::of(slice);
-        if got != *expected {
-            return Err(CoreError::Integrity(format!(
-                "chunk at pack offset {offset_in_pack}: expected sha256 {expected}, got {got}"
-            )));
-        }
-        file.seek(SeekFrom::Start(*file_offset))?;
-        file.write_all(slice)?;
-        pb.inc(*size);
-    }
-    file.flush()?;
-    Ok(())
-}
-
-/// SHA-256 of the assembled file in one sequential read pass on the blocking
-/// pool. Same rationale as `chunked_downloader::compute_sha256`: the digest
-/// loop is CPU-bound and would starve the runtime's chunk tasks if run inline.
-pub(crate) async fn compute_sha256(path: &Path) -> Result<String, CoreError> {
-    use std::io::Read;
-
-    let path = path.to_path_buf();
-    tokio::task::spawn_blocking(move || -> Result<String, CoreError> {
-        let mut file = std::fs::File::open(&path)?;
-        let mut hasher = Sha256::new();
-        let mut buf = vec![0u8; VERIFY_READ_BUFFER];
-        loop {
-            let n = file.read(&mut buf)?;
-            if n == 0 {
-                break;
-            }
-            hasher.update(&buf[..n]);
-        }
-        Ok(hex::encode(hasher.finalize()))
-    })
-    .await
-    .map_err(|join_err| CoreError::JoinFailed {
-        index: None,
-        source: join_err,
-    })?
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::chunk_fetcher::test_support::{any_digest, chunk_target};
     use crate::incremental_hash::test_support::{pattern, reference, scratch_path, TempFileGuard};
     use std::collections::HashMap;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -727,93 +441,6 @@ mod tests {
     #[test]
     fn chunk_request_timeout_is_five_minutes() {
         assert_eq!(CHUNK_REQUEST_TIMEOUT, Duration::from_mins(5));
-    }
-
-    #[test]
-    fn verify_and_scatter_writes_chunks_and_rejects_bad_digest() {
-        // L14: the verify+scatter loop (moved onto the blocking pool) must place
-        // each chunk at its file offset only after its sha256 matches the expected
-        // digest, and reject a mismatched chunk as a (retryable) Integrity error.
-        use std::io::Read;
-        let pb = ProgressBar::hidden();
-        let (a, b) = (b"AAAA".as_slice(), b"BB".as_slice()); // 4 + 2 bytes
-        let pack: Vec<u8> = [a, b].concat();
-        let ha = Sha256Digest::of(a);
-        let hb = Sha256Digest::of(b);
-        // (offset_in_pack, size, file_offset, expected_digest): scatter A->0, B->4.
-        let good = vec![chunk_target(0, 4, 0, ha), chunk_target(4, 2, 4, hb)];
-
-        let path = std::env::temp_dir().join(format!("hippius-vs-{}.bin", std::process::id()));
-        let Ok(()) = std::fs::File::create(&path).and_then(|f| f.set_len(6)) else {
-            unreachable!("temp file create")
-        };
-        let Ok(()) = verify_and_scatter("u", &pack, &good, &path, &pb) else {
-            unreachable!("valid chunks must scatter")
-        };
-        let mut got = Vec::new();
-        let Ok(_) = std::fs::File::open(&path).and_then(|mut f| f.read_to_end(&mut got)) else {
-            unreachable!("read back")
-        };
-        assert_eq!(got, b"AAAABB");
-
-        // A wrong expected digest (hb over the "AAAA" slice) is a permanent Integrity
-        // error, so a corrupt/mis-placed pack is never accepted.
-        let bad = vec![chunk_target(0, 4, 0, hb)];
-        assert!(matches!(
-            verify_and_scatter("u", &pack, &bad, &path, &pb),
-            Err(CoreError::Integrity(_))
-        ));
-        let _ = std::fs::remove_file(&path);
-    }
-
-    #[tokio::test]
-    async fn read_chunk_bounded_trips_readstall_on_a_stalled_body() {
-        // Audit M4: a peer that sends the head + a few body bytes then stalls (no
-        // more data, socket held open) must be cut by the app-level per-read idle
-        // window as a retryable ReadStall - not left until the 5-minute total
-        // timeout. The client here has NO client read_timeout (default), so the
-        // app-level ReadStall is the sole guard, proving it is default-on.
-        let Ok(listener) = tokio::net::TcpListener::bind("127.0.0.1:0").await else {
-            return;
-        };
-        let Ok(addr) = listener.local_addr() else {
-            return;
-        };
-        let server = tokio::spawn(async move {
-            if let Ok((mut sock, _)) = listener.accept().await {
-                let mut buf = [0u8; 1024];
-                let _ = sock.read(&mut buf).await;
-                // Advertise 1000 bytes, send 8, then stall (hold the socket open).
-                let _ = sock
-                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 1000\r\n\r\nABCDEFGH")
-                    .await;
-                tokio::time::sleep(Duration::from_secs(30)).await;
-            }
-        });
-
-        let url = format!("http://{addr}/blob");
-        let Ok(client) = build_download_client(TransportTimeouts::default()) else {
-            unreachable!("client builds")
-        };
-        let Ok(mut res) = client.get(&url).send().await else {
-            unreachable!("GET connects")
-        };
-        let idle = Duration::from_millis(200);
-        let outcome = tokio::time::timeout(Duration::from_secs(5), async {
-            loop {
-                match read_chunk_bounded(&mut res, idle).await {
-                    Ok(Some(_)) => {}
-                    Ok(None) => return Ok(()),
-                    Err(e) => return Err(e),
-                }
-            }
-        })
-        .await;
-        server.abort();
-        assert!(
-            matches!(outcome, Ok(Err(CoreError::ReadStall(_)))),
-            "a stalled body read must abort as a retryable ReadStall, got {outcome:?}"
-        );
     }
 
     #[tokio::test]
@@ -862,79 +489,7 @@ mod tests {
         assert!(a.is_ok());
     }
 
-    #[tokio::test]
-    async fn read_timeout_aborts_a_stalled_response_body() {
-        // Audit M4: a peer that completes the handshake, sends response headers +
-        // a few body bytes, then goes silent (an application-layer stall
-        // `connect_timeout`/`tcp_keepalive` cannot see) must be cut by the client's
-        // `read_timeout`. Without it the body read hangs until the caller's 5-min
-        // total timeout; the download plane's whole point is to fail fast and retry.
-        use tokio::net::TcpListener;
-        let Ok(listener) = TcpListener::bind("127.0.0.1:0").await else {
-            return;
-        };
-        let Ok(addr) = listener.local_addr() else {
-            return;
-        };
-        let server = tokio::spawn(async move {
-            if let Ok((mut sock, _)) = listener.accept().await {
-                let mut buf = [0u8; 1024];
-                let _ = sock.read(&mut buf).await; // consume the request line/headers
-                                                   // Promise 1_000_000 bytes, deliver 8, then stall without closing.
-                let _ = sock
-                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 1000000\r\n\r\nabcdefgh")
-                    .await;
-                let _ = sock.flush().await;
-                tokio::time::sleep(Duration::from_secs(30)).await;
-            }
-        });
-
-        let Ok(client) = build_download_client(TransportTimeouts {
-            connect: Duration::from_secs(5),
-            read: Some(Duration::from_secs(1)),
-        }) else {
-            server.abort();
-            return;
-        };
-        let url = format!("http://{addr}/blob");
-        // `Ok(Err(_))` = the inner future finished with a reqwest error (read_timeout
-        // fired - correct). `Err(_)` = the test's own 8s bound elapsed, i.e. the read
-        // hung because `read_timeout` was NOT honored (the regression this guards).
-        let outcome = tokio::time::timeout(Duration::from_secs(8), async {
-            let resp = client.get(&url).send().await?;
-            resp.bytes().await
-        })
-        .await;
-        server.abort();
-        assert!(
-            matches!(outcome, Ok(Err(_))),
-            "a stalled body read must abort via read_timeout, got {outcome:?}"
-        );
-    }
-
-    use std::io::Write as _;
-
     // --- validate_pack_plan ---
-
-    fn chunk_target(
-        offset_in_pack: u64,
-        size: u64,
-        file_offset: u64,
-        sha: Sha256Digest,
-    ) -> PackChunkTarget {
-        PackChunkTarget {
-            offset_in_pack,
-            size,
-            file_offset,
-            expected_sha256: sha,
-        }
-    }
-
-    /// Placeholder digest for plan-validation tests, which never reach the
-    /// verify step - only offsets and sizes matter there.
-    fn any_digest() -> Sha256Digest {
-        Sha256Digest::from([0u8; 32])
-    }
 
     #[test]
     fn validate_pack_plan_accepts_in_bounds_tiling() {
@@ -1002,91 +557,6 @@ mod tests {
             chunks: vec![chunk_target(0, 10, 0, any_digest())],
         }];
         assert!(validate_pack_plan(&ok, 10).is_ok());
-    }
-
-    // --- verify_file_digest (fallback / mismatch / JoinError wiring) ---
-
-    #[tokio::test]
-    async fn verify_file_digest_prefers_incremental_without_reread() {
-        // Some(correct) is returned directly; `missing` never exists, so a stray
-        // fallback re-read would error and fail this assertion.
-        let missing = scratch_path("verify_fast");
-        let expected = reference(b"payload");
-        let e = expected.clone();
-        let task = tokio::spawn(async move { Some(e) });
-        assert_eq!(
-            verify_file_digest(Some(task), &missing, &expected)
-                .await
-                .ok(),
-            Some(expected)
-        );
-    }
-
-    #[tokio::test]
-    async fn verify_file_digest_falls_back_to_reread_when_incremental_none() {
-        let content = pattern(2048);
-        let path = scratch_path("verify_fallback");
-        let _g = TempFileGuard(path.clone());
-        let wrote = std::fs::File::create(&path).and_then(|mut f| f.write_all(&content));
-        assert!(wrote.is_ok());
-        let task = tokio::spawn(async { None });
-        assert_eq!(
-            verify_file_digest(Some(task), &path, &reference(&content))
-                .await
-                .ok(),
-            Some(reference(&content))
-        );
-    }
-
-    #[tokio::test]
-    async fn verify_file_digest_none_task_reads_from_disk() {
-        let content = pattern(2048);
-        let path = scratch_path("verify_notask");
-        let _g = TempFileGuard(path.clone());
-        let wrote = std::fs::File::create(&path).and_then(|mut f| f.write_all(&content));
-        assert!(wrote.is_ok());
-        assert_eq!(
-            verify_file_digest(None, &path, &reference(&content))
-                .await
-                .ok(),
-            Some(reference(&content))
-        );
-    }
-
-    #[tokio::test]
-    async fn verify_file_digest_rejects_mismatch() {
-        // Incremental yields a digest that disagrees with `expected` -> Integrity, not
-        // an accept. Guards the `got != expected_file` comparison against inversion.
-        let missing = scratch_path("verify_mismatch");
-        let task = tokio::spawn(async { Some("a".repeat(64)) });
-        let expected = "b".repeat(64);
-        assert!(matches!(
-            verify_file_digest(Some(task), &missing, &expected).await,
-            Err(CoreError::Integrity(_))
-        ));
-    }
-
-    #[tokio::test]
-    async fn verify_file_digest_surfaces_hasher_join_error_as_join_failed() {
-        // A JoinError (task cancelled/panicked) surfaces as the honest
-        // `JoinFailed { index: None }` - NOT `Io`, which `is_retryable` would
-        // classify transient: a panicked hasher closure reproduces identically on
-        // retry, so the error must classify permanent. Aborting a pending task
-        // yields the JoinError without a panic! macro (which the crate denies).
-        let missing = scratch_path("verify_join");
-        let task: HasherTask =
-            tokio::spawn(async { std::future::pending::<Option<String>>().await });
-        task.abort();
-        let res = verify_file_digest(Some(task), &missing, &"c".repeat(64)).await;
-        match res {
-            Err(err @ CoreError::JoinFailed { index: None, .. }) => {
-                assert!(
-                    !err.is_retryable(),
-                    "a join failure must classify permanent, got retryable: {err}"
-                );
-            }
-            other => unreachable!("expected JoinFailed {{ index: None }}, got {other:?}"),
-        }
     }
 
     // --- assemble (end-to-end orchestration over a local pack server) ---
