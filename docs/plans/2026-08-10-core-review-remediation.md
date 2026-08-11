@@ -834,6 +834,11 @@ loop to consume `packs` by value, or wrap entries in `Arc`); drop the
 Windows) for `verify_and_scatter` and `read_ranges`. Only do this with a
 measurement in hand; otherwise record "skipped, no evidence" in the PR and move on.
 
+> **OUTCOME (2026-08-11): skipped, no evidence.** No profiling during Phase B/C
+> surfaced seek-syscall cost on the scatter or pack-read paths (both are
+> bandwidth-bound; C1/C2 landed the measured wins). Re-open only with a
+> measurement showing per-chunk seek overhead.
+
 ---
 
 # Phase D — Structure (branch `refactor/core-module-split`)
