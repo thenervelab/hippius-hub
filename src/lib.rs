@@ -22,6 +22,7 @@ mod diagnostics;
 mod digest;
 mod incremental_hash;
 mod retry;
+mod transport;
 mod uploader;
 
 use chunk_fetcher::{PackAssembler, PackChunkTarget, PackPlanEntry, TransportTimeouts};

@@ -848,6 +848,12 @@ Phases B/C don't churn through renamed files.
 
 ### Task D1: split `src/uploader.rs`
 
+> **OUTCOME (2026-08-11): delivered as 8 files, not the sketched 6** — Phase B
+> added `stream.rs` (ChunkStreamCore) and `hash.rs` after this plan was written.
+> Placement deviations (INIT_POST_TIMEOUT, session helpers → blob.rs;
+> read_ranges → pack.rs) documented in commit 1c70187's message; purity proven
+> by token-multiset audit on both sides of the review.
+
 `src/uploader/` directory: `mod.rs` (re-exports keep `crate::uploader::*` paths
 stable), `cdc.rs` (chunk+hash pipeline, ChunkStream producer), `client.rs`
 (upload_client + consts), `watchdog.rs` (`DoneOnEof`, `send_streaming_watchdogged`,
@@ -872,6 +878,18 @@ Single `src/transport.rs` holding the shared named constants
 `CHUNK_REQUEST_TIMEOUT`) with the existing per-side doc comments preserved; both
 clients import. Do NOT merge the clients themselves — the upload/download timeout
 philosophies differ deliberately (`src/uploader.rs:269-281`).
+
+> **OUTCOME (2026-08-11): done, with two adjustments.** The three 8 MiB read
+> buffers (`HASH_READ_BUFFER` + two `VERIFY_READ_BUFFER` copies — same value,
+> same syscall-count rationale, audit L16) merged into ONE constant,
+> `IO_READ_BUFFER`, rather than re-exporting two names for one number; per-side
+> doc comments were merged (audit refs M-UPLOAD-CONNECT, L9, L16, D6 all
+> preserved), not kept verbatim. `HEAD_REQUEST_TIMEOUT` (and
+> `DOWNLOAD_READ_IDLE`/`DOWNLOAD_POOL_MAX_IDLE`) stayed local — single
+> consumer each, nothing shared to consolidate. The two per-side
+> `CHUNK_REQUEST_TIMEOUT` value-pin tests merged into one in `transport.rs`
+> (cargo test 153 - 2 + 1 = 152). All values byte-identical before/after.
+> The clients themselves remain separate, as specified.
 
 ---
 

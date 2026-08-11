@@ -14,11 +14,13 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::mpsc::{Receiver, Sender};
 
-use crate::chunk_fetcher::VERIFY_READ_BUFFER;
+use crate::transport::IO_READ_BUFFER;
 
-/// Extents `(file_offset, size)` one completed pack contributes to the whole-file
-/// hasher - the payload of the incremental-hash channel. One byte of the file
-/// belongs to exactly one extent, so the extents across all packs tile the file.
+/// Extents `(file_offset, size)` one completed unit of download work - a pack on
+/// the pack path, a chunk on the Range path - contributes to the whole-file
+/// hasher: the payload of the incremental-hash channel. One byte of the file
+/// belongs to exactly one extent, so the extents across all completed units tile
+/// the file.
 pub(crate) type HashSignal = Vec<(u64, u64)>;
 
 /// The join handle for the background incremental hasher; yields the whole-file
@@ -26,15 +28,17 @@ pub(crate) type HashSignal = Vec<(u64, u64)>;
 /// `incremental_hash`).
 pub(crate) type HasherTask = tokio::task::JoinHandle<Option<String>>;
 
-/// What `spawn_incremental_hasher` hands back: the sender each pack signals
-/// completion on and the task handle to await, or `(None, None)` when the caller
-/// requested no whole-file digest.
+/// What `spawn_incremental_hasher` hands back: the sender the producer (a pack
+/// task, or the Range path's join-drain loop) signals completed-unit extents on
+/// and the task handle to await, or `(None, None)` when the caller requested no
+/// whole-file digest.
 pub(crate) type IncrementalHash = (Option<Sender<HashSignal>>, Option<HasherTask>);
 
 /// Spawn the background incremental hasher (see `incremental_hash`) when the caller
-/// asked for whole-file verification, handing back the sender packs signal
-/// completion on and the task handle to await. Returns `(None, None)` when no digest
-/// was requested, so the fan-out and finalize paths stay uniform either way.
+/// asked for whole-file verification, handing back the sender its producer signals
+/// completed-unit extents on and the task handle to await. Returns `(None, None)`
+/// when no digest was requested, so the fan-out and finalize paths stay uniform
+/// either way.
 pub(crate) fn spawn_incremental_hasher(
     dest: &Path,
     total_size: u64,
@@ -49,27 +53,28 @@ pub(crate) fn spawn_incremental_hasher(
     (Some(tx), Some(task))
 }
 
-/// Whole-file SHA-256 folded together incrementally from packs as they land, used
-/// to prove chunk *ordering* across packs (the one property per-chunk digests
-/// cannot). Runs on the blocking pool for the same reason as `compute_sha256`: the
-/// digest loop is CPU-bound and would starve the runtime's fetch tasks inline.
+/// Whole-file SHA-256 folded together incrementally from completed units (packs on
+/// the pack path, chunks on the Range path) as they land, used to prove content
+/// *ordering* across those units (the one property per-chunk digests cannot). Runs
+/// on the blocking pool for the same reason as `compute_sha256`: the digest loop is
+/// CPU-bound and would starve the runtime's fetch tasks inline.
 ///
-/// Each `recv` carries the `(file_offset, size)` extents one completed pack wrote.
-/// `pending` (keyed by start offset) is the reorder buffer for out-of-order packs;
-/// it holds only metadata - the bytes are already on disk - so it stays a few bytes
-/// per chunk and can never grow to the file size the way an in-memory byte reorder
-/// buffer would. `watermark` is the end of the region contiguously covered from
+/// Each `recv` carries the `(file_offset, size)` extents one completed unit wrote.
+/// `pending` (keyed by start offset) is the reorder buffer for out-of-order
+/// completions; it holds only metadata - the bytes are already on disk - so it stays
+/// a few bytes per chunk and can never grow to the file size the way an in-memory
+/// byte reorder buffer would. `watermark` is the end of the region contiguously covered from
 /// offset 0; it advances only when the extent starting exactly at the watermark has
 /// arrived. Whenever the watermark moves past `hashed`, the newly-contiguous span is
 /// read straight from the just-written (page-cache-warm) file and folded into the
-/// hasher, in strict offset order. Reads and the concurrent pack writes never touch
-/// the same bytes (each byte is written once and flushed before its extent is
+/// hasher, in strict offset order. Reads and the concurrent producer writes never
+/// touch the same bytes (each byte is written once and flushed before its extent is
 /// signalled), so the separate read handle is page-cache-coherent without locking.
 ///
 /// Best-effort by contract: returns `Some(digest)` ONLY after consuming exactly
-/// `[0, total_size)` in order AND draining every signalled extent (so no pack wrote
-/// past `total_size`); any shortfall - an abort closing the channel early, a coverage
-/// gap, a read error, or an out-of-bounds extent left in `pending` - yields `None` so
+/// `[0, total_size)` in order AND draining every signalled extent (so no producer
+/// wrote past `total_size`); any shortfall - an abort closing the channel early, a
+/// coverage gap, a read error, or an out-of-bounds extent left in `pending` - yields `None` so
 /// the caller re-reads. It therefore hashes the identical bytes `compute_sha256`
 /// would and can only ever be a faster route to the same digest, never a different
 /// verdict.
@@ -82,7 +87,7 @@ pub(crate) fn incremental_hash(
 
     let mut file = std::fs::File::open(path).ok()?;
     let mut hasher = Sha256::new();
-    let mut buf = vec![0u8; VERIFY_READ_BUFFER];
+    let mut buf = vec![0u8; IO_READ_BUFFER];
     let mut pending: HashMap<u64, u64> = HashMap::new();
     // Invariant: `hashed` == the file read position == bytes folded into `hasher`,
     // and `hashed <= watermark <= total_size` holds throughout.
@@ -107,9 +112,9 @@ pub(crate) fn incremental_hash(
         }
     }
 
-    // Channel closed: every pack task has finished. Require BOTH that the hash
+    // Channel closed: every producer has finished. Require BOTH that the hash
     // covered exactly `total_size` AND that `pending` drained. A leftover extent
-    // means a pack wrote beyond the contiguous [0, total_size) region - an
+    // means a producer wrote beyond the contiguous [0, total_size) region - an
     // out-of-bounds placement leaves the on-disk file longer than total_size - so
     // returning the prefix digest here would ACCEPT a file the full re-read rejects.
     // Any leftover instead forces None, and the caller re-reads to EOF and catches
