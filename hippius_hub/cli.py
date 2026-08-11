@@ -30,6 +30,10 @@ from .console import ConsoleError
 # 10+ codespace rationale as the download/upload exit codes: stay out of
 # bash's reserved 1-2 range (1 = generic, 2 = misuse of shell builtin /
 # argparse usage error) so shell wrappers can branch deterministically.
+# Deliberately the SAME value `_format_download_error` maps
+# `RepositoryNotFoundError` to, so the two routes to "this repo is gone" —
+# the typed-exception dispatch and the two inline checks below — agree.
+EXIT_REPO_NOT_FOUND = 11        # `revisions` / `repos delete` -> repo is gone
 EXIT_NAMESPACE_TAKEN = 17       # `registry check <name>` -> name is taken
 EXIT_INVALID_REPO_FORMAT = 18   # CLI arg `<project>/<repo>` is malformed
 
@@ -90,6 +94,12 @@ def _format_download_error(e: Exception) -> tuple[str, int]:
     Codes 17 and 18 are non-exception paths (validated by the CLI itself
     before any HTTP call) so they don't appear in this function's
     dispatch — they're set inline by the registry/models handlers.
+    Code 11 is reachable BOTH ways: dispatched here from
+    `RepositoryNotFoundError`, and set inline as `EXIT_REPO_NOT_FOUND` by
+    `revisions` (which gets `None` back from `_list_tags` rather than an
+    exception) and by `repos delete` on a 404. Both routes must keep
+    reporting the same code, which is why that constant is defined next to
+    the others instead of written as a bare literal at the call sites.
 
     Ordering invariant: HF's typed exception hierarchy has three subclass
     relationships that matter here — LocalEntryNotFoundError <: Entry-
@@ -345,7 +355,7 @@ def cmd_registry_repos_delete(args):
         if status == 404:
             print(f"❌ Repository not found: {args.repo_id} "
                   f"(pass --missing-ok to ignore).")
-            sys.exit(11)
+            sys.exit(EXIT_REPO_NOT_FOUND)
         raise
     print(f"✅ Repo deleted: {args.repo_id}")
 
@@ -585,7 +595,7 @@ def cmd_revisions(args):
         # 1 here, so a wrapper could not tell "this repo is gone" apart from any
         # other generic failure — and the sibling 401 path (deleted namespace)
         # exited 1 too, via an uncaught traceback.
-        sys.exit(11)
+        sys.exit(EXIT_REPO_NOT_FOUND)
     if not tags:
         print("No revisions yet.")
         return

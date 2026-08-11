@@ -29,8 +29,14 @@ No API, CLI, or environment-variable changes. Artifacts are byte-identical to
 
 ### Fixed
 
-- `hippius-hub revisions` no longer prints a traceback for a missing, deleted, or
-  private repository — one actionable line, non-zero exit.
+- `hippius-hub revisions` no longer prints an `httpx` traceback when the registry
+  answers `401` — a private repository, or a namespace that does not exist or was
+  deleted outright. It now prints one actionable line pointing at
+  `hippius-hub login`. A missing or deleted repo *inside* a namespace you can
+  already reach reported cleanly in 0.6.1 too; only the namespace-level 401 path
+  was broken. Note the not-found exit code is the documented `11`
+  (`EXIT_REPO_NOT_FOUND` / `RepositoryNotFoundError`), not the `1` that 0.6.1
+  returned incidentally from the uncaught exception.
 - A crashed hashing task no longer retries. It was treated as transient I/O and
   retried three times, re-downloading up to three ~64 MiB packs before failing.
 - Unrecoverable upload sessions report the real cause instead of a fabricated
