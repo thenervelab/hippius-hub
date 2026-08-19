@@ -254,6 +254,15 @@ def resolve_max_inflight_packs() -> int:
     return _resolve_positive_int("HIPPIUS_MAX_INFLIGHT_PACKS", resolve_upload_workers())
 
 
+def experimental_repo_types_enabled() -> bool:
+    """True when dataset/space repo types are explicitly opted into
+    (HIPPIUS_EXPERIMENTAL_REPO_TYPES truthy). Those types map to shared
+    registry namespaces that customer access keys have no permissions on,
+    so by default the client refuses them up front instead of letting the
+    registry's 401 surface as a misleading "repository not found"."""
+    return os.environ.get("HIPPIUS_EXPERIMENTAL_REPO_TYPES", "").lower() in ("1", "true", "yes")
+
+
 def debug_enabled() -> bool:
     """True when verbose transport logging is requested (HIPPIUS_DEBUG truthy
     or RUST_LOG set). The CLI also flips HIPPIUS_DEBUG on for `--verbose`."""

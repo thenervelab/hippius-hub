@@ -23,6 +23,13 @@ TYPE_CASES = [
 ]
 
 
+@pytest.fixture(autouse=True)
+def _experimental_repo_types(monkeypatch):
+    # dataset/space mapping is gated off by default (shared namespaces customer
+    # keys can't access); these are pure construction tests, so opt in.
+    monkeypatch.setenv("HIPPIUS_EXPERIMENTAL_REPO_TYPES", "1")
+
+
 class _FakeResponse:
     """Minimal stand-in: _build_commit_info only reads response.headers.get()."""
     def __init__(self, digest="sha256:deadbeef"):
