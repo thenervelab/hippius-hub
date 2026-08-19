@@ -31,19 +31,37 @@ from tests._helpers import sha256_of_file, write_test_file
 @pytest.mark.parametrize("repo_type,expected", [
     (None,      "foo/bar"),
     ("model",   "foo/bar"),
-    ("dataset", "datasets/foo/bar"),
-    ("space",   "spaces/foo/bar"),
 ])
 def test_oci_repo_path_mapping(repo_type, expected):
     assert _oci_repo_path("foo/bar", repo_type) == expected
+
+
+@pytest.mark.parametrize("repo_type,expected", [
+    ("dataset", "datasets/foo/bar"),
+    ("space",   "spaces/foo/bar"),
+])
+def test_oci_repo_path_mapping_experimental_types(repo_type, expected, monkeypatch):
+    monkeypatch.setenv("HIPPIUS_EXPERIMENTAL_REPO_TYPES", "1")
+    assert _oci_repo_path("foo/bar", repo_type) == expected
+
+
+@pytest.mark.parametrize("repo_type", ["dataset", "space"])
+def test_oci_repo_path_rejects_dataset_space_by_default(repo_type, monkeypatch):
+    """dataset/space map to shared namespaces customer keys hold no grants on,
+    so without the experimental opt-in the client refuses up front instead of
+    letting the registry 401 surface as a bogus RepositoryNotFoundError."""
+    monkeypatch.delenv("HIPPIUS_EXPERIMENTAL_REPO_TYPES", raising=False)
+    with pytest.raises(NotImplementedError, match="Omit repo_type"):
+        _oci_repo_path("foo/bar", repo_type)
 
 
 @pytest.mark.parametrize("repo_type,repo_id", [
     ("dataset", "datasets/foo"),
     ("space",   "spaces/foo"),
 ])
-def test_oci_repo_path_rejects_double_prefix(repo_type, repo_id):
+def test_oci_repo_path_rejects_double_prefix(repo_type, repo_id, monkeypatch):
     """Catch the foot-gun where a user passes the prefix in repo_id."""
+    monkeypatch.setenv("HIPPIUS_EXPERIMENTAL_REPO_TYPES", "1")
     with pytest.raises(ValueError, match="already starts with"):
         _oci_repo_path(repo_id, repo_type)
 
@@ -153,17 +171,25 @@ def test_hf_hub_url_custom_endpoint():
     )
 
 
-def test_hf_hub_url_dataset_namespaces_under_datasets():
+def test_hf_hub_url_dataset_namespaces_under_datasets(monkeypatch):
     """dataset repos resolve to /v2/datasets/{repo_id}/manifests/..."""
+    monkeypatch.setenv("HIPPIUS_EXPERIMENTAL_REPO_TYPES", "1")
     assert hf_hub_url("foo/bar", "model.bin", repo_type="dataset") == (
         "https://registry.hippius.com/v2/datasets/foo/bar/manifests/main"
     )
 
 
-def test_hf_hub_url_space_namespaces_under_spaces():
+def test_hf_hub_url_space_namespaces_under_spaces(monkeypatch):
+    monkeypatch.setenv("HIPPIUS_EXPERIMENTAL_REPO_TYPES", "1")
     assert hf_hub_url("foo/bar", "model.bin", repo_type="space") == (
         "https://registry.hippius.com/v2/spaces/foo/bar/manifests/main"
     )
+
+
+def test_hf_hub_url_dataset_rejected_without_optin(monkeypatch):
+    monkeypatch.delenv("HIPPIUS_EXPERIMENTAL_REPO_TYPES", raising=False)
+    with pytest.raises(NotImplementedError, match="Omit repo_type"):
+        hf_hub_url("foo/bar", "model.bin", repo_type="dataset")
 
 
 def test_hf_hub_url_rejects_unknown_repo_type():
