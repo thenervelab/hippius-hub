@@ -1,0 +1,100 @@
+# Online copy. Harbor stays live. Does not change helm.
+# Replace REPLACE_ME_BUCKET, then: kubectl -n harbor apply -f this
+# Re-apply (delete job, apply again) for catch-up. rclone skips equal-size objects.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: harbor-blob-copy
+  namespace: harbor
+spec:
+  backoffLimit: 6
+  ttlSecondsAfterFinished: 86400
+  activeDeadlineSeconds: 172800
+  template:
+    metadata:
+      labels:
+        app: harbor-blob-copy
+    spec:
+      restartPolicy: OnFailure
+      affinity:
+        nodeAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              preference:
+                matchExpressions:
+                  - key: kubernetes.io/hostname
+                    operator: In
+                    values:
+                      - k8s-v3-node1
+      containers:
+        - name: rclone
+          image: rclone/rclone:1.75.0
+          imagePullPolicy: IfNotPresent
+          args:
+            - copy
+            - /storage/docker/registry/v2/blobs
+            - s3:REPLACE_ME_BUCKET/docker/registry/v2/blobs
+            - --include
+            - "**/data"
+            - --size-only
+            - --transfers
+            - "8"
+            - --checkers
+            - "16"
+            - --retries
+            - "10"
+            - --low-level-retries
+            - "20"
+            - --retries-sleep
+            - 5s
+            - --s3-chunk-size
+            - 64M
+            - --s3-upload-concurrency
+            - "4"
+            - --stats
+            - 60s
+            - --stats-one-line
+            - --log-level
+            - INFO
+          env:
+            - name: AWS_ACCESS_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: harbor-s3
+                  key: REGISTRY_STORAGE_S3_ACCESSKEY
+            - name: AWS_SECRET_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: harbor-s3
+                  key: REGISTRY_STORAGE_S3_SECRETKEY
+            - name: AWS_REGION
+              value: us-east-1
+            - name: RCLONE_CONFIG_S3_TYPE
+              value: s3
+            - name: RCLONE_CONFIG_S3_PROVIDER
+              value: Other
+            - name: RCLONE_CONFIG_S3_ENV_AUTH
+              value: "true"
+            - name: RCLONE_CONFIG_S3_ENDPOINT
+              value: http://gateway.hippius-s3-prod.svc.cluster.local:8080
+            - name: RCLONE_CONFIG_S3_FORCE_PATH_STYLE
+              value: "true"
+            - name: RCLONE_CONFIG_S3_NO_CHECK_BUCKET
+              value: "true"
+            - name: RCLONE_CONFIG_S3_REGION
+              value: us-east-1
+          volumeMounts:
+            - name: registry-data
+              mountPath: /storage
+              readOnly: true
+          resources:
+            requests:
+              cpu: "2"
+              memory: 4Gi
+            limits:
+              cpu: "8"
+              memory: 8Gi
+      volumes:
+        - name: registry-data
+          persistentVolumeClaim:
+            claimName: harbor-registry

@@ -1,0 +1,58 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: arm-c-bench
+  namespace: harbor-staging
+spec:
+  backoffLimit: 1
+  ttlSecondsAfterFinished: 86400
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: bench
+          image: python:3.12-slim-bookworm
+          env:
+            - name: HARBOR_ENDPOINT
+              value: http://harbor.harbor-staging.svc.cluster.local
+            - name: HARBOR_ADMIN_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: harbor-staging-admin
+                  key: HARBOR_ADMIN_PASSWORD
+            - name: BENCH_SIZE_MIB
+              value: "1024"
+            - name: BENCH_RUNS
+              value: "3"
+            - name: PIP_DISABLE_PIP_VERSION_CHECK
+              value: "1"
+            - name: HIPPIUS_UPLOAD_WORKERS
+              value: "16"
+            - name: HIPPIUS_MAX_INFLIGHT_PACKS
+              value: "16"
+          resources:
+            requests:
+              cpu: "4"
+              memory: 3Gi
+            limits:
+              cpu: "8"
+              memory: 6Gi
+          volumeMounts:
+            - name: data
+              mountPath: /data
+            - name: script
+              mountPath: /bench
+          command:
+            - /bin/sh
+            - -c
+            - |
+              set -eu
+              pip install --no-cache-dir 'hippius_hub==0.7.0' httpx
+              python /bench/arm_c_bench.py
+      volumes:
+        - name: data
+          emptyDir:
+            sizeLimit: 2Gi
+        - name: script
+          configMap:
+            name: arm-c-bench
