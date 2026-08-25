@@ -625,8 +625,59 @@ def test_v2_keyboard_interrupt_mid_stream_aborts_without_commit(monkeypatch, tmp
     # (cancelled-or-completed — here it had already started, so: completed).
     assert finished.is_set(), "the executor must join the in-flight pack, not strand it"
     # No-commit proof: neither the pointer blob nor the manifest was PUT.
-    assert not put_bodies, "no blob may be PUT after a mid-stream interrupt"
+    # The empty `{}` config blob may land: it is kicked off before the pack
+    # wave and does not depend on pack digests (it is the same blob for every
+    # repo). Anything else is a pointer or pack body and must not commit.
+    assert put_bodies in ([], [b"{}"]), (
+        "no pointer/pack blob may be PUT after a mid-stream interrupt"
+    )
     assert "manifest" not in captured, "no manifest may be committed after an interrupt"
+
+
+@respx.mock
+def test_v2_config_blob_overlaps_pack_wave(monkeypatch, tmp_path):
+    """The empty `{}` config blob does not depend on pack digests.
+
+    `upload_file` must start `_ensure_config_blob_uploaded` before the pack
+    wave returns; otherwise the Harbor digest-PUT sits in the sequential
+    tail (pointer → config → manifest). Handshake: config waits for the
+    pack upload to start, and the pack waits for config to start. Sequential
+    order deadlocks one of those waits and fails this test.
+    """
+    monkeypatch.setenv("HIPPIUS_CHUNK_THRESHOLD", "1")
+    monkeypatch.setenv("HIPPIUS_CHUNKED_WRITE", "1")
+    monkeypatch.setenv("HIPPIUS_PACK_SIZE", "40")
+    captured = {}
+    _wire_registry(monkeypatch, captured, stub_chunks=False)
+
+    pack_started = threading.Event()
+    config_started = threading.Event()
+    real_config = file_upload._ensure_config_blob_uploaded
+
+    def _config(*args, **kwargs):
+        config_started.set()
+        assert pack_started.wait(2), "config ran without the pack wave starting"
+        return real_config(*args, **kwargs)
+
+    def _slow_pack(uploads_url, path, ranges, auth_token):
+        pack_started.set()
+        assert config_started.wait(2), "pack wave ran without config starting"
+        return _pack_digest(ranges)
+
+    monkeypatch.setattr(file_upload, "_ensure_config_blob_uploaded", _config)
+    monkeypatch.setattr(
+        file_upload,
+        "chunk_stream_native",
+        lambda path, avg: _FakeChunkStream([CHUNK_METAS[:1]], WHOLE_HEX),
+    )
+    monkeypatch.setattr(file_upload, "pack_upload_native", _slow_pack)
+
+    src = tmp_path / "big.bin"
+    src.write_bytes(b"x" * 100)
+    upload_file(
+        path_or_fileobj=str(src), path_in_repo="big.bin", repo_id=REPO, token="tok"
+    )
+    assert "manifest" in captured
 
 
 @respx.mock

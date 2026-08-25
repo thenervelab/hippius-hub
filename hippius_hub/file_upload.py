@@ -1036,15 +1036,22 @@ def upload_file(
                 dedup_index, pack_sizes = _build_dedup_index(
                     existing, registry, oci_repo, oci_token, exclude_packs=exclude_packs
                 )
-            new_layers = _upload_file_layers(
-                file_path, path_in_repo, registry, oci_repo, oci_token, dedup_index, pack_sizes
-            )
+            # The empty `{}` config blob does not depend on pack digests.
+            # Start it before the pack wave so its Harbor digest-PUT overlaps
+            # the layer uploads instead of sitting in the sequential tail
+            # (pointer → config → manifest).
+            with ThreadPoolExecutor(max_workers=1) as cfg_pool:
+                cfg_fut = cfg_pool.submit(
+                    _ensure_config_blob_uploaded, registry, oci_repo, oci_token
+                )
+                new_layers = _upload_file_layers(
+                    file_path, path_in_repo, registry, oci_repo, oci_token, dedup_index, pack_sizes
+                )
 
-            existing_layers = existing.manifest.get("layers", []) if existing else []
-            prev_digest = _prev_digest_or_warn(existing, repo_id, revision)
-            merged_layers = _merge_layers(existing_layers, new_layers)
-
-            config_digest, config_size = _ensure_config_blob_uploaded(registry, oci_repo, oci_token)
+                existing_layers = existing.manifest.get("layers", []) if existing else []
+                prev_digest = _prev_digest_or_warn(existing, repo_id, revision)
+                merged_layers = _merge_layers(existing_layers, new_layers)
+                config_digest, config_size = cfg_fut.result()
             manifest = _assemble_manifest(
                 config_digest, config_size, merged_layers, commit_message, commit_description
             )
