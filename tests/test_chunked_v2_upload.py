@@ -630,11 +630,12 @@ def test_v2_keyboard_interrupt_mid_stream_aborts_without_commit(monkeypatch, tmp
 
 
 @respx.mock
-def test_v2_streaming_duplicate_chunks_pack_twice(monkeypatch, tmp_path):
-    """No self-dedup, held end-to-end through the stream: a digest occurring twice
-    within one file (absent from the dedup index) is packed twice. Split across
-    two batches, with the pack under HIPPIUS_PACK_SIZE, this also pins the
-    final-partial-pack path (submitted from new_packs[n_emitted:] after finish)."""
+def test_v2_streaming_duplicate_chunks_pack_once(monkeypatch, tmp_path):
+    """Intra-file self-dedup through the stream: a digest occurring twice
+    within one file (absent from the prior-revision index) is stored once.
+    Split across two batches, with the pack under HIPPIUS_PACK_SIZE, this
+    also pins the final-partial-pack path (submitted from
+    new_packs[n_emitted:] after finish)."""
     dup_metas = [("a" * 64, 0, 40), ("a" * 64, 40, 40)]
     monkeypatch.setenv("HIPPIUS_CHUNK_THRESHOLD", "1")
     monkeypatch.setenv("HIPPIUS_CHUNKED_WRITE", "1")
@@ -650,11 +651,10 @@ def test_v2_streaming_duplicate_chunks_pack_twice(monkeypatch, tmp_path):
     src.write_bytes(b"x" * 80)
     upload_file(path_or_fileobj=str(src), path_in_repo="big.bin", repo_id=REPO, token="tok")
 
-    # Both occurrences packed, in file order, into the one (partial) pack.
-    assert packs_seen == [[(0, 40), (40, 40)]]
+    assert packs_seen == [[(0, 40)]]
     ptr_blob = next(b for b in put_bodies if b'"chunked-v2"' in b)
     refs = parse_pointer_v2(ptr_blob)
     assert [(r.chunk_digest, r.pack_offset) for r in refs] == [
         ("sha256:" + "a" * 64, 0),
-        ("sha256:" + "a" * 64, 40),
+        ("sha256:" + "a" * 64, 0),
     ]

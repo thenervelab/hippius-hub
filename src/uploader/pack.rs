@@ -1,45 +1,101 @@
 use bytes::Bytes;
 use sha2::{Digest, Sha256};
+use std::collections::HashMap;
 use std::io::SeekFrom;
 use std::path::Path;
+use std::sync::Arc;
+use std::sync::Mutex;
+use std::sync::OnceLock;
+use std::time::Duration;
 use tokio::fs::File;
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
+use tokio::sync::Mutex as AsyncMutex;
 
 use crate::error::CoreError;
 use crate::uploader::blob::{init_upload_session, UPLOAD_MAX_RETRIES};
+use crate::uploader::client::upload_client;
 use crate::uploader::watchdog::{
     pack_frames, send_put_watchdogged, RESPONSE_WAIT_TIMEOUT, WRITE_STALL_TIMEOUT,
 };
+
+/// Bound on pack HEAD (no body). Same order as the init POST: a hung registry
+/// must not hold the single-flight slot forever.
+const PACK_HEAD_TIMEOUT: Duration = Duration::from_secs(30);
+
+type InflightSlot = Arc<AsyncMutex<Option<String>>>;
+
+fn inflight_slots() -> &'static Mutex<HashMap<String, InflightSlot>> {
+    static SLOTS: OnceLock<Mutex<HashMap<String, InflightSlot>>> = OnceLock::new();
+    SLOTS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn slot_for(digest: &str) -> InflightSlot {
+    let mut map = match inflight_slots().lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    map.entry(digest.to_owned())
+        .or_insert_with(|| Arc::new(AsyncMutex::new(None)))
+        .clone()
+}
+
+fn drop_slot(digest: &str) {
+    let mut map = match inflight_slots().lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    map.remove(digest);
+}
+
+/// `{registry}/v2/{repo}/blobs/uploads/` → `{registry}/v2/{repo}/blobs/{digest}`.
+pub(super) fn blob_head_url(uploads_url: &str, digest: &str) -> Result<String, CoreError> {
+    let trimmed = uploads_url.trim_end_matches('/');
+    let Some(blobs) = trimmed.strip_suffix("/uploads") else {
+        return Err(CoreError::InvalidArgument(format!(
+            "uploads URL missing /uploads suffix: {uploads_url}"
+        )));
+    };
+    Ok(format!("{blobs}/{digest}"))
+}
+
+async fn blob_already_present(
+    uploads_url: &str,
+    digest: &str,
+    auth_token: Option<&str>,
+) -> Result<bool, CoreError> {
+    let url = blob_head_url(uploads_url, digest)?;
+    let client = upload_client()?;
+    let mut req = client.head(&url).timeout(PACK_HEAD_TIMEOUT);
+    if let Some(token) = auth_token {
+        req = req.bearer_auth(token);
+    }
+    let resp = req.send().await?;
+    match resp.status().as_u16() {
+        200 => Ok(true),
+        404 => Ok(false),
+        status => Err(CoreError::ServerError(
+            status,
+            format!("pack HEAD {digest}"),
+        )),
+    }
+}
 
 /// Read the given file byte-ranges in order into one pack blob and push it via a
 /// fresh OCI upload session (POST init + monolithic PUT-with-digest). Returns the
 /// pack's sha256 hex - the chunked-v2 caller records it in the pointer blob.
 ///
-/// A pack holds only NEW chunks (chunks the dedup index had no entry for), so its
-/// content digest is necessarily new and no HEAD is done (it would always 404).
-/// The pack is buffered once (~64 MiB target); at the upload-worker concurrency
-/// that is a bounded peak, and it keeps the retry body cheap to re-send.
+/// Identical pack bytes (intra-file CDC repeats, or two files racing) share one
+/// PUT: HEAD the digest, then single-flight the upload. The pack is buffered
+/// once (~64 MiB target); at the upload-worker concurrency that is a bounded
+/// peak, and it keeps the retry body cheap to re-send.
 pub async fn pack_upload_async(
     uploads_url: &str,
     path: &Path,
     ranges: &[(u64, u64)],
     auth_token: Option<&str>,
 ) -> Result<String, CoreError> {
-    // Own the pack bytes once as `Bytes`: the hash pass and every retry share a
-    // single allocation (a `Bytes` clone is a refcount bump, not a copy), so an
-    // in-flight pack costs one pack_size instead of two - `read_ranges`' `Vec`
-    // converts in without reallocating. The prior `.body(buf.to_vec())` re-copied
-    // the whole pack on each attempt, which the staging peak-RSS benchmark showed
-    // roughly doubled resident memory per concurrent upload.
     let body = Bytes::from(read_ranges(path, ranges).await?);
-    // Hash the ~64 MiB pack on the blocking pool (audit L14): the digest is
-    // CPU-bound and would otherwise stall the runtime's other in-flight pack
-    // uploads for the duration. The `Bytes` clone into the closure is a refcount
-    // bump, not a copy, so the pack is still buffered exactly once.
     let body_for_hash = body.clone();
-    // A join failure here (panicked digest closure / runtime shutdown) is
-    // `JoinFailed`, not `Io`: it reproduces on retry, so it must classify
-    // permanent rather than burn the pack retry budget below.
     let digest_hex =
         tokio::task::spawn_blocking(move || hex::encode(Sha256::digest(&body_for_hash)))
             .await
@@ -48,16 +104,46 @@ pub async fn pack_upload_async(
                 source: join_err,
             })?;
     let digest = format!("sha256:{digest_hex}");
+    put_pack_single_flight(uploads_url, &body, &digest, digest_hex, auth_token).await
+}
+
+async fn put_pack_single_flight(
+    uploads_url: &str,
+    body: &Bytes,
+    digest: &str,
+    digest_hex: String,
+    auth_token: Option<&str>,
+) -> Result<String, CoreError> {
+    let slot = slot_for(digest);
+    let mut guard = slot.lock().await;
+    if let Some(done) = guard.as_ref() {
+        return Ok(done.clone());
+    }
+    if blob_already_present(uploads_url, digest, auth_token).await? {
+        *guard = Some(digest_hex.clone());
+        drop(guard);
+        drop_slot(digest);
+        return Ok(digest_hex);
+    }
     let mut retries: u32 = 0;
     loop {
-        match try_pack_upload_once(uploads_url, &body, &digest, auth_token).await {
-            Ok(()) => return Ok(digest_hex),
+        match try_pack_upload_once(uploads_url, body, digest, auth_token).await {
+            Ok(()) => {
+                *guard = Some(digest_hex.clone());
+                drop(guard);
+                // Drop the map entry so unique-pack uploads do not leak a
+                // digest key per pack for the process lifetime. Waiters that
+                // already cloned the slot still see Some; later callers HEAD.
+                drop_slot(digest);
+                return Ok(digest_hex);
+            }
             Err(e) => {
                 retries += 1;
                 if !e.is_retryable() || retries > UPLOAD_MAX_RETRIES {
+                    drop(guard);
+                    drop_slot(digest);
                     return Err(e);
                 }
-                // Full-jitter backoff - see `upload_blob_async` (audit L-JITTER).
                 tokio::time::sleep(crate::retry::backoff_delay(retries)).await;
             }
         }
@@ -146,6 +232,58 @@ mod tests {
         // A range past EOF is a short read -> Integrity error, never silent truncation.
         let bad = rt.block_on(read_ranges(&path, &[(8, 5)]));
         assert!(matches!(bad, Err(CoreError::Integrity(_))));
+        std::fs::remove_file(&path).unwrap_or(());
+    }
+
+    #[test]
+    fn blob_head_url_strips_uploads_suffix() {
+        match super::blob_head_url("https://reg/v2/ns/repo/blobs/uploads/", "sha256:ab") {
+            Ok(url) => assert_eq!(url, "https://reg/v2/ns/repo/blobs/sha256:ab"),
+            Err(_) => unreachable!("uploads/ suffix"),
+        }
+        match super::blob_head_url("https://reg/v2/ns/repo/blobs/uploads", "sha256:ab") {
+            Ok(url) => assert_eq!(url, "https://reg/v2/ns/repo/blobs/sha256:ab"),
+            Err(_) => unreachable!("uploads suffix"),
+        }
+        assert!(super::blob_head_url("https://reg/v2/ns/repo/blobs/", "sha256:ab").is_err());
+    }
+
+    #[tokio::test]
+    async fn pack_upload_skips_put_when_head_is_200() {
+        use sha2::Digest;
+        use sha2::Sha256;
+        use std::io::Write;
+        use tokio::io::AsyncReadExt;
+        use tokio::io::AsyncWriteExt;
+        use tokio::net::TcpListener;
+
+        let Ok(listener) = TcpListener::bind("127.0.0.1:0").await else {
+            unreachable!("bind loopback")
+        };
+        let Ok(addr) = listener.local_addr() else {
+            unreachable!("local_addr")
+        };
+        let server = tokio::spawn(async move {
+            if let Ok((mut sock, _)) = listener.accept().await {
+                let mut buf = [0u8; 4096];
+                let _ = sock.read(&mut buf).await;
+                let _ = sock
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                    .await;
+            }
+        });
+
+        let path = std::env::temp_dir().join(format!("hippius-head-{}.bin", std::process::id()));
+        match std::fs::File::create(&path).and_then(|mut f| f.write_all(b"pack-bytes")) {
+            Ok(()) => {}
+            Err(_) => unreachable!("temp file write"),
+        }
+        let uploads = format!("http://{addr}/v2/x/blobs/uploads/");
+        let Ok(hex) = super::pack_upload_async(&uploads, &path, &[(0, 10)], None).await else {
+            unreachable!("HEAD 200 must skip PUT")
+        };
+        assert_eq!(hex, hex::encode(Sha256::digest(b"pack-bytes")));
+        server.abort();
         std::fs::remove_file(&path).unwrap_or(());
     }
 }

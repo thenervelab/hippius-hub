@@ -7,6 +7,15 @@ the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 
 ## [Unreleased]
 
+### Changed
+
+- Intra-file chunked-v2 packing stores a repeated chunk digest once (first
+  new-pack occurrence). Previously a digest appearing twice in one file was
+  packed twice. Pointer format is unchanged: both entries point at the same
+  pack offset.
+- Pack upload HEADs the digest and single-flights concurrent PUTs of the
+  same pack bytes so Harbor is not asked twice for identical content.
+
 ## [0.7.0] — 2026-08-11
 
 No API, CLI, or environment-variable changes. Artifacts are byte-identical to

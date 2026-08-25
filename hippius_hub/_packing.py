@@ -10,6 +10,7 @@ those digests back into the file-ordered chunk list that becomes the pointer blo
 Kept pure so the packing invariants (order preservation, exact coverage, pack-size
 bounds) are property-tested without a registry — see tests/test_packing.py.
 """
+
 import json
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
@@ -65,9 +66,9 @@ class PackAccumulator:
     Invariant: for any chunk sequence, feeding all chunks then `finish()` yields
     a `PackPlan` identical to `plan_packs(chunks, dedup_index, pack_size)` —
     `plan_packs` is literally implemented that way, and the equivalence is
-    property-tested in tests/test_packing.py. The dedup index is read, never
-    mutated: a digest appearing twice in one file (and absent from the index)
-    is packed twice, exactly as `plan_packs` always did.
+    property-tested in tests/test_packing.py. The prior-revision dedup index is
+    read, never mutated. A digest appearing twice in this file is stored once
+    (first new-pack occurrence); later pointer entries reuse that pack offset.
 
     `finish()` flushes the final partial pack and is idempotent; `feed()` after
     `finish()` raises RuntimeError (the plan is already sealed).
@@ -85,6 +86,8 @@ class PackAccumulator:
         self._cur_ranges: List[Tuple[int, int]] = []
         self._cur_offset = 0  # byte offset within the pack currently being built
         self._plan: Optional[PackPlan] = None
+        # digest -> (new_pack_index, pack_offset, size) for first new occurrence
+        self._seen: Dict[str, Tuple[int, int, int]] = {}
 
     def feed(self, chunk: Tuple[str, int, int]) -> List[NewPack]:
         """Plan one (chunk_digest, size, file_offset); return packs just completed.
@@ -103,11 +106,30 @@ class PackAccumulator:
                 PlannedChunk(digest, size, pack_offset, pack_digest=pack_digest)
             )
             return []
-        # New chunk → append to the pack currently open. Its eventual index is
-        # `len(self._new_packs)` because the open pack is appended on close.
+        seen = self._seen.get(digest)
+        if seen is not None:
+            pack_idx, pack_offset, seen_size = seen
+            if seen_size != size:
+                raise ValueError(
+                    f"chunk digest {digest} size {size} != first occurrence {seen_size}"
+                )
+            self._planned.append(
+                PlannedChunk(
+                    digest,
+                    size,
+                    pack_offset,
+                    new_pack_index=pack_idx,
+                )
+            )
+            return []
+        # First occurrence of this digest → append to the open pack. Its index
+        # is `len(self._new_packs)` because the open pack is appended on close.
+        pack_idx = len(self._new_packs)
+        pack_offset = self._cur_offset
         self._planned.append(
-            PlannedChunk(digest, size, self._cur_offset, new_pack_index=len(self._new_packs))
+            PlannedChunk(digest, size, pack_offset, new_pack_index=pack_idx)
         )
+        self._seen[digest] = (pack_idx, pack_offset, size)
         self._cur_ranges.append((file_offset, size))
         self._cur_offset += size
         if self._cur_offset >= self._pack_size:
@@ -172,7 +194,11 @@ def resolve_pointer_chunks(
         )
     out: List[Tuple[str, int, str, int]] = []
     for pc in plan.planned:
-        pack_digest = pc.pack_digest if pc.new_pack_index is None else new_pack_digests[pc.new_pack_index]
+        pack_digest = (
+            pc.pack_digest
+            if pc.new_pack_index is None
+            else new_pack_digests[pc.new_pack_index]
+        )
         out.append((pc.chunk_digest, pc.size, pack_digest, pc.pack_offset))
     return tuple(out)
 

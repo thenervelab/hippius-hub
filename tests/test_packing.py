@@ -5,6 +5,7 @@ order, covers every chunk exactly once, assigns new-chunk byte ranges that
 exactly reconstruct the new chunks in order, and closes packs at the size bound.
 Then resolve → serialize → parse round-trips the pointer.
 """
+
 import hashlib
 
 import pytest
@@ -45,7 +46,11 @@ _sizes = st.lists(st.integers(min_value=1, max_value=4000), min_size=0, max_size
 def test_plan_packs_invariants(sizes, pack_size, data):
     chunks = _file(sizes)
     # Mark a random subset of chunks as already present (reused).
-    reused_idx = data.draw(st.sets(st.integers(0, len(chunks) - 1), max_size=len(chunks))) if chunks else set()
+    reused_idx = (
+        data.draw(st.sets(st.integers(0, len(chunks) - 1), max_size=len(chunks)))
+        if chunks
+        else set()
+    )
     dedup = {chunks[i][0]: (_digest(f"pack{i}".encode()), 100 + i) for i in reused_idx}
 
     plan = plan_packs(chunks, dedup, pack_size)
@@ -61,9 +66,15 @@ def test_plan_packs_invariants(sizes, pack_size, data):
         else:
             assert p.new_pack_index is not None and p.pack_digest is None
 
-    # new packs' ranges exactly reconstruct the new chunks (file_offset, size) in order
+    # new packs' ranges reconstruct the FIRST occurrence of each new digest
     new_ranges = [r for np in plan.new_packs for r in np.ranges]
-    expected = [(c[2], c[1]) for c in chunks if c[0] not in dedup]
+    seen_new = set()
+    expected = []
+    for c in chunks:
+        if c[0] in dedup or c[0] in seen_new:
+            continue
+        seen_new.add(c[0])
+        expected.append((c[2], c[1]))
     assert new_ranges == expected
 
     # within-pack offsets are cumulative from 0; non-final packs reached the bound
@@ -88,10 +99,16 @@ def test_plan_packs_invariants(sizes, pack_size, data):
         whole = _digest(b"whole")[7:]
         blob = pointer_v2_bytes(whole, sum(sizes), resolved)
         parsed = parse_pointer_v2(blob)
-        assert tuple((r.chunk_digest, r.size, r.pack_digest, r.pack_offset) for r in parsed) == resolved
+        assert (
+            tuple(
+                (r.chunk_digest, r.size, r.pack_digest, r.pack_offset) for r in parsed
+            )
+            == resolved
+        )
 
 
 # ---- explicit edges ----
+
 
 def test_all_new_single_pack_when_under_size():
     chunks = _file([10, 20, 30])
@@ -102,7 +119,9 @@ def test_all_new_single_pack_when_under_size():
 
 
 def test_pack_closes_at_size_bound():
-    chunks = _file([60, 60, 60])  # pack_size 100 → close after 2nd (120>=100), 3rd new pack
+    chunks = _file(
+        [60, 60, 60]
+    )  # pack_size 100 → close after 2nd (120>=100), 3rd new pack
     plan = plan_packs(chunks, {}, pack_size=100)
     assert len(plan.new_packs) == 2
     assert plan.new_packs[0].ranges == ((0, 60), (60, 60))
@@ -129,27 +148,34 @@ def test_resolve_rejects_wrong_digest_count():
 
 # ---- PackAccumulator: incremental feed must equal batch plan_packs ----
 
+
 def _plan_packs_reference(chunks, dedup_index, pack_size):
     """Independent oracle: the original batch plan_packs loop, verbatim.
 
     Production plan_packs now DELEGATES to PackAccumulator, so comparing the
     accumulator only against it would be tautological — a boundary mutation
     would change both sides in lockstep. This copy pins the semantics: pack
-    closes at cur_offset >= pack_size; dedup index read-only (no self-dedup).
+    closes at cur_offset >= pack_size; prior-revision index is read-only;
+    intra-file digest repeats reuse the first new-pack occurrence.
 
     If a production change makes this test fail, that is the test doing its
     job — update this reference only as a deliberate, reviewed semantics
-    change, together with the explicit boundary tests. Frozen from plan_packs
-    at 6821e37 (semantically verbatim, condensed: close() inlined,
-    hit[0]/hit[1]).
+    change, together with the explicit boundary tests.
     """
     planned, new_packs, cur_ranges, cur_offset = [], [], [], 0
+    seen: dict = {}
     for digest, size, file_offset in chunks:
         hit = dedup_index.get(digest)
         if hit is not None:
             planned.append(PlannedChunk(digest, size, hit[1], pack_digest=hit[0]))
             continue
-        planned.append(PlannedChunk(digest, size, cur_offset, new_pack_index=len(new_packs)))
+        prev = seen.get(digest)
+        if prev is not None:
+            planned.append(PlannedChunk(digest, size, prev[1], new_pack_index=prev[0]))
+            continue
+        pack_idx = len(new_packs)
+        planned.append(PlannedChunk(digest, size, cur_offset, new_pack_index=pack_idx))
+        seen[digest] = (pack_idx, cur_offset)
         cur_ranges.append((file_offset, size))
         cur_offset += size
         if cur_offset >= pack_size:
@@ -179,11 +205,16 @@ def test_accumulator_equals_plan_packs(data):
         st.sampled_from(sorted({max(1, pack_size - 1), pack_size, pack_size + 1})),
     )
     # (digest_id, size) pairs: repeated digest_ids model the same chunk digest
-    # occurring twice WITHIN one file — plan_packs does not self-dedup those
-    # (the dedup index is never mutated mid-plan), and neither may the accumulator.
+    # occurring twice WITHIN one file — both sides self-dedup to the first
+    # new-pack occurrence (prior-revision index is still never mutated).
     spec = data.draw(
-        st.lists(st.tuples(st.integers(min_value=0, max_value=5), size_strat), max_size=40)
+        st.lists(
+            st.tuples(st.integers(min_value=0, max_value=5), size_strat), max_size=40
+        )
     )
+    # CDC: one digest is one size. Re-draws of the same id keep the first size.
+    size_by_id: dict = {}
+    spec = [(did, size_by_id.setdefault(did, size)) for did, size in spec]
     chunks = _file_from_spec(spec)
     # Mark a random subset of DIGESTS (not positions) as reused, so a duplicated
     # digest is consistently reused-or-new — matching a real dedup index.
@@ -227,15 +258,39 @@ def test_accumulator_oversize_chunk_completes_immediately():
     assert acc.finish().new_packs == (NewPack(((0, 500),)),)
 
 
-def test_duplicate_digest_within_file_is_packed_twice():
-    # Same digest at two file offsets, absent from the dedup index: plan_packs
-    # packs BOTH occurrences (no self-dedup), so the accumulator must too.
+def test_duplicate_digest_within_file_is_packed_once():
+    """Same digest at two file offsets, absent from the prior-revision index.
+
+    Intra-file repeats reuse the first new-pack occurrence so Harbor is not
+    asked to PUT identical 64 MiB packs (14x stampede on the repeating-buffer
+    bench). Both pointer entries keep file order and point at pack offset 0.
+    """
     d = _digest(b"dup")
     chunks = [(d, 10, 0), (d, 10, 10)]
     for plan in (plan_packs(chunks, {}, 1000), _feed_all(chunks, {}, 1000)):
-        assert plan.new_packs[0].ranges == ((0, 10), (10, 10))
+        assert plan.new_packs[0].ranges == ((0, 10),)
         assert [p.new_pack_index for p in plan.planned] == [0, 0]
-        assert [p.pack_offset for p in plan.planned] == [0, 10]
+        assert [p.pack_offset for p in plan.planned] == [0, 0]
+
+
+def test_duplicate_digest_size_mismatch_raises():
+    d = _digest(b"dup")
+    chunks = [(d, 10, 0), (d, 11, 10)]
+    with pytest.raises(ValueError, match="size"):
+        plan_packs(chunks, {}, 1000)
+
+
+def test_duplicate_digest_reuses_already_closed_pack():
+    d_a = _digest(b"a")
+    d_b = _digest(b"b")
+    chunks = [(d_a, 10, 0), (d_b, 5, 10), (d_a, 10, 15)]
+    plan = plan_packs(chunks, {}, pack_size=10)
+    assert [np.ranges for np in plan.new_packs] == [((0, 10),), ((10, 5),)]
+    assert plan.planned[0].new_pack_index == 0
+    assert plan.planned[0].pack_offset == 0
+    assert plan.planned[1].new_pack_index == 1
+    assert plan.planned[2].new_pack_index == 0
+    assert plan.planned[2].pack_offset == 0
 
 
 def _feed_all(chunks, dedup, pack_size):
