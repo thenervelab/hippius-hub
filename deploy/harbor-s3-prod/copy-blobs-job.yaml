@@ -1,6 +1,13 @@
 # Online copy. Harbor stays live. Does not change helm.
 # Replace REPLACE_ME_BUCKET, then: kubectl -n harbor apply -f this
-# Re-apply (delete job, apply again) for catch-up. rclone skips equal-size objects.
+# Re-apply (delete job, apply again) for catch-up.
+#
+# Two passes:
+#   1. blobs/**/data — content-addressed; --size-only is safe.
+#   2. repositories/**/link — tag/layer pointers. Named `link`, 71 bytes,
+#      and tag current/link is mutable, so --size-only would skip updates.
+# Skip _uploads (in-flight sessions). Postgres is Harbor's API catalog,
+# not the distribution tag lookup the registry uses on pull.
 apiVersion: batch/v1
 kind: Job
 metadata:
@@ -30,32 +37,21 @@ spec:
         - name: rclone
           image: rclone/rclone:1.75.0
           imagePullPolicy: IfNotPresent
+          command: ["sh", "-c"]
           args:
-            - copy
-            - /storage/docker/registry/v2/blobs
-            - s3:REPLACE_ME_BUCKET/docker/registry/v2/blobs
-            - --include
-            - "**/data"
-            - --size-only
-            - --transfers
-            - "8"
-            - --checkers
-            - "16"
-            - --retries
-            - "10"
-            - --low-level-retries
-            - "20"
-            - --retries-sleep
-            - 5s
-            - --s3-chunk-size
-            - 64M
-            - --s3-upload-concurrency
-            - "4"
-            - --stats
-            - 60s
-            - --stats-one-line
-            - --log-level
-            - INFO
+            - |
+              set -euo pipefail
+              BUCKET=REPLACE_ME_BUCKET
+              SRC=/storage/docker/registry/v2
+              DST="s3:${BUCKET}/docker/registry/v2"
+              FLAGS="--transfers 8 --checkers 16 --retries 10 --low-level-retries 20 --retries-sleep 5s --s3-chunk-size 64M --s3-upload-concurrency 4 --stats 60s --stats-one-line --log-level INFO"
+              # shellcheck disable=SC2086
+              rclone copy "${SRC}/blobs" "${DST}/blobs" \
+                --include "**/data" --size-only ${FLAGS}
+              # Not --size-only: every link file is ~71 bytes; tag links change
+              # without changing size.
+              rclone copy "${SRC}/repositories" "${DST}/repositories" \
+                --include "**/link" --exclude "**/_uploads/**" ${FLAGS}
           env:
             - name: AWS_ACCESS_KEY_ID
               valueFrom:

@@ -83,19 +83,19 @@ s3 workers:  UVICORN_WORKERS=4  API_DB_POOL_MAX_SIZE=15  (5 api-local)
 s3 postgres: max_connections=1000
 ```
 
-On disk (copy this tree, nothing else):
+On disk (copy both trees; skip `_uploads`):
 
 ```text
 /storage/docker/registry/v2/blobs/sha256/<aa>/<64-hex>/data
+/storage/docker/registry/v2/repositories/<name>/_manifests/.../link
+/storage/docker/registry/v2/repositories/<name>/_layers/sha256/<digest>/link
 ```
 
-S3 keys after copy (`rootdirectory` omitted):
+S3 keys after copy (`rootdirectory` omitted): the same paths under `s3://<bucket>/docker/registry/v2/`.
 
-```text
-s3://<bucket>/docker/registry/v2/blobs/sha256/<aa>/<64-hex>/data
-```
+Postgres holds Harbor's API catalog (projects, members, artifact rows). The **registry** resolves tags via `repositories/**/link` files. Copying only `blobs/` leaves `docker pull` with no tag. Link files are named `link` (~71 bytes) and tag `current/link` is mutable — never `--size-only` on that pass.
 
-Do not copy `repositories/` (Postgres already has names/tags). Do not copy JuiceFS internal chunks. Copy size is the `data` files (~1.9 TB, July census), **not** JuiceFS `used_space` 31 TiB.
+Do not copy `_uploads/` (in-flight sessions). Do not copy JuiceFS internal chunks. Blob `data` files are ~1.9 TB (July census), **not** JuiceFS `used_space` 31 TiB.
 
 `helm get values harbor -n harbor` (user-supplied) does **not** contain the node1 affinity. That is a live kubectl patch. A helm upgrade without the overlay affinity **drops** it (already happened once).
 
@@ -258,18 +258,19 @@ kubectl -n harbor apply -f deploy/harbor-s3-prod/copy-blobs-job.yaml
 kubectl -n harbor logs -f job/harbor-blob-copy
 ```
 
-Sync:
+Two rclone passes in the Job (do not collapse them):
 
 ```text
-/storage/docker/registry/v2/blobs/**/data
-  →  s3://<bucket>/docker/registry/v2/blobs/sha256/<aa>/<digest>/data
+blobs/**/data            → s3://…/blobs/…     --size-only (content-addressed)
+repositories/**/link     → s3://…/repositories/…   checksum, NOT --size-only
+                           exclude _uploads/
 ```
 
-`--size-only`: skip objects whose size already matches. Re-run the Job (delete + apply) until a pass copies ~0 bytes.
+Re-run the Job (delete + apply) until a pass copies ~0 bytes on **both** passes. A blobs-only copy is a failed cutover: §7 `docker pull` of a known tag 404s.
 
 Retry on 503 / SlowDown is in rclone flags. Do not point rclone at `hippius-juicefs-data`.
 
-Sample check (on the Job pod or a one-off): SHA-256 of local `…/sha256/<aa>/<digest>/data` equals `<digest>`; S3 `HEAD` size equals file size. Do this for ≥20 random blobs including one large pack.
+Sample check: SHA-256 of local `…/blobs/sha256/<aa>/<digest>/data` equals `<digest>`; S3 `HEAD` size equals file size (≥20 random blobs including one large pack). Plus: one tag `current/link` bytes on disk equal the S3 object (not merely the same 71-byte size).
 
 Expected wall clock: hours, not minutes (~1.9 TB). That is the long pole. **Do not freeze yet.**
 
@@ -334,6 +335,16 @@ kubectl -n harbor get deploy harbor-registry -o json
 # env must include FORCEPATHSTYLE=true, SECURE=false,
 # MULTIPARTCOPYTHRESHOLDSIZE=134217728
 ```
+
+Flush the registry blobdescriptor cache so leftover filesystem `layerinfo` entries do not 404 after the driver switch. Read the db index from the live `config.yml` (`redis.db`, typically 2). Do **not** FLUSHALL (Harbor core uses other dbs).
+
+```bash
+REDIS_DB=$(kubectl -n harbor get cm harbor-registry -o jsonpath='{.data.config\.yml}' \
+  | awk '/^redis:/{r=1} r && /db:/{print $2; exit}')
+kubectl -n harbor exec deploy/harbor-redis -- redis-cli -n "${REDIS_DB}" FLUSHDB
+```
+
+If the Redis deploy name differs (`harbor-redis` vs chart fullname), use the pod that `config.yml` `redis.addr` points at.
 
 Unfreeze:
 
@@ -437,3 +448,7 @@ Optional later: merge/release [hub #89](https://github.com/thenervelab/hippius-h
 - Skipping §A / §1 (MinIO arm C is not this gate)
 - Bucket or endpoint containing `juicefs` or `minio`
 - Unique-1GiB prove with a repeating 8 MiB buffer
+- Copy job that only syncs `blobs/` (no `repositories/**/link`) — `docker pull` will not resolve tags
+- `--size-only` on the repositories/link pass (tag `current/link` is 71 bytes and mutable)
+- Skipping the Redis `layerinfo` FLUSHDB after the driver switch
+- Live `config.yml` missing `multipartcopythresholdsize: 134217728` after helm (Move falls back to 32 MiB UploadPartCopy)

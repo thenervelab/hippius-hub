@@ -60,6 +60,33 @@ def test_env_config_refuses_juicefs_bucket(monkeypatch: pytest.MonkeyPatch) -> N
         mod.env_config()
 
 
+def test_copy_job_syncs_repository_links_without_size_only() -> None:
+    """Registry tag lookup is repositories/**/link, not Postgres.
+
+    blobs/**/data may use --size-only (content-addressed). The link pass
+    must not: every link file is ~71 bytes and tag current/link is mutable.
+    """
+    text = (
+        Path(__file__).resolve().parents[1]
+        / "deploy"
+        / "harbor-s3-prod"
+        / "copy-blobs-job.yaml"
+    ).read_text()
+    assert "repositories" in text
+    assert "**/link" in text
+    assert "_uploads" in text
+    first, second = text.split("rclone copy", 2)[1:]
+    first_cmd = "\n".join(
+        ln for ln in first.splitlines() if not ln.lstrip().startswith("#")
+    )
+    second_cmd = "\n".join(
+        ln for ln in second.splitlines() if not ln.lstrip().startswith("#")
+    )
+    assert "--size-only" in first_cmd
+    assert "repositories" in second_cmd
+    assert "--size-only" not in second_cmd
+
+
 def test_copy_object_alias_bar_rejects_streaming_get_put() -> None:
     mod = _mod()
     # Pre-#445 hippius-s3 CopyObject of 64 MiB was 4.3 MiB/s (streaming).
