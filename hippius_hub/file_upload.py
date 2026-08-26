@@ -896,6 +896,10 @@ def _finalize_upload_manifest(
 
     merged_layers = _merge_layers(existing_layers, new_layers, delete_titles=delete_titles)
 
+    # Sequential on purpose: the folder file fan-out has already finished.
+    # `upload_file` overlaps this PUT with its pack wave; overlapping here
+    # would hide only the merge above, not the files. Folder uploads get
+    # none of the unique-1-GiB 1.27× (`upload_file` only).
     config_digest, config_size = _ensure_config_blob_uploaded(registry, oci_repo, oci_token)
     manifest = _assemble_manifest(
         config_digest, config_size, merged_layers, commit_message, commit_description
@@ -1039,7 +1043,10 @@ def upload_file(
             # The empty `{}` config blob does not depend on pack digests.
             # Start it before the pack wave so its Harbor digest-PUT overlaps
             # the layer uploads instead of sitting in the sequential tail
-            # (pointer → config → manifest).
+            # (pointer → config → manifest). `upload_folder` does not: it
+            # still calls `_ensure_config_blob_uploaded` after the file
+            # fan-out in `_finalize_upload_manifest`. The 1.27× unique-1-GiB
+            # figure is this path only.
             #
             # A bare daemon thread, not a ThreadPoolExecutor: the executor's
             # workers are NON-daemon, and `concurrent.futures.thread._python_exit`
