@@ -1,6 +1,7 @@
 use bytes::Bytes;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::io::SeekFrom;
 use std::path::Path;
 use std::sync::Arc;
@@ -46,6 +47,27 @@ fn drop_slot(uploads_url: &str, digest: &str) {
         Err(poisoned) => poisoned.into_inner(),
     };
     map.remove(&(uploads_url.to_owned(), digest.to_owned()));
+}
+
+fn completed_packs() -> &'static Mutex<HashSet<SlotKey>> {
+    static DONE: OnceLock<Mutex<HashSet<SlotKey>>> = OnceLock::new();
+    DONE.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+fn was_completed(uploads_url: &str, digest: &str) -> bool {
+    let set = match completed_packs().lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    set.contains(&(uploads_url.to_owned(), digest.to_owned()))
+}
+
+fn mark_completed(uploads_url: &str, digest: &str) {
+    let mut set = match completed_packs().lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    set.insert((uploads_url.to_owned(), digest.to_owned()));
 }
 
 /// Remove the map entry when `put_pack_single_flight` returns, including
@@ -110,9 +132,10 @@ async fn blob_already_present(
 /// pack's sha256 hex - the chunked-v2 caller records it in the pointer blob.
 ///
 /// Identical pack bytes (intra-file CDC repeats, or two files racing) share one
-/// PUT: HEAD the digest, then single-flight the upload. The pack is buffered
-/// once (~64 MiB target); at the upload-worker concurrency that is a bounded
-/// peak, and it keeps the retry body cheap to re-send.
+/// PUT via single-flight. HEAD is skipped for a digest this process has never
+/// completed — unique 1 GiB is 16 new packs, all 404s, so an extra RTT before
+/// every PUT is wasted. After a successful PUT (or a HEAD 200), later calls
+/// HEAD and skip the body. The pack is buffered once (~64 MiB target).
 pub async fn pack_upload_async(
     uploads_url: &str,
     path: &Path,
@@ -148,8 +171,17 @@ async fn put_pack_single_flight(
     if let Some(done) = guard.as_ref() {
         return Ok(done.clone());
     }
-    if present_or_unknown(blob_already_present(uploads_url, digest, auth_token).await)? {
+    // Unique packs have never been PUT by this process; HEAD would 404.
+    // Only probe the registry when a prior success in this process makes
+    // a hit plausible (re-upload of the same digest).
+    let already = if was_completed(uploads_url, digest) {
+        present_or_unknown(blob_already_present(uploads_url, digest, auth_token).await)?
+    } else {
+        false
+    };
+    if already {
         *guard = Some(digest_hex.clone());
+        mark_completed(uploads_url, digest);
         return Ok(digest_hex);
     }
     let mut retries: u32 = 0;
@@ -157,6 +189,7 @@ async fn put_pack_single_flight(
         match try_pack_upload_once(uploads_url, body, digest, auth_token).await {
             Ok(()) => {
                 *guard = Some(digest_hex.clone());
+                mark_completed(uploads_url, digest);
                 return Ok(digest_hex);
             }
             Err(e) => {
@@ -299,6 +332,8 @@ mod tests {
             Err(_) => unreachable!("temp file write"),
         }
         let uploads = format!("http://{addr}/v2/x/blobs/uploads/");
+        let digest = format!("sha256:{}", hex::encode(Sha256::digest(b"pack-bytes")));
+        super::mark_completed(&uploads, &digest);
         let Ok(hex) = super::pack_upload_async(&uploads, &path, &[(0, 10)], None).await else {
             unreachable!("HEAD 200 must skip PUT")
         };
@@ -325,17 +360,18 @@ mod tests {
         }
     }
 
-    /// Serve the HEAD -> POST -> PUT pack handshake, counting PUTs.
+    /// Serve the HEAD -> POST -> PUT pack handshake, counting HEADs and PUTs.
     ///
-    /// HEAD answers 404 so every caller falls through to the upload path; the
-    /// point of the test is that single-flight collapses those into one PUT.
-    /// Bodies are drained by idle-timeout rather than Content-Length: the pack
-    /// PUT is a framed stream, so it is chunked and has no length header.
+    /// HEAD answers 404 so a caller that still probes falls through to PUT.
+    /// Unique packs must not probe. Bodies are drained by idle-timeout rather
+    /// than Content-Length: the pack PUT is a framed stream, so it is chunked
+    /// and has no length header.
     #[cfg(test)]
     async fn serve_counting_registry(
         listener: tokio::net::TcpListener,
         addr: std::net::SocketAddr,
         puts: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        heads: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     ) {
         use std::sync::atomic::Ordering;
         use tokio::io::AsyncReadExt;
@@ -346,6 +382,7 @@ mod tests {
                 return;
             };
             let puts = std::sync::Arc::clone(&puts);
+            let heads = std::sync::Arc::clone(&heads);
             tokio::spawn(async move {
                 let mut seen = Vec::new();
                 let mut buf = [0u8; 4096];
@@ -366,6 +403,7 @@ mod tests {
                 }
                 let req = String::from_utf8_lossy(&seen);
                 let resp = if req.starts_with("HEAD") {
+                    heads.fetch_add(1, Ordering::SeqCst);
                     "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
                         .to_string()
                 } else if req.starts_with("POST") {
@@ -399,14 +437,15 @@ mod tests {
             unreachable!("local_addr")
         };
         let puts = std::sync::Arc::new(AtomicUsize::new(0));
+        let heads = std::sync::Arc::new(AtomicUsize::new(0));
         let server = tokio::spawn(serve_counting_registry(
             listener,
             addr,
             std::sync::Arc::clone(&puts),
+            std::sync::Arc::clone(&heads),
         ));
 
-        let path =
-            std::env::temp_dir().join(format!("hippius-sf-two-{}.bin", std::process::id()));
+        let path = std::env::temp_dir().join(format!("hippius-sf-two-{}.bin", std::process::id()));
         match std::fs::File::create(&path).and_then(|mut f| f.write_all(b"pack-bytes")) {
             Ok(()) => {}
             Err(_) => unreachable!("temp file write"),
@@ -427,6 +466,58 @@ mod tests {
             puts.load(Ordering::SeqCst),
             1,
             "single-flight must collapse two identical concurrent packs into one PUT"
+        );
+        assert_eq!(
+            heads.load(Ordering::SeqCst),
+            0,
+            "a first-seen digest must not HEAD (unique packs always 404)"
+        );
+
+        server.abort();
+        std::fs::remove_file(&path).unwrap_or(());
+    }
+
+    #[tokio::test]
+    async fn unique_pack_skips_head_when_unknown() {
+        use std::io::Write;
+        use std::sync::atomic::AtomicUsize;
+        use std::sync::atomic::Ordering;
+        use tokio::net::TcpListener;
+
+        let Ok(listener) = TcpListener::bind("127.0.0.1:0").await else {
+            unreachable!("bind loopback")
+        };
+        let Ok(addr) = listener.local_addr() else {
+            unreachable!("local_addr")
+        };
+        let puts = std::sync::Arc::new(AtomicUsize::new(0));
+        let heads = std::sync::Arc::new(AtomicUsize::new(0));
+        let server = tokio::spawn(serve_counting_registry(
+            listener,
+            addr,
+            std::sync::Arc::clone(&puts),
+            std::sync::Arc::clone(&heads),
+        ));
+
+        let path =
+            std::env::temp_dir().join(format!("hippius-sf-unique-{}.bin", std::process::id()));
+        match std::fs::File::create(&path).and_then(|mut f| f.write_all(b"unique-pack")) {
+            Ok(()) => {}
+            Err(_) => unreachable!("temp file write"),
+        }
+        let uploads = format!("http://{addr}/v2/uniq/blobs/uploads/");
+        let Ok(_) = super::pack_upload_async(&uploads, &path, &[(0, 11)], None).await else {
+            unreachable!("unique pack PUT must succeed")
+        };
+        assert_eq!(
+            heads.load(Ordering::SeqCst),
+            0,
+            "unknown digest must skip HEAD"
+        );
+        assert_eq!(
+            puts.load(Ordering::SeqCst),
+            1,
+            "unknown digest must PUT once"
         );
 
         server.abort();
