@@ -1039,8 +1039,12 @@ def upload_file(
             # The empty `{}` config blob does not depend on pack digests.
             # Start it before the pack wave so its Harbor digest-PUT overlaps
             # the layer uploads instead of sitting in the sequential tail
-            # (pointer → config → manifest).
-            with ThreadPoolExecutor(max_workers=1) as cfg_pool:
+            # (pointer → config → manifest). Do not `with` the pool: __exit__
+            # joins with wait=True, so Ctrl-C during layers would block for
+            # the full config HEAD/PUT retry budget (minutes on a dead registry).
+            cfg_pool = ThreadPoolExecutor(max_workers=1)
+            cfg_done = False
+            try:
                 cfg_fut = cfg_pool.submit(
                     _ensure_config_blob_uploaded, registry, oci_repo, oci_token
                 )
@@ -1052,6 +1056,9 @@ def upload_file(
                 prev_digest = _prev_digest_or_warn(existing, repo_id, revision)
                 merged_layers = _merge_layers(existing_layers, new_layers)
                 config_digest, config_size = cfg_fut.result()
+                cfg_done = True
+            finally:
+                cfg_pool.shutdown(wait=cfg_done, cancel_futures=not cfg_done)
             manifest = _assemble_manifest(
                 config_digest, config_size, merged_layers, commit_message, commit_description
             )

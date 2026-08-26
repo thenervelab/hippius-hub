@@ -604,6 +604,15 @@ def test_v2_keyboard_interrupt_mid_stream_aborts_without_commit(monkeypatch, tmp
 
     monkeypatch.setattr(file_upload, "pack_upload_native", _slow_pack)
 
+    hung_config = threading.Event()
+    real_config = file_upload._ensure_config_blob_uploaded
+
+    def _hung_config(*args, **kwargs):
+        hung_config.wait(5)
+        return real_config(*args, **kwargs)
+
+    monkeypatch.setattr(file_upload, "_ensure_config_blob_uploaded", _hung_config)
+
     src = tmp_path / "big.bin"
     src.write_bytes(b"x" * 100)
 
@@ -618,8 +627,16 @@ def test_v2_keyboard_interrupt_mid_stream_aborts_without_commit(monkeypatch, tmp
 
     t = threading.Thread(target=_target, daemon=True)
     t.start()
-    t.join(30)
-    assert not t.is_alive(), "a mid-stream interrupt must not hang the upload"
+    t0 = time.monotonic()
+    t.join(2)
+    elapsed = time.monotonic() - t0
+    still_running = t.is_alive()
+    hung_config.set()
+    assert not still_running, "a mid-stream interrupt must not hang the upload"
+    assert elapsed < 1.5, (
+        "Ctrl-C must not join the config side thread "
+        "(ThreadPoolExecutor wait=True blocks on the config retry budget)"
+    )
     assert type(outcome.get("error")) is KeyboardInterrupt
     # The in-flight pack was joined to completion by the executor with-block
     # (cancelled-or-completed — here it had already started, so: completed).
@@ -671,6 +688,52 @@ def test_v2_config_blob_overlaps_pack_wave(monkeypatch, tmp_path):
         lambda path, avg: _FakeChunkStream([CHUNK_METAS[:1]], WHOLE_HEX),
     )
     monkeypatch.setattr(file_upload, "pack_upload_native", _slow_pack)
+
+    src = tmp_path / "big.bin"
+    src.write_bytes(b"x" * 100)
+    upload_file(
+        path_or_fileobj=str(src), path_in_repo="big.bin", repo_id=REPO, token="tok"
+    )
+    assert "manifest" in captured
+
+
+@respx.mock
+def test_v2_manifest_put_waits_for_config_blob(monkeypatch, tmp_path):
+    """Harbor `validation.disabled: true` accepts a manifest whose config
+    blob is missing; that only fails at pull. `_put_manifest` must not run
+    until `_ensure_config_blob_uploaded` has returned. Sleep in config so
+    a PUT-then-join mutation races and fails this assertion.
+    """
+    monkeypatch.setenv("HIPPIUS_CHUNK_THRESHOLD", "1")
+    monkeypatch.setenv("HIPPIUS_CHUNKED_WRITE", "1")
+    monkeypatch.setenv("HIPPIUS_PACK_SIZE", "40")
+    captured = {}
+    _wire_registry(monkeypatch, captured, stub_chunks=False)
+    monkeypatch.setattr(
+        file_upload,
+        "chunk_stream_native",
+        lambda path, avg: _FakeChunkStream([CHUNK_METAS[:1]], WHOLE_HEX),
+    )
+
+    config_done = threading.Event()
+    real_config = file_upload._ensure_config_blob_uploaded
+    real_put = file_upload._put_manifest
+
+    def _slow_config(*args, **kwargs):
+        time.sleep(0.2)
+        result = real_config(*args, **kwargs)
+        config_done.set()
+        return result
+
+    def _put(*args, **kwargs):
+        assert config_done.is_set(), (
+            "manifest PUT before the config blob finished "
+            "(Harbor would accept it and fail at pull)"
+        )
+        return real_put(*args, **kwargs)
+
+    monkeypatch.setattr(file_upload, "_ensure_config_blob_uploaded", _slow_config)
+    monkeypatch.setattr(file_upload, "_put_manifest", _put)
 
     src = tmp_path / "big.bin"
     src.write_bytes(b"x" * 100)
