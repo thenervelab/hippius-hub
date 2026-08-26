@@ -6,6 +6,7 @@
 #   1. blobs/**/data — content-addressed; --size-only is safe.
 #   2. repositories/**/link — tag/layer pointers. Named `link`, 71 bytes,
 #      and tag current/link is mutable, so --size-only would skip updates.
+#      --checksum (not size+modtime): S3 mtime is the copy time.
 # Skip _uploads (in-flight sessions). Postgres is Harbor's API catalog,
 # not the distribution tag lookup the registry uses on pull.
 apiVersion: batch/v1
@@ -49,9 +50,11 @@ spec:
               rclone copy "${SRC}/blobs" "${DST}/blobs" \
                 --include "**/data" --size-only ${FLAGS}
               # Not --size-only: every link file is ~71 bytes; tag links change
-              # without changing size.
+              # without changing size. --checksum (not default size+modtime):
+              # S3 mtime is the copy time, so without it every catch-up recopies
+              # every link and "transferred 0" never happens.
               rclone copy "${SRC}/repositories" "${DST}/repositories" \
-                --include "**/link" --exclude "**/_uploads/**" ${FLAGS}
+                --include "**/link" --exclude "**/_uploads/**" --checksum ${FLAGS}
           env:
             - name: AWS_ACCESS_KEY_ID
               valueFrom:

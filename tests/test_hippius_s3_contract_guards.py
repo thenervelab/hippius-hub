@@ -85,6 +85,7 @@ def test_copy_job_syncs_repository_links_without_size_only() -> None:
     assert "--size-only" in first_cmd
     assert "repositories" in second_cmd
     assert "--size-only" not in second_cmd
+    assert "--checksum" in second_cmd
 
 
 def test_copy_object_alias_bar_rejects_streaming_get_put() -> None:

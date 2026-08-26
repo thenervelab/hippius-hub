@@ -1,6 +1,6 @@
 # Prod runbook: Harbor filesystem (JuiceFS) → S3, same numbers as staging
 
-**Nothing in this document has been applied to prod.** Prod Harbor is still Helm revision 4, filesystem on JuiceFS (verified 2026-08-25).
+**Nothing in this document has been applied to prod.** Prod Harbor is still Helm revision 4, filesystem on JuiceFS (re-verified 2026-08-26).
 
 One change at the helm flip: where `harbor-registry` stores blob bytes. Hostname, chart, Postgres, robots, docker stay. `hippius-hub` 0.7.0 is enough for the 80 bar; the config-blob overlap in [PR #89](https://github.com/thenervelab/hippius-hub/pull/89) is extra.
 
@@ -28,9 +28,10 @@ That 99.6 is **not** “switch Harbor to S3 and you’re done.” The first hipp
 | Fresh-part GET | `#448` + `#451` cipher sizes on the Redis hint | missing — 5–15 s startedat GET tails |
 | `UVICORN_WORKERS` / `API_DB_POOL_MAX_SIZE` | 8 / 8 (2 api-local; 128 < PG 200) | 4 / 15 (5 api-local; PG `max_connections=1000`) |
 | Harbor storage | S3 driver, ns `harbor-staging`, helm rev 4 + kubectl knobs | filesystem / JuiceFS, ns `harbor`, helm rev 4 |
-| Harbor `multipartcopythresholdsize` | **5368709120** (5 GiB) | n/a (filesystem) |
+| Harbor `multipartcopythresholdsize` | **live 128 MiB** (kubectl patch). Overlay YAML is **5 GiB** for blobs >128 MiB. Unique 1 GiB packs are 64–75 MiB, so 128 MiB vs 5 GiB is the same alias path for the bar. | n/a (filesystem) |
 | Harbor `chunksize` | 64 MiB | n/a |
-| Registry CPU | 2 request / 4 limit | BestEffort |
+| Registry | **3** replicas × CPU 2/4 | **1** replica, BestEffort (overlay sets 2/4, keeps 1 replica) |
+| Core / nginx | 3 / 3 with CPU requests | **5 / 5**, BestEffort (overlay sets CPU, keeps 5) |
 | Client | stock 0.7.0 | stock 0.7.0 |
 
 Flipping Harbor onto **today’s** prod gateway reproduces 21.3, not 99.6.
@@ -59,7 +60,7 @@ Order:
 
 Sign-off needed on D1–D8, then fill §0. Infra runs helm in ns `harbor`. George does not.
 
-Success bar after flip: median **≥ 80 MiB/s** on a 1 GiB fresh unique-bytes `hippius-hub` 0.7.0 `upload_file` (3 runs). Target band if §A + overlay match staging: n=5 medians **96.8** stock / **122.5** with [#89](https://github.com/thenervelab/hippius-hub/pull/89) on `upload_file` only. Do not quote 134. Folder uploads unchanged.
+Success bar after flip: median **≥ 80 MiB/s** on a 1 GiB fresh unique-bytes `hippius-hub` 0.7.0 `upload_file` (3 runs). Do not treat staging n=5 **96.8 / 122.5** as the prod target: those were harbor-staging with **3** registry replicas. Prod overlay keeps **1** registry replica. Bar is 80. Do not quote 134. Folder uploads unchanged.
 
 ---
 
@@ -74,14 +75,19 @@ revision:    4   (2026-05-08)   chart harbor-1.19.0 / app 2.15.0
 externalURL: https://registry.hippius.com
 Service:     NodePort 80:30002
 postgres:    external harbor-postgres-rw.harbor.svc.cluster.local  (keep)
-registry:    deploy/harbor-registry  1 replica  pod on k8s-v3-node1
-storage:     filesystem  rootdirectory=/storage
+registry:    deploy/harbor-registry  1 replica  BestEffort  pod on k8s-v3-node1
+core/nginx:  5 / 5  BestEffort
+jobservice:  1 replica  RWO ceph-block  pod on k8s-v3-node4
+redis:       statefulset/harbor-redis  pod harbor-redis-0  (not a Deployment)
+             registry config.yml redis.addr=harbor-redis:6379  db: 2
+storage:     filesystem  rootdirectory=/storage  cache.layerinfo: redis
 PVC:         harbor-registry → pv pvc-b0dac713-…  100Ti RWX  hippius-juicefs
-             annotation helm.sh/resource-policy: keep   (present)
+             annotation helm.sh/resource-policy: keep   (present, re-checked 2026-08-26)
 S3 gateway:  http://gateway.hippius-s3-prod.svc.cluster.local:8080
 s3 image:    ghcr.io/thenervelab/hippius-s3/api:539eec1
 s3 workers:  UVICORN_WORKERS=4  API_DB_POOL_MAX_SIZE=15  (5 api-local)
 s3 postgres: max_connections=1000
+harbor-s3 secret: not created yet (correct)
 ```
 
 On disk (copy both trees; skip `_uploads`):
@@ -165,26 +171,39 @@ If the image is still `539eec1`, **stop**. Do not copy blobs. Do not helm `-n ha
 
 Arm C was Harbor → MinIO. Staging unique 1 GiB 99.6 was Harbor → `gateway.hippius-s3-staging`. This step is Harbor’s S3 ops against **`http://gateway.hippius-s3-prod.svc.cluster.local:8080`** after §A.
 
+**Do not run `./deploy/harbor-staging/install-hippius-s3.sh` against the prod Harbor bucket (0.1).** That script helms Harbor in `harbor-staging` onto whatever bucket you pass. harbor-staging is already up (helm rev 4, 2026-08-25) and its jobservice is RWO — a re-helm Multi-Attaches. Pointing it at 0.1 would also write a second Harbor’s `docker/registry/v2/` tree into the bucket the copy job is about to fill.
+
+After §A, run **only** the contract Job against the prod gateway. The contract writes `harbor-s3-probe/<run-id>/` and deletes it. Unique 1 GiB on **prod Harbor** is §7, after the flip.
+
 ```bash
 export KUBECONFIG=~/Hippius-Storage/Configs/k8s/hippius.yaml
 export HARBOR_S3_BUCKET=<0.1>
 export HARBOR_S3_ACCESS_KEY=hip_...
 export HARBOR_S3_SECRET_KEY=...
 export HARBOR_S3_ENDPOINT=http://gateway.hippius-s3-prod.svc.cluster.local:8080
-./deploy/harbor-staging/install-hippius-s3.sh
+
+# Reuse the existing harbor-staging namespace for the Job only.
+# The Job YAML reads secret harbor-staging-s3 (HARBOR_S3_BUCKET / keys / endpoint).
+kubectl -n harbor-staging create secret generic harbor-staging-s3 \
+  --from-literal=REGISTRY_STORAGE_S3_ACCESSKEY="${HARBOR_S3_ACCESS_KEY}" \
+  --from-literal=REGISTRY_STORAGE_S3_SECRETKEY="${HARBOR_S3_SECRET_KEY}" \
+  --from-literal=HARBOR_S3_BUCKET="${HARBOR_S3_BUCKET}" \
+  --from-literal=HARBOR_S3_ENDPOINT="${HARBOR_S3_ENDPOINT}" \
+  --dry-run=client -o yaml | kubectl apply -f -
+
+kubectl -n harbor-staging create configmap hippius-s3-contract \
+  --from-file=hippius_s3_contract.py=deploy/harbor-s3-prod/hippius_s3_contract.py \
+  --dry-run=client -o yaml | kubectl apply -f -
+
+kubectl -n harbor-staging delete job hippius-s3-contract --ignore-not-found
+kubectl apply -f deploy/harbor-s3-prod/hippius-s3-contract-job.yaml
+kubectl -n harbor-staging wait --for=condition=complete job/hippius-s3-contract --timeout=20m
+kubectl -n harbor-staging logs job/hippius-s3-contract
 ```
 
-That script, in `harbor-staging` only:
+Contract (`deploy/harbor-s3-prod/hippius_s3_contract.py`): path-style SigV4, tiny PUT, 64 MiB PUT, Range GET, MPU, CopyObject (Harbor blob-commit Move), List, Delete. 402 credits = fail. **CopyObject 64 MiB < 50 MiB/s = FAIL** (streaming, not alias). If it fails, **stop**. Do not copy. Do not helm `-n harbor`.
 
-1. Contract Job (`deploy/harbor-s3-prod/hippius_s3_contract.py`): path-style SigV4, tiny PUT, 64 MiB PUT, Range GET, MPU, CopyObject (Harbor blob-commit Move), List, Delete. Writes only under `harbor-s3-probe/<run-id>/` and deletes it. 402 credits = fail. **CopyObject 64 MiB < 50 MiB/s = FAIL** (streaming, not alias).
-2. Helm Harbor 1.19.0 in ns `harbor-staging` with `values-hippius-s3.yaml` (same extraEnvVars + `multipartcopythresholdsize=5368709120` as the prod overlay).
-3. Unique 1 GiB `hippius-hub` 0.7.0 × 3 (`arm-c-job.yaml`). Median **≥ 80 MiB/s**.
-
-If harbor-staging is already up from 2026-08-25 and you only needed the staging-gateway number, do not helm it again (jobservice RWO Multi-Attach). For **prod** numbers, the contract job against the prod endpoint is the one that matters after §A. You can run just the contract Job with `HARBOR_S3_ENDPOINT` pointing at prod, without reinstalling Harbor.
-
-Tear down when done: `./deploy/harbor-staging/uninstall.sh` (refuses ns `harbor`).
-
-Do not treat the MinIO 93 / 159 MiB/s numbers as this gate.
+Do not treat the MinIO 93 / 159 MiB/s numbers as this gate. Do not helm `harbor-staging` again.
 
 ---
 
@@ -238,7 +257,7 @@ Inspect the rendered `harbor-registry` ConfigMap `config.yml`:
 | `redirect.disable: true` | PVC `harbor-registry` **deleted** |
 | env `REGISTRY_STORAGE_S3_FORCEPATHSTYLE=true` | chart version ≠ 1.19.0 |
 | env `REGISTRY_STORAGE_S3_SECURE=false` | |
-| env `REGISTRY_STORAGE_S3_MULTIPARTCOPYTHRESHOLDSIZE=5368709120` | |
+| env `REGISTRY_STORAGE_S3_MULTIPARTCOPYTHRESHOLDSIZE=5368709120` | `bucket: REPLACE_ME_BUCKET` |
 
 Default `multipartcopythresholdsize` is **32 MiB**. A 64–75 MiB pack then Move’s via `UploadPartCopy` of 32 MiB ranges (GET+PUT) instead of one CopyObject alias. That alone keeps unique 1 GiB at ~79 instead of ~100.
 
@@ -246,7 +265,11 @@ Default `multipartcopythresholdsize` is **32 MiB**. A 64–75 MiB pack then Move
 
 Chart 1.19.0 does not render `s3.forcepathstyle`, and it omits `s3.secure=false`, so those two **must** stay as extraEnvVars. Do not bump the chart to “fix” that.
 
-If dry-run wants to delete the PVC, rewrite NodePort 30002, touch postgres, or bump the chart: **stop**.
+If dry-run wants to delete the PVC, rewrite NodePort 30002, touch postgres, bump the chart, or still has `REPLACE_ME_BUCKET`: **stop**.
+
+`--reuse-values` plus this overlay also sets CPU on `harbor-core` (5 replicas) and `harbor-nginx` (5 replicas). Those roll. Pull 502 is the **1** registry replica; core/nginx rollingUpdate should keep some up.
+
+`harbor-jobservice` is 1 replica on a **RWO** `ceph-block` PVC (today on `k8s-v3-node4`). Staging already wedged helm on that Multi-Attach. Scale it to 0 before the real upgrade (§6), not only in the dry-run.
 
 ---
 
@@ -263,11 +286,23 @@ Two rclone passes in the Job (do not collapse them):
 
 ```text
 blobs/**/data            → s3://…/blobs/…     --size-only (content-addressed)
-repositories/**/link     → s3://…/repositories/…   checksum, NOT --size-only
+repositories/**/link     → s3://…/repositories/…   --checksum, NOT --size-only
                            exclude _uploads/
 ```
 
-Re-run the Job (delete + apply) until a pass copies ~0 bytes on **both** passes. A blobs-only copy is a failed cutover: §7 `docker pull` of a known tag 404s.
+`--checksum` on links is load-bearing for catch-up. Default rclone compare is size+modtime; S3 object mtime is the copy time, so without `--checksum` every 71-byte `link` recopies on every re-run and “~0 bytes” never happens. With `--checksum`, unchanged tag/layer links skip; a tag that moved recopies.
+
+Re-run the Job (delete + apply) until **both** passes transfer ~0 bytes (blobs size-match; links checksum-match). A blobs-only copy is a failed cutover: §7 `docker pull` of a known tag 404s.
+
+Before copy, confirm the target bucket has **no** lifecycle expiration/transition:
+
+```bash
+# ClusterIP — run from a pod in the cluster, not from a laptop.
+# must be NoSuchLifecycleConfiguration / empty. A rule that expires or
+# tiers objects deletes blobs the Harbor DB still references.
+aws --endpoint-url http://gateway.hippius-s3-prod.svc.cluster.local:8080 \
+  s3api get-bucket-lifecycle-configuration --bucket <0.1>
+```
 
 Retry on 503 / SlowDown is in rclone flags. Do not point rclone at `hippius-juicefs-data`.
 
@@ -293,35 +328,48 @@ Only when §4 catch-up is idle.
 ADMIN=$(kubectl -n harbor get secret harbor-core \
   -o jsonpath='{.data.HARBOR_ADMIN_PASSWORD}' | base64 -d)
 
-# freeze pushes (pulls stay up until the registry restart)
-curl -sS -u "admin:${ADMIN}" \
+# freeze pushes (pulls stay up until the registry restart).
+# -f: Harbor 2.x CSRF/403 must not be ignored.
+curl -sS -f -u "admin:${ADMIN}" \
   -H 'Content-Type: application/json' \
   -X PUT https://registry.hippius.com/api/v2.0/configurations \
   -d '{"read_only":true}'
 
-curl -sS -u "admin:${ADMIN}" \
-  https://registry.hippius.com/api/v2.0/configurations | grep read_only
+curl -sS -f -u "admin:${ADMIN}" \
+  https://registry.hippius.com/api/v2.0/configurations \
+  | python3 -c "import json,sys; c=json.load(sys.stdin); assert c.get('read_only') is True, c; print('read_only', c['read_only'])"
 ```
 
 1. Announce: no pushes.
 2. Wait in-flight uploads to finish or fail (they retry after).
 3. Delete + re-apply `copy-blobs-job.yaml` once more (should be seconds–minutes).
-4. Go to §6 immediately.
+4. Go to §6 immediately. **Do not unfreeze.** Unique 1 GiB is an upload; it cannot run while `read_only`. Pull-prove first (§7a), then unfreeze, then the upload bar.
 
 ---
 
 ## 6. Flip (the only prod Helm upgrade)
 
+`harbor-jobservice` PVC is RWO `ceph-block` (live pod on `k8s-v3-node4`). A helm upgrade restarts it and staging already wedged on Multi-Attach. Scale it to 0 first. Trivy is also RWO; if helm hangs on `harbor-trivy-0`, wait for the volume detach and delete the stuck pod.
+
 ```bash
+kubectl -n harbor scale deploy/harbor-jobservice --replicas=0
+kubectl -n harbor rollout status deploy/harbor-jobservice --timeout=2m
+
 helm upgrade harbor harbor/harbor --version 1.19.0 -n harbor \
   --reuse-values \
   -f deploy/harbor-s3-prod/overlay-s3.yaml
 ```
 
-Pushes **and** pulls 502 while `harbor-registry` restarts (minutes). Postgres is not restarted.
+Pushes **and** pulls 502 while `harbor-registry` (1 replica) restarts. Core and nginx also roll (overlay sets CPU); they have 5 replicas so some stay up. Postgres is not restarted.
 
 ```bash
 kubectl -n harbor rollout status deploy/harbor-registry --timeout=5m
+kubectl -n harbor rollout status deploy/harbor-core --timeout=5m
+kubectl -n harbor rollout status deploy/harbor-nginx --timeout=5m
+
+kubectl -n harbor scale deploy/harbor-jobservice --replicas=1
+kubectl -n harbor rollout status deploy/harbor-jobservice --timeout=5m
+
 kubectl -n harbor get cm harbor-registry -o jsonpath='{.data.config\.yml}'
 # must show storage.s3, chunksize 67108864, multipartcopythresholdsize 5368709120
 # must not show storage.filesystem
@@ -337,45 +385,56 @@ kubectl -n harbor get deploy harbor-registry -o json
 # MULTIPARTCOPYTHRESHOLDSIZE=5368709120
 ```
 
-Flush the registry blobdescriptor cache so leftover filesystem `layerinfo` entries do not 404 after the driver switch. Read the db index from the live `config.yml` (`redis.db`, typically 2). Do **not** FLUSHALL (Harbor core uses other dbs).
+Flush the registry blobdescriptor cache so leftover filesystem `layerinfo` entries do not 404 after the driver switch. Live `config.yml` is `redis.addr: harbor-redis:6379` / `db: 2`. Redis is **StatefulSet** `harbor-redis`, pod `harbor-redis-0` — not a Deployment. Do **not** FLUSHALL (Harbor core uses db 0). Do **not** FLUSHDB 0.
 
 ```bash
 REDIS_DB=$(kubectl -n harbor get cm harbor-registry -o jsonpath='{.data.config\.yml}' \
   | awk '/^redis:/{r=1} r && /db:/{print $2; exit}')
-kubectl -n harbor exec deploy/harbor-redis -- redis-cli -n "${REDIS_DB}" FLUSHDB
+if [[ -z "${REDIS_DB}" || "${REDIS_DB}" == "0" ]]; then
+  echo "refusing FLUSHDB: parsed db=${REDIS_DB:-empty} (core is 0)" >&2
+  exit 1
+fi
+kubectl -n harbor exec harbor-redis-0 -- redis-cli -n "${REDIS_DB}" FLUSHDB
 ```
 
-If the Redis deploy name differs (`harbor-redis` vs chart fullname), use the pod that `config.yml` `redis.addr` points at.
-
-Unfreeze:
-
-```bash
-curl -sS -u "admin:${ADMIN}" \
-  -H 'Content-Type: application/json' \
-  -X PUT https://registry.hippius.com/api/v2.0/configurations \
-  -d '{"read_only":false}'
-```
+**Stay `read_only`.** Unfreeze is §7b, after pull-prove.
 
 ---
 
 ## 7. Prove (before anyone calls it done)
 
+Unique 1 GiB is an **upload**. It cannot run while `read_only`. Split the prove.
+
+### 7a. While still `read_only` (rollback is cheap)
+
 From the same kind of box as arm B if possible (`test/e2e-client` / `benchmark.yml`):
 
-1. `hippius-hub` 0.7.0, 1 GiB **fresh unique** bytes, 3 runs. Median **≥ 80 MiB/s**. Repeating an 8 MiB buffer is a FastCDC stampede, not this bar.
-2. Download of a **copied** public model that was **not** re-uploaded (proves keys).
-3. `docker pull` of a known tag.
-4. Existing `robot$…` login (no rotate).
-5. Anonymous pull of a public project.
-6. `hippius-hub registry me` / provision still talk to the same Harbor API.
+1. Download of a **copied** public model that was **not** re-uploaded (proves keys).
+2. `docker pull` of a known tag.
+3. Existing `robot$…` login (no rotate).
+4. Anonymous pull of a public project.
+5. `hippius-hub registry me` / provision still talk to the same Harbor API.
 
-If (1) is ~20 MiB/s: hippius-s3 CopyObject is still streaming — §A did not land. Stay on S3 only if pulls work, or roll back (§8). Do not retune JuiceFS.
+If (1) or (2) 404s: keys or prefix are wrong — roll back (§8) **now**, still frozen, no reverse copy.
 
-If (1) is ~45–80: Harbor `multipartcopythresholdsize` is still 32 MiB (Move = `UploadPartCopy` slices). Check the live `config.yml` and extraEnv. Do not helm again without `--reuse-values` and the overlay.
+### 7b. Unfreeze
 
-If (2) 404s: keys or prefix are wrong — roll back.
+```bash
+curl -sS -f -u "admin:${ADMIN}" \
+  -H 'Content-Type: application/json' \
+  -X PUT https://registry.hippius.com/api/v2.0/configurations \
+  -d '{"read_only":false}'
+```
 
-Keep Harbor `read_only` until (1) and (2) pass if you want rollback without reverse-copying new S3 writes.
+### 7c. Upload bar (writes land on S3 only)
+
+`hippius-hub` 0.7.0, 1 GiB **fresh unique** bytes, 3 runs. Median **≥ 80 MiB/s**. Repeating an 8 MiB buffer is a FastCDC stampede, not this bar. This is `upload_file`, not `upload_folder`.
+
+If (7c) is ~20 MiB/s: hippius-s3 CopyObject is still streaming — §A did not land. Freeze again and roll back (§8). Blobs pushed during 7c are **not** on JuiceFS.
+
+If (7c) is ~45–80: Harbor `multipartcopythresholdsize` is still 32 MiB (Move = `UploadPartCopy` slices). Check the live `config.yml` and extraEnv. Do not helm again without `--reuse-values` and the overlay.
+
+Prod is 1 registry replica; do not expect staging’s 96.8. Bar is 80.
 
 ---
 
@@ -385,10 +444,13 @@ JuiceFS PVC is still Bound and still has pre-flip bytes.
 
 ```bash
 # freeze again if you already unfroze
-curl -sS -u "admin:${ADMIN}" \
+curl -sS -f -u "admin:${ADMIN}" \
   -H 'Content-Type: application/json' \
   -X PUT https://registry.hippius.com/api/v2.0/configurations \
   -d '{"read_only":true}'
+
+kubectl -n harbor scale deploy/harbor-jobservice --replicas=0
+kubectl -n harbor rollout status deploy/harbor-jobservice --timeout=2m
 
 helm upgrade harbor harbor/harbor --version 1.19.0 -n harbor \
   --reuse-values \
@@ -398,7 +460,18 @@ kubectl -n harbor rollout status deploy/harbor-registry --timeout=5m
 # config.yml must show filesystem /storage again
 # PVC still Bound; affinity still node1
 
-curl -sS -u "admin:${ADMIN}" \
+# Drop S3-era layerinfo so pulls do not 404 on filesystem.
+REDIS_DB=$(kubectl -n harbor get cm harbor-registry -o jsonpath='{.data.config\.yml}' \
+  | awk '/^redis:/{r=1} r && /db:/{print $2; exit}')
+if [[ -z "${REDIS_DB}" || "${REDIS_DB}" == "0" ]]; then
+  echo "refusing FLUSHDB: parsed db=${REDIS_DB:-empty}" >&2
+  exit 1
+fi
+kubectl -n harbor exec harbor-redis-0 -- redis-cli -n "${REDIS_DB}" FLUSHDB
+
+kubectl -n harbor scale deploy/harbor-jobservice --replicas=1
+
+curl -sS -f -u "admin:${ADMIN}" \
   -H 'Content-Type: application/json' \
   -X PUT https://registry.hippius.com/api/v2.0/configurations \
   -d '{"read_only":false}'
@@ -414,7 +487,7 @@ Do not delete the PVC. Do not `juicefs format --force`.
 
 ~7 days of S3 as source of truth: then you may stop relying on the JuiceFS PVC. Separate change.
 
-Optional later: merge/release [hub #89](https://github.com/thenervelab/hippius-hub/pull/89) (config-blob overlap) for the extra ~34 MiB/s. Not a gate.
+Optional later: merge/release [hub #89](https://github.com/thenervelab/hippius-hub/pull/89) (config-blob overlap on `upload_file` only). Not a gate. Do not quote 134.
 
 ---
 
@@ -424,11 +497,11 @@ Optional later: merge/release [hub #89](https://github.com/thenervelab/hippius-h
 |---|---|
 | 0.1–0.3 bucket + key + credits | s3 |
 | 0.6 + §A hippius-s3 promote | s3 |
-| 1 hippius-s3 gate (`install-hippius-s3.sh` / contract Job) | George |
-| 0.4–0.5, 3, 6, 8 helm | infra |
+| 1 hippius-s3 gate (contract Job on prod gateway, **not** a harbor-staging re-helm) | George |
+| 0.4–0.5, 3, 6, 8 helm (scale jobservice to 0 first on 6 and 8) | infra |
 | 4 copy Job | whoever can `kubectl apply` a Job that mounts `harbor-registry` |
-| 5 / 6 freeze + unfreeze | George + infra |
-| 7 prod prove | George (`benchmark.yml` / `test/e2e-client`) |
+| 5 freeze; 7b unfreeze | George + infra |
+| 7 prod prove (7a pulls frozen, 7c upload after unfreeze) | George (`benchmark.yml` / `test/e2e-client`) |
 
 ---
 
@@ -456,3 +529,10 @@ Optional later: merge/release [hub #89](https://github.com/thenervelab/hippius-h
 - Setting `multipartcopythresholdsize` **above** 5368709120 — S3 caps a single-operation `CopyObject` at 5 GiB, so distribution would attempt a simple copy the gateway must reject
 - Running Harbor **GC** against a partially-copied bucket. GC trusts the Harbor DB, not the backend, so it deletes blobs it cannot see (distribution [#19308](https://github.com/distribution/distribution/issues/19308)). No GC until the JuiceFS PVC is deleted
 - Pointing Harbor at a bucket with an **S3 lifecycle rule**. Audit the target bucket for expiration/transition rules before the flip — a rule that expires or tiers objects silently deletes blobs the DB still references
+- Helming `harbor-staging` onto the **prod Harbor bucket** (0.1) — a second registry tree in the same prefix
+- `kubectl exec deploy/harbor-redis` — Redis is `pod/harbor-redis-0`
+- `FLUSHDB` on db 0 (Harbor core) or `FLUSHALL`
+- Unfreezing before pull-prove (7a). Unique 1 GiB cannot run while `read_only`; do pulls first
+- Helm upgrade while `harbor-jobservice` is 1/1 on RWO `ceph-block` (scale to 0 first; staging already Multi-Attached)
+- Overlay still containing `REPLACE_ME_BUCKET`
+- Treating staging unique 1 GiB 96.8 (3 registry replicas, 128 MiB threshold) as the prod number (1 replica)
