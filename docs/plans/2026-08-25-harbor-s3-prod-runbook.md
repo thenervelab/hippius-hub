@@ -17,7 +17,7 @@ Unique 1 GiB on **harbor-staging → gateway.hippius-s3-staging**, stock `hippiu
 | Stock 0.7.0 | **99.6 MiB/s** (99.6 / 86.0 / 116.2) | PASS vs 80 |
 | Harbor → MinIO (Harbor-itself ceiling) | 159.3 MiB/s | not this path |
 
-Config-blob overlap ([#89](https://github.com/thenervelab/hippius-hub/pull/89)) is extra, not a gate. Unique 1 GiB **n=5** on the same Harbor knobs (2026-08-26): stock 0.7.0 median **96.8 MiB/s** (82.8 / 89.1 / 96.8 / 97.5 / 100.3); overlap overlay median **122.5 MiB/s** (107.9 / 116.9 / 122.5 / 126.7 / 144.3). Ranges do not overlap, but spread is still large; do not quote a single 134 MiB/s figure. The process-wide config cache only helps the first upload to a repo.
+Config-blob overlap ([#89](https://github.com/thenervelab/hippius-hub/pull/89)) is extra, not a gate, and **only applies to `upload_file`**. `upload_folder` still PUTs the empty `{}` config blob synchronously in `_finalize_upload_manifest` after the file fan-out; folder uploads get none of this overlap. Unique 1 GiB **n=5**, `upload_file`, same Harbor knobs (2026-08-26): stock 0.7.0 median **96.8 MiB/s** (82.8 / 89.1 / 96.8 / 97.5 / 100.3); overlap overlay median **122.5 MiB/s** (107.9 / 116.9 / 122.5 / 126.7 / 144.3). 122.5 / 96.8 ≈ **1.27× is that single-file number**, not a general hub win. Ranges do not overlap; spread is still large; do not quote a single 134 MiB/s figure. The process-wide config cache only helps the first upload to a repo.
 
 That 99.6 is **not** “switch Harbor to S3 and you’re done.” The first hippius-s3 gate the same day, against a gateway without alias CopyObject, was **21.3 MiB/s**. Prod hippius-s3 is still that older image.
 
@@ -59,7 +59,7 @@ Order:
 
 Sign-off needed on D1–D8, then fill §0. Infra runs helm in ns `harbor`. George does not.
 
-Success bar after flip: median **≥ 80 MiB/s** on a 1 GiB fresh unique-bytes `hippius-hub` 0.7.0 upload (3 runs). Target band if §A + overlay match staging: ~100 MiB/s stock, ~134 with [#89](https://github.com/thenervelab/hippius-hub/pull/89).
+Success bar after flip: median **≥ 80 MiB/s** on a 1 GiB fresh unique-bytes `hippius-hub` 0.7.0 `upload_file` (3 runs). Target band if §A + overlay match staging: n=5 medians **96.8** stock / **122.5** with [#89](https://github.com/thenervelab/hippius-hub/pull/89) on `upload_file` only. Do not quote 134. Folder uploads unchanged.
 
 ---
 
