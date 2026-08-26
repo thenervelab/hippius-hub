@@ -17,7 +17,7 @@ import time
 import warnings
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from pathlib import Path
-from typing import BinaryIO, Dict, List, Optional, Union
+from typing import Any, BinaryIO, Dict, List, Optional, Union
 
 import httpx
 from huggingface_hub import CommitInfo
@@ -1039,26 +1039,45 @@ def upload_file(
             # The empty `{}` config blob does not depend on pack digests.
             # Start it before the pack wave so its Harbor digest-PUT overlaps
             # the layer uploads instead of sitting in the sequential tail
-            # (pointer → config → manifest). Do not `with` the pool: __exit__
-            # joins with wait=True, so Ctrl-C during layers would block for
-            # the full config HEAD/PUT retry budget (minutes on a dead registry).
-            cfg_pool = ThreadPoolExecutor(max_workers=1)
-            cfg_done = False
-            try:
-                cfg_fut = cfg_pool.submit(
-                    _ensure_config_blob_uploaded, registry, oci_repo, oci_token
-                )
-                new_layers = _upload_file_layers(
-                    file_path, path_in_repo, registry, oci_repo, oci_token, dedup_index, pack_sizes
-                )
+            # (pointer → config → manifest).
+            #
+            # A bare daemon thread, not a ThreadPoolExecutor: the executor's
+            # workers are NON-daemon, and `concurrent.futures.thread._python_exit`
+            # joins them at interpreter shutdown. `shutdown(wait=False)` therefore
+            # only makes `upload_file` return early — the CLI *process* still
+            # blocks for the full config HEAD/PUT retry budget (minutes against a
+            # dead registry) before it can exit, so Ctrl-C still looks hung.
+            # `cancel_futures` cannot help either: this future has already started.
+            # A daemon thread is abandoned at exit instead.
+            cfg_result: Dict[str, Any] = {}
 
-                existing_layers = existing.manifest.get("layers", []) if existing else []
-                prev_digest = _prev_digest_or_warn(existing, repo_id, revision)
-                merged_layers = _merge_layers(existing_layers, new_layers)
-                config_digest, config_size = cfg_fut.result()
-                cfg_done = True
-            finally:
-                cfg_pool.shutdown(wait=cfg_done, cancel_futures=not cfg_done)
+            def _run_config_blob() -> None:
+                try:
+                    cfg_result["value"] = _ensure_config_blob_uploaded(
+                        registry, oci_repo, oci_token
+                    )
+                except BaseException as exc:  # surfaced on this thread at the join below
+                    cfg_result["error"] = exc
+
+            cfg_thread = threading.Thread(
+                target=_run_config_blob, daemon=True, name="hippius-config-blob"
+            )
+            cfg_thread.start()
+            new_layers = _upload_file_layers(
+                file_path, path_in_repo, registry, oci_repo, oci_token, dedup_index, pack_sizes
+            )
+
+            existing_layers = existing.manifest.get("layers", []) if existing else []
+            prev_digest = _prev_digest_or_warn(existing, repo_id, revision)
+            merged_layers = _merge_layers(existing_layers, new_layers)
+            # Join BEFORE the manifest is assembled or PUT. Harbor runs
+            # `validation.disabled: true`, so a manifest naming a config blob that
+            # has not landed is accepted and only fails at pull time. On the error
+            # path we never reach here: the thread is simply abandoned.
+            cfg_thread.join()
+            if "error" in cfg_result:
+                raise cfg_result["error"]
+            config_digest, config_size = cfg_result["value"]
             manifest = _assemble_manifest(
                 config_digest, config_size, merged_layers, commit_message, commit_description
             )
