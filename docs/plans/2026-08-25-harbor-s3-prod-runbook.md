@@ -27,7 +27,7 @@ That 99.6 is **not** “switch Harbor to S3 and you’re done.” The first hipp
 | Fresh-part GET | `#448` + `#451` cipher sizes on the Redis hint | missing — 5–15 s startedat GET tails |
 | `UVICORN_WORKERS` / `API_DB_POOL_MAX_SIZE` | 8 / 8 (2 api-local; 128 < PG 200) | 4 / 15 (5 api-local; PG `max_connections=1000`) |
 | Harbor storage | S3 driver, ns `harbor-staging`, helm rev 4 + kubectl knobs | filesystem / JuiceFS, ns `harbor`, helm rev 4 |
-| Harbor `multipartcopythresholdsize` | **134217728** (128 MiB) | n/a (filesystem) |
+| Harbor `multipartcopythresholdsize` | **5368709120** (5 GiB) | n/a (filesystem) |
 | Harbor `chunksize` | 64 MiB | n/a |
 | Registry CPU | 2 request / 4 limit | BestEffort |
 | Client | stock 0.7.0 | stock 0.7.0 |
@@ -38,7 +38,7 @@ Order:
 
 1. **Promote hippius-s3 staging → prod** (`19bcdb1` = `#445` + `#448` + `#451`, and workers — see §A). Do not helm `-n harbor` before this.
 2. Re-run the S3 contract against `gateway.hippius-s3-prod`. CopyObject 64 MiB must be ≥ 50 MiB/s (alias). The contract script now **FAIL**s below that.
-3. Copy existing blobs. Freeze pushes for minutes. Helm `-n harbor` with `overlay-s3.yaml` (must keep `multipartcopythresholdsize=134217728`).
+3. Copy existing blobs. Freeze pushes for minutes. Helm `-n harbor` with `overlay-s3.yaml` (must keep `multipartcopythresholdsize=5368709120`).
 4. Prove unique 1 GiB stock 0.7.0 median ≥ 80 MiB/s.
 
 ---
@@ -176,7 +176,7 @@ export HARBOR_S3_ENDPOINT=http://gateway.hippius-s3-prod.svc.cluster.local:8080
 That script, in `harbor-staging` only:
 
 1. Contract Job (`deploy/harbor-s3-prod/hippius_s3_contract.py`): path-style SigV4, tiny PUT, 64 MiB PUT, Range GET, MPU, CopyObject (Harbor blob-commit Move), List, Delete. Writes only under `harbor-s3-probe/<run-id>/` and deletes it. 402 credits = fail. **CopyObject 64 MiB < 50 MiB/s = FAIL** (streaming, not alias).
-2. Helm Harbor 1.19.0 in ns `harbor-staging` with `values-hippius-s3.yaml` (same extraEnvVars + `multipartcopythresholdsize=134217728` as the prod overlay).
+2. Helm Harbor 1.19.0 in ns `harbor-staging` with `values-hippius-s3.yaml` (same extraEnvVars + `multipartcopythresholdsize=5368709120` as the prod overlay).
 3. Unique 1 GiB `hippius-hub` 0.7.0 × 3 (`arm-c-job.yaml`). Median **≥ 80 MiB/s**.
 
 If harbor-staging is already up from 2026-08-25 and you only needed the staging-gateway number, do not helm it again (jobservice RWO Multi-Attach). For **prod** numbers, the contract job against the prod endpoint is the one that matters after §A. You can run just the contract Job with `HARBOR_S3_ENDPOINT` pointing at prod, without reinstalling Harbor.
@@ -233,11 +233,11 @@ Inspect the rendered `harbor-registry` ConfigMap `config.yml`:
 | `storage.s3.bucket: <0.1>` | `bucket: bucketname` |
 | `regionendpoint: http://gateway.hippius-s3-prod.svc.cluster.local:8080` | `storage.filesystem` |
 | `chunksize: 67108864` | NodePort / postgres / `externalURL` rewritten |
-| `multipartcopythresholdsize: 134217728` | affinity dropped |
+| `multipartcopythresholdsize: 5368709120` | affinity dropped |
 | `redirect.disable: true` | PVC `harbor-registry` **deleted** |
 | env `REGISTRY_STORAGE_S3_FORCEPATHSTYLE=true` | chart version ≠ 1.19.0 |
 | env `REGISTRY_STORAGE_S3_SECURE=false` | |
-| env `REGISTRY_STORAGE_S3_MULTIPARTCOPYTHRESHOLDSIZE=134217728` | |
+| env `REGISTRY_STORAGE_S3_MULTIPARTCOPYTHRESHOLDSIZE=5368709120` | |
 
 Default `multipartcopythresholdsize` is **32 MiB**. A 64–75 MiB pack then Move’s via `UploadPartCopy` of 32 MiB ranges (GET+PUT) instead of one CopyObject alias. That alone keeps unique 1 GiB at ~79 instead of ~100.
 
@@ -322,7 +322,7 @@ Pushes **and** pulls 502 while `harbor-registry` restarts (minutes). Postgres is
 ```bash
 kubectl -n harbor rollout status deploy/harbor-registry --timeout=5m
 kubectl -n harbor get cm harbor-registry -o jsonpath='{.data.config\.yml}'
-# must show storage.s3, chunksize 67108864, multipartcopythresholdsize 134217728
+# must show storage.s3, chunksize 67108864, multipartcopythresholdsize 5368709120
 # must not show storage.filesystem
 
 kubectl -n harbor get deploy harbor-registry -o jsonpath='{.spec.template.spec.affinity}{"\n"}'
@@ -333,7 +333,7 @@ kubectl -n harbor get pvc harbor-registry
 
 kubectl -n harbor get deploy harbor-registry -o json
 # env must include FORCEPATHSTYLE=true, SECURE=false,
-# MULTIPARTCOPYTHRESHOLDSIZE=134217728
+# MULTIPARTCOPYTHRESHOLDSIZE=5368709120
 ```
 
 Flush the registry blobdescriptor cache so leftover filesystem `layerinfo` entries do not 404 after the driver switch. Read the db index from the live `config.yml` (`redis.db`, typically 2). Do **not** FLUSHALL (Harbor core uses other dbs).
@@ -451,4 +451,7 @@ Optional later: merge/release [hub #89](https://github.com/thenervelab/hippius-h
 - Copy job that only syncs `blobs/` (no `repositories/**/link`) — `docker pull` will not resolve tags
 - `--size-only` on the repositories/link pass (tag `current/link` is 71 bytes and mutable)
 - Skipping the Redis `layerinfo` FLUSHDB after the driver switch
-- Live `config.yml` missing `multipartcopythresholdsize: 134217728` after helm (Move falls back to 32 MiB UploadPartCopy)
+- Live `config.yml` missing `multipartcopythresholdsize: 5368709120` after helm (Move falls back to 32 MiB UploadPartCopy)
+- Setting `multipartcopythresholdsize` **above** 5368709120 — S3 caps a single-operation `CopyObject` at 5 GiB, so distribution would attempt a simple copy the gateway must reject
+- Running Harbor **GC** against a partially-copied bucket. GC trusts the Harbor DB, not the backend, so it deletes blobs it cannot see (distribution [#19308](https://github.com/distribution/distribution/issues/19308)). No GC until the JuiceFS PVC is deleted
+- Pointing Harbor at a bucket with an **S3 lifecycle rule**. Audit the target bucket for expiration/transition rules before the flip — a rule that expires or tiers objects silently deletes blobs the DB still references
