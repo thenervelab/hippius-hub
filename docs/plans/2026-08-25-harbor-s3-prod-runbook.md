@@ -15,8 +15,9 @@ Unique 1 GiB on **harbor-staging → gateway.hippius-s3-staging**, stock `hippiu
 | Client | Median | Runs |
 |---|---|---|
 | Stock 0.7.0 | **99.6 MiB/s** (99.6 / 86.0 / 116.2) | PASS vs 80 |
-| 0.7.0 + unreleased config-blob overlap ([#89](https://github.com/thenervelab/hippius-hub/pull/89)) | 134.1 MiB/s | extra, not required |
 | Harbor → MinIO (Harbor-itself ceiling) | 159.3 MiB/s | not this path |
+
+Config-blob overlap ([#89](https://github.com/thenervelab/hippius-hub/pull/89)) is extra, not a gate. Do not quote a 134 MiB/s figure: that arm was n=3 with a 32% spread and the process-wide config cache only helps the first upload to a repo.
 
 That 99.6 is **not** “switch Harbor to S3 and you’re done.” The first hippius-s3 gate the same day, against a gateway without alias CopyObject, was **21.3 MiB/s**. Prod hippius-s3 is still that older image.
 

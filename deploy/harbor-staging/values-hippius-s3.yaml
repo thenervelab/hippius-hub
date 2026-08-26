@@ -58,7 +58,7 @@ persistence:
       # 32 MiB ranges (GET+PUT, enqueue download) instead of one CopyObject
       # alias (~0.06s). 128 MiB keeps packs on the alias path.
       # Do not helm-upgrade ns harbor for this.
-      multipartcopythresholdsize: "134217728"
+      multipartcopythresholdsize: "5368709120"
 
 registry:
   replicas: 3
@@ -81,7 +81,7 @@ registry:
       # config.yml. Keep the env so a kubectl-only patch (no helm, because
       # jobservice RWO Multi-Attach) still takes effect.
       - name: REGISTRY_STORAGE_S3_MULTIPARTCOPYTHRESHOLDSIZE
-        value: "134217728"
+        value: "5368709120"
   controller:
     resources:
       requests:
@@ -96,7 +96,7 @@ registry:
       - name: REGISTRY_STORAGE_S3_SECURE
         value: "false"
       - name: REGISTRY_STORAGE_S3_MULTIPARTCOPYTHRESHOLDSIZE
-        value: "134217728"
+        value: "5368709120"
 
 trivy:
   enabled: false
