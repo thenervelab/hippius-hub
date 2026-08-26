@@ -325,6 +325,159 @@ mod tests {
         }
     }
 
+    /// Serve the HEAD -> POST -> PUT pack handshake, counting PUTs.
+    ///
+    /// HEAD answers 404 so every caller falls through to the upload path; the
+    /// point of the test is that single-flight collapses those into one PUT.
+    /// Bodies are drained by idle-timeout rather than Content-Length: the pack
+    /// PUT is a framed stream, so it is chunked and has no length header.
+    #[cfg(test)]
+    async fn serve_counting_registry(
+        listener: tokio::net::TcpListener,
+        addr: std::net::SocketAddr,
+        puts: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    ) {
+        use std::sync::atomic::Ordering;
+        use tokio::io::AsyncReadExt;
+        use tokio::io::AsyncWriteExt;
+
+        loop {
+            let Ok((mut sock, _)) = listener.accept().await else {
+                return;
+            };
+            let puts = std::sync::Arc::clone(&puts);
+            tokio::spawn(async move {
+                let mut seen = Vec::new();
+                let mut buf = [0u8; 4096];
+                // First read carries the request line; keep draining until the
+                // peer pauses, so a framed body cannot be mistaken for a
+                // pipelined request.
+                loop {
+                    match tokio::time::timeout(
+                        std::time::Duration::from_millis(120),
+                        sock.read(&mut buf),
+                    )
+                    .await
+                    {
+                        Ok(Ok(0)) | Err(_) => break,
+                        Ok(Ok(n)) => seen.extend_from_slice(&buf[..n]),
+                        Ok(Err(_)) => return,
+                    }
+                }
+                let req = String::from_utf8_lossy(&seen);
+                let resp = if req.starts_with("HEAD") {
+                    "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                        .to_string()
+                } else if req.starts_with("POST") {
+                    format!(
+                        "HTTP/1.1 202 Accepted\r\nLocation: http://{addr}/v2/x/blobs/uploads/s\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    )
+                } else if req.starts_with("PUT") {
+                    puts.fetch_add(1, Ordering::SeqCst);
+                    "HTTP/1.1 201 Created\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                        .to_string()
+                } else {
+                    "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                        .to_string()
+                };
+                let _ = sock.write_all(resp.as_bytes()).await;
+            });
+        }
+    }
+
+    #[tokio::test]
+    async fn concurrent_identical_packs_put_once() {
+        use std::io::Write;
+        use std::sync::atomic::AtomicUsize;
+        use std::sync::atomic::Ordering;
+        use tokio::net::TcpListener;
+
+        let Ok(listener) = TcpListener::bind("127.0.0.1:0").await else {
+            unreachable!("bind loopback")
+        };
+        let Ok(addr) = listener.local_addr() else {
+            unreachable!("local_addr")
+        };
+        let puts = std::sync::Arc::new(AtomicUsize::new(0));
+        let server = tokio::spawn(serve_counting_registry(
+            listener,
+            addr,
+            std::sync::Arc::clone(&puts),
+        ));
+
+        let path =
+            std::env::temp_dir().join(format!("hippius-sf-two-{}.bin", std::process::id()));
+        match std::fs::File::create(&path).and_then(|mut f| f.write_all(b"pack-bytes")) {
+            Ok(()) => {}
+            Err(_) => unreachable!("temp file write"),
+        }
+        let uploads = format!("http://{addr}/v2/x/blobs/uploads/");
+
+        // Two callers, same (uploads_url, digest): the second must wait on the
+        // leader's slot and adopt its result, not issue a second PUT.
+        let (a, b) = tokio::join!(
+            super::pack_upload_async(&uploads, &path, &[(0, 10)], None),
+            super::pack_upload_async(&uploads, &path, &[(0, 10)], None),
+        );
+        let (Ok(ha), Ok(hb)) = (a, b) else {
+            unreachable!("both callers must succeed")
+        };
+        assert_eq!(ha, hb, "both callers must report the same digest");
+        assert_eq!(
+            puts.load(Ordering::SeqCst),
+            1,
+            "single-flight must collapse two identical concurrent packs into one PUT"
+        );
+
+        server.abort();
+        std::fs::remove_file(&path).unwrap_or(());
+    }
+
+    #[tokio::test]
+    async fn a_failed_leader_leaves_no_poisoned_slot() {
+        // The leader's slot must not outlive a failure: `SlotLease` drops the
+        // map entry on every return, so the next caller starts from `None` and
+        // redoes the work rather than inheriting a stale error or an empty
+        // "done" marker that would skip the PUT entirely.
+        let key_url = "https://reg/v2/failed/blobs/uploads/";
+        let leader = super::slot_for(key_url, "sha256:dead");
+        {
+            let guard = leader.lock().await;
+            assert!(guard.is_none(), "a fresh slot starts empty");
+        }
+        super::drop_slot(key_url, "sha256:dead");
+
+        let next = super::slot_for(key_url, "sha256:dead");
+        assert!(
+            !std::sync::Arc::ptr_eq(&leader, &next),
+            "a dropped slot must not be handed back to the next caller"
+        );
+        let guard = next.lock().await;
+        assert!(
+            guard.is_none(),
+            "the next caller must redo the work, not adopt a poisoned result"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_completed_leader_short_circuits_the_next_caller() {
+        let key_url = "https://reg/v2/done/blobs/uploads/";
+        let slot = super::slot_for(key_url, "sha256:beef");
+        {
+            let mut guard = slot.lock().await;
+            *guard = Some("beefhex".to_string());
+        }
+        let again = super::slot_for(key_url, "sha256:beef");
+        let guard = again.lock().await;
+        assert_eq!(
+            guard.as_deref(),
+            Some("beefhex"),
+            "a waiter must adopt the leader's digest instead of re-uploading"
+        );
+        drop(guard);
+        super::drop_slot(key_url, "sha256:beef");
+    }
+
     #[test]
     fn single_flight_slot_is_per_repo() {
         let repo_a = super::slot_for("https://r/v2/repo-a/blobs/uploads/", "sha256:ab");

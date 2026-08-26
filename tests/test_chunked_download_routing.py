@@ -130,6 +130,97 @@ def test_chunked_file_routes_to_native_pack_assembler(monkeypatched_registry, mo
 
 
 @respx.mock
+def test_repeated_chunk_yields_two_targets_over_one_pack_range(
+    monkeypatched_registry, monkeypatch, tmp_path
+):
+    """Intra-file self-dedup stores a repeated digest once, so two pointer
+    entries share one `(pack, offset, size)` at different file offsets.
+
+    `_pull_packs` must emit BOTH targets. Coalescing them — by chunk digest or
+    by `(pack_offset, size)` — silently leaves a hole at the second file offset,
+    and because the pack still verifies against its own digest nothing downstream
+    notices. The native scatter side is pinned in `scatter.rs`; this pins the
+    Python target list that feeds it, which that test cannot see.
+    """
+    repeat, tail = b"X" * 1000, b"Y" * 1500
+    file_bytes = repeat + tail + repeat
+    file_digest = _sha(file_bytes)
+    # The pack holds the repeated chunk ONCE — that is the point of the dedup.
+    pack_bytes = repeat + tail
+    pack_digest = "sha256:" + _sha(pack_bytes)
+    pointer_digest = "sha256:" + _sha(b"pointer-dup")
+    hx, hy = _sha(repeat), _sha(tail)
+
+    pointer = json.dumps(
+        {
+            "version": CHUNKED_LAYOUT_V2,
+            "file": {"size": len(file_bytes), "digest": f"sha256:{file_digest}"},
+            "chunks": [
+                {"digest": f"sha256:{hx}", "size": 1000, "pack": pack_digest, "offset": 0},
+                {"digest": f"sha256:{hy}", "size": 1500, "pack": pack_digest, "offset": 1000},
+                # Same pack range as the first entry, different file offset.
+                {"digest": f"sha256:{hx}", "size": 1000, "pack": pack_digest, "offset": 0},
+            ],
+        }
+    ).encode()
+
+    manifest = {
+        "schemaVersion": 2,
+        "mediaType": "application/vnd.oci.image.manifest.v1+json",
+        "annotations": {LAYOUT_ANNOTATION_KEY: CHUNKED_LAYOUT_V2},
+        "layers": [
+            {
+                "mediaType": POINTER_MEDIA_TYPE_V2,
+                "size": 200,
+                "digest": pointer_digest,
+                "annotations": {
+                    LAYER_TITLE_KEY: "dup.bin",
+                    FILE_SIZE_KEY: str(len(file_bytes)),
+                    FILE_DIGEST_KEY: f"sha256:{file_digest}",
+                    CHUNK_COUNT_KEY: "3",
+                },
+            },
+            {"mediaType": PACK_MEDIA_TYPE, "size": len(pack_bytes), "digest": pack_digest},
+        ],
+    }
+
+    token_route(respx.mock)
+    respx.get(f"{MOCK_REGISTRY}/v2/{REPO}/manifests/main").mock(
+        return_value=httpx.Response(
+            200, json=manifest, headers={"Docker-Content-Digest": "sha256:" + "d" * 64}
+        )
+    )
+    respx.get(f"{MOCK_REGISTRY}/v2/{REPO}/blobs/{pointer_digest}").mock(
+        return_value=httpx.Response(200, content=pointer)
+    )
+
+    calls = []
+
+    def fake_native(*, pack_chunks, dest_path, total_size, file_digest, **_):
+        calls.append({"pack_chunks": pack_chunks, "total_size": total_size})
+        with open(dest_path, "wb") as f:
+            f.write(file_bytes)
+        return None
+
+    monkeypatch.setattr(file_download, "download_packs_native", fake_native)
+
+    hf_hub_download(
+        repo_id=REPO, filename="dup.bin", revision="main",
+        cache_dir=str(tmp_path), token="tok",
+    )
+
+    assert len(calls) == 1
+    targets = calls[0]["pack_chunks"][0]
+    assert targets == [
+        (0, 1000, 0, hx),
+        (1000, 1500, 1000, hy),
+        (0, 1000, 2500, hx),
+    ], "the repeated chunk must scatter to BOTH file offsets, not be coalesced"
+    # total_size covers the whole FILE, not the deduped pack.
+    assert calls[0]["total_size"] == len(file_bytes) == 3500
+
+
+@respx.mock
 def test_chunked_file_to_local_dir(monkeypatched_registry, monkeypatch, tmp_path):
     _mock_chunked()
     monkeypatch.setattr(
