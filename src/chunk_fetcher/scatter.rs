@@ -165,6 +165,35 @@ mod tests {
         };
         assert_eq!(got, b"AAAABB");
 
+        // Intra-file self-dedup writes two pointer entries with the SAME
+        // (offset_in_pack, size) at different file offsets. Scatter must copy
+        // the pack range twice, not leave a hole at the second file offset.
+        let (repeat, rest) = (b"XXXX".as_slice(), b"YY".as_slice());
+        let packed: Vec<u8> = [repeat, rest].concat();
+        let hx = Sha256Digest::of(repeat);
+        let hy = Sha256Digest::of(rest);
+        let shared = vec![
+            chunk_target(0, 4, 0, hx),
+            chunk_target(4, 2, 4, hy),
+            chunk_target(0, 4, 6, hx),
+        ];
+        let shared_path =
+            std::env::temp_dir().join(format!("hippius-vs-dup-{}.bin", std::process::id()));
+        let Ok(()) = std::fs::File::create(&shared_path).and_then(|f| f.set_len(10)) else {
+            unreachable!("temp file create")
+        };
+        let Ok(()) = verify_and_scatter("u", &packed, &shared, &shared_path, &pb) else {
+            unreachable!("shared pack range must scatter twice")
+        };
+        let mut shared_got = Vec::new();
+        let Ok(_) =
+            std::fs::File::open(&shared_path).and_then(|mut f| f.read_to_end(&mut shared_got))
+        else {
+            unreachable!("read back")
+        };
+        assert_eq!(shared_got, b"XXXXYYXXXX");
+        let _ = std::fs::remove_file(&shared_path);
+
         // A wrong expected digest (hb over the "AAAA" slice) is a permanent Integrity
         // error, so a corrupt/mis-placed pack is never accepted.
         let bad = vec![chunk_target(0, 4, 0, hb)];

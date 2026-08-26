@@ -23,28 +23,53 @@ use crate::uploader::watchdog::{
 const PACK_HEAD_TIMEOUT: Duration = Duration::from_secs(30);
 
 type InflightSlot = Arc<AsyncMutex<Option<String>>>;
+type SlotKey = (String, String);
 
-fn inflight_slots() -> &'static Mutex<HashMap<String, InflightSlot>> {
-    static SLOTS: OnceLock<Mutex<HashMap<String, InflightSlot>>> = OnceLock::new();
+fn inflight_slots() -> &'static Mutex<HashMap<SlotKey, InflightSlot>> {
+    static SLOTS: OnceLock<Mutex<HashMap<SlotKey, InflightSlot>>> = OnceLock::new();
     SLOTS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-fn slot_for(digest: &str) -> InflightSlot {
+fn slot_for(uploads_url: &str, digest: &str) -> InflightSlot {
     let mut map = match inflight_slots().lock() {
         Ok(guard) => guard,
         Err(poisoned) => poisoned.into_inner(),
     };
-    map.entry(digest.to_owned())
+    map.entry((uploads_url.to_owned(), digest.to_owned()))
         .or_insert_with(|| Arc::new(AsyncMutex::new(None)))
         .clone()
 }
 
-fn drop_slot(digest: &str) {
+fn drop_slot(uploads_url: &str, digest: &str) {
     let mut map = match inflight_slots().lock() {
         Ok(guard) => guard,
         Err(poisoned) => poisoned.into_inner(),
     };
-    map.remove(digest);
+    map.remove(&(uploads_url.to_owned(), digest.to_owned()));
+}
+
+/// Remove the map entry when `put_pack_single_flight` returns, including
+/// `?` on a permanent HEAD error. Waiters that already cloned the Arc still
+/// see the leader's result.
+struct SlotLease {
+    uploads_url: String,
+    digest: String,
+}
+
+impl Drop for SlotLease {
+    fn drop(&mut self) {
+        drop_slot(&self.uploads_url, &self.digest);
+    }
+}
+
+/// A retryable HEAD failure means "presence unknown" — PUT. A 502/timeout
+/// on HEAD must not fail a 300-pack upload the way a `?` on HEAD would.
+fn present_or_unknown(result: Result<bool, CoreError>) -> Result<bool, CoreError> {
+    match result {
+        Ok(present) => Ok(present),
+        Err(e) if e.is_retryable() => Ok(false),
+        Err(e) => Err(e),
+    }
 }
 
 /// `{registry}/v2/{repo}/blobs/uploads/` → `{registry}/v2/{repo}/blobs/{digest}`.
@@ -114,15 +139,17 @@ async fn put_pack_single_flight(
     digest_hex: String,
     auth_token: Option<&str>,
 ) -> Result<String, CoreError> {
-    let slot = slot_for(digest);
+    let slot = slot_for(uploads_url, digest);
+    let _lease = SlotLease {
+        uploads_url: uploads_url.to_owned(),
+        digest: digest.to_owned(),
+    };
     let mut guard = slot.lock().await;
     if let Some(done) = guard.as_ref() {
         return Ok(done.clone());
     }
-    if blob_already_present(uploads_url, digest, auth_token).await? {
+    if present_or_unknown(blob_already_present(uploads_url, digest, auth_token).await)? {
         *guard = Some(digest_hex.clone());
-        drop(guard);
-        drop_slot(digest);
         return Ok(digest_hex);
     }
     let mut retries: u32 = 0;
@@ -130,18 +157,11 @@ async fn put_pack_single_flight(
         match try_pack_upload_once(uploads_url, body, digest, auth_token).await {
             Ok(()) => {
                 *guard = Some(digest_hex.clone());
-                drop(guard);
-                // Drop the map entry so unique-pack uploads do not leak a
-                // digest key per pack for the process lifetime. Waiters that
-                // already cloned the slot still see Some; later callers HEAD.
-                drop_slot(digest);
                 return Ok(digest_hex);
             }
             Err(e) => {
                 retries += 1;
                 if !e.is_retryable() || retries > UPLOAD_MAX_RETRIES {
-                    drop(guard);
-                    drop_slot(digest);
                     return Err(e);
                 }
                 tokio::time::sleep(crate::retry::backoff_delay(retries)).await;
@@ -285,5 +305,32 @@ mod tests {
         assert_eq!(hex, hex::encode(Sha256::digest(b"pack-bytes")));
         server.abort();
         std::fs::remove_file(&path).unwrap_or(());
+    }
+
+    #[test]
+    fn retryable_head_error_is_presence_unknown() {
+        use crate::error::CoreError;
+
+        match super::present_or_unknown(Err(CoreError::ServerError(502, "pack HEAD".into()))) {
+            Ok(false) => {}
+            other => unreachable!("502 HEAD must PUT, got {other:?}"),
+        }
+        match super::present_or_unknown(Err(CoreError::ServerError(403, "pack HEAD".into()))) {
+            Err(CoreError::ServerError(403, _)) => {}
+            other => unreachable!("403 HEAD must stay permanent, got {other:?}"),
+        }
+        match super::present_or_unknown(Ok(true)) {
+            Ok(true) => {}
+            other => unreachable!("HEAD 200 stays present, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn single_flight_slot_is_per_repo() {
+        let repo_a = super::slot_for("https://r/v2/repo-a/blobs/uploads/", "sha256:ab");
+        let repo_b = super::slot_for("https://r/v2/repo-b/blobs/uploads/", "sha256:ab");
+        assert!(!std::sync::Arc::ptr_eq(&repo_a, &repo_b));
+        let repo_a_again = super::slot_for("https://r/v2/repo-a/blobs/uploads/", "sha256:ab");
+        assert!(std::sync::Arc::ptr_eq(&repo_a, &repo_a_again));
     }
 }
