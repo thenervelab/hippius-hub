@@ -49,6 +49,17 @@ fn drop_slot(uploads_url: &str, digest: &str) {
     map.remove(&(uploads_url.to_owned(), digest.to_owned()));
 }
 
+/// Cache of `(uploads_url, digest)` this process has already landed (a
+/// successful pack body upload, or a blob probe that returned 200).
+///
+/// Unbounded on purpose. `SlotLease` drops *inflight* `Arc<AsyncMutex>` entries
+/// so unique packs do not retain a slot for the process lifetime; this set is
+/// the opposite — a later call must know the digest landed so it probes the
+/// registry instead of repeating the body upload. Two owned `String`s per
+/// unique pack (~190 B; ~61 KiB for a 20 GiB unique upload at 64 MiB packs).
+/// Fine for the CLI (the process exits). A long-lived library consumer that
+/// never exits and uploads unbounded unique packs would want a cap; do not add
+/// one here for the CLI path.
 fn completed_packs() -> &'static Mutex<HashSet<SlotKey>> {
     static DONE: OnceLock<Mutex<HashSet<SlotKey>>> = OnceLock::new();
     DONE.get_or_init(|| Mutex::new(HashSet::new()))
