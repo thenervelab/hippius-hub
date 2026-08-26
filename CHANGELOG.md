@@ -7,6 +7,13 @@ the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 
 ## [Unreleased]
 
+### Fixed
+
+- Pack download no longer `Vec::with_capacity` of the registry-declared size.
+  The buffer `try_reserve`s arrived bytes (initial cap `min(declared, 64 MiB)`).
+  Presigned query strings are stripped from pack error messages. `HIPPIUS_PACK_SIZE`
+  is rejected if `pack_size + 16 MiB` would exceed the 1 GiB reader cap.
+
 ## [0.7.0] — 2026-08-11
 
 No API, CLI, or environment-variable changes. Artifacts are byte-identical to

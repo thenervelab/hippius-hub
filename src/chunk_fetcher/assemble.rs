@@ -22,15 +22,61 @@ use crate::transport::CHUNK_REQUEST_TIMEOUT;
 
 const MAX_RETRIES: u32 = 3;
 
-/// Absolute ceiling on a single pack blob's declared size, before any of its bytes
-/// are read or reserved. A pack aggregates `FastCDC` chunks toward `HIPPIUS_PACK_SIZE`
-/// (~64 MiB default; 16 MiB max chunk), so no legitimate pack approaches 1 GiB - the
-/// cap exists solely to bound a hostile or corrupt manifest. Without it, the pack
-/// size comes straight from a registry-controlled OCI layer descriptor: a declared
-/// 1 TiB would make `fetch_pack` reserve 1 TiB up front (an uncatchable alloc abort)
-/// and accept up to 1 TiB of body before the length check fires. Both the up-front
-/// reservation and the streaming cap are clamped to this value.
-const MAX_PACK_BYTES: u64 = 1024 * 1024 * 1024;
+/// Absolute ceiling on a single pack blob's *declared* size. A pack aggregates
+/// `FastCDC` chunks toward `HIPPIUS_PACK_SIZE` (~64 MiB default) and may overshoot
+/// by at most one chunk (`fastcdc` `MAXIMUM_MAX` = 16 MiB), so no honest pack
+/// approaches 1 GiB. The value exists to reject a hostile OCI layer size before
+/// any body is read. Kept in lockstep with `hippius_hub.constants.MAX_PACK_BYTES`.
+pub(crate) const MAX_PACK_BYTES: u64 = 1024 * 1024 * 1024;
+
+/// Initial `try_reserve` for a pack buffer: honest packs are ~64 MiB, so this
+/// avoids ~20 reallocs. Never `declared` itself — 32 concurrent packs each
+/// declaring 1 GiB would otherwise commit 32 GiB before a byte arrived.
+const PACK_RESERVE_CEILING: u64 = 64 * 1024 * 1024;
+
+fn pack_initial_reserve(declared: u64) -> usize {
+    let n = declared.min(PACK_RESERVE_CEILING);
+    usize::try_from(n).unwrap_or(usize::MAX)
+}
+
+/// Strip userinfo / query / fragment so a presigned redirect cannot leak
+/// AWS signature query parameters into Python exceptions or logs.
+fn redact_url(url: &str) -> String {
+    let (scheme, after_scheme) = match url.split_once("://") {
+        Some((s, rest)) => (format!("{s}://"), rest),
+        None => (String::new(), url),
+    };
+    let authority_end = after_scheme
+        .find(['/', '?', '#'])
+        .unwrap_or(after_scheme.len());
+    let (authority, remainder) = after_scheme.split_at(authority_end);
+    let host = authority
+        .rsplit_once('@')
+        .map_or(authority, |(_, host)| host);
+    let path_end = remainder.find(['?', '#']).unwrap_or(remainder.len());
+    let path = &remainder[..path_end];
+    let redacted_tail = if path_end < remainder.len() {
+        "?<redacted>"
+    } else {
+        ""
+    };
+    format!("{scheme}{host}{path}{redacted_tail}")
+}
+
+/// Grow `buf` by `additional` bytes. `Vec::with_capacity` / `extend_from_slice`
+/// route a failed allocation to `handle_alloc_error`, which aborts the process
+/// (not a panic: `catch_unwind` / pyo3 cannot turn it into an exception).
+fn reserve_or_err(buf: &mut Vec<u8>, additional: usize, url: &str) -> Result<(), CoreError> {
+    buf.try_reserve(additional).map_err(|e| {
+        CoreError::Io(std::io::Error::new(
+            std::io::ErrorKind::OutOfMemory,
+            format!(
+                "pack {}: cannot reserve {additional} more bytes: {e}",
+                redact_url(url)
+            ),
+        ))
+    })
+}
 
 /// Aborts every held task handle when dropped. Fires on BOTH `assemble`'s
 /// early-return error path AND on cancellation (the whole `assemble` future dropped
@@ -281,7 +327,8 @@ fn validate_pack_plan(packs: &[PackPlanEntry], total_size: u64) -> Result<(), Co
         if pack.size > MAX_PACK_BYTES {
             return Err(CoreError::Integrity(format!(
                 "pack {} declares {} bytes, over the {MAX_PACK_BYTES}-byte ceiling",
-                pack.url, pack.size
+                redact_url(&pack.url),
+                pack.size
             )));
         }
         for c in &pack.chunks {
@@ -344,6 +391,12 @@ async fn fetch_pack(
     dest_path: &Arc<Path>,
     pb: &ProgressBar,
 ) -> Result<(), CoreError> {
+    if pack_size > MAX_PACK_BYTES {
+        return Err(CoreError::Integrity(format!(
+            "pack {}: declares {pack_size} bytes, over the {MAX_PACK_BYTES}-byte ceiling",
+            redact_url(url)
+        )));
+    }
     // `&**url` re-borrows the shared `Arc<str>` as the `&str` that `IntoUrl` wants.
     let mut req = client.get(&**url).timeout(CHUNK_REQUEST_TIMEOUT);
     if let Some(t) = token {
@@ -353,23 +406,15 @@ async fn fetch_pack(
     if !res.status().is_success() {
         return Err(CoreError::ServerError(
             res.status().as_u16(),
-            format!("pack GET failed for {url}"),
+            format!("pack GET failed for {}", redact_url(url)),
         ));
     }
-    // Audit L12: read the body under a running cap instead of `res.bytes()`, which
-    // buffers an unbounded body BEFORE the length check - a chunked (no
-    // Content-Length) response from a misbehaving/compromised registry could
-    // balloon memory well past the intended ~pack_size ceiling (x32 concurrent
-    // packs) before rejection. Abort the moment the accumulated body exceeds
-    // `pack_size`, so peak memory stays bounded to one pack.
-    // Clamp the up-front reservation to MAX_PACK_BYTES so a registry-declared
-    // pack_size (validate_pack_plan rejects > MAX_PACK_BYTES up front, but this is
-    // the defense-in-depth backstop) can never turn `with_capacity` into a
-    // multi-TiB alloc abort. A larger-but-legal pack still grows the Vec on demand,
-    // bounded by the `received > pack_size` check below.
-    let reserve = pack_size.min(MAX_PACK_BYTES);
-    let cap = usize::try_from(reserve).unwrap_or(usize::MAX);
-    let mut bytes: Vec<u8> = Vec::with_capacity(cap);
+    // Audit L12: cap the stream at `pack_size`. Peak memory is arrived bytes,
+    // never the declared size: `with_capacity(declared)` let N concurrent packs
+    // commit N GiB before a body byte (RESEXHAUST-001). Initial reserve is
+    // min(declared, 64 MiB); further growth is try_reserve of arrived chunks.
+    let mut bytes = Vec::new();
+    reserve_or_err(&mut bytes, pack_initial_reserve(pack_size), url)?;
     let mut received: u64 = 0;
     // Each body read is bounded by the default-on read-idle window (audit M4): a
     // registry that stops streaming mid-pack is cut as a retryable ReadStall instead
@@ -383,14 +428,17 @@ async fn fetch_pack(
             // handling in chunked_downloader). Bounded by pack_size so a runaway
             // stream is cut here, well under the MAX_PACK_BYTES ceiling.
             return Err(CoreError::BadResponse(format!(
-                "pack {url}: body exceeds expected {pack_size} bytes (over-send)"
+                "pack {}: body exceeds expected {pack_size} bytes (over-send)",
+                redact_url(url)
             )));
         }
+        reserve_or_err(&mut bytes, chunk.len(), url)?;
         bytes.extend_from_slice(&chunk);
     }
     if bytes.len() as u64 != pack_size {
         return Err(CoreError::BadResponse(format!(
-            "pack {url}: expected {pack_size} bytes, got {}",
+            "pack {}: expected {pack_size} bytes, got {}",
+            redact_url(url),
             bytes.len()
         )));
     }
@@ -542,6 +590,77 @@ mod tests {
             chunks: vec![chunk_target(0, 10, 0, any_digest())],
         }];
         assert!(validate_pack_plan(&ok, 10).is_ok());
+    }
+
+    #[test]
+    fn pack_initial_reserve_is_capped_not_declared() {
+        // Restoring `Vec::with_capacity(declared)` (even clamped at 1 GiB) fails
+        // this: 32 concurrent 1 GiB declarations would commit 32 GiB before a
+        // body byte. The helper is what fetch_pack uses for the first try_reserve.
+        assert_eq!(
+            super::pack_initial_reserve(MAX_PACK_BYTES),
+            64 * 1024 * 1024
+        );
+        assert_eq!(super::pack_initial_reserve(1024), 1024);
+        assert_eq!(super::pack_initial_reserve(0), 0);
+    }
+
+    #[test]
+    fn fetch_pack_does_not_with_capacity_the_declared_size() {
+        let src = include_str!("assemble.rs");
+        let Some((prod, _)) = src.split_once("#[cfg(test)]") else {
+            unreachable!("test module")
+        };
+        assert!(
+            !prod.contains("let mut bytes: Vec<u8> = Vec::with_capacity"),
+            "fetch_pack must not pre-size from the declared pack_size"
+        );
+        assert!(prod.contains("let mut bytes = Vec::new()"));
+        assert!(prod.contains("pack_initial_reserve"));
+        assert!(prod.contains("try_reserve"));
+    }
+
+    #[test]
+    fn python_max_pack_bytes_matches_rust() {
+        let py = include_str!("../../hippius_hub/constants.py");
+        let Some(line) = py.lines().find(|l| l.starts_with("MAX_PACK_BYTES = ")) else {
+            unreachable!("MAX_PACK_BYTES in constants.py")
+        };
+        let raw = line.trim_start_matches("MAX_PACK_BYTES = ");
+        let Some(expr) = raw.split('#').next() else {
+            unreachable!("expr")
+        };
+        let mut acc: u64 = 1;
+        for part in expr.split('*') {
+            let Ok(n) = part.trim().parse::<u64>() else {
+                unreachable!("factor")
+            };
+            acc = acc.saturating_mul(n);
+        }
+        assert_eq!(acc, MAX_PACK_BYTES);
+    }
+
+    #[test]
+    fn redact_url_strips_query_and_userinfo() {
+        assert_eq!(
+            super::redact_url(
+                "https://user:sig@registry.example/v2/x/blobs/sha256:ab?X-Amz-Signature=dead"
+            ),
+            "https://registry.example/v2/x/blobs/sha256:ab?<redacted>"
+        );
+        assert_eq!(
+            super::redact_url("https://registry.example/v2/x/blobs/sha256:ab"),
+            "https://registry.example/v2/x/blobs/sha256:ab"
+        );
+        assert_eq!(super::redact_url("not a url"), "not a url");
+    }
+
+    #[test]
+    fn over_send_stays_retryable_bad_response() {
+        let err =
+            CoreError::BadResponse("pack u: body exceeds expected 10 bytes (over-send)".into());
+        assert!(err.is_retryable());
+        assert!(!CoreError::Integrity("declared too big".into()).is_retryable());
     }
 
     // --- assemble (end-to-end orchestration over a local pack server) ---
