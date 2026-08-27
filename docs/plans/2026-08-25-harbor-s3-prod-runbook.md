@@ -161,7 +161,7 @@ User-supplied values also contain DB and admin passwords. **Never** `helm get va
 | 0.3 | That Arion account has credits | s3 | **Still open for the real bucket.** `can_upload` 402 freezes writes (hit 2026-08-23). 25 of 27 prod suspensions are `read_only` and three landed on 2026-08-27, so the mechanism is live. Size the funding for ~1.9 TB plus the soak, during which the bytes are stored twice. |
 | 0.4 | Who runs `helm upgrade -n harbor --version 1.19.0` | infra | George does not |
 | 0.5 | Chart `harbor/harbor` **1.19.0** still pullable | infra | `helm pull harbor/harbor --version 1.19.0`. Do not upgrade the app. |
-| 0.6 | hippius-s3-prod promoted, or the gate re-run and its number accepted | s3 | Prod is `api:539eec1`; #451 and the reader-TTFB work are not in it. §1 has never run against `-prod`. |
+| 0.6 | hippius-s3-prod promoted, or the gate re-run and its number accepted | s3 | **Promotion done 2026-08-27 13:31** — prod is now `api:c9ec8b4` (merge of #459), which contains #445, #448, #451, #452 and #456, and `HIPPIUS_FS_STORE_SCAN_CONCURRENCY=64` is in the prod defaults. **Gate run against it at 13:43: upload median 51.5 MiB/s — below the 80 bar.** See §1. Decide: tune and re-gate, or accept 51.5. |
 | 0.7 | Harbor **GC schedule paused** | George | `GARBAGE_COLLECTION` cron `0 0 4 * * *`, live since 07-13, ran every day this week. It deletes blobs from storage under the copy and manipulates registry read-only mode under the freeze. |
 | 0.8 | Blob census run (`du` + file count) | whoever can apply a Job | The §4 `du` is **not** optional — the DB's 2,060 GB counts only tracked blobs; the disk carries orphans. |
 | 0.9 | Bucket's Arion account decided: same as JuiceFS, or separate | s3 | **Answered 2026-08-27: separate.** `hub-test` is owned by `5E4ZQcXV…`; `hippius-juicefs-data` by `5E71kYuD…`. `can_upload` is keyed on the main account, so a 402 on the Harbor bucket will **not** freeze the JuiceFS-backed registry still serving prod. Issue the real bucket under a non-JuiceFS account too, and fund it separately (0.3). |
@@ -177,11 +177,41 @@ The same bucket + `hip_` key are used first in namespace `harbor-staging` (§1).
 
 Arm C was Harbor → MinIO. This gate is Harbor’s S3 driver against `http://gateway.hippius-s3-prod.svc.cluster.local:8080`. If this fails, stop — do not copy, do not helm prod.
 
-> **The gate has not actually run against `-prod` yet.** The 2026-08-25 PASS was measured
-> with the staging Harbor pointed at `gateway.hippius-s3-staging`. `install-hippius-s3.sh`
-> defaults `HARBOR_S3_ENDPOINT` to `-prod`, so re-running it as written does hit the right
-> backend — but settle §0.6 first, because a `-prod` run on `api:539eec1` is expected to
-> land well below 80. Record which endpoint each result came from, in the result.
+### Gate result — 2026-08-27, first run ever against hippius-s3-prod
+
+Bucket `hub-test`, key `hub1`, endpoint `gateway.hippius-s3-prod`, prod on the promoted
+`api:c9ec8b4`. Isolated `harbor-staging`; prod Harbor untouched (still helm rev 4,
+filesystem).
+
+| Check | Result |
+|---|---|
+| S3 contract (PUT/HEAD/GET/Range/MPU/CopyObject/List/Delete) | **PASS** |
+| Raw 64 MiB PUT | **94.3 MiB/s** (staging's first gate: 49.3) |
+| CopyObject 64 MiB — the Harbor blob-commit Move | **344.2 MiB/s** (first gate: 4.3) |
+| Unique 1 GiB `hippius_hub` 0.7.0 upload ×3 | **median 51.5 MiB/s** (19.89 s) |
+| Bar ≥ 80 MiB/s | **FAIL** |
+| Unique 1 GiB download ×3 | **median 200.4 MiB/s** (5.11 s) |
+
+Two things this settles. The **CopyObject alias path works on prod** — 344 MiB/s against
+4.3 on the pre-#445 gate, so the original blocker is gone. And the **read path is not a
+problem**: 200 MiB/s, ~4× the write rate, the first pull number anyone has measured. The
+worry that `disableredirect` would bottleneck pulls through the registry does not show up
+here.
+
+Upload is still short of the bar. The progression is 21.3 (no alias) → **51.5** (prod,
+promoted) → 99.6 (staging, 2026-08-25). Prod and staging now run the *same code*, so the
+remaining difference is configuration and load:
+
+- `UVICORN_WORKERS` 4 on prod vs 8 on staging; `API_DB_POOL_MAX_SIZE` 15 vs 8.
+- 5 api-local pods on prod vs 2 on staging — more cross-node peer fetches, which is the
+  known source of the 20 s blob-commit tails.
+- prod carries real traffic; staging was idle.
+
+Treat "workers/pool explains the 2×" as the leading hypothesis, **not** a finding. The
+cheap test is a ConfigMap change plus a re-gate.
+
+Both numbers are **optimistic for prod**: this ran registry ×3, core ×3, nginx ×3 with CPU
+requests on registry. The flip is registry ×1 and adds no core/nginx requests.
 
 ```bash
 export KUBECONFIG=~/Hippius-Storage/Configs/k8s/hippius.yaml
