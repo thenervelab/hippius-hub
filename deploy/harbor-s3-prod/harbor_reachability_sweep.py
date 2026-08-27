@@ -114,11 +114,22 @@ class TokenCache:
         self._lock = threading.Lock()
         self._tokens: dict[str, str] = {}
 
-    def get(self, repository: str) -> str:
-        with self._lock:
-            hit = self._tokens.get(repository)
-        if hit is not None:
-            return hit
+    def get(self, repository: str, *, refresh: bool = False) -> str:
+        """Return a pull token, minting a fresh one when `refresh` is set.
+
+        Harbor's tokens expire (30 min by default). A repository with thousands
+        of artifacts takes longer than that to sweep, so a token cached once per
+        repository goes stale mid-run and every later probe 401s. Callers pass
+        `refresh=True` after a 401 rather than trusting the cache.
+        """
+        if refresh:
+            with self._lock:
+                self._tokens.pop(repository, None)
+        else:
+            with self._lock:
+                hit = self._tokens.get(repository)
+            if hit is not None:
+                return hit
 
         scope = f"repository:{repository}:pull"
         resp = self._client.get(
@@ -181,6 +192,36 @@ def fetch(
     return resp.status_code
 
 
+def _why(status: int, link_kind: str) -> str:
+    """Explain a non-success status without guessing.
+
+    A 404 really is a missing link. A 401 is an auth problem and must never be
+    reported as missing data — reading one as the other is what would turn a
+    stale token into a false rollback signal.
+    """
+    if status == 404:
+        return f"(missing {link_kind} link or object)"
+    if status in (401, 403):
+        return "(auth, NOT a storage problem — token refresh already retried)"
+
+    return "(unexpected — investigate before drawing a conclusion)"
+
+
+def fetch_with_refresh(
+    client: Any,
+    tokens: TokenCache,
+    repository: str,
+    url: str,
+    **kwargs: Any,
+) -> int:
+    """GET `url`, minting a fresh token once if the first attempt 401s."""
+    status = fetch(client, url, tokens.get(repository), **kwargs)
+    if status == 401:
+        status = fetch(client, url, tokens.get(repository, refresh=True), **kwargs)
+
+    return status
+
+
 def probe(
     client: Any,
     registry: str,
@@ -196,37 +237,35 @@ def probe(
     subject = f"{repository}@{digest}"
 
     try:
-        token = tokens.get(repository)
-    except Exception as exc:  # noqa: BLE001 - an auth failure is a real finding
+        status = fetch_with_refresh(
+            client,
+            tokens,
+            repository,
+            f"{registry}/v2/{repository}/manifests/{digest}",
+            accept=MANIFEST_ACCEPT,
+        )
+    except Exception as exc:  # noqa: BLE001 - minting a token failed; a real finding
         return subject, f"token: {exc}"
 
-    status = fetch(
-        client,
-        f"{registry}/v2/{repository}/manifests/{digest}",
-        token,
-        accept=MANIFEST_ACCEPT,
-    )
     if status != 200:
-        return subject, f"manifest GET {status} (missing _manifests/revisions link)"
+        return subject, f"manifest GET {status} {_why(status, '_manifests/revisions')}"
 
     # An artifact whose every blob row is its own manifest digest has no layer
     # to probe; the manifest check above is the whole of its reachability.
     if layer is None:
         return None
 
-    status = fetch(
+    status = fetch_with_refresh(
         client,
+        tokens,
+        repository,
         f"{registry}/v2/{repository}/blobs/{layer}",
-        token,
         first_byte_only=True,
     )
     # 206 is the ranged success; 200 means the registry ignored Range and sent
     # the whole layer, which still proves the bytes are there.
     if status not in (200, 206):
-        return (
-            subject,
-            f"blob GET {status} for {layer} (missing _layers link or object)",
-        )
+        return subject, f"blob GET {status} for {layer} {_why(status, '_layers')}"
 
     return None
 

@@ -16,9 +16,12 @@ metadata:
   name: harbor-reachability-sweep
   namespace: harbor
 spec:
-  backoffLimit: 1
+  # 0, not 1: the sweep takes hours and a failure means "investigate", never
+  # "run it again". The 2026-08-27 baseline retried on its own and swept prod
+  # twice for nothing.
+  backoffLimit: 0
   ttlSecondsAfterFinished: 86400
-  activeDeadlineSeconds: 10800
+  activeDeadlineSeconds: 21600
   template:
     metadata:
       labels:
