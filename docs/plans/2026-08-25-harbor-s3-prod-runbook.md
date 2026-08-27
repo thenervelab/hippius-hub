@@ -211,7 +211,7 @@ User-supplied values also contain DB and admin passwords. **Never** `helm get va
 |---|---|---|---|
 | 0.1 | Bucket name, **not** `hippius-juicefs-data` | s3 | **Still open.** `hub-test` is the **gate** bucket only (decided 2026-08-27) — it is shared scratch, already holding 26 stray `docker/registry/v2/**` blobs, old `bench` / `phase0-bench` / `harbor-s3-probe` prefixes and an unrelated PNG. Provision a clean bucket (suggested `harbor-registry-cas`) before §4. Replace `REPLACE_ME_BUCKET` in the three YAML files. |
 | 0.2 | `hip_` key scoped to that bucket | s3 | Secret `harbor-s3` in ns `harbor`, keys `REGISTRY_STORAGE_S3_ACCESSKEY` / `REGISTRY_STORAGE_S3_SECRETKEY`. The gate key `hub1` verified 2026-08-27: reaches `hub-test`, **403 on `hippius-juicefs-data`** — the credential enforces the stop-the-line rule itself. Scope the real key the same way. |
-| 0.3 | The bucket's account can write ~1.9 TB without being gated | George + dubs | **Decided 2026-08-27: a system account carrying a large on-chain balance. No hippius-s3 change.** See the note below. This step is just: confirm it is in place and that a large write actually succeeds, **before** §4 starts a multi-hour copy. |
+| 0.3 | The bucket's account can write ~2 TB without being gated | George + dubs | **Decided 2026-08-27 with dubs: dubs' existing account is designated a _system account for the platform, with no limit_. No new S3 account is created; it is handled backend-side, by George.** Hard requirement from dubs: **usage must still be pushed so miners are paid** — see the note below, that part is automatic. This step is: confirm the designation is live and that a large write actually succeeds, **before** §4 starts a multi-hour copy. |
 | 0.4 | Who runs `helm upgrade -n harbor --version 1.19.0` | infra | George does not |
 | 0.5 | Chart `harbor/harbor` **1.19.0** still pullable | infra | `helm pull harbor/harbor --version 1.19.0`. Do not upgrade the app. |
 | 0.6 | hippius-s3-prod promoted, or the gate re-run and its number accepted | s3 | **Promotion done 2026-08-27 13:31** — prod is now `api:c9ec8b4` (merge of #459), which contains #445, #448, #451, #452 and #456, and `HIPPIUS_FS_STORE_SCAN_CONCURRENCY=64` is in the prod defaults. **Gate run against it at 13:43: upload median 51.5 MiB/s — below the 80 bar.** See §1. Decide: tune and re-gate, or accept 51.5. |
@@ -220,17 +220,42 @@ User-supplied values also contain DB and admin passwords. **Never** `helm get va
 | 0.9 | Bucket's Arion account decided: same as JuiceFS, or separate | s3 | **Answered 2026-08-27: separate.** `hub-test` is owned by `5E4ZQcXV…`; `hippius-juicefs-data` by `5E71kYuD…`. `can_upload` is keyed on the main account, so a 402 on the Harbor bucket will **not** freeze the JuiceFS-backed registry still serving prod. Issue the real bucket under a non-JuiceFS account too, and fund it separately (0.3). |
 | 0.10 | **Baseline reachability sweep, before anything changes** | George | §7a's sweep run against today's filesystem-backed prod. It is read-only and works on either backend. Without it, a post-flip failure cannot be told apart from breakage that was already there — the staging rehearsal found 3 artifacts whose manifest blob was already missing from storage while Harbor's DB still referenced them. Save the output. |
 
-### On 0.3 — why funding, and not a code bypass
+### On 0.3 — a no-limit system account, and what it must not break
 
-Both credit gates on the write path reduce to one thing, the account's balance:
+The decision (George + dubs, 2026-08-27): the account already behind this bucket becomes a
+**system account serving the platform, with no limit**. Not a new account — dubs was
+explicit, "no need to create an account" — and handled backend-side rather than by asking
+a human to keep topping it up.
+
+**There are exactly two write gates to satisfy, and both reduce to the account's balance:**
 
 1. `gateway/middlewares/account.py:266` — `if not request.state.account.has_credits`, which
    is literally `free_credits > 0` from the chain (`cacher/run_cacher.py:207`).
 2. `_check_can_upload` → Arion `POST /can_upload`, a balance-vs-size check.
 
-So a system account with a large balance satisfies both with **no change to hippius-s3**.
+Anything that neutralises **both** works. Two mechanisms do, and the choice is George's:
 
-Three things verified 2026-08-27 that make this safe, and that are worth not
+- **A balance large enough to be effectively unlimited.** Zero code, satisfies both gates
+  as designed, and keeps the spend visible as real drawdown. Needs watching, since "large"
+  is not "infinite".
+- **A first-class system-account flag.** The codebase already has the shape in
+  `account_suspensions`: a tiny table where *row present = suspended*, a 30s redis cache in
+  front (`gateway/services/suspension.py`), and `/admin/*` endpoints to set it. A
+  `system_accounts` table mirroring that — row present = skip both gates — is changeable at
+  runtime without redeploying the api-local DaemonSet. That matters: `UVICORN_WORKERS=8`
+  was a staging-only ConfigMap override nobody noticed for two days, and an env-var
+  allowlist would be that same trap.
+
+**Dubs' condition — "you just have to push the usage still so we pay miners" — is satisfied
+either way, and needs no extra work.** Gating and usage are separate paths. `can_upload` is
+a pure permission check on the request path and records nothing; the pin miners are paid
+for is `upload_file_and_get_cid` in `workers/uploader.py:346`, in the async uploader, under
+the same `account_ss58`. Removing the limit changes the gate, never the accounting. The one
+consequence worth telling dubs: the account will accrue real usage that miners are paid for
+while never debiting, so the spend stops being visible as credit drawdown — worth a log
+line or metric so it stays auditable rather than silent.
+
+Three more things verified 2026-08-27 that make this safe, and that are worth not
 re-discovering:
 
 - **Miners still get paid.** Gating and usage are separate paths. `can_upload` is a pure
@@ -247,11 +272,13 @@ re-discovering:
   including anonymous ones. If the fence were ever lifted it would disable billing for
   every customer on hippius-s3-prod.
 
-The balance is large, not infinite, so it needs watching. A 402 part-way through §4 stalls
-the copy; rclone retries and the Job is re-runnable, so nothing is lost but hours. Check
-the balance before §4 and again before §5.
+Whichever mechanism: **verify it with a real write before §4**, not by reading config. If
+the designation silently fails, the first symptom is a 402 part-way through a multi-hour
+copy. Nothing is lost when that happens — rclone retries and the Job is re-runnable — but
+hours are. Re-check before §5 too, since the freeze window has no room for a surprise.
 
-Sizing the funding: **~2 TB of logical bytes**, which is what rclone transfers. See §0.8.
+If the balance route is chosen, size it against **~2 TB of logical bytes**, which is what
+rclone transfers. See §0.8.
 
 Do **not** size it off `du`, and do not assume the migration slashes the storage bill.
 `du -sk` on the blobs tree reports **30,720 GiB**, but that is JuiceFS block accounting,
