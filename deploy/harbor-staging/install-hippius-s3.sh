@@ -53,8 +53,13 @@ kretry() {
 if helm list -n harbor --filter '^harbor$' 2>/dev/null | grep -q deployed; then
   echo "prod helm release 'harbor' in namespace harbor is present; will not upgrade it"
 fi
-if helm list -n harbor -q 2>/dev/null | grep -qx "${RELEASE}"; then
-  echo "refusing: a release named ${RELEASE} already exists in namespace harbor" >&2
+# Checked against ${NS}, not ns harbor: the point is to catch a LIVE staging
+# release and refuse to helm-upgrade it in place. jobservice is RWO on
+# ceph-block, so an in-place upgrade that reschedules the pod wedges the release
+# in pending-upgrade on Multi-Attach. Tear down explicitly and reinstall.
+if helm list -n "${NS}" -q 2>/dev/null | grep -qx "${RELEASE}"; then
+  echo "refusing: ${RELEASE} is already installed in namespace ${NS}" >&2
+  echo "run ${HERE}/uninstall.sh first, then re-run this to gate a new bucket" >&2
   exit 2
 fi
 
