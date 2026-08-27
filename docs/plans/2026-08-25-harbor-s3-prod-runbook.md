@@ -72,6 +72,35 @@ but only because re-pushing regenerates link objects as a side effect. §4a now 
 directly, proved 760/760 exact against Harbor's own set on staging, which removes the only
 real advantage while keeping all 351 robots, 237 quotas and 1,327 untagged artifacts.
 
+### What the Harbor project itself says
+
+**There is no official path.** goharbor #18843 — "Migrate Harbor instance from
+Filesystem/Block storage to Object Storage" — was closed **as stale** on 2024-10-29, with
+a contributor stating plainly: "It's not stale. There is no progress on this issue from
+the dev team yet." Harbor's own docs cover upgrade/data migration (schema and settings),
+never storage backends.
+
+The nearest thing to official guidance is in that thread. Contributor **stonezdj**: "You
+could do it by replication" — immediately caveated with "the configuration and retention
+policy is not replicated. you need to setup manually." Another commenter asked in the same
+thread whether replication covers robot accounts; it does not. That is the same wall we
+hit independently, from the maintainers' own mouths.
+
+Where practitioners have written the procedure down, it is **our** shape, not replication.
+DaoCloud's documented Harbor migration is: put the source in read-only mode, `rclone copy`
+the registry storage directory to the object store, and bring the **database across with
+it**, with account passwords kept consistent — i.e. blobs and database migrated as a
+matched pair inside a read-only window. The Sovereign Cloud Stack writeup does the same,
+using read-only mode to keep source and destination in sync.
+
+We are doing that, in a tighter form: same Harbor, same Postgres, no dump/restore at all,
+so robots, quotas, memberships and project flags cannot drift. The one deliberate
+divergence is that we **generate** `repositories/` from Postgres instead of `rclone`-ing
+it. That is forced — the JuiceFS metadata walk did not finish in five minutes for a
+handful of the 225 projects — and it drops the ~6k forgotten repository directories for
+free. The cost is that it is our code rather than a byte copy, which is what §4a's staging
+rehearsal and §7a's sweep exist to cover.
+
 Sign-off needed on D1–D8, then fill §0. Infra runs the helm command. George does not. The hippius-s3 gate is §1.
 
 Success bar after flip: median **≥ 80 MiB/s** on a 1 GiB fresh unique-bytes `hippius-hub` 0.7.0 upload (3 runs).
