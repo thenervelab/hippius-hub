@@ -1,0 +1,89 @@
+# Rebuild the per-repository link objects the blob copy does not carry.
+# Replace REPLACE_ME_BUCKET, then:
+#   kubectl -n harbor create configmap harbor-link-objects \
+#     --from-file=harbor_link_objects.py=deploy/harbor-s3-prod/harbor_link_objects.py \
+#     --dry-run=client -o yaml | kubectl apply -f -
+#   kubectl -n harbor apply -f deploy/harbor-s3-prod/link-objects-job.yaml
+#
+# MODE=plan first (counts, writes nothing), then apply, then verify.
+# Reads Harbor's database read-only. PUT is idempotent, so re-running after a
+# partial failure is safe: delete the Job and apply again.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: harbor-link-objects
+  namespace: harbor
+spec:
+  backoffLimit: 3
+  ttlSecondsAfterFinished: 86400
+  activeDeadlineSeconds: 43200
+  template:
+    metadata:
+      labels:
+        app: harbor-link-objects
+    spec:
+      restartPolicy: OnFailure
+      containers:
+        - name: links
+          image: python:3.12-slim-bookworm
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: MODE
+              value: plan
+            - name: HARBOR_S3_BUCKET
+              value: REPLACE_ME_BUCKET
+            - name: HARBOR_S3_ENDPOINT
+              value: http://gateway.hippius-s3-prod.svc.cluster.local:8080
+            - name: AWS_ACCESS_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: harbor-s3
+                  key: REGISTRY_STORAGE_S3_ACCESSKEY
+            - name: AWS_SECRET_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: harbor-s3
+                  key: REGISTRY_STORAGE_S3_SECRETKEY
+            # libpq reads these directly, so a generated password never has to
+            # survive a hand-built connection URL.
+            - name: PGHOST
+              value: harbor-postgres-rw.harbor.svc.cluster.local
+            - name: PGPORT
+              value: "5432"
+            - name: PGDATABASE
+              value: registry
+            - name: PGSSLMODE
+              value: disable
+            - name: PGUSER
+              valueFrom:
+                secretKeyRef:
+                  name: harbor-postgres-superuser
+                  key: username
+            - name: PGPASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: harbor-postgres-superuser
+                  key: password
+            - name: PIP_DISABLE_PIP_VERSION_CHECK
+              value: "1"
+          command:
+            - /bin/sh
+            - -c
+            - |
+              set -eu
+              pip install --no-cache-dir boto3 'psycopg[binary]'
+              python /app/harbor_link_objects.py "${MODE}" --workers 32
+          volumeMounts:
+            - name: script
+              mountPath: /app
+          resources:
+            requests:
+              cpu: "1"
+              memory: 1Gi
+            limits:
+              cpu: "4"
+              memory: 2Gi
+      volumes:
+        - name: script
+          configMap:
+            name: harbor-link-objects

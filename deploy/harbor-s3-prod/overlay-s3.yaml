@@ -1,0 +1,82 @@
+# Overlay for: helm upgrade harbor harbor/harbor --version 1.19.0 -n harbor --reuse-values -f this
+# Do not apply until docs/plans/2026-08-25-harbor-s3-prod-runbook.md §0 is filled.
+#
+# Chart harbor-1.19.0 does not render s3.forcepathstyle, and it omits s3.secure
+# when the value is false (distribution then defaults secure=true). Both are
+# set via extraEnvVars. Do not "fix" that by bumping the chart.
+
+persistence:
+  resourcePolicy: keep
+  persistentVolumeClaim:
+    registry:
+      existingClaim: harbor-registry
+      accessMode: ReadWriteMany
+      size: 100Ti
+      storageClass: hippius-juicefs
+  imageChartStorage:
+    disableredirect: true
+    type: s3
+    s3:
+      existingSecret: harbor-s3
+      region: us-east-1
+      bucket: REPLACE_ME_BUCKET
+      regionendpoint: http://gateway.hippius-s3-prod.svc.cluster.local:8080
+      encrypt: false
+      secure: false
+      v4auth: true
+      chunksize: "67108864"
+      # Default 32 MiB. A 64–75 MiB pack then Move's via UploadPartCopy of
+      # 32 MiB ranges (GET+PUT) instead of one CopyObject alias (~0.06s).
+      # 128 MiB keeps packs on the alias path. Required for unique 1 GiB ≥ 80
+      # on hippius-s3 (harbor-staging 2026-08-25). Chart 1.19.0 renders this.
+      multipartcopythresholdsize: "134217728"
+      # empty / omitted: keys are docker/registry/v2/blobs/sha256/<aa>/<digest>/data
+
+# core and nginx are scaled to 5 by a live kubectl patch, not by helm values —
+# same class as the registry affinity below, and neither is under an HPA. A
+# helm upgrade without these renders the chart default of 1 and cuts the API and
+# proxy tiers to 20% at the same moment the registry restarts. Verified live
+# 2026-08-27. Re-check before the flip; do not lower them here to match staging.
+core:
+  replicas: 5
+
+nginx:
+  replicas: 5
+
+registry:
+  replicas: 1
+  affinity:
+    nodeAffinity:
+      preferredDuringSchedulingIgnoredDuringExecution:
+        - weight: 100
+          preference:
+            matchExpressions:
+              - key: kubernetes.io/hostname
+                operator: In
+                values:
+                  - k8s-v3-node1
+  registry:
+    # BestEffort left the digest PUT CPU-starved under 16 concurrent 64 MiB
+    # bodies on harbor-staging. Do not drop this at the flip.
+    resources:
+      requests:
+        cpu: "2"
+        memory: 2Gi
+      limits:
+        cpu: "4"
+        memory: 4Gi
+    extraEnvVars:
+      - name: REGISTRY_STORAGE_S3_FORCEPATHSTYLE
+        value: "true"
+      - name: REGISTRY_STORAGE_S3_SECURE
+        value: "false"
+      - name: REGISTRY_STORAGE_S3_MULTIPARTCOPYTHRESHOLDSIZE
+        value: "134217728"
+  controller:
+    extraEnvVars:
+      - name: REGISTRY_STORAGE_S3_FORCEPATHSTYLE
+        value: "true"
+      - name: REGISTRY_STORAGE_S3_SECURE
+        value: "false"
+      - name: REGISTRY_STORAGE_S3_MULTIPARTCOPYTHRESHOLDSIZE
+        value: "134217728"
