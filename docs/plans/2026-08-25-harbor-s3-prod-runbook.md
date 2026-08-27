@@ -156,15 +156,15 @@ User-supplied values also contain DB and admin passwords. **Never** `helm get va
 
 | # | Item | Owner | Notes |
 |---|---|---|---|
-| 0.1 | Bucket name, **not** `hippius-juicefs-data` | s3 | Suggested: `harbor-registry-cas`. Replace `REPLACE_ME_BUCKET` in the three YAML files. |
-| 0.2 | `hip_` key scoped to that bucket | s3 | Secret `harbor-s3` in ns `harbor`, keys `REGISTRY_STORAGE_S3_ACCESSKEY` / `REGISTRY_STORAGE_S3_SECRETKEY` |
-| 0.3 | That Arion account has credits | s3 | `can_upload` 402 freezes writes (hit 2026-08-23) |
+| 0.1 | Bucket name, **not** `hippius-juicefs-data` | s3 | **Still open.** `hub-test` is the **gate** bucket only (decided 2026-08-27) — it is shared scratch, already holding 26 stray `docker/registry/v2/**` blobs, old `bench` / `phase0-bench` / `harbor-s3-probe` prefixes and an unrelated PNG. Provision a clean bucket (suggested `harbor-registry-cas`) before §4. Replace `REPLACE_ME_BUCKET` in the three YAML files. |
+| 0.2 | `hip_` key scoped to that bucket | s3 | Secret `harbor-s3` in ns `harbor`, keys `REGISTRY_STORAGE_S3_ACCESSKEY` / `REGISTRY_STORAGE_S3_SECRETKEY`. The gate key `hub1` verified 2026-08-27: reaches `hub-test`, **403 on `hippius-juicefs-data`** — the credential enforces the stop-the-line rule itself. Scope the real key the same way. |
+| 0.3 | That Arion account has credits | s3 | **Still open for the real bucket.** `can_upload` 402 freezes writes (hit 2026-08-23). 25 of 27 prod suspensions are `read_only` and three landed on 2026-08-27, so the mechanism is live. Size the funding for ~1.9 TB plus the soak, during which the bytes are stored twice. |
 | 0.4 | Who runs `helm upgrade -n harbor --version 1.19.0` | infra | George does not |
 | 0.5 | Chart `harbor/harbor` **1.19.0** still pullable | infra | `helm pull harbor/harbor --version 1.19.0`. Do not upgrade the app. |
 | 0.6 | hippius-s3-prod promoted, or the gate re-run and its number accepted | s3 | Prod is `api:539eec1`; #451 and the reader-TTFB work are not in it. §1 has never run against `-prod`. |
 | 0.7 | Harbor **GC schedule paused** | George | `GARBAGE_COLLECTION` cron `0 0 4 * * *`, live since 07-13, ran every day this week. It deletes blobs from storage under the copy and manipulates registry read-only mode under the freeze. |
 | 0.8 | Blob census run (`du` + file count) | whoever can apply a Job | The §4 `du` is **not** optional — the DB's 2,060 GB counts only tracked blobs; the disk carries orphans. |
-| 0.9 | Bucket's Arion account decided: same as JuiceFS, or separate | s3 | `hippius-juicefs-data` is in the same hippius-s3-prod (9,719,799 objects) under `5E71kYuD…`. Every copy PUT passes `can_upload`, keyed on the main account — a 402 on that account would also freeze writes to the JuiceFS-backed registry still serving prod. |
+| 0.9 | Bucket's Arion account decided: same as JuiceFS, or separate | s3 | **Answered 2026-08-27: separate.** `hub-test` is owned by `5E4ZQcXV…`; `hippius-juicefs-data` by `5E71kYuD…`. `can_upload` is keyed on the main account, so a 402 on the Harbor bucket will **not** freeze the JuiceFS-backed registry still serving prod. Issue the real bucket under a non-JuiceFS account too, and fund it separately (0.3). |
 | 0.10 | **Baseline reachability sweep, before anything changes** | George | §7a's sweep run against today's filesystem-backed prod. It is read-only and works on either backend. Without it, a post-flip failure cannot be told apart from breakage that was already there — the staging rehearsal found 3 artifacts whose manifest blob was already missing from storage while Harbor's DB still referenced them. Save the output. |
 
 Helm repo `harbor` → `https://helm.goharbor.io` is already on this machine.
