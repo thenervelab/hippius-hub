@@ -165,6 +165,7 @@ User-supplied values also contain DB and admin passwords. **Never** `helm get va
 | 0.7 | Harbor **GC schedule paused** | George | `GARBAGE_COLLECTION` cron `0 0 4 * * *`, live since 07-13, ran every day this week. It deletes blobs from storage under the copy and manipulates registry read-only mode under the freeze. |
 | 0.8 | Blob census run (`du` + file count) | whoever can apply a Job | The §4 `du` is **not** optional — the DB's 2,060 GB counts only tracked blobs; the disk carries orphans. |
 | 0.9 | Bucket's Arion account decided: same as JuiceFS, or separate | s3 | `hippius-juicefs-data` is in the same hippius-s3-prod (9,719,799 objects) under `5E71kYuD…`. Every copy PUT passes `can_upload`, keyed on the main account — a 402 on that account would also freeze writes to the JuiceFS-backed registry still serving prod. |
+| 0.10 | **Baseline reachability sweep, before anything changes** | George | §7a's sweep run against today's filesystem-backed prod. It is read-only and works on either backend. Without it, a post-flip failure cannot be told apart from breakage that was already there — the staging rehearsal found 3 artifacts whose manifest blob was already missing from storage while Harbor's DB still referenced them. Save the output. |
 
 Helm repo `harbor` → `https://helm.goharbor.io` is already on this machine.
 
@@ -358,6 +359,11 @@ PUT is idempotent, so a partial failure just means delete the Job and re-apply. 
 **after** §4's blob copy has caught up and again in §5, since anything pushed between the
 two runs needs its links too.
 
+**Measured on harbor-staging 2026-08-27:** 817 link objects in 12.5 s = **66/s at 16
+workers**. At that rate prod's 151,960 objects is ~38 min; the prod Job runs 32 workers,
+so expect somewhere in 20–40 min. This is not the long pole — §4's ~1.9 TB is. Numbers
+are from hippius-s3-staging (2 api-local pods); prod has 5 but also carries real load.
+
 Rehearsal, if you want independent confirmation of the shapes: point a Harbor-to-Harbor
 replication rule from prod at the S3-backed `harbor-staging` and diff the link keys
 Harbor writes itself against what `MODE=plan` lists. That touches no prod storage.
@@ -477,6 +483,18 @@ kubectl -n harbor apply -f deploy/harbor-s3-prod/reachability-sweep-job.yaml
 kubectl -n harbor logs -f job/harbor-reachability-sweep
 # expect: swept ~27,775 artifacts / PASS every artifact resolves
 ```
+
+Compare against the §0.10 baseline. The pass condition is **no failures that were not
+already failing before the flip** — not an unconditional PASS. The sweep detects any
+Harbor-DB-to-storage inconsistency, including artifacts that were already unservable, so
+a bare count is not enough to judge the migration by.
+
+Rehearsed end to end on harbor-staging 2026-08-27 against Harbor's own data: with the
+link objects deleted the sweep failed 32 of 43 artifacts with
+`manifest GET 404 (missing _manifests/revisions link)`; after §4a regenerated them it
+failed only the 3 whose manifest blob was independently missing from the bucket. For
+every healthy artifact the generated key set reproduced Harbor's own, exactly — 760 of
+760, nothing missing, nothing spurious.
 
 Then, still frozen:
 

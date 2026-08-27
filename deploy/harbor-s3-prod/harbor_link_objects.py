@@ -136,14 +136,27 @@ def db_dsn() -> str:
     sys.exit("need HARBOR_DB_DSN, or PGHOST + PGDATABASE (with PGUSER / PGPASSWORD)")
 
 
+def read_only_connection(dsn: str) -> Any:
+    """Open a connection that cannot write to Harbor's database.
+
+    Not autocommit: a server-side cursor is a DECLARE, which Postgres only
+    accepts inside a transaction block. `read_only` has to be set before the
+    first statement opens that transaction.
+    """
+    import psycopg
+
+    conn = psycopg.connect(dsn)
+    conn.read_only = True
+
+    return conn
+
+
 def iter_links(dsn: str, batch: int = 10000) -> Iterator[tuple[str, str, bool]]:
     """Stream every (repository, digest, is_manifest) link the registry needs.
 
     Uses server-side cursors so a 150k-row result never lands in memory at once.
     """
-    import psycopg
-
-    with psycopg.connect(dsn, autocommit=True) as conn:
+    with read_only_connection(dsn) as conn:
         for sql, manifest in ((LAYER_LINK_SQL, False), (REVISION_LINK_SQL, True)):
             with conn.cursor(name=f"links_{int(manifest)}") as cur:
                 cur.itersize = batch
@@ -246,6 +259,7 @@ def run_apply(dsn: str, client: Any, bucket: str, workers: int) -> int:
     done = Counter("written")
     failures: list[tuple[str, str]] = []
     lock = threading.Lock()
+    started = time.perf_counter()
 
     def work(item: tuple[str, str, bool]) -> None:
         repository, digest, manifest = item
@@ -260,7 +274,12 @@ def run_apply(dsn: str, client: Any, bucket: str, workers: int) -> int:
         for _ in pool.map(work, iter_links(dsn)):
             pass
 
-    print(f"\nwrote {done.total} link objects")
+    elapsed = time.perf_counter() - started
+    rate = done.total / max(elapsed, 1e-6)
+    print(
+        f"\nwrote {done.total} link objects in {elapsed:.1f}s ({rate:.0f}/s, {workers} workers)"
+    )
+
     if failures:
         print(f"FAIL  {len(failures)} link objects did not write", file=sys.stderr)
         for name, err in failures[:20]:

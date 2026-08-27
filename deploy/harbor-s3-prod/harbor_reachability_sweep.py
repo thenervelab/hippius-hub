@@ -78,13 +78,26 @@ def db_dsn() -> str:
     sys.exit("need HARBOR_DB_DSN, or PGHOST + PGDATABASE (with PGUSER / PGPASSWORD)")
 
 
+def read_only_connection(dsn: str) -> Any:
+    """Open a connection that cannot write to Harbor's database.
+
+    Not autocommit: a server-side cursor is a DECLARE, which Postgres only
+    accepts inside a transaction block. `read_only` has to be set before the
+    first statement opens that transaction.
+    """
+    import psycopg
+
+    conn = psycopg.connect(dsn)
+    conn.read_only = True
+
+    return conn
+
+
 def iter_artifacts(
     dsn: str, batch: int = 5000
 ) -> Iterator[tuple[str, str, str | None]]:
     """Stream (repository, manifest digest, one layer digest) for every artifact."""
-    import psycopg
-
-    with psycopg.connect(dsn, autocommit=True) as conn:
+    with read_only_connection(dsn) as conn:
         with conn.cursor(name="artifacts") as cur:
             cur.itersize = batch
             cur.execute(ARTIFACT_SQL)
