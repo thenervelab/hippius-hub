@@ -48,6 +48,30 @@ Replication is still worth using as a **rehearsal**: a Harbor-to-Harbor rule int
 S3-backed `harbor-staging` makes Harbor generate the link objects itself, giving a
 reference set to diff §4a's output against without touching prod storage.
 
+**"Mirror mode" — evaluated 2026-08-27 against the 2.15 docs, and rejected.** In Harbor's
+vocabulary a mirror is a *proxy cache project*, and the docs are explicit: "you are not
+able to push images to a proxy cache project." Hub users push constantly, so a
+proxy-cache-backed registry is read-only and unusable as primary. It is also lazily
+populated — only what someone pulls ever lands, so the cold majority of 28k artifacts
+would never migrate — and Harbor "creates a 7 day retention policy for each new proxy
+cache project" by default, so what does land is evicted. It is a cache, not a store.
+(goharbor #22611, targeted 2.15.0, argues even the "pull-through cache" label is wrong.)
+
+**What the research does confirm is §4a.** Harbor has no migration tooling — goharbor
+#18843, asking for exactly this, was closed *as not planned* — and the community guidance
+is unambiguous: copy the entire `docker/registry/v2/` tree, blobs *and* repositories,
+skipping `_uploads/`. Without the link files "the registry has no record that a repository
+owns a given layer, so pulls will fail with blob-unknown errors". Two Harbor issues are
+this failure in the wild: #17541 (swapped S3 buckets, "docker login worked but push/pull
+broken, no obvious indicators in the logs", closed with no maintainer answer) and #11773
+(rebuilt Harbor on the same S3 showed no images). GitLab hit it too moving to a DB-backed
+registry: blob transfer alone was insufficient.
+
+So the second-Harbor path is genuinely the "safest, slowest" option in the literature —
+but only because re-pushing regenerates link objects as a side effect. §4a now does that
+directly, proved 760/760 exact against Harbor's own set on staging, which removes the only
+real advantage while keeping all 351 robots, 237 quotas and 1,327 untagged artifacts.
+
 Sign-off needed on D1–D8, then fill §0. Infra runs the helm command. George does not. The hippius-s3 gate is §1.
 
 Success bar after flip: median **≥ 80 MiB/s** on a 1 GiB fresh unique-bytes `hippius-hub` 0.7.0 upload (3 runs).
@@ -459,11 +483,18 @@ curl -sS -u "admin:${ADMIN}" \
   https://registry.hippius.com/api/v2.0/configurations | grep read_only
 ```
 
-GC must already be paused (§0.7). Harbor's GC manipulates registry read-only mode for
-the duration of a run and restores the value it captured on entry — a run that starts
-before this `read_only: true` lands would lift the freeze when it finishes, and anything
-pushed after the final catch-up would exist only on JuiceFS. Confirm no GC is running
-before continuing.
+GC must already be paused (§0.7). **Confirmed against Harbor's docs 2026-08-27:** "When GC
+runs, Harbor goes into read-only mode and all modifications to the registry are
+prohibited." It restores the value it captured on entry, so a run that starts before this
+`read_only: true` lands would lift the freeze when it finishes, and anything pushed after
+the final catch-up would exist only on JuiceFS. Confirm no GC is running before continuing.
+
+One thing the same research clears up, in our favour: Harbor 2.x's GC is **DB-driven**,
+marking from the `blob` table rather than walking storage the way upstream distribution's
+`registry garbage-collect` does. So an incomplete §4a cannot cause GC to delete blobs it
+thinks are unreferenced — the failure mode is 404s on pull, not deletion. The flip side is
+that storage-only orphans are invisible to GC forever (goharbor #23199), so the ~78 orphan
+blobs §0.8 found will simply sit in the bucket.
 
 1. Announce: no pushes.
 2. Wait in-flight uploads to finish or fail (they retry after).
@@ -674,6 +705,12 @@ change. Until then ~1.9 TiB is stored twice, plus the 9.7M JuiceFS chunk objects
 - §7a reports any unreachable artifact
 - Unfreezing before §7a passes
 - GC schedule still active during copy or freeze
+- Enabling GC's **"Delete Untagged Artifacts"**. Prod's schedule has
+  `delete_untagged: false` and must keep it: the flag *deletes* untagged artifacts rather
+  than merely collecting already-deleted ones (goharbor #16326), and prod holds **1,327**
+  of them — recent, and reachable by digest through `hippius-hub`.
+- Converting any project to a **proxy cache** to "mirror" content: they cannot be pushed
+  to, and carry a default 7-day retention that evicts what they cache
 - Copy destination is `hippius-juicefs-data`
 - `helm upgrade` without `--reuse-values` or without `--version 1.19.0`
 - `helm upgrade` without the node1 affinity overlay
