@@ -48,15 +48,22 @@ spec:
             - name: PGSSLMODE
               value: disable
             - name: PGUSER
-              valueFrom:
-                secretKeyRef:
-                  name: harbor-postgres-superuser
-                  key: username
+              value: postgres
+            # harbor-core's own DB credential. The CNPG harbor-postgres-superuser
+            # secret does NOT authenticate over TCP (verified 2026-08-27); this one
+            # does, and is the same one the registry itself connects with.
             - name: PGPASSWORD
               valueFrom:
                 secretKeyRef:
-                  name: harbor-postgres-superuser
-                  key: password
+                  name: harbor-core
+                  key: POSTGRESQL_PASSWORD
+            # 32 suits the post-flip run against S3. For the 0.10 baseline,
+            # while the registry is still on JuiceFS, drop this to ~8: a
+            # one-byte ranged GET there pulls a whole 4 MiB JuiceFS block, so
+            # the sweep is far heavier on the live registry than it will be
+            # after the flip.
+            - name: SWEEP_WORKERS
+              value: "32"
             - name: PIP_DISABLE_PIP_VERSION_CHECK
               value: "1"
           command:
@@ -65,7 +72,7 @@ spec:
             - |
               set -eu
               pip install --no-cache-dir httpx 'psycopg[binary]'
-              python /app/harbor_reachability_sweep.py --workers 32
+              python /app/harbor_reachability_sweep.py --workers "${SWEEP_WORKERS}"
           volumeMounts:
             - name: script
               mountPath: /app

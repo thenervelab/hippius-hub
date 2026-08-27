@@ -163,7 +163,7 @@ User-supplied values also contain DB and admin passwords. **Never** `helm get va
 | 0.5 | Chart `harbor/harbor` **1.19.0** still pullable | infra | `helm pull harbor/harbor --version 1.19.0`. Do not upgrade the app. |
 | 0.6 | hippius-s3-prod promoted, or the gate re-run and its number accepted | s3 | **Promotion done 2026-08-27 13:31** — prod is now `api:c9ec8b4` (merge of #459), which contains #445, #448, #451, #452 and #456, and `HIPPIUS_FS_STORE_SCAN_CONCURRENCY=64` is in the prod defaults. **Gate run against it at 13:43: upload median 51.5 MiB/s — below the 80 bar.** See §1. Decide: tune and re-gate, or accept 51.5. |
 | 0.7 | Harbor **GC schedule paused** | George | `GARBAGE_COLLECTION` cron `0 0 4 * * *`, live since 07-13, ran every day this week. It deletes blobs from storage under the copy and manipulates registry read-only mode under the freeze. |
-| 0.8 | Blob census run (`du` + file count) | whoever can apply a Job | The §4 `du` is **not** optional — the DB's 2,060 GB counts only tracked blobs; the disk carries orphans. |
+| 0.8 | Blob census run (`du` + file count) | whoever can apply a Job | **Done 2026-08-27** — `deploy/harbor-s3-prod/blob-census-job.yaml`. **78,552 blob digests on disk** against 78,474 in the database, so only ~78 orphans (0.1%) — the copy set is essentially exactly what Harbor tracks. Logical size **2,060 GB**. Ignore `du`'s 30,720 GiB; see the note below. |
 | 0.9 | Bucket's Arion account decided: same as JuiceFS, or separate | s3 | **Answered 2026-08-27: separate.** `hub-test` is owned by `5E4ZQcXV…`; `hippius-juicefs-data` by `5E71kYuD…`. `can_upload` is keyed on the main account, so a 402 on the Harbor bucket will **not** freeze the JuiceFS-backed registry still serving prod. Issue the real bucket under a non-JuiceFS account too, and fund it separately (0.3). |
 | 0.10 | **Baseline reachability sweep, before anything changes** | George | §7a's sweep run against today's filesystem-backed prod. It is read-only and works on either backend. Without it, a post-flip failure cannot be told apart from breakage that was already there — the staging rehearsal found 3 artifacts whose manifest blob was already missing from storage while Harbor's DB still referenced them. Save the output. |
 
@@ -198,10 +198,15 @@ The balance is large, not infinite, so it needs watching. A 402 part-way through
 the copy; rclone retries and the Job is re-runnable, so nothing is lost but hours. Check
 the balance before §4 and again before §5.
 
-Worth knowing for sizing: this migration should *reduce* the registry's stored footprint.
-JuiceFS holds ~1.9 TiB of blobs as 9,719,799 chunk objects (~31 TiB used space at a 4 MiB
-block size); the S3 driver holds the same registry as ~78k blobs plus ~152k links. The
-overlap during the soak is the only genuinely new spend.
+Sizing the funding: **~2 TB of logical bytes**, which is what rclone transfers. See §0.8.
+
+Do **not** size it off `du`, and do not assume the migration slashes the storage bill.
+`du -sk` on the blobs tree reports **30,720 GiB**, but that is JuiceFS block accounting,
+not bytes: the same 78.5k blobs total **2,060 GB** in Harbor's own database (avg 27 MB,
+largest 16 GB), and the JuiceFS bucket holds 8,304,880 live chunk objects for them. Whether
+JuiceFS's *billed* footprint is nearer 2 TB or 30 TiB was not measured — the join needed to
+total part sizes across 8.3M objects is too heavy to run against prod. So the
+storage-cost comparison is **open**, not a saving to bank on.
 
 Helm repo `harbor` → `https://helm.goharbor.io` is already on this machine.
 
