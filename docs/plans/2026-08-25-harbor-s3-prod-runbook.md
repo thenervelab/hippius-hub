@@ -454,7 +454,21 @@ Retry on 503 / SlowDown is in rclone flags. Do not point rclone at `hippius-juic
 
 Sample check (on the Job pod or a one-off): SHA-256 of local `…/sha256/<aa>/<digest>/data` equals `<digest>`; S3 `HEAD` size equals file size. Do this for ≥20 random blobs including one large pack.
 
-Expected wall clock: hours, not minutes (~1.9 TB). That is the long pole. **Do not freeze yet.**
+Expected wall clock: hours, not minutes (~2 TB). That is the long pole. **Do not freeze yet.**
+
+**The large-blob path is the one thing in this plan never rehearsed.** The staging
+rehearsal proved §4a's link generation; the blobs were already in that bucket because
+Harbor had written them. rclone reading the JuiceFS PVC and writing 78,552 blobs to
+hippius-s3 has not been run. The limits do permit it — **24 blobs exceed 5 GiB, 8 exceed
+10 GiB, and the largest is 16.02 GiB** (17,204,127,784 B) against a gateway cap of 5 TiB
+(`max_multipart_part_size` 512 MiB × `max_multipart_part_count` 10,000), and at
+`--s3-chunk-size 64M` that largest blob is 257 parts against a 10,000 limit. But nothing
+has yet written a single multi-GiB object to hippius-s3: the contract test tops out at a
+64 MiB PUT and a 16 MiB two-part MPU, and the gate's 1 GiB upload went through Harbor's own
+64 MiB packs.
+
+So watch the first large blob rather than assuming it. `--size-only` means a re-run repairs
+a partial transfer, and §7a is the backstop that catches anything missed.
 
 Size check before copy (**0.8 — required, not optional**):
 
