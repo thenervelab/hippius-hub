@@ -3,12 +3,24 @@
 
 The filesystem-to-S3 cut fails in exactly one way: some artifacts resolve and
 some 404, silently, until a user hits one. Sampling a handful of blobs does not
-catch it. This HEADs both link classes for every artifact Harbor knows about:
+catch it. This checks both link classes for every artifact Harbor knows about:
 
-    HEAD /v2/<repository>/manifests/<artifact digest>   -> _manifests/revisions
-    HEAD /v2/<repository>/blobs/<one layer digest>      -> _layers
+    GET /v2/<repository>/manifests/<artifact digest>    -> _manifests/revisions
+    GET /v2/<repository>/blobs/<one layer digest>       -> _layers
+        with Range: bytes=0-0
 
-No bytes are transferred, so the whole sweep is minutes against a frozen
+Both are GETs, not HEADs, on purpose. The registry runs
+`storage.cache.layerinfo: redis` and that cache is *repository-scoped* — its keys
+are `repository::<repo>::blobs::<digest>` — so a HEAD can be answered from redis
+without reading the link object or touching S3 at all. Redis is a separate
+StatefulSet and survives the registry restart, so a HEAD-based sweep would report
+PASS for a repository whose links never landed. A one-byte ranged GET has to
+resolve the link and read the object.
+
+Flush that cache before running (`redis-cli -n 2 FLUSHDB` on harbor-redis-0) so
+nothing is answered from a pre-flip descriptor.
+
+Near-zero bytes are transferred, so the whole sweep is minutes against a frozen
 registry. Run it while Harbor is still `read_only`: a failure then means a cheap
 rollback rather than reverse-copying an S3 write window.
 
@@ -131,13 +143,29 @@ class Progress:
         return self._n
 
 
-def head(client: Any, url: str, token: str, accept: str | None = None) -> int:
-    """HEAD `url` with a bearer token, returning the status code."""
+def fetch(
+    client: Any,
+    url: str,
+    token: str,
+    *,
+    accept: str | None = None,
+    first_byte_only: bool = False,
+) -> int:
+    """GET `url` with a bearer token, returning the status code.
+
+    `first_byte_only` sends `Range: bytes=0-0`, which keeps a multi-gigabyte
+    layer to one byte on the wire while still forcing a real storage read.
+    """
     headers = {"Authorization": f"Bearer {token}"}
     if accept:
         headers["Accept"] = accept
+    if first_byte_only:
+        headers["Range"] = "bytes=0-0"
 
-    return client.head(url, headers=headers, follow_redirects=True).status_code
+    resp = client.get(url, headers=headers, follow_redirects=True)
+    resp.close()
+
+    return resp.status_code
 
 
 def probe(
@@ -159,23 +187,33 @@ def probe(
     except Exception as exc:  # noqa: BLE001 - an auth failure is a real finding
         return subject, f"token: {exc}"
 
-    status = head(
+    status = fetch(
         client,
         f"{registry}/v2/{repository}/manifests/{digest}",
         token,
-        MANIFEST_ACCEPT,
+        accept=MANIFEST_ACCEPT,
     )
     if status != 200:
-        return subject, f"manifest HEAD {status} (missing _manifests/revisions link)"
+        return subject, f"manifest GET {status} (missing _manifests/revisions link)"
 
     # An artifact whose every blob row is its own manifest digest has no layer
     # to probe; the manifest check above is the whole of its reachability.
     if layer is None:
         return None
 
-    status = head(client, f"{registry}/v2/{repository}/blobs/{layer}", token)
-    if status != 200:
-        return subject, f"blob HEAD {status} for {layer} (missing _layers link)"
+    status = fetch(
+        client,
+        f"{registry}/v2/{repository}/blobs/{layer}",
+        token,
+        first_byte_only=True,
+    )
+    # 206 is the ranged success; 200 means the registry ignored Range and sent
+    # the whole layer, which still proves the bytes are there.
+    if status not in (200, 206):
+        return (
+            subject,
+            f"blob GET {status} for {layer} (missing _layers link or object)",
+        )
 
     return None
 

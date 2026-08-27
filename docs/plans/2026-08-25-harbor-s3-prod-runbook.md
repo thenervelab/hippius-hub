@@ -451,7 +451,23 @@ unfreeze, then measure writes.
 
 ### 7a. Under the freeze, before unfreezing
 
-Full reachability sweep — every artifact, both link classes, no bytes transferred:
+**First flush the registry's blob-descriptor cache**, or the sweep can pass on
+pre-flip data. `storage.cache.layerinfo: redis` is repository-scoped — keys are
+`repository::<repo>::blobs::<digest>` — and redis is a separate StatefulSet that
+survives the registry restart. A cached descriptor answers without reading the link
+object or S3 at all (3,626 entries were live on 2026-08-27).
+
+```bash
+kubectl -n harbor exec harbor-redis-0 -- redis-cli -n 2 DBSIZE
+kubectl -n harbor exec harbor-redis-0 -- redis-cli -n 2 FLUSHDB
+# it is a cache; the registry repopulates it.
+# db 2 ONLY. Verified 2026-08-27: db 0 = core (_REDIS_URL_CORE, 20,837 keys — sessions),
+# db 1 = jobservice queues (1,220), db 2 = _REDIS_URL_REG (3,628), db 3 = warmer.
+# Flushing 0 or 1 would log everyone out / drop queued jobs.
+```
+
+Full reachability sweep — every artifact, both link classes. The sweep uses ranged
+GETs rather than HEADs for the same reason, so it reads real bytes (one per layer):
 
 ```bash
 kubectl -n harbor create configmap harbor-reachability-sweep \
