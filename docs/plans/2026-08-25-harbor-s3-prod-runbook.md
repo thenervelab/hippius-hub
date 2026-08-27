@@ -272,6 +272,20 @@ re-discovering:
   including anonymous ones. If the fence were ever lifted it would disable billing for
   every customer on hippius-s3-prod.
 
+**Which account.** Two candidates, and the Slack thread does not name one explicitly —
+confirm with dubs before issuing anything:
+
+| Account | Owns | Read |
+|---|---|---|
+| `5E71kYuD…` | 23 buckets since 2025-12, incl. `hippius-juicefs-data`, `harbor-production-hippius`, `hippius-harbor-prod` | the **platform account**, and the one currently behind the registry — almost certainly the "my account" dubs meant |
+| `5E4ZQcXV…` | 12 buckets since 2026-03, incl. `hub-test` | looks like a test/personal account; it is only the **gate** key's owner |
+
+This also retires the isolation argument in §0.9. That mattered only under a credit model —
+a 402 on a shared account would have frozen the JuiceFS-backed registry too. Once the
+account is no-limit there is no 402 to propagate, so putting the production bucket on the
+same platform account as JuiceFS becomes the **simpler** choice, not a risk. It also means
+one designation covers both stores through the soak, while JuiceFS is still live.
+
 Whichever mechanism: **verify it with a real write before §4**, not by reading config. If
 the designation silently fails, the first symptom is a 402 part-way through a multi-hour
 copy. Nothing is lost when that happens — rclone retries and the Job is re-runnable — but
