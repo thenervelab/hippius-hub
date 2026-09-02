@@ -214,7 +214,7 @@ User-supplied values also contain DB and admin passwords. **Never** `helm get va
 | 0.3 | The bucket's account can write ~2 TB without being gated | George + dubs | **Decided 2026-08-27 with dubs: dubs' existing account is designated a _system account for the platform, with no limit_. No new S3 account is created; it is handled backend-side, by George.** Hard requirement from dubs: **usage must still be pushed so miners are paid** — see the note below, that part is automatic. This step is: confirm the designation is live and that a large write actually succeeds, **before** §4 starts a multi-hour copy. |
 | 0.4 | Who runs `helm upgrade -n harbor --version 1.19.0` | infra | George does not |
 | 0.5 | Chart `harbor/harbor` **1.19.0** still pullable | infra | `helm pull harbor/harbor --version 1.19.0`. Do not upgrade the app. |
-| 0.6 | hippius-s3-prod promoted, or the gate re-run and its number accepted | s3 | **Promotion done 2026-08-27 13:31** — prod is now `api:c9ec8b4` (merge of #459), which contains #445, #448, #451, #452 and #456, and `HIPPIUS_FS_STORE_SCAN_CONCURRENCY=64` is in the prod defaults. **Gate run against it at 13:43: upload median 51.5 MiB/s — below the 80 bar.** See §1. Decide: tune and re-gate, or accept 51.5. **Re-read 2026-09-02:** prod is now `api:c1e8c0d` (hippius-s3 main, merge of #471, still carries #445/#448/#451); `UVICORN_WORKERS` / `API_DB_POOL_MAX_SIZE` are still the defaults 4 / 15 and the prod environment ConfigMap is empty, so the §1 "cheap test" has **not** been run. `harbor-staging` is still installed against `gateway.hippius-s3-prod` and has logged zero blob uploads since 08-27. The re-gate is a hippius-s3-prod ConfigMap change and needs its own sign-off — it is a production change. |
+| 0.6 | hippius-s3-prod promoted, or the gate re-run and its number accepted | s3 | **Promotion done 2026-08-27 13:31** — prod is now `api:c9ec8b4` (merge of #459), which contains #445, #448, #451, #452 and #456, and `HIPPIUS_FS_STORE_SCAN_CONCURRENCY=64` is in the prod defaults. **Gate run against it at 13:43: upload median 51.5 MiB/s — below the 80 bar.** See §1. Decide: tune and re-gate, or accept 51.5. **Re-read 2026-09-02:** prod is now `api:c1e8c0d` (hippius-s3 main, merge of #471, still carries #445/#448/#451); `UVICORN_WORKERS` / `API_DB_POOL_MAX_SIZE` are still the defaults 4 / 15 and the prod environment ConfigMap is empty; the workers retune has **not** been applied. **Re-gate 2026-09-02, no hippius-s3-prod change:** registry ×3 upload median **82.9 MiB/s** (85.6 / 76.4 / 82.9), download 212.5; registry ×1 — the flip topology — upload median **89.2 MiB/s** (86.2 / 93.0 / 89.2), download 238.1. **Bar PASS** on both. The retune is no longer a prerequisite; keep it as a follow-up option. See §1. |
 | 0.7 | Harbor **GC schedule paused** | George | `GARBAGE_COLLECTION` cron `0 0 4 * * *`, live since 07-13, ran every day this week. It deletes blobs from storage under the copy and manipulates registry read-only mode under the freeze. |
 | 0.8 | Blob census run (`du` + file count) | whoever can apply a Job | **Done 2026-08-27** — `deploy/harbor-s3-prod/blob-census-job.yaml`. **78,552 blob digests on disk** against 78,474 in the database, so only ~78 orphans (0.1%) — the copy set is essentially exactly what Harbor tracks. Logical size **2,060 GB**. Ignore `du`'s 30,720 GiB; see the note below. |
 | 0.9 | Bucket's Arion account decided: same as JuiceFS, or separate | s3 | **Answered 2026-08-27: separate.** `hub-test` is owned by `5E4ZQcXV…`; `hippius-juicefs-data` by `5E71kYuD…`. `can_upload` is keyed on the main account, so a 402 on the Harbor bucket will **not** freeze the JuiceFS-backed registry still serving prod. Issue the real bucket under a non-JuiceFS account too, and fund it separately (0.3). **Conflicts with the 0.3 note below**, which argues that once the account is no-limit there is no 402 to isolate from and the platform account is the simpler choice. Both are defensible; the runbook must carry one answer before 0.1 is provisioned. |
@@ -347,6 +347,28 @@ cheap test is a ConfigMap change plus a re-gate.
 
 Both numbers are **optimistic for prod**: this ran registry ×3, core ×3, nginx ×3 with CPU
 requests on registry. The flip is registry ×1 and adds no core/nginx requests.
+
+### Gate result — 2026-09-02, second run, prod on `api:c1e8c0d`
+
+Same isolated `harbor-staging`, bucket `hub-test`, endpoint `gateway.hippius-s3-prod`.
+Nothing on hippius-s3-prod was changed for this run: `UVICORN_WORKERS` 4,
+`API_DB_POOL_MAX_SIZE` 15, 5 api-local pods, live customer traffic. Prod Harbor untouched
+(helm rev 4, filesystem). The rehearsal registry still carried the 128 MiB copy threshold
+live; unique 1 GiB packs are 64–75 MiB, so that is the same alias path as 5 GiB.
+
+| Topology | Unique 1 GiB upload ×3 | Download ×3 | Bar ≥ 80 |
+|---|---|---|---|
+| registry ×3, CPU 2/4 (as installed) | 11.96 s 85.6 / 13.40 s 76.4 / 12.35 s 82.9 → median **82.9 MiB/s** | median **212.5 MiB/s** | **PASS** |
+| registry ×1 (the flip topology) | 11.87 s 86.2 / 11.02 s 93.0 / 11.48 s 89.2 → median **89.2 MiB/s** | median **238.1 MiB/s** | **PASS** |
+
+What changed since 51.5 on 08-27 is on the hippius-s3 side, not ours: prod moved from
+`api:c9ec8b4` to `api:c1e8c0d` (merges of #468 peer read tier and #471), and the load at
+the time differed. The workers/pool hypothesis was **not** tested and is no longer needed
+for the bar. Single-replica was not slower than three; the registry is not the ceiling.
+
+Caveat that still stands: the rehearsal core/nginx run ×3 with CPU requests; prod runs
+×5 BestEffort. Margin over the bar is 3–9 MiB/s on three runs each — enough to proceed,
+not enough to promise users 90.
 
 ```bash
 export KUBECONFIG=~/Hippius-Storage/Configs/k8s/hippius.yaml
