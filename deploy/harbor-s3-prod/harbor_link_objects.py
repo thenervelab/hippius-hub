@@ -49,7 +49,7 @@ LINK_SIZE = 71
 DEFAULT_ENDPOINT = "http://gateway.hippius-s3-prod.svc.cluster.local:8080"
 PROGRESS_EVERY = 5000
 
-# Kept in step with hippius_s3_contract.py. tests/test_harbor_s3_guards.py
+# Kept in step with hippius_s3_contract.py. tests/test_hippius_s3_contract_guards.py
 # asserts the two copies agree, so a guard cannot drift on one script only.
 FORBIDDEN_BUCKETS = frozenset({"hippius-juicefs-data"})
 
