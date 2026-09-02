@@ -25,6 +25,20 @@ PACK_SIZE = 64 * 1024 * 1024
 MPU_PART = 8 * 1024 * 1024
 DEFAULT_ENDPOINT = "http://gateway.hippius-s3-prod.svc.cluster.local:8080"
 FORBIDDEN_BUCKETS = frozenset({"hippius-juicefs-data"})
+# Streaming CopyObject (pre-#445) was 4.3 MiB/s. Alias CopyObject was 657.
+# 50 MiB/s is the discriminator: below this, Harbor Move is still GET+PUT.
+COPY_OBJECT_ALIAS_MIN_MIBS = 50.0
+
+
+def copy_object_too_slow(mibs: float) -> str | None:
+    """Return a FAIL reason when CopyObject ran at streaming, not alias, speed."""
+    if mibs < COPY_OBJECT_ALIAS_MIN_MIBS:
+        return (
+            f"CopyObject 64 MiB {mibs:.1f} MiB/s is streaming GET+PUT, not an "
+            f"object_names alias (bar {COPY_OBJECT_ALIAS_MIN_MIBS:.0f} MiB/s). "
+            "Promote hippius-s3 #445/#448/#451 to this gateway before Harbor S3."
+        )
+    return None
 
 
 def bucket_forbidden(name: str) -> str | None:
@@ -298,6 +312,9 @@ def main() -> None:
         pack_dst = blob_key(prefix, digest)
         copy_dt = copy_object(client, bucket, pack_src, pack_dst, pack)
         copy_mibs = PACK_SIZE / copy_dt / (1024 * 1024)
+        slow = copy_object_too_slow(copy_mibs)
+        if slow:
+            raise SystemExit(f"FAIL  {slow}")
         pass_("copy_object_64mib", f"{copy_dt:.2f}s {copy_mibs:.1f} MiB/s")
 
         mpu_src = upload_key(prefix, "mpu")

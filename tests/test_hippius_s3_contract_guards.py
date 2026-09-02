@@ -58,3 +58,13 @@ def test_env_config_refuses_juicefs_bucket(monkeypatch: pytest.MonkeyPatch) -> N
     monkeypatch.setenv("HARBOR_S3_SECRET_KEY", "y")
     with pytest.raises(SystemExit, match="JuiceFS"):
         mod.env_config()
+
+
+def test_copy_object_alias_bar_rejects_streaming_get_put() -> None:
+    mod = _mod()
+    # Pre-#445 hippius-s3 CopyObject of 64 MiB was 4.3 MiB/s (streaming).
+    assert mod.copy_object_too_slow(4.3)
+    # Alias CopyObject on staging after #445 was 657 MiB/s; prod 08-27 was 344.
+    assert mod.copy_object_too_slow(657.5) is None
+    assert mod.copy_object_too_slow(mod.COPY_OBJECT_ALIAS_MIN_MIBS) is None
+    assert mod.copy_object_too_slow(mod.COPY_OBJECT_ALIAS_MIN_MIBS - 0.1)

@@ -13,7 +13,7 @@ Two backends:
 `install-hippius-s3.sh` runs, in order:
 
 1. Harbor-shaped S3 contract (PUT/HEAD/GET/Range/MPU/CopyObject/List/Delete)
-2. Helm Harbor 1.19.0 (`disableredirect`, `chunksize` 64 MiB, `multipartcopythresholdsize` 128 MiB, `REGISTRY_STORAGE_S3_FORCEPATHSTYLE`, `REGISTRY_STORAGE_S3_SECURE=false`). Do not helm-upgrade this release for later knobs if jobservice is RWO Multi-Attach — kubectl-patch `harbor-staging-registry` `config.yml` + env instead. Never helm `-n harbor`.
+2. Helm Harbor 1.19.0 (`disableredirect`, `chunksize` 64 MiB, `multipartcopythresholdsize` 5 GiB (matches the prod overlay), `REGISTRY_STORAGE_S3_FORCEPATHSTYLE`, `REGISTRY_STORAGE_S3_SECURE=false`). Do not helm-upgrade this release for later knobs if jobservice is RWO Multi-Attach — kubectl-patch `harbor-staging-registry` `config.yml` + env instead. Never helm `-n harbor`.
 3. Unique 1 GiB `hippius-hub` 0.7.0 upload × 3 (`arm-c-job.yaml`). Stock wheel, no overlay. 2026-08-25 median **99.6 MiB/s** on hippius-s3 after `multipartcopythresholdsize=134217728`.
 
 Success bar: contract all PASS, bench median **≥ 80 MiB/s**.

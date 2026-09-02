@@ -117,7 +117,7 @@ Success bar after flip: median **≥ 80 MiB/s** on a 1 GiB fresh unique-bytes `h
 
 **Later the same day (still `harbor-staging`, prod untouched):** hippius-s3 `#445` alias CopyObject, `#448` ingest-node hint, `#451` cipher sizes on that hint, staging `UVICORN_WORKERS=8` / `API_DB_POOL_MAX_SIZE=8`, Harbor `multipartcopythresholdsize=134217728` (kubectl patch of `config.yml` + env; helm rev still 4). Unique 1 GiB ×3 **stock `hippius_hub==0.7.0`**: 10.28s 99.6 / 11.91s 86.0 / 8.81s 116.2 → median **99.6 MiB/s**. Bar **PASS**. Unreleased config-blob overlay on the same Harbor knobs: 9.11s 112.4 / 7.64s 134.1 / 6.90s 148.5 → median 134.1 (optional, not required).
 
-Do **not** helm-upgrade `-n harbor` until `deploy/harbor-s3-prod/overlay-s3.yaml` is the flip file (it now includes `multipartcopythresholdsize=134217728`). Staging Harbor is still up in `harbor-staging` for inspection (idle since the 2026-08-27 gate; it is the vehicle for the re-gate in 0.6).
+Do **not** helm-upgrade `-n harbor` until `deploy/harbor-s3-prod/overlay-s3.yaml` is the flip file. It carries `multipartcopythresholdsize=5368709120` (5 GiB, PR #92): the 08-25 run used 128 MiB, which clears a pack but leaves the 622 blobs over 128 MiB — 127 of them over 4 GiB, a third of all bytes — on the streaming UploadPartCopy path. 5 GiB is the S3 single-CopyObject ceiling; never set it higher. Staging Harbor is still up in `harbor-staging` for inspection (idle since the 2026-08-27 gate; it is the vehicle for the re-gate in 0.6).
 
 **Read-only review 2026-08-27 — two corrections to the numbers above.**
 
@@ -804,3 +804,9 @@ change. Until then ~1.9 TiB is stored twice, plus the 9.7M JuiceFS chunk objects
 - Enabling redirect / 307 on this flip
 - Skipping §1 (MinIO arm C is not this gate)
 - Bucket or endpoint containing `juicefs` or `minio`
+- `multipartcopythresholdsize` above 5 GiB (5368709120): S3 caps a single CopyObject there,
+  so distribution would attempt a simple copy the gateway must reject
+- Any S3 lifecycle rule on the Harbor bucket: an expiration or transition rule silently
+  deletes blobs the database still references
+- GC running while the bucket is partially copied: GC marks from the database and issues
+  deletes against whichever backend is live (distribution #19308) — this is why 0.7 pauses it

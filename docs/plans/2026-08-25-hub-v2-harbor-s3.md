@@ -58,7 +58,7 @@ hippius-s3-prod runs `api:539eec1` and is missing #451 and the reader-TTFB work,
 4. Pause the daily 04:00 GC for the copy-and-flip window.
 5. Freeze **pushes** a few minutes. Catch-up (blobs and links). Scale jobservice to 0
    (RWO Multi-Attach wedges the release). Helm: `imageChartStorage.type=s3` using
-   `deploy/harbor-s3-prod/overlay-s3.yaml` (must keep `multipartcopythresholdsize=134217728`
+   `deploy/harbor-s3-prod/overlay-s3.yaml` (must keep `multipartcopythresholdsize=5368709120` — 5 GiB per PR #92, not the 128 MiB the 08-25 run used
    and the `core`/`nginx` replica counts helm would otherwise revert to 1).
 6. **Sweep every artifact for reachability before unfreezing**
    (`harbor_reachability_sweep.py`) — the upload prove cannot run under `read_only`, so

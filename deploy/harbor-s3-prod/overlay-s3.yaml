@@ -25,11 +25,19 @@ persistence:
       secure: false
       v4auth: true
       chunksize: "67108864"
-      # Default 32 MiB. A 64–75 MiB pack then Move's via UploadPartCopy of
-      # 32 MiB ranges (GET+PUT) instead of one CopyObject alias (~0.06s).
-      # 128 MiB keeps packs on the alias path. Required for unique 1 GiB ≥ 80
-      # on hippius-s3 (harbor-staging 2026-08-25). Chart 1.19.0 renders this.
-      multipartcopythresholdsize: "134217728"
+      # Default 32 MiB. Below the threshold a Move (Harbor blob commit) is one
+      # CopyObject, which hippius-s3 #445 turns into an object_names alias
+      # (~0.06 s). Above it distribution uses UploadPartCopy in 32 MiB ranges,
+      # a streaming GET+PUT per range on hippius-s3.
+      #
+      # 5 GiB, not 128 MiB (PR #92, census 2026-08-26 of 76,419 blobs): 128 MiB
+      # clears a 64-75 MiB pack but 622 blobs are larger, and 127 of those are
+      # over 4 GiB and carry 33.7% of all bytes - every one would have stayed on
+      # UploadPartCopy. 5 GiB is the S3 ceiling for a single CopyObject, so a
+      # larger value makes distribution attempt a copy the gateway must reject.
+      # The 24 blobs above 5 GiB (largest 16.0 GiB) fall back to multipart copy
+      # on their own; correct, just slower. Chart 1.19.0 renders this key.
+      multipartcopythresholdsize: "5368709120"
       # empty / omitted: keys are docker/registry/v2/blobs/sha256/<aa>/<digest>/data
 
 # core and nginx are scaled to 5 by a live kubectl patch, not by helm values —
@@ -71,7 +79,7 @@ registry:
       - name: REGISTRY_STORAGE_S3_SECURE
         value: "false"
       - name: REGISTRY_STORAGE_S3_MULTIPARTCOPYTHRESHOLDSIZE
-        value: "134217728"
+        value: "5368709120"
   controller:
     extraEnvVars:
       - name: REGISTRY_STORAGE_S3_FORCEPATHSTYLE
@@ -79,4 +87,4 @@ registry:
       - name: REGISTRY_STORAGE_S3_SECURE
         value: "false"
       - name: REGISTRY_STORAGE_S3_MULTIPARTCOPYTHRESHOLDSIZE
-        value: "134217728"
+        value: "5368709120"
