@@ -300,7 +300,7 @@ Do **not** size it off Harbor's `blob` table. `du -sk` on the blobs tree reports
 JuiceFS `usedSpace` is 31.10 TB with an empty trash, and bucket `hippius-juicefs-data`
 holds 7,846,353 block objects totalling 31.10 TB. The database total of 1.7 TB is wrong
 because 44,144 of 79,738 blob rows carry `size = 0`. 86% of the bytes are 1–5 GiB blobs;
-five projects (superstar, tora, divinequest, try, 0x998) hold 53%, none pushed since July.
+five customer projects hold 53% of it, none pushed since July.
 The migration does not shrink the bill: hippius-s3 stores ~62 TB until the JuiceFS bucket
 is deleted, and that deletion is 7.85M unpins.
 
