@@ -15,7 +15,7 @@ Artifacts: `deploy/harbor-s3-prod/`.
 | D1 | Keep Harbor 2.15. Switch only `persistence.imageChartStorage.type` to `s3`. | **Yes** | Arm C: 93 MiB/s vs prod JuiceFS 47 MiB/s. Client already 769 MiB/s. |
 | D2 | Copy blobs **and rebuild the per-repository link objects** into a **new** bucket using Harbor’s own keys. Same Postgres. No `pgdump`. | **Yes** | Blobs 404 if missing. Tags live in Postgres, but `_layers` / `_manifests/revisions` links do **not** — see §4a. |
 | D3 | `disableredirect: true` on day one (no 307 → presigned GET). | **Yes** | ATS cache key includes SigV4 query string. Redirect is a later change. |
-| D4 | Freeze = Harbor `read_only` at the helm flip, after copy has caught up. Budget **one to two hours** of no pushes, not minutes: the window holds the final catch-up, §4a apply + verify (20–40 min measured), the registry rollout, the redis flush and the full §7a sweep, which has never been timed against S3. Pulls stay up except during the registry restart. | **Yes** | Freeze-before-copy = a day of downtime. Prod pushes ~20 blobs a day (registry log, 2026-09-02), so the cost of the window is small — but announce it honestly. |
+| D4 | Freeze = Harbor `read_only` at the helm flip, after copy has caught up. Budget **one to two hours** of no pushes, not minutes: the window holds the final catch-up, §4a apply + verify (20–40 min measured), the registry rollout, the redis flush and the full §7a sweep, which has never been timed against S3. Pulls stay up except during the registry restart. | **Yes** | Freeze-before-copy = a day of downtime. Prod pushes 60–2,000 blobs a day, 1.4–7 GB (blob table, 2026-08-24 → 09-03), so the cost of the window is small — but announce it honestly. |
 | D5 | Keep PVC `harbor-registry` until a later soak. | **Yes** | Rollback path. |
 | D6 | No client release, no JuiceFS format, no Harbor replication endpoints, no new registry. | **Yes** | Stock `hippius_hub==0.7.0` unique 1 GiB median **99.6 MiB/s** on harbor-staging after Harbor `multipartcopythresholdsize=134217728`. Config-blob overlap is extra (134.1), not required for the bar. Replication re-examined 2026-08-27 — reasoning below. |
 | D7 | Pass the **hippius-s3** gate (not MinIO) before copy. | **Yes** | Arm C 93 MiB/s was MinIO. Prod writes hippius-s3. |
@@ -177,8 +177,9 @@ Verified from the other side too — Harbor's own S3 driver wrote 1,005 `_layers
 `_manifests/revisions` link objects into the staging bucket alongside 386 blobs.
 
 Do not copy `_uploads/` (transient). Do not copy JuiceFS internal chunks. Blob copy size
-is the `data` files (~1.9 TB; Postgres says 78,055 blobs / 2,060 GB), **not** JuiceFS
-`used_space` 31 TiB. Link objects add ~151,958 keys at 71 bytes.
+is the `data` files: **79,816 files, 31.08 TB** (measured 2026-09-03 from JuiceFS dir
+stats; `du` agrees). Harbor's `blob` table says 1.7 TB only because 55% of its rows have
+`size = 0` — do not size anything off that table. Link objects add ~153,500 keys at 71 bytes.
 
 The disk also carries ~6,000 repository directories the database has already forgotten
 (16,234 on disk vs 10,113 live). §4a generates from Postgres, so those orphans are
@@ -211,14 +212,14 @@ User-supplied values also contain DB and admin passwords. **Never** `helm get va
 |---|---|---|---|
 | 0.1 | Bucket name, **not** `hippius-juicefs-data` | s3 | **Still open.** `hub-test` is the **gate** bucket only (decided 2026-08-27) — it is shared scratch, already holding 26 stray `docker/registry/v2/**` blobs, old `bench` / `phase0-bench` / `harbor-s3-probe` prefixes and an unrelated PNG. Provision a clean bucket (suggested `harbor-registry-cas`) before §4. Replace `REPLACE_ME_BUCKET` in the three YAML files. |
 | 0.2 | `hip_` key scoped to that bucket | s3 | Secret `harbor-s3` in ns `harbor`, keys `REGISTRY_STORAGE_S3_ACCESSKEY` / `REGISTRY_STORAGE_S3_SECRETKEY`. The gate key `hub1` verified 2026-08-27: reaches `hub-test`, **403 on `hippius-juicefs-data`** — the credential enforces the stop-the-line rule itself. Scope the real key the same way. |
-| 0.3 | The bucket's account can write ~2 TB without being gated | George + dubs | **Decided 2026-08-27 with dubs: dubs' existing account is designated a _system account for the platform, with no limit_. No new S3 account is created; it is handled backend-side, by George.** Hard requirement from dubs: **usage must still be pushed so miners are paid** — see the note below, that part is automatic. This step is: confirm the designation is live and that a large write actually succeeds, **before** §4 starts a multi-hour copy. |
+| 0.3 | The bucket's account can write ~31 TB without being gated | George + dubs | **Decided 2026-08-27 with dubs: dubs' existing account is designated a _system account for the platform, with no limit_. No new S3 account is created; it is handled backend-side, by George.** Hard requirement from dubs: **usage must still be pushed so miners are paid** — see the note below, that part is automatic. This step is: confirm the designation is live and that a large write actually succeeds, **before** §4 starts a multi-hour copy. |
 | 0.4 | Who runs `helm upgrade -n harbor --version 1.19.0` | infra | George does not |
 | 0.5 | Chart `harbor/harbor` **1.19.0** still pullable | infra | `helm pull harbor/harbor --version 1.19.0`. Do not upgrade the app. |
 | 0.6 | hippius-s3-prod promoted, or the gate re-run and its number accepted | s3 | **Promotion done 2026-08-27 13:31** — prod is now `api:c9ec8b4` (merge of #459), which contains #445, #448, #451, #452 and #456, and `HIPPIUS_FS_STORE_SCAN_CONCURRENCY=64` is in the prod defaults. **Gate run against it at 13:43: upload median 51.5 MiB/s — below the 80 bar.** See §1. Decide: tune and re-gate, or accept 51.5. **Re-read 2026-09-02:** prod is now `api:c1e8c0d` (hippius-s3 main, merge of #471, still carries #445/#448/#451); `UVICORN_WORKERS` / `API_DB_POOL_MAX_SIZE` are still the defaults 4 / 15 and the prod environment ConfigMap is empty; the workers retune has **not** been applied. **Re-gate 2026-09-02, no hippius-s3-prod change:** registry ×3 upload median **82.9 MiB/s** (85.6 / 76.4 / 82.9), download 212.5; registry ×1 — the flip topology — upload median **89.2 MiB/s** (86.2 / 93.0 / 89.2), download 238.1. **Bar PASS** on both. The retune is no longer a prerequisite; keep it as a follow-up option. See §1. |
 | 0.7 | Harbor **GC schedule paused** | George | `GARBAGE_COLLECTION` cron `0 0 4 * * *`, live since 07-13, ran every day this week. It deletes blobs from storage under the copy and manipulates registry read-only mode under the freeze. |
-| 0.8 | Blob census run (`du` + file count) | whoever can apply a Job | **Done 2026-08-27** — `deploy/harbor-s3-prod/blob-census-job.yaml`. **78,552 blob digests on disk** against 78,474 in the database, so only ~78 orphans (0.1%) — the copy set is essentially exactly what Harbor tracks. Logical size **2,060 GB**. Ignore `du`'s 30,720 GiB; see the note below. |
+| 0.8 | Blob census run (`du` + file count) | whoever can apply a Job | **Done 2026-08-27** — `deploy/harbor-s3-prod/blob-census-job.yaml`. **79,816 blob digests on disk** against 79,738 in the database (set diff 2026-09-03: 92 orphans on disk, 0.62 TB, four of them 49.7 GB; 14 DB blobs missing on disk, already 404). Size on disk **31.08 TB** — `du`'s 30,720 GiB was right. See the note below. |
 | 0.9 | Bucket's Arion account decided: same as JuiceFS, or separate | s3 | **Answered 2026-08-27: separate.** `hub-test` is owned by `5E4ZQcXV…`; `hippius-juicefs-data` by `5E71kYuD…`. `can_upload` is keyed on the main account, so a 402 on the Harbor bucket will **not** freeze the JuiceFS-backed registry still serving prod. Issue the real bucket under a non-JuiceFS account too, and fund it separately (0.3). **Conflicts with the 0.3 note below**, which argues that once the account is no-limit there is no 402 to isolate from and the platform account is the simpler choice. Both are defensible; the runbook must carry one answer before 0.1 is provisioned. |
-| 0.10 | **Baseline reachability sweep, before anything changes** | George | §7a's sweep run against today's filesystem-backed prod. It is read-only and works on either backend. Without it, a post-flip failure cannot be told apart from breakage that was already there — the staging rehearsal found 3 artifacts whose manifest blob was already missing from storage while Harbor's DB still referenced them. Save the output. |
+| 0.10 | **Baseline reachability sweep, before anything changes** | George | §7a's sweep run against today's filesystem-backed prod. It is read-only and works on either backend. Without it, a post-flip failure cannot be told apart from breakage that was already there — the staging rehearsal found 3 artifacts whose manifest blob was already missing from storage while Harbor's DB still referenced them. Save the output. It also stamps `artifact.pull_time` on every artifact (26,500 rows dated 2026-08-27 from the first run), so snapshot `pull_time` first if pull recency is ever needed for retention or pruning. |
 
 ### On 0.3 — a no-limit system account, and what it must not break
 
@@ -291,16 +292,17 @@ the designation silently fails, the first symptom is a 402 part-way through a mu
 copy. Nothing is lost when that happens — rclone retries and the Job is re-runnable — but
 hours are. Re-check before §5 too, since the freeze window has no room for a surprise.
 
-If the balance route is chosen, size it against **~2 TB of logical bytes**, which is what
+If the balance route is chosen, size it against **~31 TB of logical bytes**, which is what
 rclone transfers. See §0.8.
 
-Do **not** size it off `du`, and do not assume the migration slashes the storage bill.
-`du -sk` on the blobs tree reports **30,720 GiB**, but that is JuiceFS block accounting,
-not bytes: the same 78.5k blobs total **2,060 GB** in Harbor's own database (avg 27 MB,
-largest 16 GB), and the JuiceFS bucket holds 8,304,880 live chunk objects for them. Whether
-JuiceFS's *billed* footprint is nearer 2 TB or 30 TiB was not measured — the join needed to
-total part sizes across 8.3M objects is too heavy to run against prod. So the
-storage-cost comparison is **open**, not a saving to bank on.
+Do **not** size it off Harbor's `blob` table. `du -sk` on the blobs tree reports
+**30,720 GiB**, and that is real: JuiceFS `st_blocks` is exact (checked on a 16 GiB blob),
+JuiceFS `usedSpace` is 31.10 TB with an empty trash, and bucket `hippius-juicefs-data`
+holds 7,846,353 block objects totalling 31.10 TB. The database total of 1.7 TB is wrong
+because 44,144 of 79,738 blob rows carry `size = 0`. 86% of the bytes are 1–5 GiB blobs;
+five projects (superstar, tora, divinequest, try, 0x998) hold 53%, none pushed since July.
+The migration does not shrink the bill: hippius-s3 stores ~62 TB until the JuiceFS bucket
+is deleted, and that deletion is 7.85M unpins.
 
 Helm repo `harbor` → `https://helm.goharbor.io` is already on this machine.
 
@@ -490,15 +492,36 @@ Retry on 503 / SlowDown is in rclone flags. Do not point rclone at `hippius-juic
 
 Sample check (on the Job pod or a one-off): SHA-256 of local `…/sha256/<aa>/<digest>/data` equals `<digest>`; S3 `HEAD` size equals file size. Do this for ≥20 random blobs including one large pack.
 
-Expected wall clock: hours, not minutes (~2 TB). That is the long pole. **Do not freeze yet.**
+Expected wall clock, for 31.08 TB at the gateway rates seen so far:
+
+| Sustained rate | Copy time |
+|---|---|
+| 200 MB/s (aggregate upload) | ~43 h (1.8 days) |
+| 300 MB/s (single-part upload) | ~29 h (1.2 days) |
+
+Both assume the read side keeps up. It is not free: sampled JuiceFS blocks are in neither
+the gateway fs cache nor ingest SSD, so every byte is first a cold 4 MiB GET from Arion
+through the same gateway, then a PUT back into it, then ~7.8M new chunks for arion-uploader
+to pin (it already ran ~176 MiB/s of live traffic on 2026-09-03). Plan for **days**,
+alongside customer traffic, and rehearse one shard (~120 GB) into the real bucket first,
+watching gateway 503s, ingest SSD fill and `cephor_replication_status` pending. That is the
+long pole. **Do not freeze yet.**
+
+Run the Job on a node **other than** the registry's: on node1 it shares the registry's
+JuiceFS mount pod (5 GiB limit), and an OOM there detaches `/storage` from the live registry.
+Add `--s3-upload-cutoff 64M` so nothing goes as a >64 MiB single PUT, and `--bwlimit` as the
+throttle. Prefer `--files-from` generated from Postgres (`artifact_blob` digests, or
+`blob.creation_time > last pass` for catch-up): a full source walk stats ~80k files over
+FUSE and takes tens of minutes, and it skips the 0.62 TB of orphans.
 
 **The large-blob path is the one thing in this plan never rehearsed.** The staging
 rehearsal proved §4a's link generation; the blobs were already in that bucket because
-Harbor had written them. rclone reading the JuiceFS PVC and writing 78,552 blobs to
-hippius-s3 has not been run. The limits do permit it — **24 blobs exceed 5 GiB, 8 exceed
-10 GiB, and the largest is 16.02 GiB** (17,204,127,784 B) against a gateway cap of 5 TiB
-(`max_multipart_part_size` 512 MiB × `max_multipart_part_count` 10,000), and at
-`--s3-chunk-size 64M` that largest blob is 257 parts against a 10,000 limit. But nothing
+Harbor had written them. rclone reading the JuiceFS PVC and writing 79,816 blobs to
+hippius-s3 has not been run. The limits do permit it — **133 blobs exceed 5 GiB, 80 exceed
+16 GB, and the largest is 49.7 GB** (an orphan; largest DB-tracked blob is 16.02 GiB)
+against a gateway cap of 5 TiB (`max_multipart_part_size` 512 MiB ×
+`max_multipart_part_count` 10,000), and at `--s3-chunk-size 64M` that largest blob is 742
+parts against a 10,000 limit. But nothing
 has yet written a single multi-GiB object to hippius-s3: the contract test tops out at a
 64 MiB PUT and a 16 MiB two-part MPU, and the gate's 1 GiB upload went through Harbor's own
 64 MiB packs.
@@ -562,7 +585,7 @@ two runs needs its links too.
 
 **Measured on harbor-staging 2026-08-27:** 817 link objects in 12.5 s = **66/s at 16
 workers**. At that rate prod's 151,960 objects is ~38 min; the prod Job runs 32 workers,
-so expect somewhere in 20–40 min. This is not the long pole — §4's ~1.9 TB is. Numbers
+so expect somewhere in 20–40 min. This is not the long pole — §4's ~31 TB is. Numbers
 are from hippius-s3-staging (2 api-local pods); prod has 5 but also carries real load.
 
 Rehearsal, if you want independent confirmation of the shapes: point a Harbor-to-Harbor
@@ -781,7 +804,8 @@ Same day:
   link objects are being written by Harbor itself, not just by §4a.
 
 After ~7 days of S3 as source of truth you may stop relying on the JuiceFS PVC. Separate
-change. Until then ~1.9 TiB is stored twice, plus the 9.7M JuiceFS chunk objects.
+change. Until then ~31 TB is stored twice, plus the 7.85M JuiceFS chunk objects, and
+deleting the JuiceFS bucket is itself a 7.85M-unpin event to plan, not a footnote.
 
 ---
 
