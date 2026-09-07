@@ -7,6 +7,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::OnceLock;
+use std::sync::PoisonError;
 use std::time::Duration;
 use tokio::fs::File;
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
@@ -23,7 +24,10 @@ use crate::uploader::watchdog::{
 /// must not hold the single-flight slot forever.
 const PACK_HEAD_TIMEOUT: Duration = Duration::from_secs(30);
 
-type InflightSlot = Arc<AsyncMutex<Option<String>>>;
+/// `true` once the leader has landed the pack; a waiter that observes it
+/// returns without touching the registry. The digest is part of the key, so
+/// there is nothing else to hand over.
+type InflightSlot = Arc<AsyncMutex<bool>>;
 type SlotKey = (String, String);
 
 fn inflight_slots() -> &'static Mutex<HashMap<SlotKey, InflightSlot>> {
@@ -32,21 +36,19 @@ fn inflight_slots() -> &'static Mutex<HashMap<SlotKey, InflightSlot>> {
 }
 
 fn slot_for(uploads_url: &str, digest: &str) -> InflightSlot {
-    let mut map = match inflight_slots().lock() {
-        Ok(guard) => guard,
-        Err(poisoned) => poisoned.into_inner(),
-    };
-    map.entry((uploads_url.to_owned(), digest.to_owned()))
-        .or_insert_with(|| Arc::new(AsyncMutex::new(None)))
+    inflight_slots()
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .entry((uploads_url.to_owned(), digest.to_owned()))
+        .or_insert_with(|| Arc::new(AsyncMutex::new(false)))
         .clone()
 }
 
 fn drop_slot(uploads_url: &str, digest: &str) {
-    let mut map = match inflight_slots().lock() {
-        Ok(guard) => guard,
-        Err(poisoned) => poisoned.into_inner(),
-    };
-    map.remove(&(uploads_url.to_owned(), digest.to_owned()));
+    inflight_slots()
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .remove(&(uploads_url.to_owned(), digest.to_owned()));
 }
 
 /// Cache of `(uploads_url, digest)` this process has already landed (a
@@ -66,19 +68,17 @@ fn completed_packs() -> &'static Mutex<HashSet<SlotKey>> {
 }
 
 fn was_completed(uploads_url: &str, digest: &str) -> bool {
-    let set = match completed_packs().lock() {
-        Ok(guard) => guard,
-        Err(poisoned) => poisoned.into_inner(),
-    };
-    set.contains(&(uploads_url.to_owned(), digest.to_owned()))
+    completed_packs()
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .contains(&(uploads_url.to_owned(), digest.to_owned()))
 }
 
 fn mark_completed(uploads_url: &str, digest: &str) {
-    let mut set = match completed_packs().lock() {
-        Ok(guard) => guard,
-        Err(poisoned) => poisoned.into_inner(),
-    };
-    set.insert((uploads_url.to_owned(), digest.to_owned()));
+    completed_packs()
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .insert((uploads_url.to_owned(), digest.to_owned()));
 }
 
 /// Remove the map entry when `put_pack_single_flight` returns, including
@@ -179,8 +179,8 @@ async fn put_pack_single_flight(
         digest: digest.to_owned(),
     };
     let mut guard = slot.lock().await;
-    if let Some(done) = guard.as_ref() {
-        return Ok(done.clone());
+    if *guard {
+        return Ok(digest_hex);
     }
     // Unique packs have never been PUT by this process; HEAD would 404.
     // Only probe the registry when a prior success in this process makes
@@ -191,7 +191,7 @@ async fn put_pack_single_flight(
         false
     };
     if already {
-        *guard = Some(digest_hex.clone());
+        *guard = true;
         mark_completed(uploads_url, digest);
         return Ok(digest_hex);
     }
@@ -199,7 +199,7 @@ async fn put_pack_single_flight(
     loop {
         match try_pack_upload_once(uploads_url, body, digest, auth_token).await {
             Ok(()) => {
-                *guard = Some(digest_hex.clone());
+                *guard = true;
                 mark_completed(uploads_url, digest);
                 return Ok(digest_hex);
             }
@@ -373,16 +373,19 @@ mod tests {
 
     /// Serve the HEAD -> POST -> PUT pack handshake, counting HEADs and PUTs.
     ///
-    /// HEAD answers 404 so a caller that still probes falls through to PUT.
-    /// Unique packs must not probe. Bodies are drained by idle-timeout rather
-    /// than Content-Length: the pack PUT is a framed stream, so it is chunked
-    /// and has no length header.
+    /// HEAD answers 200 when `head_found`, else 404 so a caller that still
+    /// probes falls through to PUT. Unique packs must not probe. The first PUT
+    /// answers 403 (permanent) when `fail_first_put`, later PUTs 201. Bodies
+    /// are drained by idle-timeout rather than Content-Length: the pack PUT is
+    /// a framed stream, so it is chunked and has no length header.
     #[cfg(test)]
     async fn serve_counting_registry(
         listener: tokio::net::TcpListener,
         addr: std::net::SocketAddr,
         puts: std::sync::Arc<std::sync::atomic::AtomicUsize>,
         heads: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        head_found: bool,
+        fail_first_put: bool,
     ) {
         use std::sync::atomic::Ordering;
         use tokio::io::AsyncReadExt;
@@ -415,16 +418,26 @@ mod tests {
                 let req = String::from_utf8_lossy(&seen);
                 let resp = if req.starts_with("HEAD") {
                     heads.fetch_add(1, Ordering::SeqCst);
-                    "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
-                        .to_string()
+                    if head_found {
+                        "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                            .to_string()
+                    } else {
+                        "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                            .to_string()
+                    }
                 } else if req.starts_with("POST") {
                     format!(
                         "HTTP/1.1 202 Accepted\r\nLocation: http://{addr}/v2/x/blobs/uploads/s\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
                     )
                 } else if req.starts_with("PUT") {
-                    puts.fetch_add(1, Ordering::SeqCst);
-                    "HTTP/1.1 201 Created\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
-                        .to_string()
+                    let nth = puts.fetch_add(1, Ordering::SeqCst);
+                    if fail_first_put && nth == 0 {
+                        "HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                            .to_string()
+                    } else {
+                        "HTTP/1.1 201 Created\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                            .to_string()
+                    }
                 } else {
                     "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
                         .to_string()
@@ -454,6 +467,8 @@ mod tests {
             addr,
             std::sync::Arc::clone(&puts),
             std::sync::Arc::clone(&heads),
+            false,
+            false,
         ));
 
         let path = std::env::temp_dir().join(format!("hippius-sf-two-{}.bin", std::process::id()));
@@ -508,6 +523,8 @@ mod tests {
             addr,
             std::sync::Arc::clone(&puts),
             std::sync::Arc::clone(&heads),
+            false,
+            false,
         ));
 
         let path =
@@ -545,7 +562,7 @@ mod tests {
         let leader = super::slot_for(key_url, "sha256:dead");
         {
             let guard = leader.lock().await;
-            assert!(guard.is_none(), "a fresh slot starts empty");
+            assert!(!*guard, "a fresh slot starts empty");
         }
         super::drop_slot(key_url, "sha256:dead");
 
@@ -556,7 +573,7 @@ mod tests {
         );
         let guard = next.lock().await;
         assert!(
-            guard.is_none(),
+            !*guard,
             "the next caller must redo the work, not adopt a poisoned result"
         );
     }
@@ -567,17 +584,135 @@ mod tests {
         let slot = super::slot_for(key_url, "sha256:beef");
         {
             let mut guard = slot.lock().await;
-            *guard = Some("beefhex".to_string());
+            *guard = true;
         }
         let again = super::slot_for(key_url, "sha256:beef");
         let guard = again.lock().await;
-        assert_eq!(
-            guard.as_deref(),
-            Some("beefhex"),
-            "a waiter must adopt the leader's digest instead of re-uploading"
+        assert!(
+            *guard,
+            "a waiter must adopt the leader's completion instead of re-uploading"
         );
         drop(guard);
         super::drop_slot(key_url, "sha256:beef");
+    }
+
+    /// Bind a loopback counting registry and write `pack` to a temp file.
+    #[cfg(test)]
+    async fn counting_registry_fixture(
+        tag: &str,
+        pack: &[u8],
+        head_found: bool,
+        fail_first_put: bool,
+    ) -> (
+        tokio::task::JoinHandle<()>,
+        std::path::PathBuf,
+        String,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    ) {
+        use std::io::Write;
+        use std::sync::atomic::AtomicUsize;
+        use tokio::net::TcpListener;
+
+        let Ok(listener) = TcpListener::bind("127.0.0.1:0").await else {
+            unreachable!("bind loopback")
+        };
+        let Ok(addr) = listener.local_addr() else {
+            unreachable!("local_addr")
+        };
+        let puts = std::sync::Arc::new(AtomicUsize::new(0));
+        let heads = std::sync::Arc::new(AtomicUsize::new(0));
+        let server = tokio::spawn(serve_counting_registry(
+            listener,
+            addr,
+            std::sync::Arc::clone(&puts),
+            std::sync::Arc::clone(&heads),
+            head_found,
+            fail_first_put,
+        ));
+        let path =
+            std::env::temp_dir().join(format!("hippius-sf-{tag}-{}.bin", std::process::id()));
+        match std::fs::File::create(&path).and_then(|mut f| f.write_all(pack)) {
+            Ok(()) => {}
+            Err(_) => unreachable!("temp file write"),
+        }
+        let uploads = format!("http://{addr}/v2/{tag}/blobs/uploads/");
+        (server, path, uploads, puts, heads)
+    }
+
+    #[tokio::test]
+    async fn completed_put_makes_the_next_call_head_and_skip_the_body() {
+        use std::sync::atomic::Ordering;
+
+        // Re-upload of a digest this process already landed: the second call
+        // must HEAD (the gate opened on the first PUT) and, on 200, send no
+        // body. Pins `mark_completed` after a successful PUT end to end.
+        let (server, path, uploads, puts, heads) =
+            counting_registry_fixture("again", b"again-pack", true, false).await;
+        let Ok(first) = super::pack_upload_async(&uploads, &path, &[(0, 10)], None).await else {
+            unreachable!("first PUT must succeed")
+        };
+        let Ok(second) = super::pack_upload_async(&uploads, &path, &[(0, 10)], None).await else {
+            unreachable!("HEAD 200 must skip PUT")
+        };
+        assert_eq!(first, second);
+        assert_eq!(
+            puts.load(Ordering::SeqCst),
+            1,
+            "only the first call may PUT"
+        );
+        assert_eq!(
+            heads.load(Ordering::SeqCst),
+            1,
+            "a completed digest must be probed, not re-sent"
+        );
+
+        server.abort();
+        std::fs::remove_file(&path).unwrap_or(());
+    }
+
+    #[tokio::test]
+    async fn failed_leader_drops_its_slot_and_the_next_call_puts_afresh() {
+        use crate::error::CoreError;
+        use sha2::Digest;
+        use sha2::Sha256;
+        use std::sync::atomic::Ordering;
+
+        // A permanent PUT failure must leave neither an inflight slot (the
+        // lease drops it on the error return) nor a completed mark: the next
+        // call starts from nothing and re-PUTs instead of inheriting the
+        // failure or skipping to a HEAD.
+        let (server, path, uploads, puts, heads) =
+            counting_registry_fixture("failed", b"fail-first", false, true).await;
+        let digest = format!("sha256:{}", hex::encode(Sha256::digest(b"fail-first")));
+        match super::pack_upload_async(&uploads, &path, &[(0, 10)], None).await {
+            Err(CoreError::ServerError(403, _)) => {}
+            other => unreachable!("first PUT must fail permanently, got {other:?}"),
+        }
+        let leaked = super::inflight_slots()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains_key(&(uploads.clone(), digest.clone()));
+        assert!(
+            !leaked,
+            "a failed leader must not leave its slot in the map"
+        );
+        assert!(
+            !super::was_completed(&uploads, &digest),
+            "a failed PUT must not mark the digest completed"
+        );
+        let Ok(_) = super::pack_upload_async(&uploads, &path, &[(0, 10)], None).await else {
+            unreachable!("the retry after a failed leader must PUT and succeed")
+        };
+        assert_eq!(puts.load(Ordering::SeqCst), 2, "both calls must PUT");
+        assert_eq!(
+            heads.load(Ordering::SeqCst),
+            0,
+            "nothing completed, so no HEAD"
+        );
+
+        server.abort();
+        std::fs::remove_file(&path).unwrap_or(());
     }
 
     #[test]
