@@ -141,7 +141,7 @@ def _format_download_error(e: Exception) -> tuple[str, int]:
     if isinstance(e, (GatedRepoError, DisabledRepoError)):
         return (f"❌ Access denied: {e}", 14)
     if isinstance(e, RepositoryNotFoundError):
-        return (f"❌ Repository not found: {e}", 11)
+        return (f"❌ Repository not found: {e}", EXIT_REPO_NOT_FOUND)
     if isinstance(e, RevisionNotFoundError):
         return (f"❌ Revision not found: {e}", 12)
     # ConcurrentManifestUpdateError subclasses HfHubHTTPError; it must be

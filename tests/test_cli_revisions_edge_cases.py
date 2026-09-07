@@ -162,6 +162,7 @@ def test_revisions_404_exits_11(monkeypatched_registry, capsys):
     with pytest.raises(SystemExit) as exc:
         cli.cmd_revisions(_revisions_args())
     assert exc.value.code == 11
+    assert exc.value.code == cli.EXIT_REPO_NOT_FOUND
     assert "not found" in capsys.readouterr().out.lower()
 
 

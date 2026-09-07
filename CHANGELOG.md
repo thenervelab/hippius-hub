@@ -34,9 +34,11 @@ No API, CLI, or environment-variable changes. Artifacts are byte-identical to
   deleted outright. It now prints one actionable line pointing at
   `hippius-hub login`. A missing or deleted repo *inside* a namespace you can
   already reach reported cleanly in 0.6.1 too; only the namespace-level 401 path
-  was broken. Note the not-found exit code is the documented `11`
-  (`EXIT_REPO_NOT_FOUND` / `RepositoryNotFoundError`), not the `1` that 0.6.1
-  returned incidentally from the uncaught exception.
+  was broken. Both paths now exit with the documented not-found code `11`
+  (`EXIT_REPO_NOT_FOUND` / `RepositoryNotFoundError`). 0.6.1 exited `1` on
+  both — deliberately on the 404, incidentally on the 401 via the uncaught
+  exception — so a wrapper that tests `$? -eq 1` for a missing repo must be
+  updated.
 - A crashed hashing task no longer retries. It was treated as transient I/O and
   retried three times, re-downloading up to three ~64 MiB packs before failing.
 - Unrecoverable upload sessions report the real cause instead of a fabricated
