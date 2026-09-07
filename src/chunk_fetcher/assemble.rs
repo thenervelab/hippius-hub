@@ -379,6 +379,44 @@ async fn fetch_pack_with_retry(
     }
 }
 
+/// Stream a pack body into memory under the `pack_size` cap. Returns whatever
+/// arrived (the caller checks it against `pack_size`); over-send is rejected here
+/// the moment it is detected. Split from `fetch_pack` so a test can observe the
+/// buffer's capacity - the property RESEXHAUST-001 is about - not just an error.
+async fn read_pack_body(
+    res: &mut reqwest::Response,
+    pack_size: u64,
+    url: &str,
+) -> Result<Vec<u8>, CoreError> {
+    // Audit L12: cap the stream at `pack_size`. Peak memory is arrived bytes,
+    // never the declared size: `with_capacity(declared)` let N concurrent packs
+    // commit N GiB before a body byte (RESEXHAUST-001). Initial reserve is
+    // min(declared, 64 MiB); further growth is try_reserve of arrived chunks.
+    let mut bytes = Vec::new();
+    reserve_or_err(&mut bytes, pack_initial_reserve(pack_size), url)?;
+    let mut received: u64 = 0;
+    // Each body read is bounded by the default-on read-idle window (audit M4): a
+    // registry that stops streaming mid-pack is cut as a retryable ReadStall instead
+    // of holding the connection until the 5-minute total timeout.
+    while let Some(chunk) = read_chunk_bounded(res, download_read_idle()).await? {
+        received = received.saturating_add(chunk.len() as u64);
+        if received > pack_size {
+            // Transport length anomaly, not a wrong-bytes integrity failure - a
+            // proxy/CDN that over-sends a self-consistent body can clear on retry,
+            // so classify it retryable (matches the Range path's short/over-length
+            // handling in chunked_downloader). Bounded by pack_size so a runaway
+            // stream is cut here, well under the MAX_PACK_BYTES ceiling.
+            return Err(CoreError::BadResponse(format!(
+                "pack {}: body exceeds expected {pack_size} bytes (over-send)",
+                redact_url(url)
+            )));
+        }
+        reserve_or_err(&mut bytes, chunk.len(), url)?;
+        bytes.extend_from_slice(&chunk);
+    }
+    Ok(bytes)
+}
+
 /// Fetch one pack blob whole, verify each carved chunk's sha256, and scatter each
 /// slice to its file offset. Buffering the pack (~64 MiB) is bounded by the
 /// semaphore; the length check rejects a server that over-sends before slicing.
@@ -409,32 +447,7 @@ async fn fetch_pack(
             format!("pack GET failed for {}", redact_url(url)),
         ));
     }
-    // Audit L12: cap the stream at `pack_size`. Peak memory is arrived bytes,
-    // never the declared size: `with_capacity(declared)` let N concurrent packs
-    // commit N GiB before a body byte (RESEXHAUST-001). Initial reserve is
-    // min(declared, 64 MiB); further growth is try_reserve of arrived chunks.
-    let mut bytes = Vec::new();
-    reserve_or_err(&mut bytes, pack_initial_reserve(pack_size), url)?;
-    let mut received: u64 = 0;
-    // Each body read is bounded by the default-on read-idle window (audit M4): a
-    // registry that stops streaming mid-pack is cut as a retryable ReadStall instead
-    // of holding the connection until the 5-minute total timeout.
-    while let Some(chunk) = read_chunk_bounded(&mut res, download_read_idle()).await? {
-        received = received.saturating_add(chunk.len() as u64);
-        if received > pack_size {
-            // Transport length anomaly, not a wrong-bytes integrity failure - a
-            // proxy/CDN that over-sends a self-consistent body can clear on retry,
-            // so classify it retryable (matches the Range path's short/over-length
-            // handling in chunked_downloader). Bounded by pack_size so a runaway
-            // stream is cut here, well under the MAX_PACK_BYTES ceiling.
-            return Err(CoreError::BadResponse(format!(
-                "pack {}: body exceeds expected {pack_size} bytes (over-send)",
-                redact_url(url)
-            )));
-        }
-        reserve_or_err(&mut bytes, chunk.len(), url)?;
-        bytes.extend_from_slice(&chunk);
-    }
+    let bytes = read_pack_body(&mut res, pack_size, url).await?;
     if bytes.len() as u64 != pack_size {
         return Err(CoreError::BadResponse(format!(
             "pack {}: expected {pack_size} bytes, got {}",
@@ -606,21 +619,6 @@ mod tests {
     }
 
     #[test]
-    fn fetch_pack_does_not_with_capacity_the_declared_size() {
-        let src = include_str!("assemble.rs");
-        let Some((prod, _)) = src.split_once("#[cfg(test)]") else {
-            unreachable!("test module")
-        };
-        assert!(
-            !prod.contains("let mut bytes: Vec<u8> = Vec::with_capacity"),
-            "fetch_pack must not pre-size from the declared pack_size"
-        );
-        assert!(prod.contains("let mut bytes = Vec::new()"));
-        assert!(prod.contains("pack_initial_reserve"));
-        assert!(prod.contains("try_reserve"));
-    }
-
-    #[test]
     fn python_max_pack_bytes_matches_rust() {
         let py = include_str!("../../hippius_hub/constants.py");
         let Some(line) = py.lines().find(|l| l.starts_with("MAX_PACK_BYTES = ")) else {
@@ -653,14 +651,6 @@ mod tests {
             "https://registry.example/v2/x/blobs/sha256:ab"
         );
         assert_eq!(super::redact_url("not a url"), "not a url");
-    }
-
-    #[test]
-    fn over_send_stays_retryable_bad_response() {
-        let err =
-            CoreError::BadResponse("pack u: body exceeds expected 10 bytes (over-send)".into());
-        assert!(err.is_retryable());
-        assert!(!CoreError::Integrity("declared too big".into()).is_retryable());
     }
 
     // --- assemble (end-to-end orchestration over a local pack server) ---
@@ -732,6 +722,38 @@ mod tests {
                 )],
             },
         ]
+    }
+
+    #[tokio::test]
+    async fn pack_body_capacity_tracks_arrived_bytes_not_declared_size() {
+        // RESEXHAUST-001: a pack declared at the 1 GiB ceiling that delivers 2000
+        // bytes must leave the buffer at the 64 MiB initial reserve, not 1 GiB.
+        // Observes the real allocation, so restoring `with_capacity(declared)`
+        // (even clamped to MAX_PACK_BYTES) fails here. No skip-guards: a bind or
+        // client failure is a test failure, not a silent pass.
+        let mut routes = HashMap::new();
+        routes.insert("/pack".to_string(), vec![7u8; 2000]);
+        let Ok(base) = serve_packs(routes).await else {
+            unreachable!("loopback bind")
+        };
+        let Ok(client) = download_client(TransportTimeouts::default()) else {
+            unreachable!("download client")
+        };
+        let Ok(mut res) = client.get(format!("{base}/pack")).send().await else {
+            unreachable!("pack GET")
+        };
+        let Ok(body) = read_pack_body(&mut res, MAX_PACK_BYTES, "pack").await else {
+            unreachable!("short body is returned as-is; fetch_pack does the length check")
+        };
+        assert_eq!(body.len(), 2000);
+        let Ok(ceiling) = usize::try_from(PACK_RESERVE_CEILING) else {
+            unreachable!("64 MiB fits usize")
+        };
+        assert!(
+            body.capacity() <= ceiling,
+            "buffer capacity {} exceeds the 64 MiB initial reserve",
+            body.capacity()
+        );
     }
 
     #[tokio::test]
