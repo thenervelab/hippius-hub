@@ -1,7 +1,7 @@
 # 0.8 blob census. Read-only: mounts the registry PVC with readOnly: true and
 # only lists and sizes. Answers what 4 actually has to copy, which the Harbor
-# database cannot: the DB knows 78,055 blobs / 2,060 GB, but the disk also
-# carries blobs for repositories the DB has forgotten.
+# database cannot: 55% of blob rows have size = 0, so the DB total (1.7 TB) is
+# not the stored volume. Measured 2026-09-03: 79,816 blobs, 31.08 TB on disk.
 #
 #   kubectl -n harbor apply -f deploy/harbor-s3-prod/blob-census-job.yaml
 #   kubectl -n harbor logs -f job/harbor-blob-census
@@ -51,12 +51,12 @@ spec:
                 n=$((n + c))
               done
               echo "blob digests on disk: $n"
-              echo "  (Harbor's database knows 78055 - any excess is orphaned)"
+              echo "  (Harbor's database knew 79738 on 2026-09-03 - excess is orphaned)"
               echo
               echo "sizing the tree (full walk, slower)..."
               kb=$(du -sk "$B" | awk '{print $1}')
               echo "blob bytes on disk: ${kb} KiB = $((kb / 1024 / 1024)) GiB"
-              echo "  (Harbor's database totals 2060 GB of tracked blobs)"
+              echo "  (du is exact on JuiceFS; the DB total is not, 55% of rows have size 0)"
           volumeMounts:
             - name: registry-data
               mountPath: /storage
