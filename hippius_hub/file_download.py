@@ -349,7 +349,6 @@ def hf_hub_download(
     if subfolder:
         filename = f"{subfolder}/{filename}"
 
-    oci_repo = _oci_repo_path(repo_id, repo_type)
     paths = _resolve_dest_paths(
         repo_id=repo_id,
         filename=filename,
@@ -367,6 +366,11 @@ def hf_hub_download(
             f"and local_files_only=True"
         )
 
+    # Resolved only once we know the registry will be contacted: the
+    # dataset/space gate inside is about registry permissions, so a cache hit
+    # or local_files_only must keep working exactly as snapshot_download and
+    # try_to_load_from_cache do.
+    oci_repo = _oci_repo_path(repo_id, repo_type)
     registry = resolve_registry(endpoint)
 
     # Refresh the OCI token and retry once on a 401 (audit M2): a token minted here

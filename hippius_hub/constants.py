@@ -260,7 +260,7 @@ def experimental_repo_types_enabled() -> bool:
     registry namespaces that customer access keys have no permissions on,
     so by default the client refuses them up front instead of letting the
     registry's 401 surface as a misleading "repository not found"."""
-    return os.environ.get("HIPPIUS_EXPERIMENTAL_REPO_TYPES", "").lower() in ("1", "true", "yes")
+    return _resolve_bool("HIPPIUS_EXPERIMENTAL_REPO_TYPES", False)
 
 
 def debug_enabled() -> bool:

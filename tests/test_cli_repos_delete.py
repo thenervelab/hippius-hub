@@ -89,6 +89,21 @@ def test_passthrough_repo_type_missing_ok_token(spy_delete):
                                          "missing_ok": True})]
 
 
+def test_dataset_repo_type_refused_cleanly_via_main(monkeypatch, capsys):
+    """Without the experimental opt-in the dataset gate fires inside
+    delete_repo before any network call; main() must render it as a one-line
+    refusal with exit 1, not a traceback."""
+    monkeypatch.delenv("HIPPIUS_EXPERIMENTAL_REPO_TYPES", raising=False)
+    monkeypatch.setattr("sys.argv", ["hippius-hub", "registry", "repos", "delete",
+                                     "org/model", "--repo-type", "dataset", "--yes"])
+    with pytest.raises(SystemExit) as got:
+        cli.main()
+    assert got.value.code == 1
+    captured = capsys.readouterr()
+    assert "Traceback" not in captured.out and "Traceback" not in captured.err
+    assert "Omit repo_type" in captured.out
+
+
 # ---------- error mapping ----------
 
 def _raise(exc):

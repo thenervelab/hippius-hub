@@ -18,7 +18,7 @@ from typing import Any
 from . import __version__
 from .auth import get_oci_bearer_token, login, resolve_token_value
 from .constants import resolve_registry
-from .file_download import _oci_repo_path, hippius_hub_download
+from .file_download import _oci_repo_path, _validate_repo_type, hippius_hub_download
 from ._repo_ops import _list_tags, _revision_digest_and_created, delete_repo
 from . import console
 from .console import ConsoleError
@@ -574,6 +574,7 @@ def cmd_models_formats(_args):
 # ----- revisions -----
 
 def cmd_revisions(args):
+    _validate_repo_type(args.repo_type)
     oci_repo = _oci_repo_path(args.repo_id, args.repo_type)
     registry = resolve_registry(None)
     oci_token = get_oci_bearer_token(oci_repo, resolve_token_value(None), push=False)
@@ -941,11 +942,14 @@ def main():
         # traceback. Deliberately narrow — only huggingface_hub's typed error
         # families are caught, so a genuine bug (TypeError, KeyError, ...) still
         # bubbles up with its traceback intact rather than being flattened into
-        # a tidy but undebuggable message.
+        # a tidy but undebuggable message. NotImplementedError is the one
+        # non-HF addition: it is this package's own "unsupported input" signal
+        # (the dataset/space repo_type gate, rejected HF kwargs), an expected
+        # refusal the user must act on, not a defect.
         from .errors import EntryNotFoundError, HfHubHTTPError
         try:
             handlers[args.command](args)
-        except (HfHubHTTPError, EntryNotFoundError) as e:
+        except (HfHubHTTPError, EntryNotFoundError, NotImplementedError) as e:
             msg, code = _format_download_error(e)
             print(msg)
             sys.exit(code)
@@ -958,6 +962,10 @@ def main():
             args.func(args)
         except ConsoleError as e:
             _handle_console_error(e)
+        except NotImplementedError as e:
+            msg, code = _format_download_error(e)
+            print(msg)
+            sys.exit(code)
         return
     parser.print_help()
     sys.exit(1)

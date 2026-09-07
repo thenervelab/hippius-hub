@@ -201,6 +201,9 @@ def _run_main(monkeypatch, argv, handler):
             "gone", response=httpx.Response(401, request=httpx.Request("GET", "about:blank"))), 11),
         (GatedRepoError(
             "denied", response=httpx.Response(403, request=httpx.Request("GET", "about:blank"))), 14),
+        # The package's own "unsupported input" refusal (repo_type gate) is an
+        # expected condition the user must act on, not a defect.
+        (NotImplementedError("repo_type='dataset' is not supported"), 1),
     ],
 )
 def test_main_renders_typed_errors_as_clean_exit(monkeypatch, capsys, exc, expected_code):
@@ -215,6 +218,20 @@ def test_main_renders_typed_errors_as_clean_exit(monkeypatch, capsys, exc, expec
     captured = capsys.readouterr()
     assert "Traceback" not in captured.out and "Traceback" not in captured.err
     assert "❌" in captured.out
+
+
+@pytest.mark.parametrize("repo_type, match", [
+    ("dataset", "Omit repo_type"),
+    ("bogus", "Valid values"),
+])
+def test_revisions_refuses_unsupported_repo_type_before_network(monkeypatch, repo_type, match):
+    """`--repo-type dataset` (gated by default) and `--repo-type bogus` both
+    raise the package's NotImplementedError — never the "unreachable"
+    AssertionError, and never a token/registry call."""
+    monkeypatch.delenv("HIPPIUS_EXPERIMENTAL_REPO_TYPES", raising=False)
+    args = argparse.Namespace(repo_id=REPO, repo_type=repo_type, json=False)
+    with pytest.raises(NotImplementedError, match=match):
+        cli.cmd_revisions(args)
 
 
 def test_main_lets_genuine_bugs_traceback(monkeypatch):

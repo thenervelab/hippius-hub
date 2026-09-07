@@ -186,6 +186,29 @@ def test_hf_hub_url_space_namespaces_under_spaces(monkeypatch):
     )
 
 
+def test_hf_hub_download_dataset_cache_hit_bypasses_gate(tmp_path, monkeypatch):
+    """The gate guards registry access only: a file already in the cache (or a
+    local_files_only read) must resolve without opt-in, matching
+    snapshot_download / try_to_load_from_cache which never consult the mapping."""
+    monkeypatch.delenv("HIPPIUS_EXPERIMENTAL_REPO_TYPES", raising=False)
+    cache_dir = tmp_path / "cache"
+    cached = cache_dir / _cache_dirname("foo/bar", "dataset") / "snapshots" / "main" / "x.bin"
+    cached.parent.mkdir(parents=True)
+    cached.write_bytes(b"cached")
+
+    out = hf_hub_download("foo/bar", "x.bin", repo_type="dataset", cache_dir=cache_dir)
+    assert out == str(cached)
+    out = hf_hub_download("foo/bar", "x.bin", repo_type="dataset", cache_dir=cache_dir,
+                          local_files_only=True)
+    assert out == str(cached)
+
+
+def test_hf_hub_download_dataset_cache_miss_hits_gate(tmp_path, monkeypatch):
+    monkeypatch.delenv("HIPPIUS_EXPERIMENTAL_REPO_TYPES", raising=False)
+    with pytest.raises(NotImplementedError, match="Omit repo_type"):
+        hf_hub_download("foo/bar", "x.bin", repo_type="dataset", cache_dir=tmp_path)
+
+
 def test_hf_hub_url_dataset_rejected_without_optin(monkeypatch):
     monkeypatch.delenv("HIPPIUS_EXPERIMENTAL_REPO_TYPES", raising=False)
     with pytest.raises(NotImplementedError, match="Omit repo_type"):
