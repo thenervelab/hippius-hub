@@ -30,12 +30,14 @@ persistence:
       # (~0.06 s). Above it distribution uses UploadPartCopy in 32 MiB ranges,
       # a streaming GET+PUT per range on hippius-s3.
       #
-      # 5 GiB, not 128 MiB (PR #92, census 2026-08-26 of 76,419 blobs): 128 MiB
-      # clears a 64-75 MiB pack but 622 blobs are larger, and 127 of those are
-      # over 4 GiB and carry 33.7% of all bytes - every one would have stayed on
-      # UploadPartCopy. 5 GiB is the S3 ceiling for a single CopyObject, so a
-      # larger value makes distribution attempt a copy the gateway must reject.
-      # The 24 blobs above 5 GiB (largest 16.0 GiB) fall back to multipart copy
+      # 5 GiB, not 128 MiB (PR #92; on-disk census 2026-09-03 of 79,816 blobs,
+      # Harbor's blob table undercounts because 55% of rows have size 0): 128 MiB
+      # clears a 64-75 MiB pack but 8,697 blobs are larger and carry 93.5% of all
+      # bytes; 1,761 are over 4 GiB (31.8%) - every one would have stayed on
+      # UploadPartCopy. 5 GiB is the AWS ceiling for a single CopyObject; hippius-s3
+      # itself has no such cap and its same-bucket alias copy is metadata-only, so
+      # a higher value is worth asking the s3 team about rather than forbidden.
+      # The 130 blobs above 5 GiB (largest 49.7 GB) fall back to multipart copy
       # on their own; correct, just slower. Chart 1.19.0 renders this key.
       multipartcopythresholdsize: "5368709120"
       # empty / omitted: keys are docker/registry/v2/blobs/sha256/<aa>/<digest>/data

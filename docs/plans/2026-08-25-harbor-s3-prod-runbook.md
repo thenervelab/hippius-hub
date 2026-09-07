@@ -117,7 +117,7 @@ Success bar after flip: median **≥ 80 MiB/s** on a 1 GiB fresh unique-bytes `h
 
 **Later the same day (still `harbor-staging`, prod untouched):** hippius-s3 `#445` alias CopyObject, `#448` ingest-node hint, `#451` cipher sizes on that hint, staging `UVICORN_WORKERS=8` / `API_DB_POOL_MAX_SIZE=8`, Harbor `multipartcopythresholdsize=134217728` (kubectl patch of `config.yml` + env; helm rev still 4). Unique 1 GiB ×3 **stock `hippius_hub==0.7.0`**: 10.28s 99.6 / 11.91s 86.0 / 8.81s 116.2 → median **99.6 MiB/s**. Bar **PASS**. Unreleased config-blob overlay on the same Harbor knobs: 9.11s 112.4 / 7.64s 134.1 / 6.90s 148.5 → median 134.1 (optional, not required).
 
-Do **not** helm-upgrade `-n harbor` until `deploy/harbor-s3-prod/overlay-s3.yaml` is the flip file. It carries `multipartcopythresholdsize=5368709120` (5 GiB, PR #92): the 08-25 run used 128 MiB, which clears a pack but leaves the 622 blobs over 128 MiB — 127 of them over 4 GiB, a third of all bytes — on the streaming UploadPartCopy path. 5 GiB is the S3 single-CopyObject ceiling; never set it higher. Staging Harbor is still up in `harbor-staging` for inspection (idle since the 2026-08-27 gate; it is the vehicle for the re-gate in 0.6).
+Do **not** helm-upgrade `-n harbor` until `deploy/harbor-s3-prod/overlay-s3.yaml` is the flip file. It carries `multipartcopythresholdsize=5368709120` (5 GiB, PR #92): the 08-25 run used 128 MiB, which clears a pack but leaves the 8,697 blobs over 128 MiB — 93.5% of all bytes, 1,761 of them over 4 GiB — on the streaming UploadPartCopy path. 5 GiB is the AWS single-CopyObject ceiling; hippius-s3 has no such cap and its alias copy is metadata-only, so confirm with the s3 team before treating 5 GiB as a hard limit. Staging Harbor is still up in `harbor-staging` for inspection (idle since the 2026-08-27 gate; it is the vehicle for the re-gate in 0.6).
 
 **Read-only review 2026-08-27 — two corrections to the numbers above.**
 
@@ -517,7 +517,7 @@ FUSE and takes tens of minutes, and it skips the 0.62 TB of orphans.
 **The large-blob path is the one thing in this plan never rehearsed.** The staging
 rehearsal proved §4a's link generation; the blobs were already in that bucket because
 Harbor had written them. rclone reading the JuiceFS PVC and writing 79,816 blobs to
-hippius-s3 has not been run. The limits do permit it — **133 blobs exceed 5 GiB, 80 exceed
+hippius-s3 has not been run. The limits do permit it — **130 blobs exceed 5 GiB, 80 exceed
 16 GB, and the largest is 49.7 GB** (an orphan; largest DB-tracked blob is 16.02 GiB)
 against a gateway cap of 5 TiB (`max_multipart_part_size` 512 MiB ×
 `max_multipart_part_count` 10,000), and at `--s3-chunk-size 64M` that largest blob is 742
