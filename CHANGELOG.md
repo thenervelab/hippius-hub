@@ -9,6 +9,13 @@ the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 
 ### Changed
 
+- Intra-file chunked-v2 packing stores a repeated chunk digest once (first
+  new-pack occurrence). Previously a digest appearing twice in one file was
+  packed twice. Pointer format is unchanged: both entries point at the same
+  pack offset.
+- Pack upload single-flights concurrent PUTs of the same pack bytes, and a
+  digest this process has already landed is HEADed before it is re-sent, so
+  Harbor is not asked twice for identical content.
 - Large-file uploads start the empty OCI config blob (`{}`) in parallel with
   the pack wave. It does not depend on pack digests; previously it sat in
   the sequential tail after packs (pointer → config → manifest).
