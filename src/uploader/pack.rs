@@ -14,7 +14,7 @@ use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use tokio::sync::Mutex as AsyncMutex;
 
 use crate::error::CoreError;
-use crate::uploader::blob::{init_upload_session, UPLOAD_MAX_RETRIES};
+use crate::uploader::blob::{init_upload_session, INIT_POST_TIMEOUT, UPLOAD_MAX_RETRIES};
 use crate::uploader::client::upload_client;
 use crate::uploader::watchdog::{
     pack_frames, send_put_watchdogged, RESPONSE_WAIT_TIMEOUT, WRITE_STALL_TIMEOUT,
@@ -22,7 +22,7 @@ use crate::uploader::watchdog::{
 
 /// Bound on pack HEAD (no body). Same order as the init POST: a hung registry
 /// must not hold the single-flight slot forever.
-const PACK_HEAD_TIMEOUT: Duration = Duration::from_secs(30);
+const PACK_HEAD_TIMEOUT: Duration = INIT_POST_TIMEOUT;
 
 /// `true` once the leader has landed the pack; a waiter that observes it
 /// returns without touching the registry. The digest is part of the key, so
@@ -106,7 +106,7 @@ fn present_or_unknown(result: Result<bool, CoreError>) -> Result<bool, CoreError
 }
 
 /// `{registry}/v2/{repo}/blobs/uploads/` → `{registry}/v2/{repo}/blobs/{digest}`.
-pub(super) fn blob_head_url(uploads_url: &str, digest: &str) -> Result<String, CoreError> {
+fn blob_head_url(uploads_url: &str, digest: &str) -> Result<String, CoreError> {
     let trimmed = uploads_url.trim_end_matches('/');
     let Some(blobs) = trimmed.strip_suffix("/uploads") else {
         return Err(CoreError::InvalidArgument(format!(
@@ -163,16 +163,16 @@ pub async fn pack_upload_async(
                 source: join_err,
             })?;
     let digest = format!("sha256:{digest_hex}");
-    put_pack_single_flight(uploads_url, &body, &digest, digest_hex, auth_token).await
+    put_pack_single_flight(uploads_url, &body, &digest, auth_token).await?;
+    Ok(digest_hex)
 }
 
 async fn put_pack_single_flight(
     uploads_url: &str,
     body: &Bytes,
     digest: &str,
-    digest_hex: String,
     auth_token: Option<&str>,
-) -> Result<String, CoreError> {
+) -> Result<(), CoreError> {
     let slot = slot_for(uploads_url, digest);
     let _lease = SlotLease {
         uploads_url: uploads_url.to_owned(),
@@ -180,7 +180,7 @@ async fn put_pack_single_flight(
     };
     let mut guard = slot.lock().await;
     if *guard {
-        return Ok(digest_hex);
+        return Ok(());
     }
     // Unique packs have never been PUT by this process; HEAD would 404.
     // Only probe the registry when a prior success in this process makes
@@ -192,8 +192,7 @@ async fn put_pack_single_flight(
     };
     if already {
         *guard = true;
-        mark_completed(uploads_url, digest);
-        return Ok(digest_hex);
+        return Ok(());
     }
     let mut retries: u32 = 0;
     loop {
@@ -201,7 +200,7 @@ async fn put_pack_single_flight(
             Ok(()) => {
                 *guard = true;
                 mark_completed(uploads_url, digest);
-                return Ok(digest_hex);
+                return Ok(());
             }
             Err(e) => {
                 retries += 1;
@@ -316,41 +315,23 @@ mod tests {
     async fn pack_upload_skips_put_when_head_is_200() {
         use sha2::Digest;
         use sha2::Sha256;
-        use std::io::Write;
-        use tokio::io::AsyncReadExt;
-        use tokio::io::AsyncWriteExt;
-        use tokio::net::TcpListener;
+        use std::sync::atomic::Ordering;
 
-        let Ok(listener) = TcpListener::bind("127.0.0.1:0").await else {
-            unreachable!("bind loopback")
-        };
-        let Ok(addr) = listener.local_addr() else {
-            unreachable!("local_addr")
-        };
-        let server = tokio::spawn(async move {
-            if let Ok((mut sock, _)) = listener.accept().await {
-                let mut buf = [0u8; 4096];
-                let _ = sock.read(&mut buf).await;
-                let _ = sock
-                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
-                    .await;
-            }
-        });
-
-        let path = std::env::temp_dir().join(format!("hippius-head-{}.bin", std::process::id()));
-        match std::fs::File::create(&path).and_then(|mut f| f.write_all(b"pack-bytes")) {
-            Ok(()) => {}
-            Err(_) => unreachable!("temp file write"),
-        }
-        let uploads = format!("http://{addr}/v2/x/blobs/uploads/");
+        let (server, path, uploads, puts, heads) =
+            counting_registry_fixture("head", b"pack-bytes", true, false).await;
         let digest = format!("sha256:{}", hex::encode(Sha256::digest(b"pack-bytes")));
         super::mark_completed(&uploads, &digest);
-        let Ok(hex) = super::pack_upload_async(&uploads, &path, &[(0, 10)], None).await else {
+        let Ok(hex) = super::pack_upload_async(&uploads, &path.0, &[(0, 10)], None).await else {
             unreachable!("HEAD 200 must skip PUT")
         };
         assert_eq!(hex, hex::encode(Sha256::digest(b"pack-bytes")));
+        assert_eq!(
+            heads.load(Ordering::SeqCst),
+            1,
+            "a completed digest is probed"
+        );
+        assert_eq!(puts.load(Ordering::SeqCst), 0, "HEAD 200 must skip the PUT");
         server.abort();
-        std::fs::remove_file(&path).unwrap_or(());
     }
 
     #[test]
@@ -378,7 +359,6 @@ mod tests {
     /// answers 403 (permanent) when `fail_first_put`, later PUTs 201. Bodies
     /// are drained by idle-timeout rather than Content-Length: the pack PUT is
     /// a framed stream, so it is chunked and has no length header.
-    #[cfg(test)]
     async fn serve_counting_registry(
         listener: tokio::net::TcpListener,
         addr: std::net::SocketAddr,
@@ -449,40 +429,16 @@ mod tests {
 
     #[tokio::test]
     async fn concurrent_identical_packs_put_once() {
-        use std::io::Write;
-        use std::sync::atomic::AtomicUsize;
         use std::sync::atomic::Ordering;
-        use tokio::net::TcpListener;
 
-        let Ok(listener) = TcpListener::bind("127.0.0.1:0").await else {
-            unreachable!("bind loopback")
-        };
-        let Ok(addr) = listener.local_addr() else {
-            unreachable!("local_addr")
-        };
-        let puts = std::sync::Arc::new(AtomicUsize::new(0));
-        let heads = std::sync::Arc::new(AtomicUsize::new(0));
-        let server = tokio::spawn(serve_counting_registry(
-            listener,
-            addr,
-            std::sync::Arc::clone(&puts),
-            std::sync::Arc::clone(&heads),
-            false,
-            false,
-        ));
-
-        let path = std::env::temp_dir().join(format!("hippius-sf-two-{}.bin", std::process::id()));
-        match std::fs::File::create(&path).and_then(|mut f| f.write_all(b"pack-bytes")) {
-            Ok(()) => {}
-            Err(_) => unreachable!("temp file write"),
-        }
-        let uploads = format!("http://{addr}/v2/x/blobs/uploads/");
+        let (server, path, uploads, puts, heads) =
+            counting_registry_fixture("two", b"pack-bytes", false, false).await;
 
         // Two callers, same (uploads_url, digest): the second must wait on the
         // leader's slot and adopt its result, not issue a second PUT.
         let (a, b) = tokio::join!(
-            super::pack_upload_async(&uploads, &path, &[(0, 10)], None),
-            super::pack_upload_async(&uploads, &path, &[(0, 10)], None),
+            super::pack_upload_async(&uploads, &path.0, &[(0, 10)], None),
+            super::pack_upload_async(&uploads, &path.0, &[(0, 10)], None),
         );
         let (Ok(ha), Ok(hb)) = (a, b) else {
             unreachable!("both callers must succeed")
@@ -500,41 +456,15 @@ mod tests {
         );
 
         server.abort();
-        std::fs::remove_file(&path).unwrap_or(());
     }
 
     #[tokio::test]
     async fn unique_pack_skips_head_when_unknown() {
-        use std::io::Write;
-        use std::sync::atomic::AtomicUsize;
         use std::sync::atomic::Ordering;
-        use tokio::net::TcpListener;
 
-        let Ok(listener) = TcpListener::bind("127.0.0.1:0").await else {
-            unreachable!("bind loopback")
-        };
-        let Ok(addr) = listener.local_addr() else {
-            unreachable!("local_addr")
-        };
-        let puts = std::sync::Arc::new(AtomicUsize::new(0));
-        let heads = std::sync::Arc::new(AtomicUsize::new(0));
-        let server = tokio::spawn(serve_counting_registry(
-            listener,
-            addr,
-            std::sync::Arc::clone(&puts),
-            std::sync::Arc::clone(&heads),
-            false,
-            false,
-        ));
-
-        let path =
-            std::env::temp_dir().join(format!("hippius-sf-unique-{}.bin", std::process::id()));
-        match std::fs::File::create(&path).and_then(|mut f| f.write_all(b"unique-pack")) {
-            Ok(()) => {}
-            Err(_) => unreachable!("temp file write"),
-        }
-        let uploads = format!("http://{addr}/v2/uniq/blobs/uploads/");
-        let Ok(_) = super::pack_upload_async(&uploads, &path, &[(0, 11)], None).await else {
+        let (server, path, uploads, puts, heads) =
+            counting_registry_fixture("uniq", b"unique-pack", false, false).await;
+        let Ok(_) = super::pack_upload_async(&uploads, &path.0, &[(0, 11)], None).await else {
             unreachable!("unique pack PUT must succeed")
         };
         assert_eq!(
@@ -549,55 +479,11 @@ mod tests {
         );
 
         server.abort();
-        std::fs::remove_file(&path).unwrap_or(());
     }
 
-    #[tokio::test]
-    async fn a_failed_leader_leaves_no_poisoned_slot() {
-        // The leader's slot must not outlive a failure: `SlotLease` drops the
-        // map entry on every return, so the next caller starts from `None` and
-        // redoes the work rather than inheriting a stale error or an empty
-        // "done" marker that would skip the PUT entirely.
-        let key_url = "https://reg/v2/failed/blobs/uploads/";
-        let leader = super::slot_for(key_url, "sha256:dead");
-        {
-            let guard = leader.lock().await;
-            assert!(!*guard, "a fresh slot starts empty");
-        }
-        super::drop_slot(key_url, "sha256:dead");
-
-        let next = super::slot_for(key_url, "sha256:dead");
-        assert!(
-            !std::sync::Arc::ptr_eq(&leader, &next),
-            "a dropped slot must not be handed back to the next caller"
-        );
-        let guard = next.lock().await;
-        assert!(
-            !*guard,
-            "the next caller must redo the work, not adopt a poisoned result"
-        );
-    }
-
-    #[tokio::test]
-    async fn a_completed_leader_short_circuits_the_next_caller() {
-        let key_url = "https://reg/v2/done/blobs/uploads/";
-        let slot = super::slot_for(key_url, "sha256:beef");
-        {
-            let mut guard = slot.lock().await;
-            *guard = true;
-        }
-        let again = super::slot_for(key_url, "sha256:beef");
-        let guard = again.lock().await;
-        assert!(
-            *guard,
-            "a waiter must adopt the leader's completion instead of re-uploading"
-        );
-        drop(guard);
-        super::drop_slot(key_url, "sha256:beef");
-    }
-
-    /// Bind a loopback counting registry and write `pack` to a temp file.
-    #[cfg(test)]
+    /// Bind a loopback counting registry and write `pack` to a scratch file
+    /// (removed when the returned guard drops, so a failed assertion still
+    /// cleans up).
     async fn counting_registry_fixture(
         tag: &str,
         pack: &[u8],
@@ -605,11 +491,12 @@ mod tests {
         fail_first_put: bool,
     ) -> (
         tokio::task::JoinHandle<()>,
-        std::path::PathBuf,
+        crate::incremental_hash::test_support::TempFileGuard,
         String,
         std::sync::Arc<std::sync::atomic::AtomicUsize>,
         std::sync::Arc<std::sync::atomic::AtomicUsize>,
     ) {
+        use crate::incremental_hash::test_support::{scratch_path, TempFileGuard};
         use std::io::Write;
         use std::sync::atomic::AtomicUsize;
         use tokio::net::TcpListener;
@@ -630,14 +517,13 @@ mod tests {
             head_found,
             fail_first_put,
         ));
-        let path =
-            std::env::temp_dir().join(format!("hippius-sf-{tag}-{}.bin", std::process::id()));
+        let path = scratch_path(&format!("sf-{tag}"));
         match std::fs::File::create(&path).and_then(|mut f| f.write_all(pack)) {
             Ok(()) => {}
             Err(_) => unreachable!("temp file write"),
         }
         let uploads = format!("http://{addr}/v2/{tag}/blobs/uploads/");
-        (server, path, uploads, puts, heads)
+        (server, TempFileGuard(path), uploads, puts, heads)
     }
 
     #[tokio::test]
@@ -649,10 +535,10 @@ mod tests {
         // body. Pins `mark_completed` after a successful PUT end to end.
         let (server, path, uploads, puts, heads) =
             counting_registry_fixture("again", b"again-pack", true, false).await;
-        let Ok(first) = super::pack_upload_async(&uploads, &path, &[(0, 10)], None).await else {
+        let Ok(first) = super::pack_upload_async(&uploads, &path.0, &[(0, 10)], None).await else {
             unreachable!("first PUT must succeed")
         };
-        let Ok(second) = super::pack_upload_async(&uploads, &path, &[(0, 10)], None).await else {
+        let Ok(second) = super::pack_upload_async(&uploads, &path.0, &[(0, 10)], None).await else {
             unreachable!("HEAD 200 must skip PUT")
         };
         assert_eq!(first, second);
@@ -668,7 +554,6 @@ mod tests {
         );
 
         server.abort();
-        std::fs::remove_file(&path).unwrap_or(());
     }
 
     #[tokio::test]
@@ -685,7 +570,7 @@ mod tests {
         let (server, path, uploads, puts, heads) =
             counting_registry_fixture("failed", b"fail-first", false, true).await;
         let digest = format!("sha256:{}", hex::encode(Sha256::digest(b"fail-first")));
-        match super::pack_upload_async(&uploads, &path, &[(0, 10)], None).await {
+        match super::pack_upload_async(&uploads, &path.0, &[(0, 10)], None).await {
             Err(CoreError::ServerError(403, _)) => {}
             other => unreachable!("first PUT must fail permanently, got {other:?}"),
         }
@@ -701,7 +586,7 @@ mod tests {
             !super::was_completed(&uploads, &digest),
             "a failed PUT must not mark the digest completed"
         );
-        let Ok(_) = super::pack_upload_async(&uploads, &path, &[(0, 10)], None).await else {
+        let Ok(_) = super::pack_upload_async(&uploads, &path.0, &[(0, 10)], None).await else {
             unreachable!("the retry after a failed leader must PUT and succeed")
         };
         assert_eq!(puts.load(Ordering::SeqCst), 2, "both calls must PUT");
@@ -712,7 +597,6 @@ mod tests {
         );
 
         server.abort();
-        std::fs::remove_file(&path).unwrap_or(());
     }
 
     #[test]
@@ -722,5 +606,527 @@ mod tests {
         assert!(!std::sync::Arc::ptr_eq(&repo_a, &repo_b));
         let repo_a_again = super::slot_for("https://r/v2/repo-a/blobs/uploads/", "sha256:ab");
         assert!(std::sync::Arc::ptr_eq(&repo_a, &repo_a_again));
+    }
+
+    /// What a scripted registry answers to one PUT: a status, or hold the
+    /// response back for 30 s so the caller can be cancelled mid-flight.
+    #[derive(Clone, Copy)]
+    enum PutReply {
+        Status(u16),
+        Stall,
+    }
+
+    /// Scripted HEAD -> POST -> PUT registry. `head` is the HEAD status (None =
+    /// close the socket without answering, the shape of a dropped connection or
+    /// an idle-timeout cut). `put_script` is consumed one entry per PUT; the last
+    /// entry repeats. Counts HEADs and PUTs like `serve_counting_registry`.
+    #[cfg(test)]
+    async fn serve_scripted_registry(
+        listener: tokio::net::TcpListener,
+        addr: std::net::SocketAddr,
+        puts: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        heads: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        head: Option<u16>,
+        put_script: Vec<PutReply>,
+    ) {
+        use std::sync::atomic::Ordering;
+        use tokio::io::AsyncReadExt;
+        use tokio::io::AsyncWriteExt;
+
+        let status_line = |code: u16| {
+            format!("HTTP/1.1 {code} Scripted\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+        };
+        let put_script = std::sync::Arc::new(put_script);
+        loop {
+            let Ok((mut sock, _)) = listener.accept().await else {
+                return;
+            };
+            let puts = std::sync::Arc::clone(&puts);
+            let heads = std::sync::Arc::clone(&heads);
+            let put_script = std::sync::Arc::clone(&put_script);
+            tokio::spawn(async move {
+                let mut seen = Vec::new();
+                let mut buf = [0u8; 4096];
+                loop {
+                    match tokio::time::timeout(
+                        std::time::Duration::from_millis(120),
+                        sock.read(&mut buf),
+                    )
+                    .await
+                    {
+                        Ok(Ok(0)) | Err(_) => break,
+                        Ok(Ok(n)) => seen.extend_from_slice(&buf[..n]),
+                        Ok(Err(_)) => return,
+                    }
+                }
+                let req = String::from_utf8_lossy(&seen);
+                let resp = if req.starts_with("HEAD") {
+                    heads.fetch_add(1, Ordering::SeqCst);
+                    if let Some(code) = head {
+                        status_line(code)
+                    } else {
+                        let _ = sock.shutdown().await;
+                        return;
+                    }
+                } else if req.starts_with("POST") {
+                    format!(
+                        "HTTP/1.1 202 Accepted\r\nLocation: http://{addr}/v2/x/blobs/uploads/s\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    )
+                } else if req.starts_with("PUT") {
+                    let nth = puts.fetch_add(1, Ordering::SeqCst);
+                    let Some(reply) = put_script.get(nth).or(put_script.last()) else {
+                        unreachable!("put_script is never empty")
+                    };
+                    match reply {
+                        PutReply::Status(code) => status_line(*code),
+                        PutReply::Stall => {
+                            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                            status_line(201)
+                        }
+                    }
+                } else {
+                    status_line(400)
+                };
+                let _ = sock.write_all(resp.as_bytes()).await;
+            });
+        }
+    }
+
+    /// Bind a loopback scripted registry and write `pack` to a temp file.
+    #[cfg(test)]
+    async fn scripted_registry_fixture(
+        tag: &str,
+        pack: &[u8],
+        head: Option<u16>,
+        put_script: Vec<PutReply>,
+    ) -> (
+        tokio::task::JoinHandle<()>,
+        std::path::PathBuf,
+        String,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    ) {
+        use std::io::Write;
+        use std::sync::atomic::AtomicUsize;
+        use tokio::net::TcpListener;
+
+        let Ok(listener) = TcpListener::bind("127.0.0.1:0").await else {
+            unreachable!("bind loopback")
+        };
+        let Ok(addr) = listener.local_addr() else {
+            unreachable!("local_addr")
+        };
+        let puts = std::sync::Arc::new(AtomicUsize::new(0));
+        let heads = std::sync::Arc::new(AtomicUsize::new(0));
+        let server = tokio::spawn(serve_scripted_registry(
+            listener,
+            addr,
+            std::sync::Arc::clone(&puts),
+            std::sync::Arc::clone(&heads),
+            head,
+            put_script,
+        ));
+        let path =
+            std::env::temp_dir().join(format!("hippius-sr-{tag}-{}.bin", std::process::id()));
+        match std::fs::File::create(&path).and_then(|mut f| f.write_all(pack)) {
+            Ok(()) => {}
+            Err(_) => unreachable!("temp file write"),
+        }
+        let uploads = format!("http://{addr}/v2/{tag}/blobs/uploads/");
+        (server, path, uploads, puts, heads)
+    }
+
+    #[cfg(test)]
+    fn slot_is_inflight(uploads: &str, digest: &str) -> bool {
+        super::inflight_slots()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains_key(&(uploads.to_owned(), digest.to_owned()))
+    }
+
+    #[tokio::test]
+    async fn completed_digest_whose_head_404s_is_put_again() {
+        use std::sync::atomic::Ordering;
+
+        // The registry garbage-collected the blob between two uploads in one
+        // process: the HEAD gate opened, the probe misses, and the pack must be
+        // re-sent rather than trusted from the completed cache.
+        let (server, path, uploads, puts, heads) = scripted_registry_fixture(
+            "gc404",
+            b"gc-pack-01",
+            Some(404),
+            vec![PutReply::Status(201)],
+        )
+        .await;
+        let Ok(first) = super::pack_upload_async(&uploads, &path, &[(0, 10)], None).await else {
+            unreachable!("first PUT must succeed")
+        };
+        let Ok(second) = super::pack_upload_async(&uploads, &path, &[(0, 10)], None).await else {
+            unreachable!("HEAD 404 must fall through to a PUT")
+        };
+        assert_eq!(first, second);
+        assert_eq!(
+            heads.load(Ordering::SeqCst),
+            1,
+            "the completed digest is probed once"
+        );
+        assert_eq!(
+            puts.load(Ordering::SeqCst),
+            2,
+            "a HEAD miss must re-send the pack"
+        );
+
+        server.abort();
+        std::fs::remove_file(&path).unwrap_or(());
+    }
+
+    #[tokio::test]
+    async fn completed_digest_whose_head_503s_is_put_not_failed() {
+        use std::sync::atomic::Ordering;
+
+        // A 5xx on the probe is "presence unknown": the upload must proceed to
+        // the PUT, not fail the whole file on an optimisation's round trip.
+        let (server, path, uploads, puts, heads) = scripted_registry_fixture(
+            "h503",
+            b"h503-pack-",
+            Some(503),
+            vec![PutReply::Status(201)],
+        )
+        .await;
+        let Ok(_) = super::pack_upload_async(&uploads, &path, &[(0, 10)], None).await else {
+            unreachable!("first PUT must succeed")
+        };
+        let Ok(_) = super::pack_upload_async(&uploads, &path, &[(0, 10)], None).await else {
+            unreachable!("a 503 HEAD must not fail the upload")
+        };
+        assert_eq!(heads.load(Ordering::SeqCst), 1);
+        assert_eq!(puts.load(Ordering::SeqCst), 2, "unknown presence must PUT");
+
+        server.abort();
+        std::fs::remove_file(&path).unwrap_or(());
+    }
+
+    #[tokio::test]
+    async fn completed_digest_whose_head_403s_fails_without_a_put() {
+        use crate::error::CoreError;
+        use sha2::Digest;
+        use sha2::Sha256;
+        use std::sync::atomic::Ordering;
+
+        // 403 is permanent: no PUT would fare better, so the error surfaces and
+        // the slot is released for the next caller (the completed mark stays,
+        // the first PUT did land).
+        let (server, path, uploads, puts, heads) = scripted_registry_fixture(
+            "h403",
+            b"h403-pack-",
+            Some(403),
+            vec![PutReply::Status(201)],
+        )
+        .await;
+        let digest = format!("sha256:{}", hex::encode(Sha256::digest(b"h403-pack-")));
+        let Ok(_) = super::pack_upload_async(&uploads, &path, &[(0, 10)], None).await else {
+            unreachable!("first PUT must succeed")
+        };
+        match super::pack_upload_async(&uploads, &path, &[(0, 10)], None).await {
+            Err(CoreError::ServerError(403, _)) => {}
+            other => unreachable!("a 403 HEAD must surface as permanent, got {other:?}"),
+        }
+        assert_eq!(heads.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            puts.load(Ordering::SeqCst),
+            1,
+            "a 403 HEAD must not fall through to PUT"
+        );
+        assert!(
+            !slot_is_inflight(&uploads, &digest),
+            "the `?` on HEAD must still drop the single-flight slot"
+        );
+
+        server.abort();
+        std::fs::remove_file(&path).unwrap_or(());
+    }
+
+    #[tokio::test]
+    async fn completed_digest_whose_head_connection_drops_is_put() {
+        use std::sync::atomic::Ordering;
+
+        // The registry closes the HEAD socket without a status (what a proxy
+        // idle cut or a mid-handshake reset looks like): a transport error is
+        // retryable, so presence is unknown and the pack is PUT.
+        let (server, path, uploads, puts, heads) =
+            scripted_registry_fixture("hdrop", b"hdrop-pack", None, vec![PutReply::Status(201)])
+                .await;
+        let Ok(_) = super::pack_upload_async(&uploads, &path, &[(0, 10)], None).await else {
+            unreachable!("first PUT must succeed")
+        };
+        let Ok(_) = super::pack_upload_async(&uploads, &path, &[(0, 10)], None).await else {
+            unreachable!("a dropped HEAD must not fail the upload")
+        };
+        assert_eq!(heads.load(Ordering::SeqCst), 1);
+        assert_eq!(puts.load(Ordering::SeqCst), 2, "unknown presence must PUT");
+
+        server.abort();
+        std::fs::remove_file(&path).unwrap_or(());
+    }
+
+    #[tokio::test]
+    async fn completed_mark_is_per_repo_so_another_repo_skips_the_head() {
+        use std::sync::atomic::Ordering;
+
+        // The same bytes landed under repo A. Uploading them to repo B in the
+        // same process is a first-seen digest for B: no HEAD (it would 404 on
+        // a namespace that never saw the blob), straight to PUT.
+        let (server_a, path, uploads_a, puts_a, heads_a) = scripted_registry_fixture(
+            "repo-a",
+            b"shared-pak",
+            Some(200),
+            vec![PutReply::Status(201)],
+        )
+        .await;
+        let (server_b, path_b, uploads_b, puts_b, heads_b) = scripted_registry_fixture(
+            "repo-b",
+            b"shared-pak",
+            Some(200),
+            vec![PutReply::Status(201)],
+        )
+        .await;
+        let Ok(_) = super::pack_upload_async(&uploads_a, &path, &[(0, 10)], None).await else {
+            unreachable!("repo A PUT must succeed")
+        };
+        let Ok(_) = super::pack_upload_async(&uploads_b, &path, &[(0, 10)], None).await else {
+            unreachable!("repo B PUT must succeed")
+        };
+        assert_eq!(puts_a.load(Ordering::SeqCst), 1);
+        assert_eq!(heads_a.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            puts_b.load(Ordering::SeqCst),
+            1,
+            "repo B has never seen the digest: PUT"
+        );
+        assert_eq!(
+            heads_b.load(Ordering::SeqCst),
+            0,
+            "repo B must not inherit repo A's mark"
+        );
+
+        server_a.abort();
+        server_b.abort();
+        std::fs::remove_file(&path).unwrap_or(());
+        std::fs::remove_file(&path_b).unwrap_or(());
+    }
+
+    #[tokio::test]
+    async fn waiter_redoes_the_put_when_the_leader_fails_permanently() {
+        use crate::error::CoreError;
+        use std::sync::atomic::Ordering;
+
+        // Two concurrent callers, same pack. The leader's PUT is refused with a
+        // permanent 403; the waiter must NOT adopt that failure (the slot flag
+        // is still `false`) - it takes the lock and PUTs for itself.
+        let (server, path, uploads, puts, heads) = scripted_registry_fixture(
+            "lead-fail",
+            b"lead-fail!",
+            Some(200),
+            vec![PutReply::Status(403), PutReply::Status(201)],
+        )
+        .await;
+        let (a, b) = tokio::join!(
+            super::pack_upload_async(&uploads, &path, &[(0, 10)], None),
+            super::pack_upload_async(&uploads, &path, &[(0, 10)], None),
+        );
+        let outcomes = [a, b];
+        let failed = outcomes
+            .iter()
+            .filter(|r| matches!(r, Err(CoreError::ServerError(403, _))))
+            .count();
+        let succeeded = outcomes.iter().filter(|r| r.is_ok()).count();
+        assert_eq!(
+            failed, 1,
+            "exactly the leader sees the 403, got {outcomes:?}"
+        );
+        assert_eq!(
+            succeeded, 1,
+            "the waiter must PUT for itself, got {outcomes:?}"
+        );
+        assert_eq!(puts.load(Ordering::SeqCst), 2, "leader PUT + waiter PUT");
+        assert_eq!(
+            heads.load(Ordering::SeqCst),
+            0,
+            "no HEAD: nothing completed before the waiter ran"
+        );
+
+        server.abort();
+        std::fs::remove_file(&path).unwrap_or(());
+    }
+
+    #[tokio::test]
+    async fn cancelled_leader_releases_the_slot_to_the_waiter() {
+        use sha2::Digest;
+        use sha2::Sha256;
+        use std::sync::atomic::Ordering;
+        use std::time::Duration;
+
+        // The leader is dropped (Ctrl-C / task abort) while its PUT is in
+        // flight. Its guard and lease go with it, so a waiter blocked on the
+        // slot wakes, sees `false`, and PUTs; and no stale slot survives.
+        let (server, path, uploads, puts, heads) = scripted_registry_fixture(
+            "lead-cancel",
+            b"lead-cncl!",
+            Some(200),
+            vec![PutReply::Stall, PutReply::Status(201)],
+        )
+        .await;
+        let digest = format!("sha256:{}", hex::encode(Sha256::digest(b"lead-cncl!")));
+        let (uploads_l, path_l) = (uploads.clone(), path.clone());
+        let leader = tokio::spawn(async move {
+            super::pack_upload_async(&uploads_l, &path_l, &[(0, 10)], None).await
+        });
+        let mut waited = 0u32;
+        while puts.load(Ordering::SeqCst) == 0 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            waited += 1;
+            assert!(waited < 1000, "leader never reached its PUT");
+        }
+        assert!(
+            slot_is_inflight(&uploads, &digest),
+            "the leader holds the slot"
+        );
+        let (uploads_w, path_w) = (uploads.clone(), path.clone());
+        let waiter = tokio::spawn(async move {
+            super::pack_upload_async(&uploads_w, &path_w, &[(0, 10)], None).await
+        });
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(
+            puts.load(Ordering::SeqCst),
+            1,
+            "the waiter must be parked on the slot"
+        );
+
+        leader.abort();
+        match leader.await {
+            Err(e) if e.is_cancelled() => {}
+            other => unreachable!("leader must be cancelled, got {other:?}"),
+        }
+        let Ok(Ok(Ok(hex))) = tokio::time::timeout(Duration::from_secs(10), waiter).await else {
+            unreachable!("the waiter must wake and PUT after the leader is cancelled")
+        };
+        assert_eq!(hex, hex::encode(Sha256::digest(b"lead-cncl!")));
+        assert_eq!(puts.load(Ordering::SeqCst), 2, "waiter must PUT for itself");
+        assert_eq!(heads.load(Ordering::SeqCst), 0);
+        assert!(
+            !slot_is_inflight(&uploads, &digest),
+            "no slot may outlive the cancelled leader and the finished waiter"
+        );
+        assert!(
+            super::was_completed(&uploads, &digest),
+            "the waiter's PUT landed"
+        );
+
+        server.abort();
+        std::fs::remove_file(&path).unwrap_or(());
+    }
+
+    #[tokio::test]
+    async fn retry_exhaustion_on_put_fails_and_leaves_no_slot_or_mark() {
+        use crate::error::CoreError;
+        use crate::uploader::blob::UPLOAD_MAX_RETRIES;
+        use sha2::Digest;
+        use sha2::Sha256;
+        use std::sync::atomic::Ordering;
+
+        // Every PUT 503s: the retry ladder is walked exactly once
+        // (1 + UPLOAD_MAX_RETRIES attempts), the error is the last 503, the
+        // slot is released and nothing is marked completed.
+        let (server, path, uploads, puts, heads) = scripted_registry_fixture(
+            "exhaust",
+            b"exhaust-pk",
+            Some(200),
+            vec![PutReply::Status(503)],
+        )
+        .await;
+        let digest = format!("sha256:{}", hex::encode(Sha256::digest(b"exhaust-pk")));
+        match super::pack_upload_async(&uploads, &path, &[(0, 10)], None).await {
+            Err(CoreError::ServerError(503, _)) => {}
+            other => unreachable!("exhausted retries must surface the 503, got {other:?}"),
+        }
+        let Ok(expected_puts) = usize::try_from(UPLOAD_MAX_RETRIES + 1) else {
+            unreachable!("small constant")
+        };
+        assert_eq!(
+            puts.load(Ordering::SeqCst),
+            expected_puts,
+            "one attempt per retry budget step"
+        );
+        assert_eq!(heads.load(Ordering::SeqCst), 0);
+        assert!(
+            !slot_is_inflight(&uploads, &digest),
+            "an exhausted leader must drop its slot"
+        );
+        assert!(
+            !super::was_completed(&uploads, &digest),
+            "a failed pack is not completed"
+        );
+
+        server.abort();
+        std::fs::remove_file(&path).unwrap_or(());
+    }
+
+    #[tokio::test]
+    async fn init_post_failure_does_not_mark_completed() {
+        use crate::error::CoreError;
+        use sha2::Digest;
+        use sha2::Sha256;
+        use std::sync::atomic::Ordering;
+        use tokio::io::AsyncReadExt;
+        use tokio::io::AsyncWriteExt;
+        use tokio::net::TcpListener;
+
+        // The registry refuses the upload-session POST outright (401): the
+        // failure is permanent, no PUT is ever attempted, and a later call in
+        // this process must not HEAD as if the pack had landed.
+        let Ok(listener) = TcpListener::bind("127.0.0.1:0").await else {
+            unreachable!("bind loopback")
+        };
+        let Ok(addr) = listener.local_addr() else {
+            unreachable!("local_addr")
+        };
+        let posts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let posts_srv = std::sync::Arc::clone(&posts);
+        let server = tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let posts = std::sync::Arc::clone(&posts_srv);
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 4096];
+                    let _ = sock.read(&mut buf).await;
+                    posts.fetch_add(1, Ordering::SeqCst);
+                    let _ = sock
+                        .write_all(b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                        .await;
+                });
+            }
+        });
+        let path = std::env::temp_dir().join(format!("hippius-post401-{}.bin", std::process::id()));
+        match std::fs::File::create(&path)
+            .and_then(|mut f| std::io::Write::write_all(&mut f, b"post-401!!"))
+        {
+            Ok(()) => {}
+            Err(_) => unreachable!("temp file write"),
+        }
+        let uploads = format!("http://{addr}/v2/p401/blobs/uploads/");
+        let digest = format!("sha256:{}", hex::encode(Sha256::digest(b"post-401!!")));
+        match super::pack_upload_async(&uploads, &path, &[(0, 10)], None).await {
+            Err(CoreError::ServerError(401, _)) => {}
+            other => unreachable!("a 401 on the init POST is permanent, got {other:?}"),
+        }
+        assert_eq!(
+            posts.load(Ordering::SeqCst),
+            1,
+            "one POST, no retry, no PUT"
+        );
+        assert!(!super::was_completed(&uploads, &digest));
+        assert!(!slot_is_inflight(&uploads, &digest));
+
+        server.abort();
+        std::fs::remove_file(&path).unwrap_or(());
     }
 }

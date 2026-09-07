@@ -115,6 +115,28 @@ pub fn chunk_and_hash(path: &Path, avg_size: u64) -> Result<(String, ChunkList),
     chunk_and_hash_reader(std::fs::File::open(path)?, avg_size)
 }
 
+/// Validate `avg_size` and derive the `(min, avg, max)` chunk sizes `StreamCDC`
+/// takes (min = avg/4, max = avg*4).
+fn cdc_bounds(avg_size: u64) -> Result<(usize, usize, usize), CoreError> {
+    if !(CDC_MIN_AVG..=CDC_MAX_AVG).contains(&avg_size) {
+        return Err(CoreError::InvalidArgument(format!(
+            "FastCDC average size {avg_size} out of range [{CDC_MIN_AVG}, {CDC_MAX_AVG}]"
+        )));
+    }
+    // The range check above guarantees min/avg/max fit usize (fastcdc 4 takes
+    // usize sizes); try_from keeps that provable to clippy without an unchecked
+    // `as` cast.
+    let to_usize = |v: u64| -> Result<usize, CoreError> {
+        usize::try_from(v)
+            .map_err(|_| CoreError::InvalidArgument(format!("chunk size {v} exceeds usize")))
+    };
+    Ok((
+        to_usize(avg_size / 4)?,
+        to_usize(avg_size)?,
+        to_usize(avg_size * 4)?,
+    ))
+}
+
 /// Reader-based core of [`chunk_and_hash`], split out so tests can drive it from
 /// an in-memory `Cursor` (no temp file, no I/O `unwrap`). Semantics are
 /// identical: `StreamCDC` yields the same boundaries whether the source is a
@@ -190,20 +212,7 @@ pub(super) fn run_chunk_pipeline<R, T>(
 where
     R: std::io::Read + Send,
 {
-    if !(CDC_MIN_AVG..=CDC_MAX_AVG).contains(&avg_size) {
-        return Err(CoreError::InvalidArgument(format!(
-            "FastCDC average size {avg_size} out of range [{CDC_MIN_AVG}, {CDC_MAX_AVG}]"
-        )));
-    }
-    // The range check above guarantees min/avg/max fit usize (fastcdc 4 takes
-    // usize sizes); try_from keeps that provable to clippy without an unchecked
-    // `as` cast.
-    let to_usize = |v: u64| -> Result<usize, CoreError> {
-        usize::try_from(v)
-            .map_err(|_| CoreError::InvalidArgument(format!("chunk size {v} exceeds usize")))
-    };
-    let (min, max) = (to_usize(avg_size / 4)?, to_usize(avg_size * 4)?);
-    let avg = to_usize(avg_size)?;
+    let (min, avg, max) = cdc_bounds(avg_size)?;
 
     // StreamCDC allocates and memcpys a Vec per chunk on top of the gear-hash
     // scan; that copy is part of the producer floor (the py-spy "CDC = 6%"
@@ -398,17 +407,7 @@ fn chunk_and_hash_reader_serial<R: std::io::Read>(
     source: R,
     avg_size: u64,
 ) -> Result<(String, ChunkList), CoreError> {
-    if !(CDC_MIN_AVG..=CDC_MAX_AVG).contains(&avg_size) {
-        return Err(CoreError::InvalidArgument(format!(
-            "FastCDC average size {avg_size} out of range [{CDC_MIN_AVG}, {CDC_MAX_AVG}]"
-        )));
-    }
-    let to_usize = |v: u64| -> Result<usize, CoreError> {
-        usize::try_from(v)
-            .map_err(|_| CoreError::InvalidArgument(format!("chunk size {v} exceeds usize")))
-    };
-    let (min, max) = (to_usize(avg_size / 4)?, to_usize(avg_size * 4)?);
-    let avg = to_usize(avg_size)?;
+    let (min, avg, max) = cdc_bounds(avg_size)?;
 
     let chunker = StreamCDC::new(source, min, avg, max);
 
@@ -817,5 +816,88 @@ mod cdc_tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn derived_min_and_max_meet_the_fastcdc_caps_exactly_at_both_ends() {
+        use fastcdc::v2020::{MAXIMUM_MAX, MAXIMUM_MIN, MINIMUM_MAX, MINIMUM_MIN};
+        // fastcdc 4 takes usize bounds and asserts min >= MINIMUM_MIN,
+        // min <= MINIMUM_MAX, max >= MAXIMUM_MIN, max <= MAXIMUM_MAX in
+        // StreamCDC::new. Our avg/4 and avg*4 derivations land exactly ON those
+        // caps at both ends of the accepted average range, so any drift in
+        // either the crate's constants or our ratios reopens a panic - pin all
+        // four corners, not just the averages.
+        assert_eq!(Ok(CDC_MIN_AVG / 4), u64::try_from(MINIMUM_MIN));
+        assert_eq!(Ok(CDC_MIN_AVG * 4), u64::try_from(MAXIMUM_MIN));
+        assert_eq!(Ok(CDC_MAX_AVG / 4), u64::try_from(MINIMUM_MAX));
+        assert_eq!(Ok(CDC_MAX_AVG * 4), u64::try_from(MAXIMUM_MAX));
+    }
+
+    #[test]
+    fn chunks_at_the_floor_avg_without_panic_and_within_derived_bounds() {
+        // The lower bound is INCLUSIVE and valid: at avg = 256 B the derived
+        // min = 64 = MINIMUM_MIN and max = 1024 = MAXIMUM_MIN, fastcdc's floors.
+        // Must chunk (not panic, not reject); every chunk but the last must fall
+        // inside [min, max], and the chunks must tile the input exactly.
+        let mut data = vec![0u8; 20_000];
+        for (i, b) in data.iter_mut().enumerate() {
+            *b = u8::try_from(i * 31 % 251).unwrap_or(0);
+        }
+        let Ok((_, chunks)) = chunk_and_hash_reader(Cursor::new(&data), CDC_MIN_AVG) else {
+            unreachable!("chunking at the floor avg must succeed")
+        };
+        assert!(chunks.len() >= 2, "20 KB at max 1 KiB chunks must split");
+        let (min, max) = (CDC_MIN_AVG / 4, CDC_MIN_AVG * 4);
+        let mut expect_offset = 0u64;
+        for (i, (_, offset, len)) in chunks.iter().enumerate() {
+            assert_eq!(
+                *offset, expect_offset,
+                "chunk {i} must start where the last ended"
+            );
+            assert!(*len <= max, "chunk {i} of {len} bytes exceeds max {max}");
+            if i + 1 < chunks.len() {
+                assert!(*len >= min, "chunk {i} of {len} bytes is under min {min}");
+            }
+            expect_offset += len;
+        }
+        assert_eq!(
+            expect_offset,
+            data.len() as u64,
+            "chunks must tile the input exactly"
+        );
+    }
+
+    #[test]
+    fn cut_points_are_pinned_to_the_fastcdc_3_layout() {
+        // fastcdc 3.2.1 -> 4.0.1 is a wire-contract bump: cross-version dedup
+        // only works if identical bytes re-chunk identically. This golden pins
+        // the cut points the 3.x line produced (verified identical on the
+        // 0.7.0 tree) so a future crate bump that moves boundaries fails HERE
+        // instead of silently defeating dedup against older revisions. 64 KiB
+        // of LCG bytes at avg 4 KiB (min 1 KiB, max 16 KiB).
+        let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
+        let data: Vec<u8> = (0..65_536)
+            .map(|_| {
+                state = state
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1_442_695_040_888_963_407);
+                u8::try_from((state >> 56) & 0xFF).unwrap_or(0)
+            })
+            .collect();
+        let Ok((_, chunks)) = chunk_and_hash_reader(Cursor::new(&data), 4096) else {
+            unreachable!("chunking valid bytes at avg 4 KiB cannot fail")
+        };
+        let layout = chunks
+            .iter()
+            .map(|(_, offset, len)| format!("{offset}:{len}\n"))
+            .collect::<Vec<String>>()
+            .concat();
+        let golden = hex::encode(Sha256::digest(layout.as_bytes()));
+        assert_eq!(
+            golden,
+            "442ff72e0c6ee5b399f3b66b92078423cd133739f271944b64386e6ea51fb6f1",
+            "cut points moved; {} chunks, layout:\n{layout}",
+            chunks.len()
+        );
     }
 }
