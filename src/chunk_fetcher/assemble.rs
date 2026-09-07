@@ -860,14 +860,23 @@ mod tests {
             super::redact_url("https://h.example/p?a=1#frag"),
             "https://h.example/p?<redacted>"
         );
-        assert_eq!(super::redact_url("https://u:p@h.example/p"), "https://h.example/p");
-        assert_eq!(super::redact_url("https://u:p@h.example"), "https://h.example");
+        assert_eq!(
+            super::redact_url("https://u:p@h.example/p"),
+            "https://h.example/p"
+        );
+        assert_eq!(
+            super::redact_url("https://u:p@h.example"),
+            "https://h.example"
+        );
         assert_eq!(
             super::redact_url("https://h.example?X-Amz-Signature=s"),
             "https://h.example?<redacted>"
         );
         assert_eq!(super::redact_url("http://h.example/"), "http://h.example/");
-        assert_eq!(super::redact_url("https://h.example/a@b/c"), "https://h.example/a@b/c");
+        assert_eq!(
+            super::redact_url("https://h.example/a@b/c"),
+            "https://h.example/a@b/c"
+        );
         assert_eq!(super::redact_url(""), "");
     }
 
@@ -887,7 +896,10 @@ mod tests {
         let Err(err) = res else {
             unreachable!("reserving usize::MAX bytes cannot succeed")
         };
-        assert!(err.is_retryable(), "OutOfMemory must be retryable, got {err:?}");
+        assert!(
+            err.is_retryable(),
+            "OutOfMemory must be retryable, got {err:?}"
+        );
         match &err {
             CoreError::Io(io) => {
                 assert_eq!(io.kind(), std::io::ErrorKind::OutOfMemory);
@@ -1034,7 +1046,13 @@ mod tests {
         let Ok(base) = serve_packs(routes).await else {
             unreachable!("loopback bind")
         };
-        let res = fetch_pack_plain(&format!("{base}/pack"), MAX_PACK_BYTES, Vec::new(), "at_ceiling").await;
+        let res = fetch_pack_plain(
+            &format!("{base}/pack"),
+            MAX_PACK_BYTES,
+            Vec::new(),
+            "at_ceiling",
+        )
+        .await;
         assert!(
             matches!(res, Err(CoreError::BadResponse(_))),
             "exactly-at-cap must reach the GET, got {res:?}"
@@ -1049,7 +1067,10 @@ mod tests {
             unreachable!("loopback bind")
         };
         let res = fetch_pack_plain(&format!("{base}/empty"), 0, Vec::new(), "size_zero").await;
-        assert!(res.is_ok(), "a zero-byte pack with no targets is valid, got {res:?}");
+        assert!(
+            res.is_ok(),
+            "a zero-byte pack with no targets is valid, got {res:?}"
+        );
     }
 
     /// A file where one 1000-byte chunk repeats three times around a 500-byte
@@ -1082,7 +1103,14 @@ mod tests {
         (content, pack, plan)
     }
 
-    async fn assemble_shared(pack_served: Option<Vec<u8>>, tag: &str) -> (Result<Option<String>, CoreError>, Vec<u8>, std::path::PathBuf) {
+    async fn assemble_shared(
+        pack_served: Option<Vec<u8>>,
+        tag: &str,
+    ) -> (
+        Result<Option<String>, CoreError>,
+        Vec<u8>,
+        std::path::PathBuf,
+    ) {
         let mut routes = HashMap::new();
         if let Some(body) = pack_served {
             routes.insert("/shared".to_string(), body);
@@ -1115,7 +1143,10 @@ mod tests {
         let Ok(got) = std::fs::read(&dest) else {
             unreachable!("read back")
         };
-        assert_eq!(got, content, "every occurrence of the repeated chunk must be written");
+        assert_eq!(
+            got, content,
+            "every occurrence of the repeated chunk must be written"
+        );
     }
 
     #[tokio::test]

@@ -751,9 +751,13 @@ mod tests {
         // The registry garbage-collected the blob between two uploads in one
         // process: the HEAD gate opened, the probe misses, and the pack must be
         // re-sent rather than trusted from the completed cache.
-        let (server, path, uploads, puts, heads) =
-            scripted_registry_fixture("gc404", b"gc-pack-01", Some(404), vec![PutReply::Status(201)])
-                .await;
+        let (server, path, uploads, puts, heads) = scripted_registry_fixture(
+            "gc404",
+            b"gc-pack-01",
+            Some(404),
+            vec![PutReply::Status(201)],
+        )
+        .await;
         let Ok(first) = super::pack_upload_async(&uploads, &path, &[(0, 10)], None).await else {
             unreachable!("first PUT must succeed")
         };
@@ -761,8 +765,16 @@ mod tests {
             unreachable!("HEAD 404 must fall through to a PUT")
         };
         assert_eq!(first, second);
-        assert_eq!(heads.load(Ordering::SeqCst), 1, "the completed digest is probed once");
-        assert_eq!(puts.load(Ordering::SeqCst), 2, "a HEAD miss must re-send the pack");
+        assert_eq!(
+            heads.load(Ordering::SeqCst),
+            1,
+            "the completed digest is probed once"
+        );
+        assert_eq!(
+            puts.load(Ordering::SeqCst),
+            2,
+            "a HEAD miss must re-send the pack"
+        );
 
         server.abort();
         std::fs::remove_file(&path).unwrap_or(());
@@ -774,9 +786,13 @@ mod tests {
 
         // A 5xx on the probe is "presence unknown": the upload must proceed to
         // the PUT, not fail the whole file on an optimisation's round trip.
-        let (server, path, uploads, puts, heads) =
-            scripted_registry_fixture("h503", b"h503-pack-", Some(503), vec![PutReply::Status(201)])
-                .await;
+        let (server, path, uploads, puts, heads) = scripted_registry_fixture(
+            "h503",
+            b"h503-pack-",
+            Some(503),
+            vec![PutReply::Status(201)],
+        )
+        .await;
         let Ok(_) = super::pack_upload_async(&uploads, &path, &[(0, 10)], None).await else {
             unreachable!("first PUT must succeed")
         };
@@ -800,9 +816,13 @@ mod tests {
         // 403 is permanent: no PUT would fare better, so the error surfaces and
         // the slot is released for the next caller (the completed mark stays,
         // the first PUT did land).
-        let (server, path, uploads, puts, heads) =
-            scripted_registry_fixture("h403", b"h403-pack-", Some(403), vec![PutReply::Status(201)])
-                .await;
+        let (server, path, uploads, puts, heads) = scripted_registry_fixture(
+            "h403",
+            b"h403-pack-",
+            Some(403),
+            vec![PutReply::Status(201)],
+        )
+        .await;
         let digest = format!("sha256:{}", hex::encode(Sha256::digest(b"h403-pack-")));
         let Ok(_) = super::pack_upload_async(&uploads, &path, &[(0, 10)], None).await else {
             unreachable!("first PUT must succeed")
@@ -812,7 +832,11 @@ mod tests {
             other => unreachable!("a 403 HEAD must surface as permanent, got {other:?}"),
         }
         assert_eq!(heads.load(Ordering::SeqCst), 1);
-        assert_eq!(puts.load(Ordering::SeqCst), 1, "a 403 HEAD must not fall through to PUT");
+        assert_eq!(
+            puts.load(Ordering::SeqCst),
+            1,
+            "a 403 HEAD must not fall through to PUT"
+        );
         assert!(
             !slot_is_inflight(&uploads, &digest),
             "the `?` on HEAD must still drop the single-flight slot"
@@ -852,12 +876,20 @@ mod tests {
         // The same bytes landed under repo A. Uploading them to repo B in the
         // same process is a first-seen digest for B: no HEAD (it would 404 on
         // a namespace that never saw the blob), straight to PUT.
-        let (server_a, path, uploads_a, puts_a, heads_a) =
-            scripted_registry_fixture("repo-a", b"shared-pak", Some(200), vec![PutReply::Status(201)])
-                .await;
-        let (server_b, path_b, uploads_b, puts_b, heads_b) =
-            scripted_registry_fixture("repo-b", b"shared-pak", Some(200), vec![PutReply::Status(201)])
-                .await;
+        let (server_a, path, uploads_a, puts_a, heads_a) = scripted_registry_fixture(
+            "repo-a",
+            b"shared-pak",
+            Some(200),
+            vec![PutReply::Status(201)],
+        )
+        .await;
+        let (server_b, path_b, uploads_b, puts_b, heads_b) = scripted_registry_fixture(
+            "repo-b",
+            b"shared-pak",
+            Some(200),
+            vec![PutReply::Status(201)],
+        )
+        .await;
         let Ok(_) = super::pack_upload_async(&uploads_a, &path, &[(0, 10)], None).await else {
             unreachable!("repo A PUT must succeed")
         };
@@ -866,8 +898,16 @@ mod tests {
         };
         assert_eq!(puts_a.load(Ordering::SeqCst), 1);
         assert_eq!(heads_a.load(Ordering::SeqCst), 0);
-        assert_eq!(puts_b.load(Ordering::SeqCst), 1, "repo B has never seen the digest: PUT");
-        assert_eq!(heads_b.load(Ordering::SeqCst), 0, "repo B must not inherit repo A's mark");
+        assert_eq!(
+            puts_b.load(Ordering::SeqCst),
+            1,
+            "repo B has never seen the digest: PUT"
+        );
+        assert_eq!(
+            heads_b.load(Ordering::SeqCst),
+            0,
+            "repo B must not inherit repo A's mark"
+        );
 
         server_a.abort();
         server_b.abort();
@@ -900,10 +940,20 @@ mod tests {
             .filter(|r| matches!(r, Err(CoreError::ServerError(403, _))))
             .count();
         let succeeded = outcomes.iter().filter(|r| r.is_ok()).count();
-        assert_eq!(failed, 1, "exactly the leader sees the 403, got {outcomes:?}");
-        assert_eq!(succeeded, 1, "the waiter must PUT for itself, got {outcomes:?}");
+        assert_eq!(
+            failed, 1,
+            "exactly the leader sees the 403, got {outcomes:?}"
+        );
+        assert_eq!(
+            succeeded, 1,
+            "the waiter must PUT for itself, got {outcomes:?}"
+        );
         assert_eq!(puts.load(Ordering::SeqCst), 2, "leader PUT + waiter PUT");
-        assert_eq!(heads.load(Ordering::SeqCst), 0, "no HEAD: nothing completed before the waiter ran");
+        assert_eq!(
+            heads.load(Ordering::SeqCst),
+            0,
+            "no HEAD: nothing completed before the waiter ran"
+        );
 
         server.abort();
         std::fs::remove_file(&path).unwrap_or(());
@@ -937,13 +987,20 @@ mod tests {
             waited += 1;
             assert!(waited < 1000, "leader never reached its PUT");
         }
-        assert!(slot_is_inflight(&uploads, &digest), "the leader holds the slot");
+        assert!(
+            slot_is_inflight(&uploads, &digest),
+            "the leader holds the slot"
+        );
         let (uploads_w, path_w) = (uploads.clone(), path.clone());
         let waiter = tokio::spawn(async move {
             super::pack_upload_async(&uploads_w, &path_w, &[(0, 10)], None).await
         });
         tokio::time::sleep(Duration::from_millis(200)).await;
-        assert_eq!(puts.load(Ordering::SeqCst), 1, "the waiter must be parked on the slot");
+        assert_eq!(
+            puts.load(Ordering::SeqCst),
+            1,
+            "the waiter must be parked on the slot"
+        );
 
         leader.abort();
         match leader.await {
@@ -960,7 +1017,10 @@ mod tests {
             !slot_is_inflight(&uploads, &digest),
             "no slot may outlive the cancelled leader and the finished waiter"
         );
-        assert!(super::was_completed(&uploads, &digest), "the waiter's PUT landed");
+        assert!(
+            super::was_completed(&uploads, &digest),
+            "the waiter's PUT landed"
+        );
 
         server.abort();
         std::fs::remove_file(&path).unwrap_or(());
@@ -977,9 +1037,13 @@ mod tests {
         // Every PUT 503s: the retry ladder is walked exactly once
         // (1 + UPLOAD_MAX_RETRIES attempts), the error is the last 503, the
         // slot is released and nothing is marked completed.
-        let (server, path, uploads, puts, heads) =
-            scripted_registry_fixture("exhaust", b"exhaust-pk", Some(200), vec![PutReply::Status(503)])
-                .await;
+        let (server, path, uploads, puts, heads) = scripted_registry_fixture(
+            "exhaust",
+            b"exhaust-pk",
+            Some(200),
+            vec![PutReply::Status(503)],
+        )
+        .await;
         let digest = format!("sha256:{}", hex::encode(Sha256::digest(b"exhaust-pk")));
         match super::pack_upload_async(&uploads, &path, &[(0, 10)], None).await {
             Err(CoreError::ServerError(503, _)) => {}
@@ -988,10 +1052,20 @@ mod tests {
         let Ok(expected_puts) = usize::try_from(UPLOAD_MAX_RETRIES + 1) else {
             unreachable!("small constant")
         };
-        assert_eq!(puts.load(Ordering::SeqCst), expected_puts, "one attempt per retry budget step");
+        assert_eq!(
+            puts.load(Ordering::SeqCst),
+            expected_puts,
+            "one attempt per retry budget step"
+        );
         assert_eq!(heads.load(Ordering::SeqCst), 0);
-        assert!(!slot_is_inflight(&uploads, &digest), "an exhausted leader must drop its slot");
-        assert!(!super::was_completed(&uploads, &digest), "a failed pack is not completed");
+        assert!(
+            !slot_is_inflight(&uploads, &digest),
+            "an exhausted leader must drop its slot"
+        );
+        assert!(
+            !super::was_completed(&uploads, &digest),
+            "a failed pack is not completed"
+        );
 
         server.abort();
         std::fs::remove_file(&path).unwrap_or(());
@@ -1032,7 +1106,9 @@ mod tests {
             }
         });
         let path = std::env::temp_dir().join(format!("hippius-post401-{}.bin", std::process::id()));
-        match std::fs::File::create(&path).and_then(|mut f| std::io::Write::write_all(&mut f, b"post-401!!")) {
+        match std::fs::File::create(&path)
+            .and_then(|mut f| std::io::Write::write_all(&mut f, b"post-401!!"))
+        {
             Ok(()) => {}
             Err(_) => unreachable!("temp file write"),
         }
@@ -1042,7 +1118,11 @@ mod tests {
             Err(CoreError::ServerError(401, _)) => {}
             other => unreachable!("a 401 on the init POST is permanent, got {other:?}"),
         }
-        assert_eq!(posts.load(Ordering::SeqCst), 1, "one POST, no retry, no PUT");
+        assert_eq!(
+            posts.load(Ordering::SeqCst),
+            1,
+            "one POST, no retry, no PUT"
+        );
         assert!(!super::was_completed(&uploads, &digest));
         assert!(!slot_is_inflight(&uploads, &digest));
 

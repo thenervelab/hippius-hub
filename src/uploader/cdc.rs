@@ -850,14 +850,21 @@ mod cdc_tests {
         let (min, max) = (CDC_MIN_AVG / 4, CDC_MIN_AVG * 4);
         let mut expect_offset = 0u64;
         for (i, (_, offset, len)) in chunks.iter().enumerate() {
-            assert_eq!(*offset, expect_offset, "chunk {i} must start where the last ended");
+            assert_eq!(
+                *offset, expect_offset,
+                "chunk {i} must start where the last ended"
+            );
             assert!(*len <= max, "chunk {i} of {len} bytes exceeds max {max}");
             if i + 1 < chunks.len() {
                 assert!(*len >= min, "chunk {i} of {len} bytes is under min {min}");
             }
             expect_offset += len;
         }
-        assert_eq!(expect_offset, data.len() as u64, "chunks must tile the input exactly");
+        assert_eq!(
+            expect_offset,
+            data.len() as u64,
+            "chunks must tile the input exactly"
+        );
     }
 
     #[test]
@@ -887,7 +894,8 @@ mod cdc_tests {
             .concat();
         let golden = hex::encode(Sha256::digest(layout.as_bytes()));
         assert_eq!(
-            golden, "442ff72e0c6ee5b399f3b66b92078423cd133739f271944b64386e6ea51fb6f1",
+            golden,
+            "442ff72e0c6ee5b399f3b66b92078423cd133739f271944b64386e6ea51fb6f1",
             "cut points moved; {} chunks, layout:\n{layout}",
             chunks.len()
         );
