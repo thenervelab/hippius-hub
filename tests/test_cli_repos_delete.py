@@ -114,6 +114,7 @@ def test_404_maps_to_not_found_exit_11(monkeypatch, capsys):
     with pytest.raises(SystemExit) as ei:
         cli.cmd_registry_repos_delete(_args(yes=True))
     assert ei.value.code == 11
+    assert ei.value.code == cli.EXIT_REPO_NOT_FOUND
     assert "not found" in capsys.readouterr().out.lower()
 
 
