@@ -11,9 +11,13 @@ import pytest
 from hippius_hub.constants import (
     DEFAULT_CDC_AVG_SIZE,
     DEFAULT_CHUNK_THRESHOLD,
+    DEFAULT_PACK_SIZE,
+    FASTCDC_MAXIMUM_MAX,
+    MAX_PACK_BYTES,
     resolve_cdc_avg_size,
     resolve_chunk_threshold,
     resolve_chunked_write_enabled,
+    resolve_pack_size,
     resolve_verify_hash,
 )
 
@@ -69,6 +73,26 @@ def test_chunked_write_unrecognized_value_raises(monkeypatch, value):
     monkeypatch.setenv("HIPPIUS_CHUNKED_WRITE", value)
     with pytest.raises(ValueError):
         resolve_chunked_write_enabled()
+
+
+def test_pack_size_default_fits_reader_cap_with_cdc_overshoot(monkeypatch):
+    monkeypatch.delenv("HIPPIUS_PACK_SIZE", raising=False)
+    value = resolve_pack_size()
+    assert value == DEFAULT_PACK_SIZE
+    assert value + FASTCDC_MAXIMUM_MAX <= MAX_PACK_BYTES
+
+
+def test_pack_size_rejects_target_that_overshoots_reader_cap(monkeypatch):
+    # Exactly MAX_PACK_BYTES would produce packs of MAX + 16 MiB - 1 that
+    # the reader refuses. The guard is pack_size + 16 MiB <= MAX, not
+    # pack_size <= MAX.
+    monkeypatch.setenv("HIPPIUS_PACK_SIZE", str(MAX_PACK_BYTES))
+    with pytest.raises(ValueError, match="overshoot"):
+        resolve_pack_size()
+    monkeypatch.setenv(
+        "HIPPIUS_PACK_SIZE", str(MAX_PACK_BYTES - FASTCDC_MAXIMUM_MAX)
+    )
+    assert resolve_pack_size() == MAX_PACK_BYTES - FASTCDC_MAXIMUM_MAX
 
 
 def test_empty_write_gate_defaults_enabled(monkeypatch):

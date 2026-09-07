@@ -68,6 +68,11 @@ PACK_MEDIA_TYPE = "application/vnd.hippius.pack.v1"
 # 64 MiB = HF-Xet's block/xorb size (~16 chunks/pack) — the transfer unit we could
 # not use in v1 because fastcdc caps a single CHUNK at 4 MiB; packing lifts that.
 DEFAULT_PACK_SIZE = 64 * 1024 * 1024
+# Reader cap (src/chunk_fetcher/assemble.rs `MAX_PACK_BYTES`). Must stay equal.
+MAX_PACK_BYTES = 1024 * 1024 * 1024
+# fastcdc MAXIMUM_MAX. plan_packs closes AFTER exceeding pack_size, so an
+# honest pack reaches pack_size + FASTCDC_MAXIMUM_MAX - 1.
+FASTCDC_MAXIMUM_MAX = 16 * 1024 * 1024
 
 # CNCF Distribution hard-caps a manifest PUT body at 4 MiB (maxManifestBodySize).
 # Past it the registry returns an opaque 400 — AFTER every blob is already
@@ -124,8 +129,20 @@ def resolve_cdc_avg_size() -> int:
 
 
 def resolve_pack_size() -> int:
-    """Target pack size (bytes) for the chunked-v2 layout. Overridable for testing."""
-    return _resolve_positive_int("HIPPIUS_PACK_SIZE", DEFAULT_PACK_SIZE)
+    """Target pack size (bytes) for the chunked-v2 layout. Overridable for testing.
+
+    Bounded so `pack_size + FASTCDC_MAXIMUM_MAX` cannot exceed the reader cap:
+    the accumulator appends the chunk first, then closes on `cur_offset >=
+    pack_size`, so an honest pack is up to `pack_size + 16 MiB - 1`.
+    """
+    value = _resolve_positive_int("HIPPIUS_PACK_SIZE", DEFAULT_PACK_SIZE)
+    max_target = MAX_PACK_BYTES - FASTCDC_MAXIMUM_MAX
+    if value > max_target:
+        raise ValueError(
+            f"HIPPIUS_PACK_SIZE {value} plus the 16 MiB CDC overshoot "
+            f"exceeds the reader cap {MAX_PACK_BYTES}"
+        )
+    return value
 
 
 def resolve_chunked_write_enabled() -> bool:
