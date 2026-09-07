@@ -7,6 +7,12 @@ the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 
 ## [Unreleased]
 
+### Changed
+
+- Large-file uploads start the empty OCI config blob (`{}`) in parallel with
+  the pack wave. It does not depend on pack digests; previously it sat in
+  the sequential tail after packs (pointer → config → manifest).
+
 ## [0.7.0] — 2026-08-11
 
 No API, CLI, or environment-variable changes. Artifacts are byte-identical to

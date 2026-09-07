@@ -17,7 +17,7 @@ import time
 import warnings
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from pathlib import Path
-from typing import BinaryIO, Dict, List, Optional, Union
+from typing import Any, BinaryIO, Callable, Dict, List, Optional, Union
 
 import httpx
 from huggingface_hub import CommitInfo
@@ -187,6 +187,47 @@ def _ensure_config_blob_uploaded(registry: str, repo_id: str, oci_token: str) ->
     with _config_blob_lock:
         _config_blob_present.add(cache_key)
     return digest, size
+
+
+def _start_config_blob_upload(registry: str, repo_id: str, oci_token: str) -> Callable[[], tuple]:
+    """Run `_ensure_config_blob_uploaded` on a side thread; return its join.
+
+    The returned callable blocks until the worker finishes and then returns the
+    `(digest, size)` tuple — or re-raises the worker's exception, unchanged, on the
+    caller's thread (so a 401 still reaches `call_with_oci_token_refresh`). Call it
+    BEFORE assembling the manifest; never call it on an error path, where the
+    worker is simply abandoned.
+
+    A bare daemon thread, not a ThreadPoolExecutor: the executor's
+    workers are NON-daemon, and `concurrent.futures.thread._python_exit`
+    joins them at interpreter shutdown. `shutdown(wait=False)` therefore
+    only makes `upload_file` return early — the CLI *process* still
+    blocks for the full config HEAD/PUT retry budget (minutes against a
+    dead registry) before it can exit, so Ctrl-C still looks hung.
+    `cancel_futures` cannot help either: this future has already started.
+    A daemon thread is abandoned at exit instead.
+
+    The try/except is load-bearing: a thread's exception is otherwise dropped
+    by `threading.excepthook`, never re-raised. It is stored and re-raised at
+    the join, not swallowed."""
+    result: Dict[str, Any] = {}
+
+    def _run() -> None:
+        try:
+            result["value"] = _ensure_config_blob_uploaded(registry, repo_id, oci_token)
+        except BaseException as exc:  # surfaced on the caller's thread at the join
+            result["error"] = exc
+
+    thread = threading.Thread(target=_run, daemon=True, name="hippius-config-blob")
+    thread.start()
+
+    def _join() -> tuple:
+        thread.join()
+        if "error" in result:
+            raise result["error"]
+        return result["value"]
+
+    return _join
 
 
 def _ensure_bytes_blob_uploaded(registry: str, repo_id: str, oci_token: str, data: bytes, digest: str) -> None:
@@ -896,6 +937,10 @@ def _finalize_upload_manifest(
 
     merged_layers = _merge_layers(existing_layers, new_layers, delete_titles=delete_titles)
 
+    # Sequential on purpose: the folder file fan-out has already finished.
+    # `upload_file` overlaps this PUT with its pack wave; overlapping here
+    # would hide only the merge above, not the files. Folder uploads get
+    # none of the unique-1-GiB 1.27× (`upload_file` only).
     config_digest, config_size = _ensure_config_blob_uploaded(registry, oci_repo, oci_token)
     manifest = _assemble_manifest(
         config_digest, config_size, merged_layers, commit_message, commit_description
@@ -1036,6 +1081,14 @@ def upload_file(
                 dedup_index, pack_sizes = _build_dedup_index(
                     existing, registry, oci_repo, oci_token, exclude_packs=exclude_packs
                 )
+            # The empty `{}` config blob does not depend on pack digests.
+            # Start it before the pack wave so its Harbor digest-PUT overlaps
+            # the layer uploads instead of sitting in the sequential tail
+            # (pointer → config → manifest). `upload_folder` does not: it
+            # still calls `_ensure_config_blob_uploaded` after the file
+            # fan-out in `_finalize_upload_manifest`. The 1.27× unique-1-GiB
+            # figure is this path only.
+            join_config_blob = _start_config_blob_upload(registry, oci_repo, oci_token)
             new_layers = _upload_file_layers(
                 file_path, path_in_repo, registry, oci_repo, oci_token, dedup_index, pack_sizes
             )
@@ -1043,8 +1096,11 @@ def upload_file(
             existing_layers = existing.manifest.get("layers", []) if existing else []
             prev_digest = _prev_digest_or_warn(existing, repo_id, revision)
             merged_layers = _merge_layers(existing_layers, new_layers)
-
-            config_digest, config_size = _ensure_config_blob_uploaded(registry, oci_repo, oci_token)
+            # Join BEFORE the manifest is assembled or PUT. Harbor runs
+            # `validation.disabled: true`, so a manifest naming a config blob that
+            # has not landed is accepted and only fails at pull time. On the error
+            # path we never reach here: the thread is simply abandoned.
+            config_digest, config_size = join_config_blob()
             manifest = _assemble_manifest(
                 config_digest, config_size, merged_layers, commit_message, commit_description
             )
