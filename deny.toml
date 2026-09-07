@@ -24,17 +24,7 @@ yanked = "deny"
 # the version range it applies to, the rationale for not patching,
 # and a follow-up plan. Review at every Dependabot merge to confirm
 # the exception is still legitimate.
-ignore = [
-    { id = "RUSTSEC-2025-0119", reason = """
-number_prefix 0.4.0 (transitive via indicatif 0.17) is unmaintained
-but not insecure — RUSTSEC-2025-0119 is an "unmaintained" advisory,
-not a CVE. The crate provides trivial integer→human-prefix arithmetic
-that's effectively "done" rather than "abandoned". The fix path is
-upstream: indicatif must migrate to unit-prefix. Track via
-https://github.com/console-rs/indicatif issues; remove this ignore
-when indicatif drops number_prefix.
-""" },
-]
+ignore = []
 
 [licenses]
 # Allowlist set derived from `cargo tree -e no-build,no-dev --format '{l}'`
