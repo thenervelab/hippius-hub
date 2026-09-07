@@ -7,6 +7,12 @@ the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 
 ## [Unreleased]
 
+## [0.7.2] — 2026-09-07
+
+Pointer and pack formats are unchanged; 0.7.0 clients read 0.7.2 uploads and
+vice versa. One client-side behaviour change: `repo_type="dataset"` and
+`"space"` are refused by default (see Changed).
+
 ### Changed
 
 - Intra-file chunked-v2 packing stores a repeated chunk digest once (first
@@ -19,6 +25,14 @@ the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 - Large-file uploads start the empty OCI config blob (`{}`) in parallel with
   the pack wave. It does not depend on pack digests; previously it sat in
   the sequential tail after packs (pointer → config → manifest).
+- `repo_type="dataset"` / `"space"` are refused up front with a
+  `NotImplementedError` telling the caller to omit `repo_type`. Those types map
+  to shared registry namespaces that customer access keys hold no grants on, so
+  every real call 401'd and surfaced as a misleading "repository not found".
+  Set `HIPPIUS_EXPERIMENTAL_REPO_TYPES=1` to opt back in (the e2e suite does).
+  Cache-side `repo_type` handling is unchanged.
+- CLI: the repo-not-found exit code is the named `EXIT_REPO_NOT_FOUND` (11) at
+  every site, including the typed-exception dispatch. Value unchanged.
 
 ### Fixed
 
@@ -26,6 +40,19 @@ the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html
   The buffer `try_reserve`s arrived bytes (initial cap `min(declared, 64 MiB)`).
   Presigned query strings are stripped from pack error messages. `HIPPIUS_PACK_SIZE`
   is rejected if `pack_size + 16 MiB` would exceed the 1 GiB reader cap.
+- Unsupported `--repo-type` values in `revisions` and `registry repos delete`
+  print a one-line error and exit 1 instead of a traceback.
+- `hf_hub_download` consults the local cache before resolving the registry
+  path, so cached dataset/space files still resolve with `local_files_only`.
+- Ctrl-C during a large-file upload no longer waits on the config-blob side
+  thread; a config-blob failure fails the upload before any manifest PUT.
+
+### Dependencies
+
+- fastcdc 3.2.1 → 4.0.1 (chunk boundaries verified byte-identical), tokio
+  1.53.1, indicatif 0.18.6 and the rest of the rust-runtime group; pytest 9.1.1
+  in the smoke suite; GitHub Actions: checkout v7.0.1, setup-python v7.0.0,
+  cargo-deny-action v2.1.1, action-gh-release v3.0.2.
 
 ## [0.7.0] — 2026-08-11
 
