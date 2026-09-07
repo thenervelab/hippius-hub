@@ -24,15 +24,17 @@ vice versa. One client-side behaviour change: `repo_type="dataset"` and
   Harbor is not asked twice for identical content.
 - Large-file uploads start the empty OCI config blob (`{}`) in parallel with
   the pack wave. It does not depend on pack digests; previously it sat in
-  the sequential tail after packs (pointer → config → manifest).
+  the sequential tail after packs (pointer → config → manifest). The side
+  thread is a daemon: Ctrl-C returns immediately, and a config-blob failure
+  fails the upload before any manifest PUT.
 - `repo_type="dataset"` / `"space"` are refused up front with a
   `NotImplementedError` telling the caller to omit `repo_type`. Those types map
   to shared registry namespaces that customer access keys hold no grants on, so
   every real call 401'd and surfaced as a misleading "repository not found".
   Set `HIPPIUS_EXPERIMENTAL_REPO_TYPES=1` to opt back in (the e2e suite does).
-  Cache-side `repo_type` handling is unchanged.
-- CLI: the repo-not-found exit code is the named `EXIT_REPO_NOT_FOUND` (11) at
-  every site, including the typed-exception dispatch. Value unchanged.
+  Cache-side `repo_type` handling is unchanged, and `hf_hub_download` checks
+  the local cache before the gate, so cached dataset/space files still resolve
+  with `local_files_only`.
 
 ### Fixed
 
@@ -42,10 +44,6 @@ vice versa. One client-side behaviour change: `repo_type="dataset"` and
   is rejected if `pack_size + 16 MiB` would exceed the 1 GiB reader cap.
 - Unsupported `--repo-type` values in `revisions` and `registry repos delete`
   print a one-line error and exit 1 instead of a traceback.
-- `hf_hub_download` consults the local cache before resolving the registry
-  path, so cached dataset/space files still resolve with `local_files_only`.
-- Ctrl-C during a large-file upload no longer waits on the config-blob side
-  thread; a config-blob failure fails the upload before any manifest PUT.
 
 ### Dependencies
 
