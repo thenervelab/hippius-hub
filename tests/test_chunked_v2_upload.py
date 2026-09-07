@@ -17,6 +17,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 
 import httpx
+import pytest
 import respx
 
 from hippius_hub import file_upload
@@ -606,8 +607,10 @@ def test_v2_keyboard_interrupt_mid_stream_aborts_without_commit(monkeypatch, tmp
 
     hung_config = threading.Event()
     real_config = file_upload._ensure_config_blob_uploaded
+    config_worker = {}
 
     def _hung_config(*args, **kwargs):
+        config_worker["thread"] = threading.current_thread()
         hung_config.wait(5)
         return real_config(*args, **kwargs)
 
@@ -632,6 +635,12 @@ def test_v2_keyboard_interrupt_mid_stream_aborts_without_commit(monkeypatch, tmp
     elapsed = time.monotonic() - t0
     still_running = t.is_alive()
     hung_config.set()
+    # Reap the abandoned daemon worker HERE, while this test's respx routes are
+    # still up: released, it runs the real config HEAD/PUT, and left alive it
+    # outlives the test and lands that traffic (and a cache entry) in whichever
+    # later test has a matching route.
+    config_worker["thread"].join(5)
+    assert not config_worker["thread"].is_alive(), "the released config worker must finish"
     assert not still_running, "a mid-stream interrupt must not hang the upload"
     assert elapsed < 1.5, (
         "Ctrl-C must not join the config side thread "
@@ -714,6 +723,39 @@ def test_v2_config_worker_is_a_daemon_thread(monkeypatch, tmp_path):
         "(e.g. any ThreadPoolExecutor) is joined by _python_exit at "
         "interpreter shutdown, so Ctrl-C still hangs the CLI process"
     )
+
+
+@respx.mock
+def test_v2_config_blob_failure_fails_the_upload(monkeypatch, tmp_path):
+    """A config failure on the side thread must be the upload's failure.
+
+    A thread's exception is dropped by `threading.excepthook`, never re-raised,
+    so the join must carry it over unchanged: the SAME object (a 401 has to
+    reach `call_with_oci_token_refresh` intact), raised before any manifest
+    PUT — Harbor `validation.disabled: true` would accept a manifest naming a
+    config blob that never landed.
+    """
+    monkeypatch.setenv("HIPPIUS_CHUNK_THRESHOLD", "1")
+    monkeypatch.setenv("HIPPIUS_CHUNKED_WRITE", "1")
+    monkeypatch.setenv("HIPPIUS_PACK_SIZE", "40")
+    captured = {}
+    _wire_registry(monkeypatch, captured)
+
+    boom = RuntimeError("config blob PUT failed")
+
+    def _failing_config(*args, **kwargs):
+        raise boom
+
+    monkeypatch.setattr(file_upload, "_ensure_config_blob_uploaded", _failing_config)
+
+    src = tmp_path / "big.bin"
+    src.write_bytes(b"x" * 100)
+    with pytest.raises(RuntimeError) as exc_info:
+        upload_file(
+            path_or_fileobj=str(src), path_in_repo="big.bin", repo_id=REPO, token="tok"
+        )
+    assert exc_info.value is boom, "the worker's exception must surface unchanged"
+    assert "manifest" not in captured, "no manifest may be PUT after the config blob failed"
 
 
 @respx.mock
