@@ -115,6 +115,28 @@ pub fn chunk_and_hash(path: &Path, avg_size: u64) -> Result<(String, ChunkList),
     chunk_and_hash_reader(std::fs::File::open(path)?, avg_size)
 }
 
+/// Validate `avg_size` and derive the `(min, avg, max)` chunk sizes `StreamCDC`
+/// takes (min = avg/4, max = avg*4).
+fn cdc_bounds(avg_size: u64) -> Result<(usize, usize, usize), CoreError> {
+    if !(CDC_MIN_AVG..=CDC_MAX_AVG).contains(&avg_size) {
+        return Err(CoreError::InvalidArgument(format!(
+            "FastCDC average size {avg_size} out of range [{CDC_MIN_AVG}, {CDC_MAX_AVG}]"
+        )));
+    }
+    // The range check above guarantees min/avg/max fit usize (fastcdc 4 takes
+    // usize sizes); try_from keeps that provable to clippy without an unchecked
+    // `as` cast.
+    let to_usize = |v: u64| -> Result<usize, CoreError> {
+        usize::try_from(v)
+            .map_err(|_| CoreError::InvalidArgument(format!("chunk size {v} exceeds usize")))
+    };
+    Ok((
+        to_usize(avg_size / 4)?,
+        to_usize(avg_size)?,
+        to_usize(avg_size * 4)?,
+    ))
+}
+
 /// Reader-based core of [`chunk_and_hash`], split out so tests can drive it from
 /// an in-memory `Cursor` (no temp file, no I/O `unwrap`). Semantics are
 /// identical: `StreamCDC` yields the same boundaries whether the source is a
@@ -190,20 +212,7 @@ pub(super) fn run_chunk_pipeline<R, T>(
 where
     R: std::io::Read + Send,
 {
-    if !(CDC_MIN_AVG..=CDC_MAX_AVG).contains(&avg_size) {
-        return Err(CoreError::InvalidArgument(format!(
-            "FastCDC average size {avg_size} out of range [{CDC_MIN_AVG}, {CDC_MAX_AVG}]"
-        )));
-    }
-    // The range check above guarantees min/avg/max fit usize (fastcdc 4 takes
-    // usize sizes); try_from keeps that provable to clippy without an unchecked
-    // `as` cast.
-    let to_usize = |v: u64| -> Result<usize, CoreError> {
-        usize::try_from(v)
-            .map_err(|_| CoreError::InvalidArgument(format!("chunk size {v} exceeds usize")))
-    };
-    let (min, max) = (to_usize(avg_size / 4)?, to_usize(avg_size * 4)?);
-    let avg = to_usize(avg_size)?;
+    let (min, avg, max) = cdc_bounds(avg_size)?;
 
     // StreamCDC allocates and memcpys a Vec per chunk on top of the gear-hash
     // scan; that copy is part of the producer floor (the py-spy "CDC = 6%"
@@ -398,17 +407,7 @@ fn chunk_and_hash_reader_serial<R: std::io::Read>(
     source: R,
     avg_size: u64,
 ) -> Result<(String, ChunkList), CoreError> {
-    if !(CDC_MIN_AVG..=CDC_MAX_AVG).contains(&avg_size) {
-        return Err(CoreError::InvalidArgument(format!(
-            "FastCDC average size {avg_size} out of range [{CDC_MIN_AVG}, {CDC_MAX_AVG}]"
-        )));
-    }
-    let to_usize = |v: u64| -> Result<usize, CoreError> {
-        usize::try_from(v)
-            .map_err(|_| CoreError::InvalidArgument(format!("chunk size {v} exceeds usize")))
-    };
-    let (min, max) = (to_usize(avg_size / 4)?, to_usize(avg_size * 4)?);
-    let avg = to_usize(avg_size)?;
+    let (min, avg, max) = cdc_bounds(avg_size)?;
 
     let chunker = StreamCDC::new(source, min, avg, max);
 

@@ -30,7 +30,7 @@ pub(super) const UPLOAD_MAX_RETRIES: u32 = 3;
 /// (via the shared `_pack_upload_gate`) would otherwise wedge the whole folder
 /// upload. Unlike the streamed PUT body, a `.timeout()` here can't clip an honest
 /// transfer because there is no body to stream.
-const INIT_POST_TIMEOUT: Duration = Duration::from_secs(30);
+pub(super) const INIT_POST_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Stream-upload a file to the OCI URL returned by /blobs/uploads/ (the PUT-with-digest finalises the blob).
 /// Shows a per-call progress bar - useful for large blobs (multi-GB).

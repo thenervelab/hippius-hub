@@ -24,9 +24,11 @@ const MAX_RETRIES: u32 = 3;
 
 /// Absolute ceiling on a single pack blob's *declared* size. A pack aggregates
 /// `FastCDC` chunks toward `HIPPIUS_PACK_SIZE` (~64 MiB default) and may overshoot
-/// by at most one chunk (`fastcdc` `MAXIMUM_MAX` = 16 MiB), so no honest pack
-/// approaches 1 GiB. The value exists to reject a hostile OCI layer size before
-/// any body is read. Kept in lockstep with `hippius_hub.constants.MAX_PACK_BYTES`.
+/// by at most one chunk (`fastcdc` `MAXIMUM_MAX` = 16 MiB); Python's
+/// `resolve_pack_size` bounds the target so `pack_size + 16 MiB <= MAX_PACK_BYTES`,
+/// and the default is nowhere near it. The value exists to reject a hostile OCI
+/// layer size before any body is read. Kept in lockstep with
+/// `hippius_hub.constants.MAX_PACK_BYTES`.
 pub(crate) const MAX_PACK_BYTES: u64 = 1024 * 1024 * 1024;
 
 /// Initial `try_reserve` for a pack buffer: honest packs are ~64 MiB, so this
@@ -429,6 +431,8 @@ async fn fetch_pack(
     dest_path: &Arc<Path>,
     pb: &ProgressBar,
 ) -> Result<(), CoreError> {
+    // Defense-in-depth backstop: `validate_pack_plan` already rejects this on
+    // every `assemble` path; this guards callers that reach `fetch_pack` directly.
     if pack_size > MAX_PACK_BYTES {
         return Err(CoreError::Integrity(format!(
             "pack {}: declares {pack_size} bytes, over the {MAX_PACK_BYTES}-byte ceiling",

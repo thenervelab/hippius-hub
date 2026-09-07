@@ -86,8 +86,9 @@ class PackAccumulator:
         self._cur_ranges: List[Tuple[int, int]] = []
         self._cur_offset = 0  # byte offset within the pack currently being built
         self._plan: Optional[PackPlan] = None
-        # digest -> (new_pack_index, pack_offset, size) for first new occurrence
-        self._seen: Dict[str, Tuple[int, int, int]] = {}
+        # digest -> the PlannedChunk of its first new occurrence; a repeat
+        # re-appends that same entry (frozen, so it is safe to share).
+        self._seen: Dict[str, PlannedChunk] = {}
 
     def feed(self, chunk: Tuple[str, int, int]) -> List[NewPack]:
         """Plan one (chunk_digest, size, file_offset); return packs just completed.
@@ -106,30 +107,21 @@ class PackAccumulator:
                 PlannedChunk(digest, size, pack_offset, pack_digest=pack_digest)
             )
             return []
-        seen = self._seen.get(digest)
-        if seen is not None:
-            pack_idx, pack_offset, seen_size = seen
-            if seen_size != size:
+        first = self._seen.get(digest)
+        if first is not None:
+            if first.size != size:
                 raise ValueError(
-                    f"chunk digest {digest} size {size} != first occurrence {seen_size}"
+                    f"chunk digest {digest} size {size} != first occurrence {first.size}"
                 )
-            self._planned.append(
-                PlannedChunk(
-                    digest,
-                    size,
-                    pack_offset,
-                    new_pack_index=pack_idx,
-                )
-            )
+            self._planned.append(first)
             return []
         # First occurrence of this digest → append to the open pack. Its index
         # is `len(self._new_packs)` because the open pack is appended on close.
-        pack_idx = len(self._new_packs)
-        pack_offset = self._cur_offset
-        self._planned.append(
-            PlannedChunk(digest, size, pack_offset, new_pack_index=pack_idx)
+        first = PlannedChunk(
+            digest, size, self._cur_offset, new_pack_index=len(self._new_packs)
         )
-        self._seen[digest] = (pack_idx, pack_offset, size)
+        self._planned.append(first)
+        self._seen[digest] = first
         self._cur_ranges.append((file_offset, size))
         self._cur_offset += size
         if self._cur_offset >= self._pack_size:
