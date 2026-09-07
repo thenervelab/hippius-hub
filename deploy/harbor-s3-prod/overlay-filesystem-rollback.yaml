@@ -1,0 +1,41 @@
+# Overlay for rollback: helm upgrade harbor harbor/harbor --version 1.19.0 -n harbor --reuse-values -f this
+# JuiceFS PVC must still exist. Anything pushed during the S3 window is not on JuiceFS.
+
+persistence:
+  resourcePolicy: keep
+  persistentVolumeClaim:
+    registry:
+      existingClaim: harbor-registry
+      accessMode: ReadWriteMany
+      size: 100Ti
+      storageClass: hippius-juicefs
+  imageChartStorage:
+    disableredirect: false
+    type: filesystem
+    filesystem:
+      rootdirectory: /storage
+
+# Rollback must restore the same live-patched replica counts as the flip, or it
+# trades one outage for another. See the note in overlay-s3.yaml.
+core:
+  replicas: 5
+
+nginx:
+  replicas: 5
+
+registry:
+  replicas: 1
+  affinity:
+    nodeAffinity:
+      preferredDuringSchedulingIgnoredDuringExecution:
+        - weight: 100
+          preference:
+            matchExpressions:
+              - key: kubernetes.io/hostname
+                operator: In
+                values:
+                  - k8s-v3-node1
+  registry:
+    extraEnvVars: []
+  controller:
+    extraEnvVars: []

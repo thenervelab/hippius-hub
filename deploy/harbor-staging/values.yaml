@@ -1,0 +1,73 @@
+# Harbor 2.15 (chart 1.19.0) for arm C: S3 driver, isolated namespace.
+# NEVER pass -n harbor or --reuse-values from the prod release.
+
+expose:
+  type: clusterIP
+  tls:
+    enabled: false
+  clusterIP:
+    name: harbor
+    ports:
+      httpPort: 80
+
+externalURL: http://harbor.harbor-staging.svc.cluster.local
+
+# In-chart postgres + redis on ceph-block. Do not share prod harbor-postgres.
+database:
+  type: internal
+redis:
+  type: internal
+
+persistence:
+  enabled: true
+  resourcePolicy: keep
+  persistentVolumeClaim:
+    registry:
+      storageClass: "-"
+      size: 1Gi
+    jobservice:
+      jobLog:
+        storageClass: ceph-block
+        size: 2Gi
+    database:
+      storageClass: ceph-block
+      size: 10Gi
+    redis:
+      storageClass: ceph-block
+      size: 2Gi
+    trivy:
+      storageClass: ceph-block
+      size: 2Gi
+  imageChartStorage:
+    # MinIO does not support Harbor redirect; keep bytes on the registry hop.
+    disableredirect: true
+    type: s3
+    s3:
+      existingSecret: harbor-staging-s3
+      region: us-east-1
+      bucket: harbor-staging
+      regionendpoint: http://minio.harbor-staging.svc.cluster.local:9000
+      encrypt: false
+      secure: false
+      skipverify: true
+      v4auth: true
+      forcepathstyle: true
+      chunksize: "67108864"
+      rootdirectory: /docker
+
+trivy:
+  enabled: false
+
+metrics:
+  enabled: false
+
+portal:
+  replicas: 1
+core:
+  replicas: 1
+jobservice:
+  replicas: 1
+registry:
+  replicas: 1
+nginx:
+  replicas: 1
