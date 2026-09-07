@@ -17,6 +17,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 
 import httpx
+import pytest
 import respx
 
 from hippius_hub import file_upload
@@ -604,6 +605,17 @@ def test_v2_keyboard_interrupt_mid_stream_aborts_without_commit(monkeypatch, tmp
 
     monkeypatch.setattr(file_upload, "pack_upload_native", _slow_pack)
 
+    hung_config = threading.Event()
+    real_config = file_upload._ensure_config_blob_uploaded
+    config_worker = {}
+
+    def _hung_config(*args, **kwargs):
+        config_worker["thread"] = threading.current_thread()
+        hung_config.wait(5)
+        return real_config(*args, **kwargs)
+
+    monkeypatch.setattr(file_upload, "_ensure_config_blob_uploaded", _hung_config)
+
     src = tmp_path / "big.bin"
     src.write_bytes(b"x" * 100)
 
@@ -618,23 +630,233 @@ def test_v2_keyboard_interrupt_mid_stream_aborts_without_commit(monkeypatch, tmp
 
     t = threading.Thread(target=_target, daemon=True)
     t.start()
-    t.join(30)
-    assert not t.is_alive(), "a mid-stream interrupt must not hang the upload"
+    t0 = time.monotonic()
+    t.join(2)
+    elapsed = time.monotonic() - t0
+    still_running = t.is_alive()
+    hung_config.set()
+    # Reap the abandoned daemon worker HERE, while this test's respx routes are
+    # still up: released, it runs the real config HEAD/PUT, and left alive it
+    # outlives the test and lands that traffic (and a cache entry) in whichever
+    # later test has a matching route.
+    config_worker["thread"].join(5)
+    assert not config_worker["thread"].is_alive(), "the released config worker must finish"
+    assert not still_running, "a mid-stream interrupt must not hang the upload"
+    assert elapsed < 1.5, (
+        "Ctrl-C must not join the config side thread "
+        "(a non-daemon worker blocks on the config retry budget)"
+    )
     assert type(outcome.get("error")) is KeyboardInterrupt
     # The in-flight pack was joined to completion by the executor with-block
     # (cancelled-or-completed — here it had already started, so: completed).
     assert finished.is_set(), "the executor must join the in-flight pack, not strand it"
-    # No-commit proof: neither the pointer blob nor the manifest was PUT.
-    assert not put_bodies, "no blob may be PUT after a mid-stream interrupt"
+    # No-commit proof, stated as what must NOT land rather than an allow-list:
+    # an allow-list of `([], [b"{}"])` also passes when nothing was PUT at all,
+    # so it stops proving anything the moment the config stops being started.
+    # The empty `{}` config blob MAY land — it is kicked off before the pack
+    # wave, does not depend on pack digests, and is the same blob for every
+    # repo. A pointer or pack body must not.
+    non_config = [b for b in put_bodies if b != b"{}"]
+    assert non_config == [], (
+        f"no pointer/pack blob may be PUT after a mid-stream interrupt, got {non_config!r}"
+    )
     assert "manifest" not in captured, "no manifest may be committed after an interrupt"
 
 
 @respx.mock
-def test_v2_streaming_duplicate_chunks_pack_twice(monkeypatch, tmp_path):
-    """No self-dedup, held end-to-end through the stream: a digest occurring twice
-    within one file (absent from the dedup index) is packed twice. Split across
-    two batches, with the pack under HIPPIUS_PACK_SIZE, this also pins the
-    final-partial-pack path (submitted from new_packs[n_emitted:] after finish)."""
+def test_v2_config_worker_is_a_daemon_thread(monkeypatch, tmp_path):
+    """The config worker must not keep the interpreter alive.
+
+    Returning early from `upload_file` is not enough. `ThreadPoolExecutor`
+    workers are non-daemon and `concurrent.futures.thread._python_exit` joins
+    them at interpreter shutdown, so `shutdown(wait=False)` still leaves the
+    CLI *process* blocked for the whole config HEAD/PUT retry budget after
+    Ctrl-C — the user-visible hang is unchanged. A thread-level timing test
+    cannot see that: it runs inside a live interpreter that never exits.
+
+    Pinning `daemon` is what actually guards it, because a daemon thread is
+    abandoned at exit rather than joined.
+    """
+    monkeypatch.setenv("HIPPIUS_CHUNK_THRESHOLD", "1")
+    monkeypatch.setenv("HIPPIUS_CHUNKED_WRITE", "1")
+    monkeypatch.setenv("HIPPIUS_PACK_SIZE", "40")
+    captured = {}
+    _wire_registry(monkeypatch, captured, stub_chunks=False)
+
+    seen = {}
+    config_running = threading.Event()
+    release_config = threading.Event()
+    real_config = file_upload._ensure_config_blob_uploaded
+
+    def _config(*args, **kwargs):
+        # Record the worker while it is alive; a finished thread is still
+        # introspectable but a pooled one would have been recycled by then.
+        seen["thread"] = threading.current_thread()
+        config_running.set()
+        assert release_config.wait(2), "pack wave never released config"
+        return real_config(*args, **kwargs)
+
+    def _pack(uploads_url, path, ranges, auth_token):
+        assert config_running.wait(2), "config never started"
+        release_config.set()
+        return _pack_digest(ranges)
+
+    monkeypatch.setattr(file_upload, "_ensure_config_blob_uploaded", _config)
+    monkeypatch.setattr(
+        file_upload,
+        "chunk_stream_native",
+        lambda path, avg: _FakeChunkStream([CHUNK_METAS[:1]], WHOLE_HEX),
+    )
+    monkeypatch.setattr(file_upload, "pack_upload_native", _pack)
+
+    src = tmp_path / "big.bin"
+    src.write_bytes(b"x" * 100)
+    upload_file(
+        path_or_fileobj=str(src), path_in_repo="big.bin", repo_id=REPO, token="tok"
+    )
+
+    worker = seen.get("thread")
+    assert worker is not None, "config never ran on a side thread"
+    assert worker is not threading.main_thread(), "config must overlap the pack wave"
+    assert worker.daemon, (
+        "the config worker must be a daemon thread: a non-daemon worker "
+        "(e.g. any ThreadPoolExecutor) is joined by _python_exit at "
+        "interpreter shutdown, so Ctrl-C still hangs the CLI process"
+    )
+
+
+@respx.mock
+def test_v2_config_blob_failure_fails_the_upload(monkeypatch, tmp_path):
+    """A config failure on the side thread must be the upload's failure.
+
+    A thread's exception is dropped by `threading.excepthook`, never re-raised,
+    so the join must carry it over unchanged: the SAME object (a 401 has to
+    reach `call_with_oci_token_refresh` intact), raised before any manifest
+    PUT — Harbor `validation.disabled: true` would accept a manifest naming a
+    config blob that never landed.
+    """
+    monkeypatch.setenv("HIPPIUS_CHUNK_THRESHOLD", "1")
+    monkeypatch.setenv("HIPPIUS_CHUNKED_WRITE", "1")
+    monkeypatch.setenv("HIPPIUS_PACK_SIZE", "40")
+    captured = {}
+    _wire_registry(monkeypatch, captured)
+
+    boom = RuntimeError("config blob PUT failed")
+
+    def _failing_config(*args, **kwargs):
+        raise boom
+
+    monkeypatch.setattr(file_upload, "_ensure_config_blob_uploaded", _failing_config)
+
+    src = tmp_path / "big.bin"
+    src.write_bytes(b"x" * 100)
+    with pytest.raises(RuntimeError) as exc_info:
+        upload_file(
+            path_or_fileobj=str(src), path_in_repo="big.bin", repo_id=REPO, token="tok"
+        )
+    assert exc_info.value is boom, "the worker's exception must surface unchanged"
+    assert "manifest" not in captured, "no manifest may be PUT after the config blob failed"
+
+
+@respx.mock
+def test_v2_config_blob_overlaps_pack_wave(monkeypatch, tmp_path):
+    """The empty `{}` config blob does not depend on pack digests.
+
+    `upload_file` must start `_ensure_config_blob_uploaded` before the pack
+    wave returns; otherwise the Harbor digest-PUT sits in the sequential
+    tail (pointer → config → manifest). Handshake: config waits for the
+    pack upload to start, and the pack waits for config to start. Sequential
+    order deadlocks one of those waits and fails this test.
+    """
+    monkeypatch.setenv("HIPPIUS_CHUNK_THRESHOLD", "1")
+    monkeypatch.setenv("HIPPIUS_CHUNKED_WRITE", "1")
+    monkeypatch.setenv("HIPPIUS_PACK_SIZE", "40")
+    captured = {}
+    _wire_registry(monkeypatch, captured, stub_chunks=False)
+
+    pack_started = threading.Event()
+    config_started = threading.Event()
+    real_config = file_upload._ensure_config_blob_uploaded
+
+    def _config(*args, **kwargs):
+        config_started.set()
+        assert pack_started.wait(2), "config ran without the pack wave starting"
+        return real_config(*args, **kwargs)
+
+    def _slow_pack(uploads_url, path, ranges, auth_token):
+        pack_started.set()
+        assert config_started.wait(2), "pack wave ran without config starting"
+        return _pack_digest(ranges)
+
+    monkeypatch.setattr(file_upload, "_ensure_config_blob_uploaded", _config)
+    monkeypatch.setattr(
+        file_upload,
+        "chunk_stream_native",
+        lambda path, avg: _FakeChunkStream([CHUNK_METAS[:1]], WHOLE_HEX),
+    )
+    monkeypatch.setattr(file_upload, "pack_upload_native", _slow_pack)
+
+    src = tmp_path / "big.bin"
+    src.write_bytes(b"x" * 100)
+    upload_file(
+        path_or_fileobj=str(src), path_in_repo="big.bin", repo_id=REPO, token="tok"
+    )
+    assert "manifest" in captured
+
+
+@respx.mock
+def test_v2_manifest_put_waits_for_config_blob(monkeypatch, tmp_path):
+    """Harbor `validation.disabled: true` accepts a manifest whose config
+    blob is missing; that only fails at pull. `_put_manifest` must not run
+    until `_ensure_config_blob_uploaded` has returned. Sleep in config so
+    a PUT-then-join mutation races and fails this assertion.
+    """
+    monkeypatch.setenv("HIPPIUS_CHUNK_THRESHOLD", "1")
+    monkeypatch.setenv("HIPPIUS_CHUNKED_WRITE", "1")
+    monkeypatch.setenv("HIPPIUS_PACK_SIZE", "40")
+    captured = {}
+    _wire_registry(monkeypatch, captured, stub_chunks=False)
+    monkeypatch.setattr(
+        file_upload,
+        "chunk_stream_native",
+        lambda path, avg: _FakeChunkStream([CHUNK_METAS[:1]], WHOLE_HEX),
+    )
+
+    config_done = threading.Event()
+    real_config = file_upload._ensure_config_blob_uploaded
+    real_put = file_upload._put_manifest
+
+    def _slow_config(*args, **kwargs):
+        time.sleep(0.2)
+        result = real_config(*args, **kwargs)
+        config_done.set()
+        return result
+
+    def _put(*args, **kwargs):
+        assert config_done.is_set(), (
+            "manifest PUT before the config blob finished "
+            "(Harbor would accept it and fail at pull)"
+        )
+        return real_put(*args, **kwargs)
+
+    monkeypatch.setattr(file_upload, "_ensure_config_blob_uploaded", _slow_config)
+    monkeypatch.setattr(file_upload, "_put_manifest", _put)
+
+    src = tmp_path / "big.bin"
+    src.write_bytes(b"x" * 100)
+    upload_file(
+        path_or_fileobj=str(src), path_in_repo="big.bin", repo_id=REPO, token="tok"
+    )
+    assert "manifest" in captured
+
+
+@respx.mock
+def test_v2_streaming_duplicate_chunks_pack_once(monkeypatch, tmp_path):
+    """Intra-file self-dedup through the stream: a digest occurring twice
+    within one file (absent from the prior-revision index) is stored once.
+    Split across two batches, with the pack under HIPPIUS_PACK_SIZE, this
+    also pins the final-partial-pack path (submitted from
+    new_packs[n_emitted:] after finish)."""
     dup_metas = [("a" * 64, 0, 40), ("a" * 64, 40, 40)]
     monkeypatch.setenv("HIPPIUS_CHUNK_THRESHOLD", "1")
     monkeypatch.setenv("HIPPIUS_CHUNKED_WRITE", "1")
@@ -650,11 +872,10 @@ def test_v2_streaming_duplicate_chunks_pack_twice(monkeypatch, tmp_path):
     src.write_bytes(b"x" * 80)
     upload_file(path_or_fileobj=str(src), path_in_repo="big.bin", repo_id=REPO, token="tok")
 
-    # Both occurrences packed, in file order, into the one (partial) pack.
-    assert packs_seen == [[(0, 40), (40, 40)]]
+    assert packs_seen == [[(0, 40)]]
     ptr_blob = next(b for b in put_bodies if b'"chunked-v2"' in b)
     refs = parse_pointer_v2(ptr_blob)
     assert [(r.chunk_digest, r.pack_offset) for r in refs] == [
         ("sha256:" + "a" * 64, 0),
-        ("sha256:" + "a" * 64, 40),
+        ("sha256:" + "a" * 64, 0),
     ]

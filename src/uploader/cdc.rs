@@ -195,14 +195,15 @@ where
             "FastCDC average size {avg_size} out of range [{CDC_MIN_AVG}, {CDC_MAX_AVG}]"
         )));
     }
-    // The range check above guarantees min/avg/max fit u32; try_from keeps that
-    // provable to clippy without an unchecked `as` cast.
-    let to_u32 = |v: u64| -> Result<u32, CoreError> {
-        u32::try_from(v)
-            .map_err(|_| CoreError::InvalidArgument(format!("chunk size {v} exceeds u32")))
+    // The range check above guarantees min/avg/max fit usize (fastcdc 4 takes
+    // usize sizes); try_from keeps that provable to clippy without an unchecked
+    // `as` cast.
+    let to_usize = |v: u64| -> Result<usize, CoreError> {
+        usize::try_from(v)
+            .map_err(|_| CoreError::InvalidArgument(format!("chunk size {v} exceeds usize")))
     };
-    let (min, max) = (to_u32(avg_size / 4)?, to_u32(avg_size * 4)?);
-    let avg = to_u32(avg_size)?;
+    let (min, max) = (to_usize(avg_size / 4)?, to_usize(avg_size * 4)?);
+    let avg = to_usize(avg_size)?;
 
     // StreamCDC allocates and memcpys a Vec per chunk on top of the gear-hash
     // scan; that copy is part of the producer floor (the py-spy "CDC = 6%"
@@ -402,12 +403,12 @@ fn chunk_and_hash_reader_serial<R: std::io::Read>(
             "FastCDC average size {avg_size} out of range [{CDC_MIN_AVG}, {CDC_MAX_AVG}]"
         )));
     }
-    let to_u32 = |v: u64| -> Result<u32, CoreError> {
-        u32::try_from(v)
-            .map_err(|_| CoreError::InvalidArgument(format!("chunk size {v} exceeds u32")))
+    let to_usize = |v: u64| -> Result<usize, CoreError> {
+        usize::try_from(v)
+            .map_err(|_| CoreError::InvalidArgument(format!("chunk size {v} exceeds usize")))
     };
-    let (min, max) = (to_u32(avg_size / 4)?, to_u32(avg_size * 4)?);
-    let avg = to_u32(avg_size)?;
+    let (min, max) = (to_usize(avg_size / 4)?, to_usize(avg_size * 4)?);
+    let avg = to_usize(avg_size)?;
 
     let chunker = StreamCDC::new(source, min, avg, max);
 
@@ -455,8 +456,8 @@ mod cdc_tests {
         // [AVERAGE_MIN, AVERAGE_MAX] do the derived min = avg/4 and max = avg*4 stay
         // within fastcdc's MINIMUM_MAX/MAXIMUM_MAX, so StreamCDC::new cannot panic.
         // If a fastcdc bump moves these, fail here rather than ship another panic.
-        assert_eq!(CDC_MIN_AVG, u64::from(AVERAGE_MIN));
-        assert_eq!(CDC_MAX_AVG, u64::from(AVERAGE_MAX));
+        assert_eq!(Ok(CDC_MIN_AVG), u64::try_from(AVERAGE_MIN));
+        assert_eq!(Ok(CDC_MAX_AVG), u64::try_from(AVERAGE_MAX));
     }
 
     #[test]

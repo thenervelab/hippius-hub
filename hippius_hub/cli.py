@@ -18,7 +18,7 @@ from typing import Any
 from . import __version__
 from .auth import get_oci_bearer_token, login, resolve_token_value
 from .constants import resolve_registry
-from .file_download import _oci_repo_path, hippius_hub_download
+from .file_download import _oci_repo_path, _validate_repo_type, hippius_hub_download
 from ._repo_ops import _list_tags, _revision_digest_and_created, delete_repo
 from . import console
 from .console import ConsoleError
@@ -30,6 +30,10 @@ from .console import ConsoleError
 # 10+ codespace rationale as the download/upload exit codes: stay out of
 # bash's reserved 1-2 range (1 = generic, 2 = misuse of shell builtin /
 # argparse usage error) so shell wrappers can branch deterministically.
+# Deliberately the SAME value `_format_download_error` maps
+# `RepositoryNotFoundError` to, so the two routes to "this repo is gone" —
+# the typed-exception dispatch and the two inline checks below — agree.
+EXIT_REPO_NOT_FOUND = 11        # `revisions` / `repos delete` -> repo is gone
 EXIT_NAMESPACE_TAKEN = 17       # `registry check <name>` -> name is taken
 EXIT_INVALID_REPO_FORMAT = 18   # CLI arg `<project>/<repo>` is malformed
 
@@ -90,6 +94,12 @@ def _format_download_error(e: Exception) -> tuple[str, int]:
     Codes 17 and 18 are non-exception paths (validated by the CLI itself
     before any HTTP call) so they don't appear in this function's
     dispatch — they're set inline by the registry/models handlers.
+    Code 11 is reachable BOTH ways: dispatched here from
+    `RepositoryNotFoundError`, and set inline as `EXIT_REPO_NOT_FOUND` by
+    `revisions` (which gets `None` back from `_list_tags` rather than an
+    exception) and by `repos delete` on a 404. Both routes must keep
+    reporting the same code, which is why that constant is defined next to
+    the others instead of written as a bare literal at the call sites.
 
     Ordering invariant: HF's typed exception hierarchy has three subclass
     relationships that matter here — LocalEntryNotFoundError <: Entry-
@@ -131,7 +141,7 @@ def _format_download_error(e: Exception) -> tuple[str, int]:
     if isinstance(e, (GatedRepoError, DisabledRepoError)):
         return (f"❌ Access denied: {e}", 14)
     if isinstance(e, RepositoryNotFoundError):
-        return (f"❌ Repository not found: {e}", 11)
+        return (f"❌ Repository not found: {e}", EXIT_REPO_NOT_FOUND)
     if isinstance(e, RevisionNotFoundError):
         return (f"❌ Revision not found: {e}", 12)
     # ConcurrentManifestUpdateError subclasses HfHubHTTPError; it must be
@@ -345,7 +355,7 @@ def cmd_registry_repos_delete(args):
         if status == 404:
             print(f"❌ Repository not found: {args.repo_id} "
                   f"(pass --missing-ok to ignore).")
-            sys.exit(11)
+            sys.exit(EXIT_REPO_NOT_FOUND)
         raise
     print(f"✅ Repo deleted: {args.repo_id}")
 
@@ -574,6 +584,7 @@ def cmd_models_formats(_args):
 # ----- revisions -----
 
 def cmd_revisions(args):
+    _validate_repo_type(args.repo_type)
     oci_repo = _oci_repo_path(args.repo_id, args.repo_type)
     registry = resolve_registry(None)
     oci_token = get_oci_bearer_token(oci_repo, resolve_token_value(None), push=False)
@@ -585,7 +596,7 @@ def cmd_revisions(args):
         # 1 here, so a wrapper could not tell "this repo is gone" apart from any
         # other generic failure — and the sibling 401 path (deleted namespace)
         # exited 1 too, via an uncaught traceback.
-        sys.exit(11)
+        sys.exit(EXIT_REPO_NOT_FOUND)
     if not tags:
         print("No revisions yet.")
         return
@@ -941,11 +952,14 @@ def main():
         # traceback. Deliberately narrow — only huggingface_hub's typed error
         # families are caught, so a genuine bug (TypeError, KeyError, ...) still
         # bubbles up with its traceback intact rather than being flattened into
-        # a tidy but undebuggable message.
+        # a tidy but undebuggable message. NotImplementedError is the one
+        # non-HF addition: it is this package's own "unsupported input" signal
+        # (the dataset/space repo_type gate, rejected HF kwargs), an expected
+        # refusal the user must act on, not a defect.
         from .errors import EntryNotFoundError, HfHubHTTPError
         try:
             handlers[args.command](args)
-        except (HfHubHTTPError, EntryNotFoundError) as e:
+        except (HfHubHTTPError, EntryNotFoundError, NotImplementedError) as e:
             msg, code = _format_download_error(e)
             print(msg)
             sys.exit(code)
@@ -958,6 +972,10 @@ def main():
             args.func(args)
         except ConsoleError as e:
             _handle_console_error(e)
+        except NotImplementedError as e:
+            msg, code = _format_download_error(e)
+            print(msg)
+            sys.exit(code)
         return
     parser.print_help()
     sys.exit(1)

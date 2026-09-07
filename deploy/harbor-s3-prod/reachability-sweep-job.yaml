@@ -1,0 +1,92 @@
+# HEAD both link classes for every artifact Harbor knows about.
+# Run this after the flip and BEFORE the unfreeze — a failure while Harbor is
+# still read_only means a cheap rollback instead of reverse-copying S3 writes.
+#
+#   kubectl -n harbor create configmap harbor-reachability-sweep \
+#     --from-file=harbor_reachability_sweep.py=deploy/harbor-s3-prod/harbor_reachability_sweep.py \
+#     --dry-run=client -o yaml | kubectl apply -f -
+#   kubectl -n harbor apply -f deploy/harbor-s3-prod/reachability-sweep-job.yaml
+#   kubectl -n harbor logs -f job/harbor-reachability-sweep
+#
+# Talks to harbor-core in-cluster, so it exercises the registry the same way a
+# pull does without depending on ingress. No bytes are transferred.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: harbor-reachability-sweep
+  namespace: harbor
+spec:
+  # 0, not 1: the sweep takes hours and a failure means "investigate", never
+  # "run it again". The 2026-08-27 baseline retried on its own and swept prod
+  # twice for nothing.
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 86400
+  activeDeadlineSeconds: 21600
+  template:
+    metadata:
+      labels:
+        app: harbor-reachability-sweep
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: sweep
+          image: python:3.12-slim-bookworm
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: HARBOR_ENDPOINT
+              value: http://harbor-core.harbor.svc.cluster.local:80
+            - name: HARBOR_ADMIN_USER
+              value: admin
+            - name: HARBOR_ADMIN_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: harbor-core
+                  key: HARBOR_ADMIN_PASSWORD
+            - name: PGHOST
+              value: harbor-postgres-rw.harbor.svc.cluster.local
+            - name: PGPORT
+              value: "5432"
+            - name: PGDATABASE
+              value: registry
+            - name: PGSSLMODE
+              value: disable
+            - name: PGUSER
+              value: postgres
+            # harbor-core's own DB credential. The CNPG harbor-postgres-superuser
+            # secret does NOT authenticate over TCP (verified 2026-08-27); this one
+            # does, and is the same one the registry itself connects with.
+            - name: PGPASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: harbor-core
+                  key: POSTGRESQL_PASSWORD
+            # 32 suits the post-flip run against S3. For the 0.10 baseline,
+            # while the registry is still on JuiceFS, drop this to ~8: a
+            # one-byte ranged GET there pulls a whole 4 MiB JuiceFS block, so
+            # the sweep is far heavier on the live registry than it will be
+            # after the flip.
+            - name: SWEEP_WORKERS
+              value: "32"
+            - name: PIP_DISABLE_PIP_VERSION_CHECK
+              value: "1"
+          command:
+            - /bin/sh
+            - -c
+            - |
+              set -eu
+              pip install --no-cache-dir httpx 'psycopg[binary]'
+              python /app/harbor_reachability_sweep.py --workers "${SWEEP_WORKERS}"
+          volumeMounts:
+            - name: script
+              mountPath: /app
+          resources:
+            requests:
+              cpu: "1"
+              memory: 1Gi
+            limits:
+              cpu: "4"
+              memory: 2Gi
+      volumes:
+        - name: script
+          configMap:
+            name: harbor-reachability-sweep

@@ -7,6 +7,19 @@ the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 
 ## [Unreleased]
 
+### Changed
+
+- Intra-file chunked-v2 packing stores a repeated chunk digest once (first
+  new-pack occurrence). Previously a digest appearing twice in one file was
+  packed twice. Pointer format is unchanged: both entries point at the same
+  pack offset.
+- Pack upload single-flights concurrent PUTs of the same pack bytes, and a
+  digest this process has already landed is HEADed before it is re-sent, so
+  Harbor is not asked twice for identical content.
+- Large-file uploads start the empty OCI config blob (`{}`) in parallel with
+  the pack wave. It does not depend on pack digests; previously it sat in
+  the sequential tail after packs (pointer → config → manifest).
+
 ### Fixed
 
 - Pack download no longer `Vec::with_capacity` of the registry-declared size.
@@ -36,8 +49,16 @@ No API, CLI, or environment-variable changes. Artifacts are byte-identical to
 
 ### Fixed
 
-- `hippius-hub revisions` no longer prints a traceback for a missing, deleted, or
-  private repository — one actionable line, non-zero exit.
+- `hippius-hub revisions` no longer prints an `httpx` traceback when the registry
+  answers `401` — a private repository, or a namespace that does not exist or was
+  deleted outright. It now prints one actionable line pointing at
+  `hippius-hub login`. A missing or deleted repo *inside* a namespace you can
+  already reach reported cleanly in 0.6.1 too; only the namespace-level 401 path
+  was broken. Both paths now exit with the documented not-found code `11`
+  (`EXIT_REPO_NOT_FOUND` / `RepositoryNotFoundError`). 0.6.1 exited `1` on
+  both — deliberately on the 404, incidentally on the 401 via the uncaught
+  exception — so a wrapper that tests `$? -eq 1` for a missing repo must be
+  updated.
 - A crashed hashing task no longer retries. It was treated as transient I/O and
   retried three times, re-downloading up to three ~64 MiB packs before failing.
 - Unrecoverable upload sessions report the real cause instead of a fabricated
