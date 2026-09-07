@@ -842,4 +842,351 @@ mod tests {
         let got = tokio::time::timeout(Duration::from_secs(30), fut).await;
         assert!(matches!(got, Ok(Err(CoreError::Integrity(_)))));
     }
+
+    #[test]
+    fn redact_url_covers_fragment_port_userinfo_and_clean_inputs() {
+        // Fragment alone, query alone, userinfo alone, a port in the authority,
+        // and inputs with nothing to strip - each shape is a separate branch of
+        // the hand-rolled parser (no `url` crate), so each is pinned.
+        assert_eq!(
+            super::redact_url("https://h.example:8443/v2/x/blobs/sha256:ab#frag"),
+            "https://h.example:8443/v2/x/blobs/sha256:ab?<redacted>"
+        );
+        assert_eq!(
+            super::redact_url("https://h.example/p?a=1#frag"),
+            "https://h.example/p?<redacted>"
+        );
+        assert_eq!(super::redact_url("https://u:p@h.example/p"), "https://h.example/p");
+        assert_eq!(super::redact_url("https://u:p@h.example"), "https://h.example");
+        assert_eq!(
+            super::redact_url("https://h.example?X-Amz-Signature=s"),
+            "https://h.example?<redacted>"
+        );
+        assert_eq!(super::redact_url("http://h.example/"), "http://h.example/");
+        assert_eq!(super::redact_url("https://h.example/a@b/c"), "https://h.example/a@b/c");
+        assert_eq!(super::redact_url(""), "");
+    }
+
+    #[test]
+    fn reserve_failure_is_a_retryable_out_of_memory_io_error_with_a_redacted_url() {
+        // `try_reserve(usize::MAX)` fails deterministically (capacity overflow)
+        // - the same `TryReserveError` path a real allocation failure takes -
+        // so this pins the mapping without needing to exhaust memory: an
+        // `Io(OutOfMemory)` that the retry loop treats as transient, carrying
+        // the pack URL with its presigned query stripped, and no bytes reserved.
+        let mut buf: Vec<u8> = Vec::new();
+        let res = super::reserve_or_err(
+            &mut buf,
+            usize::MAX,
+            "https://h.example/v2/x/blobs/sha256:ab?X-Amz-Signature=secret",
+        );
+        let Err(err) = res else {
+            unreachable!("reserving usize::MAX bytes cannot succeed")
+        };
+        assert!(err.is_retryable(), "OutOfMemory must be retryable, got {err:?}");
+        match &err {
+            CoreError::Io(io) => {
+                assert_eq!(io.kind(), std::io::ErrorKind::OutOfMemory);
+                let msg = io.to_string();
+                assert!(!msg.contains("secret"), "presigned query leaked: {msg}");
+                assert!(msg.contains("?<redacted>"), "URL not redacted: {msg}");
+                assert!(msg.contains("cannot reserve"), "unexpected message: {msg}");
+            }
+            other => unreachable!("expected Io(OutOfMemory), got {other:?}"),
+        }
+        assert_eq!(buf.capacity(), 0, "a failed reserve must not allocate");
+    }
+
+    /// `fetch_pack` plumbing shared by the error-shape tests below.
+    async fn fetch_pack_plain(
+        url: &str,
+        pack_size: u64,
+        targets: Vec<PackChunkTarget>,
+        tag: &str,
+    ) -> Result<(), CoreError> {
+        let Ok(client) = download_client(TransportTimeouts::default()) else {
+            unreachable!("download client")
+        };
+        let pb = ProgressBar::hidden();
+        let dest = scratch_path(tag);
+        let _g = TempFileGuard(dest.clone());
+        let Ok(()) = std::fs::File::create(&dest).and_then(|f| f.set_len(4000)) else {
+            unreachable!("dest create")
+        };
+        let url: Arc<str> = url.into();
+        let targets: Arc<[PackChunkTarget]> = targets.into();
+        let dest_arc: Arc<Path> = dest.as_path().into();
+        fetch_pack(client, &url, None, pack_size, &targets, &dest_arc, &pb).await
+    }
+
+    #[tokio::test]
+    async fn fetch_pack_short_body_is_retryable_bad_response_with_redacted_url() {
+        // Registry closes the body early (500 of the declared 1000 bytes): a
+        // length anomaly is a retryable BadResponse, never Integrity, and the
+        // message carries the URL without its presigned query.
+        let mut routes = HashMap::new();
+        routes.insert("/pack?X-Amz-Signature=secret".to_string(), vec![1u8; 500]);
+        let Ok(base) = serve_packs(routes).await else {
+            unreachable!("loopback bind")
+        };
+        let res = fetch_pack_plain(
+            &format!("{base}/pack?X-Amz-Signature=secret"),
+            1000,
+            Vec::new(),
+            "short_body",
+        )
+        .await;
+        match &res {
+            Err(CoreError::BadResponse(m)) => {
+                assert!(m.contains("expected 1000 bytes, got 500"), "{m}");
+                assert!(!m.contains("secret"), "presigned query leaked: {m}");
+                assert!(m.contains("?<redacted>"), "URL not redacted: {m}");
+            }
+            other => unreachable!("a short body must be BadResponse, got {other:?}"),
+        }
+        assert!(res.is_err_and(|e| e.is_retryable()));
+    }
+
+    #[tokio::test]
+    async fn fetch_pack_over_send_message_is_redacted() {
+        let mut routes = HashMap::new();
+        routes.insert("/pack?X-Amz-Signature=secret".to_string(), vec![1u8; 1500]);
+        let Ok(base) = serve_packs(routes).await else {
+            unreachable!("loopback bind")
+        };
+        let res = fetch_pack_plain(
+            &format!("{base}/pack?X-Amz-Signature=secret"),
+            1000,
+            Vec::new(),
+            "over_send_redacted",
+        )
+        .await;
+        match &res {
+            Err(CoreError::BadResponse(m)) => {
+                assert!(m.contains("over-send"), "{m}");
+                assert!(!m.contains("secret"), "presigned query leaked: {m}");
+                assert!(m.contains("?<redacted>"), "URL not redacted: {m}");
+            }
+            other => unreachable!("an over-send must be BadResponse, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn fetch_pack_http_error_status_is_server_error_with_redacted_url() {
+        // No route registered: the pack GET 404s. Status errors keep their
+        // code (so the retry policy sees 4xx vs 5xx) and redact the URL.
+        let Ok(base) = serve_packs(HashMap::new()).await else {
+            unreachable!("loopback bind")
+        };
+        let res = fetch_pack_plain(
+            &format!("{base}/missing?X-Amz-Signature=secret"),
+            1000,
+            Vec::new(),
+            "http_404",
+        )
+        .await;
+        match &res {
+            Err(CoreError::ServerError(404, m)) => {
+                assert!(!m.contains("secret"), "presigned query leaked: {m}");
+                assert!(m.contains("?<redacted>"), "URL not redacted: {m}");
+            }
+            other => unreachable!("a 404 pack GET must be ServerError(404), got {other:?}"),
+        }
+        assert!(
+            res.is_err_and(|e| !e.is_retryable()),
+            "a 404 is permanent; the retry loop must not re-GET it"
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_pack_refuses_a_declared_size_over_the_ceiling_before_any_request() {
+        // Port 9 (discard) refuses connections: if the backstop check were
+        // removed the GET would fail as a retryable transport error, not the
+        // permanent Integrity below - so the test discriminates on the order.
+        let res = fetch_pack_plain(
+            "http://127.0.0.1:9/pack?X-Amz-Signature=secret",
+            MAX_PACK_BYTES + 1,
+            Vec::new(),
+            "over_ceiling",
+        )
+        .await;
+        match &res {
+            Err(CoreError::Integrity(m)) => {
+                assert!(m.contains("over the"), "{m}");
+                assert!(!m.contains("secret"), "presigned query leaked: {m}");
+            }
+            other => unreachable!("an over-ceiling declaration must be Integrity, got {other:?}"),
+        }
+        assert!(res.is_err_and(|e| !e.is_retryable()));
+    }
+
+    #[tokio::test]
+    async fn fetch_pack_accepts_a_pack_declared_exactly_at_the_ceiling() {
+        // The cap is inclusive: exactly MAX_PACK_BYTES passes the backstop and
+        // reaches the GET (which then fails on the short body, a BadResponse -
+        // proof the request was made rather than refused up front).
+        let mut routes = HashMap::new();
+        routes.insert("/pack".to_string(), vec![1u8; 10]);
+        let Ok(base) = serve_packs(routes).await else {
+            unreachable!("loopback bind")
+        };
+        let res = fetch_pack_plain(&format!("{base}/pack"), MAX_PACK_BYTES, Vec::new(), "at_ceiling").await;
+        assert!(
+            matches!(res, Err(CoreError::BadResponse(_))),
+            "exactly-at-cap must reach the GET, got {res:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_pack_of_size_zero_with_no_targets_succeeds_on_an_empty_body() {
+        let mut routes = HashMap::new();
+        routes.insert("/empty".to_string(), Vec::new());
+        let Ok(base) = serve_packs(routes).await else {
+            unreachable!("loopback bind")
+        };
+        let res = fetch_pack_plain(&format!("{base}/empty"), 0, Vec::new(), "size_zero").await;
+        assert!(res.is_ok(), "a zero-byte pack with no targets is valid, got {res:?}");
+    }
+
+    /// A file where one 1000-byte chunk repeats three times around a 500-byte
+    /// tail, packed by the intra-file self-dedup as ONE occurrence: the pack
+    /// is `repeat + tail` (1500 bytes) and the plan carries four targets, three
+    /// of which share pack range `[0, 1000)` at different file offsets.
+    fn shared_range_fixture(base: &str) -> (Vec<u8>, Vec<u8>, Vec<PackPlanEntry>) {
+        let repeat = pattern(1000);
+        let tail = vec![0x5Au8; 500];
+        let content = [
+            repeat.as_slice(),
+            tail.as_slice(),
+            repeat.as_slice(),
+            repeat.as_slice(),
+        ]
+        .concat();
+        let pack = [repeat.as_slice(), tail.as_slice()].concat();
+        let hx = Sha256Digest::of(&repeat);
+        let hy = Sha256Digest::of(&tail);
+        let plan = vec![PackPlanEntry {
+            url: format!("{base}/shared"),
+            size: 1500,
+            chunks: vec![
+                chunk_target(0, 1000, 0, hx),
+                chunk_target(1000, 500, 1000, hy),
+                chunk_target(0, 1000, 1500, hx),
+                chunk_target(0, 1000, 2500, hx),
+            ],
+        }];
+        (content, pack, plan)
+    }
+
+    async fn assemble_shared(pack_served: Option<Vec<u8>>, tag: &str) -> (Result<Option<String>, CoreError>, Vec<u8>, std::path::PathBuf) {
+        let mut routes = HashMap::new();
+        if let Some(body) = pack_served {
+            routes.insert("/shared".to_string(), body);
+        }
+        let Ok(base) = serve_packs(routes).await else {
+            unreachable!("loopback bind")
+        };
+        let (content, _, plan) = shared_range_fixture(&base);
+        let dest = scratch_path(tag);
+        let Ok(assembler) = PackAssembler::new(None, 4, TransportTimeouts::default()) else {
+            unreachable!("assembler")
+        };
+        let expected = reference(&content);
+        let fut = assembler.assemble(&dest, plan, Some(&expected), content.len() as u64);
+        let Ok(res) = tokio::time::timeout(Duration::from_secs(30), fut).await else {
+            unreachable!("assemble must settle within the retry budget")
+        };
+        (res, content, dest)
+    }
+
+    #[tokio::test]
+    async fn assemble_scatters_a_thrice_shared_pack_range_to_every_file_offset() {
+        let (_, pack, _) = shared_range_fixture("http://unused");
+        let (res, content, dest) = assemble_shared(Some(pack), "shared_ok").await;
+        let _g = TempFileGuard(dest.clone());
+        let Ok(Some(digest)) = res else {
+            unreachable!("a deduped pack must reconstruct the file, got {res:?}")
+        };
+        assert_eq!(digest, reference(&content));
+        let Ok(got) = std::fs::read(&dest) else {
+            unreachable!("read back")
+        };
+        assert_eq!(got, content, "every occurrence of the repeated chunk must be written");
+    }
+
+    #[tokio::test]
+    async fn assemble_rejects_a_corrupt_shared_pack_as_permanent_integrity() {
+        // One flipped byte inside the shared range: the FIRST target that
+        // carves it fails its digest; the error is Integrity (permanent, no
+        // retry) wrapped in ChunkFailed by the fan-out.
+        let (_, mut pack, _) = shared_range_fixture("http://unused");
+        pack[10] ^= 0xFF;
+        let (res, _, dest) = assemble_shared(Some(pack), "shared_corrupt").await;
+        let _g = TempFileGuard(dest);
+        match &res {
+            Err(CoreError::ChunkFailed { source, .. }) => {
+                assert!(
+                    matches!(**source, CoreError::Integrity(_)),
+                    "corrupt bytes must be Integrity, got {source:?}"
+                );
+            }
+            other => unreachable!("expected ChunkFailed(Integrity), got {other:?}"),
+        }
+        assert!(res.is_err_and(|e| !e.is_retryable()));
+    }
+
+    #[tokio::test]
+    async fn assemble_rejects_a_short_shared_pack_as_bad_response_after_retries() {
+        // 1400 of the declared 1500 bytes arrive: retryable BadResponse, walked
+        // through the pack retry ladder (the server keeps serving short), then
+        // surfaced as ChunkFailed(BadResponse) - not Integrity, not a hang.
+        let (_, pack, _) = shared_range_fixture("http://unused");
+        let (res, _, dest) = assemble_shared(Some(pack[..1400].to_vec()), "shared_short").await;
+        let _g = TempFileGuard(dest);
+        match &res {
+            Err(CoreError::ChunkFailed { source, .. }) => {
+                assert!(
+                    matches!(&**source, CoreError::BadResponse(m) if m.contains("expected 1500 bytes, got 1400")),
+                    "a short pack must be BadResponse, got {source:?}"
+                );
+            }
+            other => unreachable!("expected ChunkFailed(BadResponse), got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn assemble_rejects_an_over_sent_shared_pack_as_bad_response() {
+        let (_, mut pack, _) = shared_range_fixture("http://unused");
+        pack.extend_from_slice(&[0u8; 100]);
+        let (res, _, dest) = assemble_shared(Some(pack), "shared_over").await;
+        let _g = TempFileGuard(dest);
+        match &res {
+            Err(CoreError::ChunkFailed { source, .. }) => {
+                assert!(
+                    matches!(&**source, CoreError::BadResponse(m) if m.contains("over-send")),
+                    "an over-sent pack must be BadResponse, got {source:?}"
+                );
+            }
+            other => unreachable!("expected ChunkFailed(BadResponse), got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn assemble_rejects_a_missing_pack_as_permanent_server_error() {
+        // The registry 404s the pack (a GC'd blob): a permanent status, so the
+        // fan-out fails on the first attempt without walking the retry ladder,
+        // and the status code survives the ChunkFailed wrapping.
+        let (res, _, dest) = assemble_shared(None, "shared_missing").await;
+        let _g = TempFileGuard(dest);
+        match &res {
+            Err(CoreError::ChunkFailed { source, .. }) => {
+                assert!(
+                    matches!(**source, CoreError::ServerError(404, _)),
+                    "a missing pack must be ServerError(404), got {source:?}"
+                );
+            }
+            other => unreachable!("expected ChunkFailed(ServerError), got {other:?}"),
+        }
+        assert!(res.is_err_and(|e| !e.is_retryable()));
+    }
 }
