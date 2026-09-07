@@ -32,6 +32,13 @@ TYPE_CASES = [
 ]
 
 
+@pytest.fixture(autouse=True)
+def _experimental_repo_types(monkeypatch):
+    # dataset/space mapping is gated off by default (shared namespaces customer
+    # keys can't access); these are pure construction tests, so opt in.
+    monkeypatch.setenv("HIPPIUS_EXPERIMENTAL_REPO_TYPES", "1")
+
+
 def _ours(repo_type: str | None, repo_id: str = REPO_ID) -> RepoUrl:
     """RepoUrl exactly as `create_repo` builds it: via the OCI repo path."""
     return _build_repo_url(_oci_repo_path(repo_id, repo_type), EP)
