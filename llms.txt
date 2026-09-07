@@ -292,12 +292,13 @@ Parallel `upload_file` calls to the same `repo_id:revision` are guarded by an `I
 - `HIPPIUS_CHUNK_THRESHOLD` (default `268435456` = 256 MiB) — files at/above this size upload chunked-v2 (content-defined chunks packed into content-addressed packs + one `pointer.v2` record); below it, a single object
 - `HIPPIUS_CDC_AVG_SIZE` (default `4194304` = 4 MiB) — FastCDC average chunk size; part of the layout wire contract, change with care (4 MiB is fastcdc's AVERAGE_MAX ceiling; larger is rejected)
 - `HIPPIUS_UPLOAD_CHUNK_SIZE` (default `16777216` = 16 MiB) — per-request chunk size for resumable single-object uploads; a transient failure resumes from the registry's committed offset, so at most one chunk is re-sent
-- `HIPPIUS_PACK_SIZE` (default `67108864` = 64 MiB) — target size of a content-addressed pack (many CDC chunks per pack)
+- `HIPPIUS_PACK_SIZE` (default `67108864` = 64 MiB) — target size of a content-addressed pack (many CDC chunks per pack); rejected above `1056964608` (1 GiB − 16 MiB) because a pack may overshoot by one 16 MiB chunk and the reader caps a pack at 1 GiB
 - `HIPPIUS_MAX_INFLIGHT_PACKS` (default = `HIPPIUS_UPLOAD_WORKERS`, i.e. `8`) — process-wide cap on concurrent pack uploads, so a folder upload doesn't multiply resident memory
 - `HIPPIUS_BLOB_REUPLOAD_RETRIES` (default `2`) — extra whole-upload retries when the registry reports a just-committed object as missing (`BLOB_UNKNOWN`)
 - `HIPPIUS_MANIFEST_PUT_RETRIES` (default `12`) — retries for the final commit; widens the window for the registry's write-visibility lag (`MANIFEST_BLOB_UNKNOWN` / transient 5xx)
 - `HIPPIUS_CHUNKED_WRITE` (default on) — set to `0`/`false` to emit the pre-chunking single-object layout for large files (escape hatch; a reader must be >= 0.6.0 to read a chunked artifact — older readers have no guard and misread it)
 - `HIPPIUS_DEBUG` / `RUST_LOG` (default off) — verbose transport logging (per-chunk timings, retries)
+- `HIPPIUS_EXPERIMENTAL_REPO_TYPES` (default off) — set `1`/`true` to allow `repo_type="dataset"` / `"space"`; off by default because those map to shared registry namespaces a customer access key holds no grants on, so the call is refused up front instead of surfacing a misleading "repository not found"
 - `HIPPIUS_HUB_NO_UPDATE_CHECK` (default off) — set `1`/`true` to skip the CLI's "newer version available" check (auto-skipped when `CI` is set)
 - `HIPPIUS_API_URL` (default `https://api.hippius.com`) — console API base for the `registry` + `models` CLI subtrees
 - `HIPPIUS_TEST_REPO` (default `test/e2e-client`) — only used by the e2e test suite
