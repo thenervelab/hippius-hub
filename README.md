@@ -415,51 +415,58 @@ The suite lives in `smoke/`, **not** `tests/`. `tests/` is a Python package whos
 # Run it locally (from inside smoke/, so rootdir resolves correctly)
 pip install -r smoke/requirements.txt
 cd smoke
-HIPPIUS_TEST_USER='...' HIPPIUS_TEST_PASS='...' HIPPIUS_SMOKE_MODEL_MB=5 pytest -v
+HIPPIUS_SMOKE_USER='...' HIPPIUS_SMOKE_PASS='...' HIPPIUS_TEST_CONSOLE_TOKEN='...' HIPPIUS_SMOKE_MODEL_MB=5 pytest -v
 ```
 
 | Env var | Default | Purpose |
 |---|---|---|
-| `HIPPIUS_SMOKE_REPO` | `$HIPPIUS_TEST_REPO`, else `test/e2e-client` | Namespace the smoke run pushes to. |
+| `HIPPIUS_SMOKE_REPO` | `$HIPPIUS_TEST_REPO`, else `veggies-test/e2e-client` | Namespace the smoke run pushes to. Must be the console token's Harbor project, or the sweep cannot delete what it pushed. |
 | `HIPPIUS_SMOKE_MODEL_MB` | `100` | Size of the synthetic weights file. Lower it for a quick local run. |
 | `HIPPIUS_SMOKE_RETENTION_HOURS` | `6` | How long `smoke-*` revisions survive before the sweep deletes them. |
 
-Each run pushes **freshly random** bytes at a unique `smoke-<timestamp>-<short>` revision. That's not incidental: stored objects are content-addressed, so re-uploading identical bytes would dedup server-side and the "upload" would become a no-op HEAD — the suite would go green without pushing a byte. The cost of that is ~2.4 GB/day of new data, which is why `test_01` sweeps revisions older than the retention window before anything else runs. Only revisions whose names parse as `smoke-<YYYYmmdd-HHMMSS>-…` are touched, so e2e revisions sharing the namespace are never at risk.
+Each run pushes **freshly random** bytes at a unique `smoke-<timestamp>-<short>` revision. That's not incidental: stored objects are content-addressed, so re-uploading identical bytes would dedup server-side and the "upload" would become a no-op HEAD — the suite would go green without pushing a byte. The cost of that is ~2.4 GB/day of new data, which is why `test_01` sweeps revisions older than the retention window before anything else runs. Only revisions whose names parse as `smoke-<YYYYmmdd-HHMMSS>-…` are touched. The hourly job pushes to `veggies-test/e2e-client`, not the e2e repo `test/e2e-client`: the console API deletes only inside the token's own Harbor project (`veggies-test`).
 
 On failure, `scripts/extract_failure_details.py` (ported from `hippius-s3`, so both smoke suites alert identically) turns the pytest JSON report into a Mattermost message naming the test, a plain-language explanation of the error class, and the traceback frame in our own code.
 
 ## CI secrets
 
-Both live workflows draw on the same secrets. The `creds` fixture in `tests/conftest.py:34-45` accepts either the USER+PASS pair (Basic Auth) OR the TOKEN (Bearer) path; if both env vars are empty the `_have_creds()` check returns False and every `@pytest.mark.e2e` test skips cleanly. This is deliberate so PRs from **forks** — which never receive secrets under the `pull_request` trigger by GitHub's default — see the offline suite pass and the live suite skip, rather than a confusing fail.
+The e2e workflow and the hourly smoke workflow use different registry robots. The `creds` fixture in `tests/conftest.py:34-45` accepts either the USER+PASS pair (Basic Auth) OR the TOKEN (Bearer) path; if both env vars are empty the `_have_creds()` check returns False and every `@pytest.mark.e2e` test skips cleanly. This is deliberate so PRs from **forks** — which never receive secrets under the `pull_request` trigger by GitHub's default — see the offline suite pass and the live suite skip, rather than a confusing fail.
 
 The smoke suite behaves the opposite way on purpose: missing credentials are a **hard failure**, not a skip. It only ever runs on a cron with secrets available, and a smoke suite that silently skips is indistinguishable from a green one — precisely the failure mode the job exists to prevent.
 
 | Secret name                  | Status      | Used by        | Purpose |
 |------------------------------|-------------|----------------|---------|
-| `HIPPIUS_TEST_USER`          | recommended | e2e + smoke    | Username for Basic Auth against registry.hippius.com. Paired with HIPPIUS_TEST_PASS. |
-| `HIPPIUS_TEST_PASS`          | recommended | e2e + smoke    | Registry secret paired with HIPPIUS_TEST_USER. |
-| `HIPPIUS_TEST_TOKEN`         | optional    | e2e + smoke    | Bearer token alternative. Useful when rotating to a role-scoped key via `hippius-hub registry keys create --role push`. |
-| `HIPPIUS_TEST_CONSOLE_TOKEN` | recommended | e2e + smoke    | console.hippius.com API token. The smoke suite needs it to delete a single old revision; without it `test_01` skips and old `smoke-*` revisions accumulate. |
+| `HIPPIUS_TEST_USER`          | recommended | e2e            | Username for Basic Auth against registry.hippius.com. Paired with HIPPIUS_TEST_PASS. Robot in Harbor project `test`. |
+| `HIPPIUS_TEST_PASS`          | recommended | e2e            | Registry secret paired with HIPPIUS_TEST_USER. |
+| `HIPPIUS_TEST_TOKEN`         | optional    | e2e            | Bearer token alternative. Useful when rotating to a role-scoped key via `hippius-hub registry keys create --role push`. |
+| `HIPPIUS_SMOKE_USER`         | required    | smoke          | Push robot in Harbor project `veggies-test`, paired with HIPPIUS_SMOKE_PASS. Not the e2e robot. |
+| `HIPPIUS_SMOKE_PASS`         | required    | smoke          | Registry secret paired with HIPPIUS_SMOKE_USER. |
+| `HIPPIUS_SMOKE_TOKEN`        | optional    | smoke          | Bearer alternative to the smoke user/pass pair. |
+| `HIPPIUS_TEST_CONSOLE_TOKEN` | recommended | e2e + smoke    | console.hippius.com API token for the `veggies-test` account. The smoke suite needs it to delete a single old revision; without it `test_01` skips and old `smoke-*` revisions accumulate. |
 | `MATTERMOST_WEBHOOK_URL`     | optional    | smoke          | Where the hourly failure alert is posted. Unset means no notification — the run still goes red in the Actions UI. |
 
 Set them in repo settings under **Settings → Secrets and variables → Actions → Repository secrets**, or via the CLI:
 
 ```bash
-gh secret set HIPPIUS_TEST_USER            # the login printed by `registry keys create`
+gh secret set HIPPIUS_TEST_USER            # the login printed by `registry keys create` (project test)
 gh secret set HIPPIUS_TEST_PASS            # interactive prompt; value won't appear in shell history
 gh secret set HIPPIUS_TEST_TOKEN           # only if using the Bearer path
-gh secret set HIPPIUS_TEST_CONSOLE_TOKEN   # console API token, for the smoke suite's revision sweep
+gh secret set HIPPIUS_SMOKE_USER           # push robot in Harbor project veggies-test
+gh secret set HIPPIUS_SMOKE_PASS
+gh secret set HIPPIUS_SMOKE_TOKEN          # only if using the Bearer path for smoke
+gh secret set HIPPIUS_TEST_CONSOLE_TOKEN   # console API token for the veggies-test account
 gh secret set MATTERMOST_WEBHOOK_URL       # same webhook hippius-s3 posts its smoke alerts to
 ```
 
-**Scope the test credentials to `test/e2e-client` only — never to a production namespace.** That keeps the blast radius of any leak limited to test data. For finer-grained scope, create a role-scoped key:
+**Scope the e2e credentials to `test/e2e-client` only, and the smoke credentials to `veggies-test/e2e-client` only — never to a production namespace.** That keeps the blast radius of any leak limited to test data. The two robots are different Harbor projects: the console API will not delete a tag outside the token's project. For finer-grained scope, create a role-scoped key:
 
 ```bash
 # On the workstation where you're already logged in:
 hippius-hub registry keys create ci-e2e --role push --expires-days 90
-# Use the printed login/secret as HIPPIUS_TEST_USER / HIPPIUS_TEST_PASS.
+# Logged into project test: HIPPIUS_TEST_USER / HIPPIUS_TEST_PASS.
+# Logged into project veggies-test: HIPPIUS_SMOKE_USER / HIPPIUS_SMOKE_PASS.
 ```
 
-The test namespace defaults to `test/e2e-client` (overridable via `HIPPIUS_TEST_REPO`).
+The e2e namespace defaults to `test/e2e-client` (overridable via `HIPPIUS_TEST_REPO`). The hourly smoke namespace defaults to `veggies-test/e2e-client` (overridable via `HIPPIUS_SMOKE_REPO`).
 
 GitHub Actions auto-masks secret values in job logs (they appear as `***`), but a malicious test that explicitly `print()`s a credential could still leak it via the streamed log. Review test changes accordingly.

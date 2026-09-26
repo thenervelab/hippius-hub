@@ -93,7 +93,7 @@ def test_01_cleanup_old_revisions(
         f"deleted, past the {STALE_BACKLOG_LIMIT} threshold — the sweep has been "
         f"failing for roughly a day and the namespace is growing ~100 MiB/hour. "
         f"Check that the console API is up and that HIPPIUS_TEST_CONSOLE_TOKEN "
-        f"still has artifact-delete permission.\n" + "\n".join(unreachable)
+        f"belongs to the Harbor project in {smoke_repo}.\n" + "\n".join(unreachable)
     )
 
 

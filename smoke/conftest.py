@@ -81,12 +81,13 @@ def client_path():
 def smoke_repo():
     """Namespace the smoke run pushes to.
 
-    Defaults to the same `test/e2e-client` repo the e2e suite uses, because the
-    CI robot credentials are scoped to it (README §CI secrets). Smoke revisions
-    are prefixed `smoke-` so the sweep never touches an e2e revision.
+    Defaults to `veggies-test/e2e-client`, the Harbor project that owns
+    `HIPPIUS_TEST_CONSOLE_TOKEN`. The console API deletes only inside the
+    caller's project, so a push into `test/e2e-client` (the e2e robot's
+    project) can never be swept. Smoke revisions are still prefixed `smoke-`.
     """
     return os.environ.get(
-        "HIPPIUS_SMOKE_REPO", os.environ.get("HIPPIUS_TEST_REPO", "test/e2e-client")
+        "HIPPIUS_SMOKE_REPO", os.environ.get("HIPPIUS_TEST_REPO", "veggies-test/e2e-client")
     )
 
 
@@ -107,7 +108,7 @@ def session_revision():
 
 
 @pytest.fixture(scope="session")
-def logged_in(client_path, tmp_path_factory):
+def logged_in(client_path, tmp_path_factory, smoke_repo):
     """Authenticate against the production registry.
 
     Writes the credential to an ephemeral token file rather than the real
@@ -119,12 +120,29 @@ def logged_in(client_path, tmp_path_factory):
     silently skips is indistinguishable from a green one, which is exactly the
     failure mode this job exists to prevent.
     """
-    user = os.environ.get("HIPPIUS_TEST_USER")
-    password = os.environ.get("HIPPIUS_TEST_PASS")
-    token = os.environ.get("HIPPIUS_TEST_TOKEN")
+    # HIPPIUS_SMOKE_* is a robot in the smoke repo's project (veggies-test).
+    # HIPPIUS_TEST_* stays the e2e robot for project `test`. Falling back to it
+    # when the smoke repo is veggies-test pushes into a project that robot
+    # cannot write and that the console token cannot delete.
+    smoke_user = os.environ.get("HIPPIUS_SMOKE_USER") or ""
+    smoke_pass = os.environ.get("HIPPIUS_SMOKE_PASS") or ""
+    smoke_token = os.environ.get("HIPPIUS_SMOKE_TOKEN") or ""
+    if smoke_user or smoke_pass or smoke_token:
+        user, password, token = smoke_user, smoke_pass, smoke_token
+    elif smoke_repo.split("/", 1)[0] == "veggies-test":
+        raise RuntimeError(
+            f"Smoke repo is {smoke_repo}. Set HIPPIUS_SMOKE_USER + "
+            "HIPPIUS_SMOKE_PASS, or HIPPIUS_SMOKE_TOKEN, to a push robot in "
+            "Harbor project veggies-test. HIPPIUS_TEST_* is the e2e robot for "
+            "project test and cannot push or be cleaned up here."
+        )
+    else:
+        user = os.environ.get("HIPPIUS_TEST_USER")
+        password = os.environ.get("HIPPIUS_TEST_PASS")
+        token = os.environ.get("HIPPIUS_TEST_TOKEN")
     if not token and not (user and password):
         raise RuntimeError(
-            "Set HIPPIUS_TEST_USER + HIPPIUS_TEST_PASS, or HIPPIUS_TEST_TOKEN. "
+            "Set HIPPIUS_SMOKE_USER + HIPPIUS_SMOKE_PASS, or HIPPIUS_SMOKE_TOKEN. "
             "The production smoke suite must never run unauthenticated."
         )
 
