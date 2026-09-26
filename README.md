@@ -420,7 +420,7 @@ HIPPIUS_SMOKE_USER='...' HIPPIUS_SMOKE_PASS='...' HIPPIUS_TEST_CONSOLE_TOKEN='..
 
 | Env var | Default | Purpose |
 |---|---|---|
-| `HIPPIUS_SMOKE_REPO` | `$HIPPIUS_TEST_REPO`, else `veggies-test/e2e-client` | Namespace the smoke run pushes to. Must be the console token's Harbor project, or the sweep cannot delete what it pushed. |
+| `HIPPIUS_SMOKE_REPO` | `veggies-test/e2e-client` | Namespace the smoke run pushes to. Must be the console token's Harbor project. `HIPPIUS_TEST_REPO` is the e2e suite only and is not read here. |
 | `HIPPIUS_SMOKE_MODEL_MB` | `100` | Size of the synthetic weights file. Lower it for a quick local run. |
 | `HIPPIUS_SMOKE_RETENTION_HOURS` | `6` | How long `smoke-*` revisions survive before the sweep deletes them. |
 
