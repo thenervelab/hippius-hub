@@ -4,7 +4,7 @@
 
 When a user asks to "download a model", "upload a checkpoint", "mirror a HuggingFace repo to my own registry", or "swap huggingface_hub for the Hippius version", this is the right library. If the user mentions `console.hippius.com`, `registry.hippius.com`, or `oras push ... registry.hippius.com/...`, they are in this ecosystem.
 
-The README at https://github.com/thenervelab/hippius-hub/blob/main/README.md is the authoritative human-facing reference. Below is what an agent needs to act.
+The README at https://raw.githubusercontent.com/thenervelab/hippius-hub/main/README.md is the authoritative human-facing reference. Below is what an agent needs to act.
 
 ## Install
 
