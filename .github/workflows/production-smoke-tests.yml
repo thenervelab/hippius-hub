@@ -72,9 +72,13 @@ jobs:
         timeout-minutes: 20
         working-directory: smoke
         env:
-          HIPPIUS_TEST_USER: ${{ secrets.HIPPIUS_TEST_USER }}
-          HIPPIUS_TEST_PASS: ${{ secrets.HIPPIUS_TEST_PASS }}
-          HIPPIUS_TEST_TOKEN: ${{ secrets.HIPPIUS_TEST_TOKEN }}
+          # Push and delete must share one Harbor project. The console token
+          # can only delete inside veggies-test. HIPPIUS_TEST_* is the e2e
+          # robot for project test and is intentionally not used here.
+          HIPPIUS_SMOKE_REPO: veggies-test/e2e-client
+          HIPPIUS_SMOKE_USER: ${{ secrets.HIPPIUS_SMOKE_USER }}
+          HIPPIUS_SMOKE_PASS: ${{ secrets.HIPPIUS_SMOKE_PASS }}
+          HIPPIUS_SMOKE_TOKEN: ${{ secrets.HIPPIUS_SMOKE_TOKEN }}
           HIPPIUS_TEST_CONSOLE_TOKEN: ${{ secrets.HIPPIUS_TEST_CONSOLE_TOKEN }}
         run: |
           mkdir -p "$GITHUB_WORKSPACE/reports"
