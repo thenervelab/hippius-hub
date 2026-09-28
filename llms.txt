@@ -122,6 +122,8 @@ hippius-hub diagnose <project>/<repo> <filename> [--revision <tag>] [--probe-mb 
 
 A **namespace** is the first segment of every repo path — `myns/qwen-7b`. Each user gets their own namespace via `provision`. Without it, pushes fail with auth errors because there's no quota or credential to back them.
 
+The Free plan still requires credits on the account before that namespace can be created. `REGISTRY_MIN_CREDITS` is 10. It is a spam check. An account with a zero balance is refused, and the error does not say "top up". Top up at https://console.hippius.com (Billing) so the balance is at least 10 credits, then run `provision`. The plan price stays zero. https://docs.hippius.com/use/console/hub and https://docs.hippius.com/use/console/billing
+
 ```bash
 # 1. Check the name is available (lowercase alnum + dash, 1-63 chars)
 hippius-hub registry check myns
@@ -312,3 +314,5 @@ The `endpoint=` kwarg on every function lets you point at an alternative Hippius
 - "I want to manage my namespace, plan, docker creds" → CLI `hippius-hub registry ...`
 - "I want to search/browse models by architecture/quantization/etc." → CLI `hippius-hub models ...` or `from hippius_hub import console; console.models_list(...)`
 - "I'm running a script that already uses `huggingface_hub`" → change the import line, log in once, done
+
+Human guides on the docs site: https://docs.hippius.com/registry (quickstart), https://docs.hippius.com/registry/push, https://docs.hippius.com/registry/pull, https://docs.hippius.com/registry/cli, and the console Hub page https://docs.hippius.com/use/console/hub. Documentation home: https://docs.hippius.com
