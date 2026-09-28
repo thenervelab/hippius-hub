@@ -81,13 +81,12 @@ def client_path():
 def smoke_repo():
     """Namespace the smoke run pushes to.
 
-    Defaults to the same `test/e2e-client` repo the e2e suite uses, because the
-    CI robot credentials are scoped to it (README §CI secrets). Smoke revisions
-    are prefixed `smoke-` so the sweep never touches an e2e revision.
+    Defaults to `veggies-test/e2e-client`, the Harbor project that owns
+    `HIPPIUS_TEST_CONSOLE_TOKEN`. The console API deletes only inside the
+    caller's project, so a push into `test/e2e-client` (the e2e robot's
+    project) can never be swept. Smoke revisions are still prefixed `smoke-`.
     """
-    return os.environ.get(
-        "HIPPIUS_SMOKE_REPO", os.environ.get("HIPPIUS_TEST_REPO", "test/e2e-client")
-    )
+    return os.environ.get("HIPPIUS_SMOKE_REPO", "veggies-test/e2e-client")
 
 
 @pytest.fixture(scope="session")
@@ -107,7 +106,7 @@ def session_revision():
 
 
 @pytest.fixture(scope="session")
-def logged_in(client_path, tmp_path_factory):
+def logged_in(client_path, tmp_path_factory, smoke_repo):
     """Authenticate against the production registry.
 
     Writes the credential to an ephemeral token file rather than the real
@@ -119,13 +118,17 @@ def logged_in(client_path, tmp_path_factory):
     silently skips is indistinguishable from a green one, which is exactly the
     failure mode this job exists to prevent.
     """
-    user = os.environ.get("HIPPIUS_TEST_USER")
-    password = os.environ.get("HIPPIUS_TEST_PASS")
-    token = os.environ.get("HIPPIUS_TEST_TOKEN")
+    # Never HIPPIUS_TEST_*. That robot's project is `test`, and the console
+    # token cannot delete what it pushes.
+    user = os.environ.get("HIPPIUS_SMOKE_USER")
+    password = os.environ.get("HIPPIUS_SMOKE_PASS")
+    token = os.environ.get("HIPPIUS_SMOKE_TOKEN")
     if not token and not (user and password):
         raise RuntimeError(
-            "Set HIPPIUS_TEST_USER + HIPPIUS_TEST_PASS, or HIPPIUS_TEST_TOKEN. "
-            "The production smoke suite must never run unauthenticated."
+            f"Smoke repo is {smoke_repo}. Set HIPPIUS_SMOKE_USER + "
+            "HIPPIUS_SMOKE_PASS, or HIPPIUS_SMOKE_TOKEN, to a push robot in "
+            "that Harbor project. Do not use HIPPIUS_TEST_*: that robot is "
+            "scoped to project test, and the console token cannot delete there."
         )
 
     token_file = tmp_path_factory.mktemp("hippius-smoke") / "token"

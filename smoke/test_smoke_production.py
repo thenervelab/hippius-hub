@@ -88,12 +88,27 @@ def test_01_cleanup_old_revisions(
     if unreachable:
         print(f"Cleanup could not delete {len(unreachable)}: " + "; ".join(unreachable))
 
+    # The console API answers 204 when Harbor 404s, so a raised-exception check
+    # cannot see a delete that did not remove the tag.
+    if stale:
+        refs_after = hippius_hub.list_repo_refs(smoke_repo)
+        still_there = {r.name for r in refs_after.tags} | {b.name for b in refs_after.branches}
+        remaining = [r for r in stale if r in still_there]
+        shown = ", ".join(remaining[:20])
+        if len(remaining) > 20:
+            shown += f" (+{len(remaining) - 20} more)"
+        assert not remaining, (
+            f"delete_artifact reported success but {len(remaining)} tag(s) are "
+            f"still listed on {smoke_repo}: {shown}. The console token's Harbor "
+            f"project does not own this repo, or the API swallowed a Harbor 404."
+        )
+
     assert len(unreachable) < STALE_BACKLOG_LIMIT, (
         f"{len(unreachable)} stale smoke revisions in {smoke_repo} could not be "
         f"deleted, past the {STALE_BACKLOG_LIMIT} threshold — the sweep has been "
         f"failing for roughly a day and the namespace is growing ~100 MiB/hour. "
         f"Check that the console API is up and that HIPPIUS_TEST_CONSOLE_TOKEN "
-        f"still has artifact-delete permission.\n" + "\n".join(unreachable)
+        f"belongs to the Harbor project in {smoke_repo}.\n" + "\n".join(unreachable)
     )
 
 
