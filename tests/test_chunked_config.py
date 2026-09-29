@@ -113,3 +113,38 @@ def test_verify_hash_enabled_by_default(monkeypatch):
 def test_verify_hash_disabled_by_falsy_values(monkeypatch, value):
     monkeypatch.setenv("HIPPIUS_VERIFY_HASH", value)
     assert resolve_verify_hash() is False
+
+
+_PACK_CAP = MAX_PACK_BYTES - FASTCDC_MAXIMUM_MAX
+
+
+@pytest.mark.parametrize("raw", [str(_PACK_CAP - 1), str(_PACK_CAP), "1", str(DEFAULT_PACK_SIZE)])
+def test_pack_size_accepts_values_up_to_and_including_the_cap(monkeypatch, raw):
+    monkeypatch.setenv("HIPPIUS_PACK_SIZE", raw)
+    assert resolve_pack_size() == int(raw)
+
+
+@pytest.mark.parametrize("raw", [str(_PACK_CAP + 1), str(MAX_PACK_BYTES + 1), str(2**40)])
+def test_pack_size_rejects_every_value_over_the_cap(monkeypatch, raw):
+    monkeypatch.setenv("HIPPIUS_PACK_SIZE", raw)
+    with pytest.raises(ValueError, match="overshoot"):
+        resolve_pack_size()
+
+
+@pytest.mark.parametrize("raw", ["0", "-1", "-67108864"])
+def test_pack_size_rejects_non_positive_values(monkeypatch, raw):
+    monkeypatch.setenv("HIPPIUS_PACK_SIZE", raw)
+    with pytest.raises(ValueError, match="positive"):
+        resolve_pack_size()
+
+
+@pytest.mark.parametrize("raw", ["64M", "abc", "1.5", "0x40", " "])
+def test_pack_size_rejects_non_numeric_values(monkeypatch, raw):
+    monkeypatch.setenv("HIPPIUS_PACK_SIZE", raw)
+    with pytest.raises(ValueError):
+        resolve_pack_size()
+
+
+def test_pack_size_blank_falls_back_to_the_default(monkeypatch):
+    monkeypatch.setenv("HIPPIUS_PACK_SIZE", "")
+    assert resolve_pack_size() == DEFAULT_PACK_SIZE

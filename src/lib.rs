@@ -512,8 +512,9 @@ fn diagnose_blob_native(
 ///
 /// # Arguments
 /// - `uploads_url`: the repo's `.../blobs/uploads/` endpoint; this call does the
-///   POST-init + monolithic PUT itself (a new pack is never dedup-HEADed - its
-///   content is new by construction).
+///   POST-init + monolithic PUT itself. Identical concurrent packs share one
+///   PUT, and a digest this process already landed is probed with a `HEAD`
+///   first — see `uploader::pack::pack_upload_async`.
 /// - `path`: local source file.
 /// - `ranges`: `(offset, length)` byte ranges to concatenate, in pack order.
 /// - `auth_token`: optional bearer token.

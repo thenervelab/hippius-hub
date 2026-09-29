@@ -839,9 +839,7 @@ def _cmd_download(args):
         )
         print(f"✅ File downloaded to: {path}")
     except Exception as e:
-        msg, code = _format_download_error(e)
-        print(msg)
-        sys.exit(code)
+        _exit_with_download_error(e)
 
 
 def _cmd_upload(args):
@@ -851,9 +849,7 @@ def _cmd_upload(args):
     try:
         hippius_hub_upload(repo_id=args.repo_id, local_path=args.local_path, revision=args.revision)
     except Exception as e:
-        msg, code = _format_download_error(e)
-        print(msg)
-        sys.exit(code)
+        _exit_with_download_error(e)
 
 
 def _cmd_diagnose(args):
@@ -900,6 +896,13 @@ def _cmd_login(args):
     except ValueError as e:
         print(f"❌ Login failed: {e}")
         sys.exit(1)
+
+
+def _exit_with_download_error(e: Exception) -> None:
+    """Print `_format_download_error`'s message and exit with its code."""
+    msg, code = _format_download_error(e)
+    print(msg)
+    sys.exit(code)
 
 
 def _handle_console_error(e: ConsoleError) -> None:
@@ -960,9 +963,7 @@ def main():
         try:
             handlers[args.command](args)
         except (HfHubHTTPError, EntryNotFoundError, NotImplementedError) as e:
-            msg, code = _format_download_error(e)
-            print(msg)
-            sys.exit(code)
+            _exit_with_download_error(e)
         return
     if args.command in ("registry", "models"):
         if not hasattr(args, "func"):
@@ -973,9 +974,7 @@ def main():
         except ConsoleError as e:
             _handle_console_error(e)
         except NotImplementedError as e:
-            msg, code = _format_download_error(e)
-            print(msg)
-            sys.exit(code)
+            _exit_with_download_error(e)
         return
     parser.print_help()
     sys.exit(1)

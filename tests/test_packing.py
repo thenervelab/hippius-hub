@@ -314,3 +314,110 @@ def test_accumulator_rejects_nonpositive_pack_size():
         PackAccumulator({}, pack_size=0)
     with pytest.raises(ValueError):
         plan_packs([], {}, pack_size=-1)
+
+
+# ---- intra-file self-dedup (0.7.2): repeats across pack boundaries ----
+
+
+def test_digest_repeated_three_times_across_pack_boundaries_is_stored_once():
+    """`a` occurs four times spread over three packs (pack_size=10 closes a
+    pack per new chunk). Only its FIRST occurrence lands in a pack; every later
+    pointer entry points back at pack 0 / offset 0 - including one that arrives
+    after two other packs have closed and one that closes the file."""
+    a, b, c = _digest(b"a"), _digest(b"b"), _digest(b"c")
+    chunks = [(a, 10, 0), (b, 10, 10), (a, 10, 20), (c, 10, 30), (a, 10, 40), (a, 10, 50)]
+    for plan in (plan_packs(chunks, {}, 10), _feed_all(chunks, {}, 10)):
+        assert [np.ranges for np in plan.new_packs] == [((0, 10),), ((10, 10),), ((30, 10),)]
+        assert [p.new_pack_index for p in plan.planned] == [0, 1, 0, 2, 0, 0]
+        assert [p.pack_offset for p in plan.planned] == [0] * 6
+        assert all(p.pack_digest is None for p in plan.planned)
+        assert [p.chunk_digest for p in plan.planned] == [a, b, a, c, a, a]
+
+
+def test_trailing_repeats_do_not_emit_an_empty_final_pack():
+    """Once the only pack has closed, the remaining chunks are all repeats:
+    `finish()` must not flush an empty pack, and the streaming caller's
+    `new_packs[n_emitted:]` tail must be empty."""
+    a, b = _digest(b"a"), _digest(b"b")
+    chunks = [(a, 10, 0), (b, 5, 10), (a, 10, 15), (b, 5, 25)]
+    acc = PackAccumulator({}, pack_size=15)
+    emitted = []
+    for chunk in chunks:
+        emitted.extend(acc.feed(chunk))
+    assert emitted == [NewPack(((0, 10), (10, 5)))]
+    plan = acc.finish()
+    assert plan.new_packs == (NewPack(((0, 10), (10, 5))),)
+    assert plan.new_packs[len(emitted):] == ()
+    assert [(p.new_pack_index, p.pack_offset) for p in plan.planned] == [
+        (0, 0), (0, 10), (0, 0), (0, 10),
+    ]
+    assert plan == plan_packs(chunks, {}, 15)
+
+
+def test_repeat_inside_the_final_partial_pack_reuses_its_offset():
+    a, b, c = _digest(b"a"), _digest(b"b"), _digest(b"c")
+    chunks = [(a, 10, 0), (b, 5, 10), (c, 3, 15), (b, 5, 18)]
+    plan = plan_packs(chunks, {}, pack_size=100)
+    assert plan.new_packs == (NewPack(((0, 10), (10, 5), (15, 3))),)
+    assert [(p.new_pack_index, p.pack_offset) for p in plan.planned] == [
+        (0, 0), (0, 10), (0, 15), (0, 10),
+    ]
+
+
+def test_repeat_of_a_pack_closing_chunk_does_not_reopen_that_pack():
+    """The repeat of the chunk that closed pack 0 must reference pack 0 at its
+    original offset, not be appended to the now-open pack 1."""
+    a, b = _digest(b"a"), _digest(b"b")
+    chunks = [(b, 4, 0), (a, 6, 4), (a, 6, 10), (b, 4, 16)]
+    plan = plan_packs(chunks, {}, pack_size=10)
+    assert plan.new_packs == (NewPack(((0, 4), (4, 6))),)
+    assert [(p.new_pack_index, p.pack_offset) for p in plan.planned] == [
+        (0, 0), (0, 4), (0, 4), (0, 0),
+    ]
+
+
+def test_prior_revision_index_wins_over_an_intra_file_repeat():
+    """A digest the prior revision already holds is reused from the index on
+    EVERY occurrence; the intra-file `_seen` map never learns it, so no new
+    pack is opened for it."""
+    a = _digest(b"a")
+    dedup = {a: (_digest(b"oldpack"), 77)}
+    chunks = [(a, 10, 0), (a, 10, 10), (a, 10, 20)]
+    for plan in (plan_packs(chunks, dedup, 1000), _feed_all(chunks, dedup, 1000)):
+        assert plan.new_packs == ()
+        assert all(p.new_pack_index is None for p in plan.planned)
+        assert [(p.pack_digest, p.pack_offset) for p in plan.planned] == [
+            (_digest(b"oldpack"), 77)] * 3
+
+
+def test_size_mismatch_on_a_later_occurrence_raises_before_sealing():
+    a = _digest(b"a")
+    acc = PackAccumulator({}, pack_size=1000)
+    acc.feed((a, 10, 0))
+    acc.feed((a, 10, 10))
+    with pytest.raises(ValueError, match="size 9 != first occurrence 10"):
+        acc.feed((a, 9, 20))
+
+
+def test_resolve_pointer_chunks_points_every_repeat_at_the_one_stored_copy():
+    a, b = _digest(b"a"), _digest(b"b")
+    chunks = [(a, 10, 0), (b, 5, 10), (a, 10, 15), (a, 10, 25)]
+    plan = plan_packs(chunks, {}, pack_size=10)
+    resolved = resolve_pointer_chunks(plan, [_digest(b"p0"), _digest(b"p1")])
+    assert resolved == (
+        (a, 10, _digest(b"p0"), 0),
+        (b, 5, _digest(b"p1"), 0),
+        (a, 10, _digest(b"p0"), 0),
+        (a, 10, _digest(b"p0"), 0),
+    )
+
+
+def test_feed_after_finish_still_raises_for_a_repeat():
+    """A repeat is resolved from `_seen` without touching the open pack, but
+    the sealed-plan guard must still fire first."""
+    a = _digest(b"a")
+    acc = PackAccumulator({}, pack_size=1000)
+    acc.feed((a, 10, 0))
+    acc.finish()
+    with pytest.raises(RuntimeError):
+        acc.feed((a, 10, 10))

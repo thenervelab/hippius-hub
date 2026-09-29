@@ -325,12 +325,13 @@ Existing code that catches HF's exceptions keeps working.
 | `HIPPIUS_CHUNK_THRESHOLD` | `268435456` (256 MiB) | Files at or above this size upload as content-defined chunks; below it, a single object |
 | `HIPPIUS_CDC_AVG_SIZE` | `4194304` (4 MiB) | FastCDC average chunk size — 4 MiB is fastcdc's max (larger is rejected); part of the layout wire contract |
 | `HIPPIUS_UPLOAD_CHUNK_SIZE` | `16777216` (16 MiB) | Per-request chunk size for resumable single-object uploads (resume granularity on a transient failure) |
-| `HIPPIUS_PACK_SIZE` | `67108864` (64 MiB) | Target size of a content-addressed pack (many CDC chunks per pack) |
+| `HIPPIUS_PACK_SIZE` | `67108864` (64 MiB) | Target size of a content-addressed pack (many CDC chunks per pack). Rejected above `1056964608` (1 GiB − 16 MiB): a pack may overshoot the target by one 16 MiB chunk and the reader caps a pack at 1 GiB |
 | `HIPPIUS_MAX_INFLIGHT_PACKS` | `HIPPIUS_UPLOAD_WORKERS` (8) | Process-wide cap on concurrent pack uploads across all files — each in-flight pack is resident in memory (~`HIPPIUS_PACK_SIZE`), so this bounds peak memory. Raising it alone is a no-op for a single file (the per-file pool stays at `HIPPIUS_UPLOAD_WORKERS`); raise both to go wider |
 | `HIPPIUS_BLOB_REUPLOAD_RETRIES` | `2` | Extra whole-upload retries when the registry reports a just-committed object as missing (`BLOB_UNKNOWN`) |
 | `HIPPIUS_MANIFEST_PUT_RETRIES` | `12` | Retries for the final commit — widens the window for the registry's write-visibility lag (`MANIFEST_BLOB_UNKNOWN` / transient 5xx) without a release |
 | `HIPPIUS_CHUNKED_WRITE` | on | Set `0`/`false` to store large files in the pre-chunking single-object layout. Default on as of 0.6.0 — a reader must be ≥ 0.6.0 to read a chunked artifact |
 | `HIPPIUS_DEBUG` / `RUST_LOG` | off | Verbose transport logging (per-chunk timings, retries) |
+| `HIPPIUS_EXPERIMENTAL_REPO_TYPES` | off | Set `1`/`true` to allow `repo_type="dataset"` / `"space"`. Off by default: those map to shared registry namespaces a customer access key holds no grants on, so the call is refused up front instead of failing with a misleading "repository not found" |
 | `HIPPIUS_HUB_NO_UPDATE_CHECK` | off | Set `1`/`true` to skip the CLI's "newer version available" check (auto-skipped when `CI` is set) |
 | `HIPPIUS_API_URL` | `https://api.hippius.com` | Console API base used by the `registry` + `models` CLI subtrees |
 | `HIPPIUS_TEST_REPO` | `test/e2e-client` | Override the test repo used by the e2e suite |
