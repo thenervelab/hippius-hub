@@ -35,7 +35,7 @@ thiserror = "2.0"
 # hand-roll it. `StreamCDC` chunks a `Read` in bounded memory (no whole-file load).
 # 4.0.0 moved cut points for non-power-of-two averages; 4.0.1 restored the 3.x
 # boundaries, so the floor is 4.0.1 (verified boundary-identical to 3.2.1).
-fastcdc = "4.0.1"
+fastcdc = "5.0.0"
 # Diagnostics probe (src/diagnostics.rs) serializes its DiagnosticReport into
 # a JSON string handed back to Python.
 serde = { version = "1", features = ["derive"] }
