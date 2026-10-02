@@ -2,7 +2,7 @@
 # Copy Hugging Face models into a public Hippius namespace and a private one.
 # Works on macOS and Linux (POSIX sh, no macOS-only commands).
 #
-#   pip install -U "huggingface_hub[cli]" hippius_hub
+#   pip install "hippius_hub>=0.7" "huggingface_hub>=1,<2"
 #   hf auth login
 #   hippius-hub login --hippius-token <token-from-console.hippius.com>
 #   sh mirror-hf-namespaces.sh --public my-models
@@ -57,8 +57,12 @@ robot_matches() {
 }
 
 read_me() {
-  me_project=$(hippius-hub registry me | awk '/^Project:/ { print $2; exit }')
-  me_public=$(hippius-hub registry me | awk '/^Public:/ { print $2; exit }')
+  me_out=$(hippius-hub registry me) || {
+    echo "Could not read the active project from 'hippius-hub registry me'." >&2
+    exit 1
+  }
+  me_project=$(printf '%s\n' "$me_out" | awk '/^Project:/ { print $2; exit }')
+  me_public=$(printf '%s\n' "$me_out" | awk '/^Public:/ { print $2; exit }')
 }
 
 show_provlog() {
@@ -105,11 +109,6 @@ wait_active() {
 stash_login() {
   cp "$1" "$stash_dir/$2"
   chmod 600 "$stash_dir/$2"
-}
-
-remember_visibility() {
-  printf '%s\n' "$2" > "$stash_dir/$1.visibility"
-  chmod 600 "$stash_dir/$1.visibility"
 }
 
 # Provision $1 if needed and remember its registry login. Sets last_created
@@ -189,21 +188,11 @@ set_visibility() {
         exit 1
       fi
     fi
-    remember_visibility "$ns" "$want"
     return 0
   fi
 
-  saved=
-  if [ -f "$stash_dir/$ns.visibility" ]; then
-    saved=$(cat "$stash_dir/$ns.visibility")
-  fi
-  if [ "$saved" = "$want" ]; then
-    echo "Keeping $ns $want. The active project is ${me_project:-unknown}."
-    return 0
-  fi
   if [ "$want" = "public" ] && [ "$created" = 1 ]; then
     echo "$ns is new, so it is public."
-    remember_visibility "$ns" "public"
     return 0
   fi
   if [ "$want" = "private" ]; then
@@ -213,6 +202,14 @@ set_visibility() {
     exit 1
   fi
   echo "Left the visibility of $ns unchanged. The active project is ${me_project:-none}."
+}
+
+confirm_private() {
+  read_me
+  if [ "$me_project" != "$1" ] || [ "$me_public" != "False" ]; then
+    echo "Cannot confirm $1 is private. The active project is ${me_project:-none}. Stopped before copying." >&2
+    exit 1
+  fi
 }
 
 activate_ns() {
@@ -399,18 +396,14 @@ if [ "$do_private" = 1 ]; then
   ensure_robot "$private_ns"
   private_created=$last_created
   set_visibility "$private_ns" private "$private_created"
+  confirm_private "$private_ns"
+  copy_list "$private_ns" "$privf"
+  echo "Copied $priv_n private models to $private_ns."
 fi
 if [ "$do_public" = 1 ]; then
   ensure_robot "$public_ns"
   public_created=$last_created
   set_visibility "$public_ns" public "$public_created"
-fi
-
-if [ "$do_private" = 1 ]; then
-  copy_list "$private_ns" "$privf"
-  echo "Copied $priv_n private models to $private_ns."
-fi
-if [ "$do_public" = 1 ]; then
   copy_list "$public_ns" "$pubf"
   echo "Copied $pub_n public models to $public_ns."
 fi
