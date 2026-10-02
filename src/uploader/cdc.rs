@@ -685,7 +685,7 @@ mod cdc_tests {
         let outcome = run_chunk_pipeline(FailAfter { remaining: 5000 }, AVG, 3, |out_rx| {
             for msg in out_rx {
                 match msg {
-                    PipelineMsg::Batch(batch) => assert!(!batch.is_empty()),
+                    PipelineMsg::Batch(batch) => assert_ne!(batch, vec![]),
                     PipelineMsg::Done { whole_hex } => {
                         unreachable!("must not report success past a read failure: {whole_hex}")
                     }
