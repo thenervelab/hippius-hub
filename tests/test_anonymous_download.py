@@ -42,6 +42,26 @@ def _point_registry_at_mock(monkeypatch):
     monkeypatch.setattr("hippius_hub.auth.DEFAULT_REGISTRY_URL", REGISTRY)
 
 
+@pytest.fixture(autouse=True)
+def _no_saved_login_token(monkeypatch):
+    """Pin the saved-login lookup to None so these tests describe only `token=`.
+
+    `resolve_token_value(None)` ends in `get_token()`, which reads
+    `~/.cache/hippius/hub/token`. In `get_oci_bearer_token` the docker-config
+    fallback is guarded by `if not effective_token and not no_auth:` — so on a
+    machine with a saved login token, `effective_token` is truthy and the docker
+    branch is skipped entirely. `test_token_none_does_consult_docker_auth` then
+    fails, having asserted a property that only holds when no login token exists.
+
+    Clearing it here restores the condition the test means to describe (no
+    caller preference AND no stored credential -> docker is consulted) rather
+    than weakening the assertion. NB this is test isolation only: the real
+    precedence (saved login token beats docker config) is deliberately left
+    unchanged — nothing in this fixture alters production behavior.
+    """
+    monkeypatch.setattr("hippius_hub.auth.get_token", lambda: None)
+
+
 @pytest.fixture
 def stub_blob_download(monkeypatch):
     """Replace download_file_native so the Rust extension isn't exercised.

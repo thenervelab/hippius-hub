@@ -21,6 +21,7 @@ from .constants import (
     DEFAULT_CACHE_DIR,
     DEFAULT_HTTP_TIMEOUT,
     PACK_MEDIA_TYPE,
+    experimental_repo_types_enabled,
     resolve_chunk_size,
     resolve_connect_timeout,
     resolve_max_concurrent,
@@ -122,6 +123,19 @@ def _oci_repo_path(repo_id: str, repo_type: Optional[str]) -> str:
     if repo_type in (None, "model"):
         return repo_id
     if repo_type in ("dataset", "space"):
+        # The datasets/spaces prefixes land in shared registry namespaces that
+        # customer access keys hold no grants on, so every real-world call 401s
+        # and gets surfaced as a bogus RepositoryNotFoundError. Refuse up front
+        # until per-user namespaces exist; CI opts in to keep exercising the
+        # mapping against its seeded projects.
+        if not experimental_repo_types_enabled():
+            raise NotImplementedError(
+                f"repo_type={repo_type!r} is not supported on Hippius yet — "
+                f"your access key has no permissions on the shared {repo_type} "
+                "namespace, so the operation would fail. Omit repo_type: repos "
+                "are namespaced under your own project, e.g. 'my-namespace/my-repo'. "
+                "(Set HIPPIUS_EXPERIMENTAL_REPO_TYPES=1 to override.)"
+            )
         prefix = f"{repo_type}s"  # datasets, spaces
         if repo_id.startswith(f"{prefix}/"):
             raise ValueError(
@@ -335,7 +349,6 @@ def hf_hub_download(
     if subfolder:
         filename = f"{subfolder}/{filename}"
 
-    oci_repo = _oci_repo_path(repo_id, repo_type)
     paths = _resolve_dest_paths(
         repo_id=repo_id,
         filename=filename,
@@ -353,6 +366,11 @@ def hf_hub_download(
             f"and local_files_only=True"
         )
 
+    # Resolved only once we know the registry will be contacted: the
+    # dataset/space gate inside is about registry permissions, so a cache hit
+    # or local_files_only must keep working exactly as snapshot_download and
+    # try_to_load_from_cache do.
+    oci_repo = _oci_repo_path(repo_id, repo_type)
     registry = resolve_registry(endpoint)
 
     # Refresh the OCI token and retry once on a 401 (audit M2): a token minted here

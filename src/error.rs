@@ -27,30 +27,30 @@ pub type Result<T> = std::result::Result<T, CoreError>;
 /// # Stability
 ///
 /// `Reqwest`, `Io`, `ServerError`, `ChunkFailed`, `JoinFailed`, and
-/// `MissingContentLength` are stable contracts — callers may match on
+/// `MissingContentLength` are stable contracts - callers may match on
 /// them. Future variants gated by `#[non_exhaustive]` may be added in
 /// any release; do not match exhaustively without a wildcard arm if
 /// you depend on forward compatibility.
 ///
 /// # Source chain
 ///
-/// `Reqwest`, `Io`, `ChunkFailed`, and `JoinFailed` preserve the
-/// underlying cause via `std::error::Error::source()` (wired by
+/// `Reqwest`, `Io`, `ChunkFailed`, `JoinFailed`, and `SessionRestart`
+/// preserve the underlying cause via `std::error::Error::source()` (wired by
 /// `thiserror`'s `#[from]` / `#[source]` attributes). Walk the chain
 /// with `let mut cur = err.source(); while let Some(s) = cur { ...; cur
-/// = s.source(); }` — exactly what `lib.rs::core_err_to_py` does at
+/// = s.source(); }` - exactly what `lib.rs::core_err_to_py` does at
 /// the Python boundary.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum CoreError {
-    /// HTTP transport error from reqwest — connect failure, read
+    /// HTTP transport error from reqwest - connect failure, read
     /// timeout, TLS handshake, mid-stream error, etc. The reqwest
     /// `Error` is preserved as the cause so callers can downcast to
     /// inspect (`err.is_timeout()`, `err.status()`).
     #[error("HTTP transport error")]
     Reqwest(#[from] reqwest::Error),
 
-    /// Local I/O error from the standard library — file open, read,
+    /// Local I/O error from the standard library - file open, read,
     /// write, seek, sync. The `io::Error` is preserved in the cause
     /// chain; check `io_err.kind()` for `ErrorKind::NotFound` and
     /// similar branch points.
@@ -74,7 +74,7 @@ pub enum CoreError {
     ChunkFailed {
         /// 0-based index of the chunk in the parent file.
         index: usize,
-        /// Inner cause — typically `Reqwest`, `Io`, or `ServerError`.
+        /// Inner cause - typically `Reqwest`, `Io`, or `ServerError`.
         /// Never another `ChunkFailed`: the orchestrator builds this
         /// variant once, on the first failure to escape its inner
         /// retry loop.
@@ -82,12 +82,14 @@ pub enum CoreError {
         source: Box<CoreError>,
     },
 
-    /// A `tokio::spawn`'d chunk task panicked or was aborted before
-    /// completion. `index` is `None` when the join error fired
+    /// A spawned task - a `tokio::spawn`'d chunk/pack task or a
+    /// `spawn_blocking` hash/scatter closure - panicked or was aborted
+    /// before completion. `index` is `None` when the join error fired
     /// before the `(i, res)` tuple was constructed inside the task
-    /// body — the chunk identity is then lost in the join layer, and
-    /// no caller can recover it. `Some(i)` is unused today (the
-    /// downloader only sees the chunkless case) but reserved for
+    /// body - the chunk identity is then lost in the join layer, and
+    /// no caller can recover it - and at the `spawn_blocking` sites,
+    /// where no chunk index is in scope. `Some(i)` is unused today
+    /// (every constructor sees the indexless case) but reserved for
     /// future failure modes where the spawn site has the index.
     /// Reserved instead of dropped so the field type encodes the
     /// "identity may be unknown" invariant rather than a sentinel
@@ -111,7 +113,7 @@ pub enum CoreError {
     /// to proceed: a missing header is qualitatively different from
     /// `Content-Length: 0` (an explicitly empty blob), and silently
     /// treating it as zero would truncate the destination file to 0
-    /// bytes — the audit D3 regression this variant was introduced
+    /// bytes - the audit D3 regression this variant was introduced
     /// to prevent. Unit variant: the failure IS the absence; there
     /// is no inspectable field a caller could use beyond the
     /// discriminant.
@@ -121,7 +123,7 @@ pub enum CoreError {
     /// A downloaded chunk (or the assembled whole file) did not match its
     /// content-addressed digest or its declared byte length. Distinct from
     /// `ServerError`: transport succeeded and the bytes arrived, but they are
-    /// the *wrong* bytes — so a content-addressed blob will serve the same
+    /// the *wrong* bytes - so a content-addressed blob will serve the same
     /// wrong bytes on retry (see `is_retryable`, which classifies this
     /// permanent). The string carries the offending context (chunk offset /
     /// "assembled file") plus expected-vs-got so the Python side can surface a
@@ -136,7 +138,7 @@ pub enum CoreError {
     /// `connect_timeout` passed) and keeps the connection alive at the TCP layer
     /// (so `tcp_keepalive` never fires) but stopped draining the socket, for which
     /// reqwest has no per-operation timeout. The `Duration` is the observed idle
-    /// gap. Retryable — a fresh attempt to a healthy replica (a rolling redeploy
+    /// gap. Retryable - a fresh attempt to a healthy replica (a rolling redeploy
     /// or a dead backend behind a live load balancer) is expected to succeed.
     #[error("upload write stalled: no progress for {0:?}")]
     Stall(std::time::Duration),
@@ -148,28 +150,45 @@ pub enum CoreError {
     /// `read_timeout` only catches when enabled. Default-on and reset on each
     /// successful read, so it bounds a slow-loris without capping an honest
     /// slow-but-steady transfer. The `Duration` is the idle window that elapsed.
-    /// Retryable — a fresh attempt to a healthy replica should succeed.
+    /// Retryable - a fresh attempt to a healthy replica should succeed.
     #[error("download read stalled: no data for {0:?}")]
     ReadStall(std::time::Duration),
 
-    /// A caller/configuration input was invalid — e.g. a `FastCDC` average
+    /// A caller/configuration input was invalid - e.g. a `FastCDC` average
     /// outside the splitter's accepted range, or a size that does not fit this
     /// platform's `usize`. Distinct from [`CoreError::Integrity`]: the bytes are
-    /// not wrong, the *parameters* are. Permanent (see `is_retryable`) — the same
+    /// not wrong, the *parameters* are. Permanent (see `is_retryable`) - the same
     /// bad input reproduces the same failure, so retrying only wastes backoff.
     #[error("invalid argument: {0}")]
     InvalidArgument(String),
 
     /// The server completed the request but returned a response that violates the
-    /// protocol contract in a way that is plausibly transient — a missing/invalid
+    /// protocol contract in a way that is plausibly transient - a missing/invalid
     /// `Location` on upload-init, or a body whose length disagrees with the
     /// declared size (short/over-send). Distinct from [`CoreError::ServerError`]
     /// (which carries a status code) and [`CoreError::Integrity`] (wrong bytes,
     /// permanent): a load balancer mid-rollout or a mangling proxy can emit these,
-    /// so `is_retryable` classifies them retryable — a fresh attempt to a healthy
+    /// so `is_retryable` classifies them retryable - a fresh attempt to a healthy
     /// replica is expected to return a well-formed response.
     #[error("malformed server response: {0}")]
     BadResponse(String),
+
+    /// The current OCI upload session is unrecoverable (expired 404, offset
+    /// desync the intra-session GET could not resolve, or a 416 after
+    /// resume). Retryable BY DESIGN: the recovery is a fresh session from
+    /// offset 0 in the outer retry loop - the fabricated-503 workaround this
+    /// variant replaces. `source` carries the real give-up cause (typically a
+    /// `ServerError` such as the 416, or a transport error). Never another
+    /// `SessionRestart`: the only constructor, `uploader::force_retryable`,
+    /// passes retryable errors through untouched, and this variant IS
+    /// retryable, so it can never be re-wrapped.
+    #[error("upload session unrecoverable; restarting")]
+    SessionRestart {
+        /// The real give-up cause - the non-retryable error (e.g. a 416
+        /// `ServerError`) that made the session unrecoverable.
+        #[source]
+        source: Box<CoreError>,
+    },
 }
 
 impl CoreError {
@@ -179,29 +198,31 @@ impl CoreError {
     /// Audit U3 (Phase 3.11): both the downloader's per-chunk retry loop
     /// and the uploader's whole-request retry loop need the same
     /// transient-vs-permanent classifier. Keeping it as an inherent
-    /// method on `CoreError` is the single source of truth — the
+    /// method on `CoreError` is the single source of truth - the
     /// alternative (a free fn in one module that the other imports, or a
     /// duplicated copy) drifts as soon as either site adds a variant.
     ///
     /// Classification:
     ///
-    /// * [`CoreError::Reqwest`] / [`CoreError::Io`] — transient
+    /// * [`CoreError::Reqwest`] / [`CoreError::Io`] - transient
     ///   transport-layer blips (TCP reset, transient EIO, mid-stream
     ///   read), retryable.
-    /// * [`CoreError::ServerError`] with `status ∈ 500..600` — RFC 9110
-    ///   §15.6 server-error status codes, retryable.
-    /// * [`CoreError::ServerError`] of 408 or 429 — the two retryable 4xx:
-    ///   408 Request Timeout (RFC 9110 §15.5.9) and 429 Too Many Requests
-    ///   (RFC 6585 §4). Harbor emits 429 under per-token rate limits, so
+    /// * [`CoreError::ServerError`] with `status in 500..600` - RFC 9110
+    ///   section 15.6 server-error status codes, retryable.
+    /// * [`CoreError::ServerError`] of 408 or 429 - the two retryable 4xx:
+    ///   408 Request Timeout (RFC 9110 section 15.5.9) and 429 Too Many Requests
+    ///   (RFC 6585 section 4). Harbor emits 429 under per-token rate limits, so
     ///   treating it as permanent would surface routine backpressure as a
     ///   terminal failure.
-    /// * [`CoreError::ServerError`] with any other status — permanent (4xx
+    /// * [`CoreError::ServerError`] with any other status - permanent (4xx
     ///   auth/format or any non-HTTP code), not retryable.
-    /// * [`CoreError::ChunkFailed`] / [`CoreError::JoinFailed`] —
-    ///   constructed by the orchestrator AFTER an inner retry loop has
-    ///   already given up; retrying compounds backoff for failures
-    ///   already declared terminal.
-    /// * [`CoreError::MissingContentLength`] — HEAD-response shape
+    /// * [`CoreError::ChunkFailed`] - constructed by the orchestrator
+    ///   AFTER an inner retry loop has already given up; retrying
+    ///   compounds backoff for failures already declared terminal.
+    /// * [`CoreError::JoinFailed`] - a panicked (or shutdown-aborted)
+    ///   task closure reproduces identically on retry, so retrying
+    ///   only burns backoff on a certain failure.
+    /// * [`CoreError::MissingContentLength`] - HEAD-response shape
     ///   error, not transient.
     ///
     /// The match is intentionally exhaustive (no wildcard arm). The
@@ -214,17 +235,22 @@ impl CoreError {
     pub fn is_retryable(&self) -> bool {
         match self {
             // Network/transport errors are retryable, and so is an upload
-            // write-stall (audit H1) — the watchdog aborts a socket the peer
+            // write-stall (audit H1) - the watchdog aborts a socket the peer
             // stopped draining; a fresh attempt to a healthy replica succeeds.
             // Network/transport blips, both stall watchdogs, and a
             // malformed-but-plausibly-transient response (missing Location, a
             // short/over-sent body) all clear on a fresh attempt to a healthy
-            // replica — retryable.
+            // replica - retryable. `SessionRestart` joins them by DESIGN, not
+            // because its cause is transient: the recovery for a dead upload
+            // session is a FRESH session from offset 0 in the uploader's outer
+            // retry loop, even though the wrapped cause (e.g. a 416) is itself
+            // permanent.
             CoreError::Reqwest(_)
             | CoreError::Io(_)
             | CoreError::Stall(_)
             | CoreError::ReadStall(_)
-            | CoreError::BadResponse(_) => true,
+            | CoreError::BadResponse(_)
+            | CoreError::SessionRestart { .. } => true,
             // 5xx server errors are retryable, plus the two retryable 4xx
             // (408 Request Timeout, 429 Too Many Requests). Everything else
             // 4xx is permanent. `(500..600).contains(status)` operates on
@@ -233,11 +259,16 @@ impl CoreError {
             CoreError::ServerError(status, _) => {
                 matches!(*status, 408 | 429) || (500..600).contains(status)
             }
-            // Three permanent variants:
-            //   - ChunkFailed / JoinFailed are structured terminal errors
-            //     produced after the per-chunk retry loop already did its
-            //     work — retrying compounds backoff for failures the inner
-            //     loop already declared unrecoverable.
+            // The permanent variants:
+            //   - ChunkFailed is a structured terminal error produced after
+            //     the per-chunk retry loop already did its work - retrying
+            //     compounds backoff for a failure the inner loop already
+            //     declared unrecoverable.
+            //   - JoinFailed means our own task closure panicked (or the
+            //     runtime shut down mid-join): the same closure over the
+            //     same input reproduces the same failure, so a retry only
+            //     burns backoff - and during shutdown it would pointlessly
+            //     delay the exit.
             //   - MissingContentLength is a HEAD-response shape error,
             //     not a transient network condition.
             //   - Integrity is a wrong-bytes error on a content-addressed
@@ -262,7 +293,7 @@ mod tests {
     // Source-chain walk on a `ChunkFailed` wrapping a `ServerError`.
     // Pins two invariants: (1) the wrapper renders via its own
     // `Display` (chunk N failed), without flattening the inner cause
-    // into its message — that is the anti-pattern axiom
+    // into its message - that is the anti-pattern axiom
     // rust_quality_57_error_source_chain calls out; (2) the inner
     // `ServerError` is reachable through `source()` so callers / the
     // Python boundary can render it as a `caused by:` tail. A future
@@ -300,7 +331,7 @@ mod tests {
     // by constructing the constructor at a typed function-pointer
     // binding. We can't construct a real `JoinError` here without a
     // runtime (tokio's `JoinError` has no public constructor) and so
-    // can't render the `Display` directly — the runtime-side test
+    // can't render the `Display` directly - the runtime-side test
     // lives in
     // `chunked_downloader::retry_classification_tests::join_failed_is_not_retryable`,
     // where a real aborted task produces a genuine `JoinError`. The
@@ -335,7 +366,7 @@ mod tests {
 
     // A download read-stall (audit M4) must also classify retryable so the per-chunk
     // retry loop re-fetches from a healthy replica instead of surfacing the idle-cut
-    // as terminal — the download counterpart of the upload write-stall above.
+    // as terminal - the download counterpart of the upload write-stall above.
     #[test]
     fn read_stall_is_retryable() {
         assert!(CoreError::ReadStall(std::time::Duration::from_secs(30)).is_retryable());
@@ -351,10 +382,25 @@ mod tests {
     }
 
     // An invalid caller/config argument reproduces on retry, so it must classify
-    // permanent — retrying a bad FastCDC average only burns backoff.
+    // permanent - retrying a bad FastCDC average only burns backoff.
     #[test]
     fn invalid_argument_is_not_retryable() {
         assert!(!CoreError::InvalidArgument("avg out of range".into()).is_retryable());
+    }
+
+    // A dead upload session must classify retryable (the recovery is a fresh
+    // session from offset 0 in the outer loop) while keeping the real cause -
+    // e.g. the 416 that killed the session - reachable via `source()`, unlike
+    // the fabricated-503 workaround this variant replaces, which flattened the
+    // cause into a message string.
+    #[test]
+    fn session_restart_is_retryable_and_chains_cause() {
+        let cause = CoreError::ServerError(416, "range not satisfiable".into());
+        let e = CoreError::SessionRestart {
+            source: Box::new(cause),
+        };
+        assert!(e.is_retryable());
+        assert!(std::error::Error::source(&e).is_some());
     }
 
     #[test]
@@ -368,7 +414,7 @@ mod tests {
     }
 
     // Verify the `Result<T>` alias is exported as a `Result<T,
-    // CoreError>` — small but load-bearing because `lib.rs` and the
+    // CoreError>` - small but load-bearing because `lib.rs` and the
     // downloader rely on the alias resolving to the same error type
     // for `?` to compose.
     #[test]

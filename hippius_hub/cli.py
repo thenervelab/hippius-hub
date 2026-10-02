@@ -18,8 +18,8 @@ from typing import Any
 from . import __version__
 from .auth import get_oci_bearer_token, login, resolve_token_value
 from .constants import resolve_registry
-from .file_download import _oci_repo_path, hippius_hub_download
-from ._repo_ops import _list_tags, _revision_digest_and_created
+from .file_download import _oci_repo_path, _validate_repo_type, hippius_hub_download
+from ._repo_ops import _list_tags, _revision_digest_and_created, delete_repo
 from . import console
 from .console import ConsoleError
 
@@ -30,6 +30,10 @@ from .console import ConsoleError
 # 10+ codespace rationale as the download/upload exit codes: stay out of
 # bash's reserved 1-2 range (1 = generic, 2 = misuse of shell builtin /
 # argparse usage error) so shell wrappers can branch deterministically.
+# Deliberately the SAME value `_format_download_error` maps
+# `RepositoryNotFoundError` to, so the two routes to "this repo is gone" —
+# the typed-exception dispatch and the two inline checks below — agree.
+EXIT_REPO_NOT_FOUND = 11        # `revisions` / `repos delete` -> repo is gone
 EXIT_NAMESPACE_TAKEN = 17       # `registry check <name>` -> name is taken
 EXIT_INVALID_REPO_FORMAT = 18   # CLI arg `<project>/<repo>` is malformed
 
@@ -97,6 +101,12 @@ def _format_download_error(e: Exception) -> tuple[str, int]:
     Codes 17 and 18 are non-exception paths (validated by the CLI itself
     before any HTTP call) so they don't appear in this function's
     dispatch — they're set inline by the registry/models handlers.
+    Code 11 is reachable BOTH ways: dispatched here from
+    `RepositoryNotFoundError`, and set inline as `EXIT_REPO_NOT_FOUND` by
+    `revisions` (which gets `None` back from `_list_tags` rather than an
+    exception) and by `repos delete` on a 404. Both routes must keep
+    reporting the same code, which is why that constant is defined next to
+    the others instead of written as a bare literal at the call sites.
 
     Ordering invariant: HF's typed exception hierarchy has three subclass
     relationships that matter here — LocalEntryNotFoundError <: Entry-
@@ -150,7 +160,7 @@ def _format_download_error(e: Exception) -> tuple[str, int]:
     if isinstance(e, (GatedRepoError, DisabledRepoError)):
         return (f"❌ Access denied: {e}", 14)
     if isinstance(e, RepositoryNotFoundError):
-        return (f"❌ Repository not found: {e}", 11)
+        return (f"❌ Repository not found: {e}", EXIT_REPO_NOT_FOUND)
     if isinstance(e, RevisionNotFoundError):
         return (f"❌ Revision not found: {e}", 12)
     # ConcurrentManifestUpdateError subclasses HfHubHTTPError; it must be
@@ -326,6 +336,57 @@ def cmd_registry_repos(args):
         repo = full.split("/", 1)[1] if "/" in full else full
         print(f"  {repo:40} artifacts={r.get('artifact_count', 0):4} "
               f"pulls={r.get('pull_count', 0):6} updated={r.get('update_time', '—')}")
+
+
+def cmd_registry_repos_delete(args):
+    """Delete a whole repository (`hippius-hub registry repos delete`).
+
+    Mirrors `hf repos delete`: prompts for confirmation unless `--yes`, honors
+    `--repo-type` / `--missing-ok` / `--token`, and prints a "Repo deleted"
+    line on success. Unlike the sibling `registry` commands this hits Harbor's
+    admin API (via `delete_repo`) rather than the console API, so its failures
+    surface as httpx / RepositoryNotFoundError rather than ConsoleError — they
+    are mapped to friendly messages and typed exit codes here instead of by the
+    central ConsoleError handler in `main()`.
+    """
+    repo_type = args.repo_type or "model"
+    if not args.yes:
+        # Same wording as `hf repos delete` so muscle memory carries over.
+        reply = input(
+            f"You are about to permanently delete {repo_type} "
+            f"'{args.repo_id}'. Proceed? [y/N] "
+        ).strip().lower()
+        if reply not in ("y", "yes"):
+            print("Aborted.")
+            return
+
+    import httpx
+    from .errors import RepositoryNotFoundError
+
+    try:
+        delete_repo(
+            args.repo_id,
+            token=args.token,
+            repo_type=args.repo_type,
+            missing_ok=args.missing_ok,
+        )
+    except RepositoryNotFoundError:
+        # delete_repo raises this (not an httpx error) only when no credential
+        # could be resolved for the Harbor admin call.
+        print("❌ Not logged in. Run `hippius-hub login` first.")
+        sys.exit(1)
+    except httpx.HTTPStatusError as e:
+        status = e.response.status_code
+        if status == 403:
+            print("❌ Deleting a repository requires admin permissions on the "
+                  "project; the current credentials can't delete it.")
+            sys.exit(1)
+        if status == 404:
+            print(f"❌ Repository not found: {args.repo_id} "
+                  f"(pass --missing-ok to ignore).")
+            sys.exit(EXIT_REPO_NOT_FOUND)
+        raise
+    print(f"✅ Repo deleted: {args.repo_id}")
 
 
 def cmd_registry_artifacts(args):
@@ -552,13 +613,19 @@ def cmd_models_formats(_args):
 # ----- revisions -----
 
 def cmd_revisions(args):
+    _validate_repo_type(args.repo_type)
     oci_repo = _oci_repo_path(args.repo_id, args.repo_type)
     registry = resolve_registry(None)
     oci_token = get_oci_bearer_token(oci_repo, resolve_token_value(None), push=False)
     tags = _list_tags(registry, oci_repo, oci_token)
     if tags is None:
         print("❌ Repository not found.")
-        sys.exit(1)
+        # 11, not 1: this is exactly the RepositoryNotFoundError condition the
+        # exit-code contract in `_format_download_error` documents. It answered
+        # 1 here, so a wrapper could not tell "this repo is gone" apart from any
+        # other generic failure — and the sibling 401 path (deleted namespace)
+        # exited 1 too, via an uncaught traceback.
+        sys.exit(EXIT_REPO_NOT_FOUND)
     if not tags:
         print("No revisions yet.")
         return
@@ -688,10 +755,25 @@ def _build_parser() -> argparse.ArgumentParser:
                          "(hippius-hub's own auth is always re-persisted regardless)")
     rr.set_defaults(func=cmd_registry_rotate)
 
-    rrepos = regsub.add_parser("repos", help="List my repositories")
+    rrepos = regsub.add_parser("repos", help="List my repositories (or `repos delete` to remove one)")
     rrepos.add_argument("--page", type=int, default=1)
     rrepos.add_argument("--page-size", type=int, default=50)
     rrepos.set_defaults(func=cmd_registry_repos)
+    # Sub-tree so bare `registry repos` still lists (parent default func) while
+    # `registry repos delete <repo>` mirrors `hf repos delete`.
+    rreposub = rrepos.add_subparsers(dest="repos_cmd")
+    rrd = rreposub.add_parser("delete", help="Delete a whole repository (irreversible)")
+    rrd.add_argument("repo_id", metavar="<project>/<repo>",
+                     help="Repository to delete, e.g. myorg/my-model")
+    rrd.add_argument("--repo-type", default=None,
+                     help="model (default), dataset, or space")
+    rrd.add_argument("--token", default=None,
+                     help="Explicit auth token; defaults to your saved login")
+    rrd.add_argument("--missing-ok", action="store_true",
+                     help="Do not error if the repository does not exist")
+    rrd.add_argument("-y", "--yes", action="store_true",
+                     help="Answer yes to the confirmation prompt automatically")
+    rrd.set_defaults(func=cmd_registry_repos_delete)
 
     rart = regsub.add_parser("artifacts", help="List artifacts in one repo")
     rart.add_argument("repo", metavar="<project>/<repo>",
@@ -798,9 +880,7 @@ def _cmd_download(args):
         )
         print(f"✅ File downloaded to: {path}")
     except Exception as e:
-        msg, code = _format_download_error(e)
-        print(msg)
-        sys.exit(code)
+        _exit_with_download_error(e)
 
 
 def _cmd_upload(args):
@@ -810,9 +890,7 @@ def _cmd_upload(args):
     try:
         hippius_hub_upload(repo_id=args.repo_id, local_path=args.local_path, revision=args.revision)
     except Exception as e:
-        msg, code = _format_download_error(e)
-        print(msg)
-        sys.exit(code)
+        _exit_with_download_error(e)
 
 
 def _cmd_delete(args):
@@ -889,6 +967,13 @@ def _cmd_login(args):
         sys.exit(1)
 
 
+def _exit_with_download_error(e: Exception) -> None:
+    """Print `_format_download_error`'s message and exit with its code."""
+    msg, code = _format_download_error(e)
+    print(msg)
+    sys.exit(code)
+
+
 def _handle_console_error(e: ConsoleError) -> None:
     """Map a ConsoleError to a user-facing message and exit.
 
@@ -933,7 +1018,22 @@ def main():
         "diagnose": _cmd_diagnose,
     }
     if args.command in handlers:
-        handlers[args.command](args)
+        # Backstop so an *expected* registry condition can never reach the user
+        # as a stack trace. `download`/`upload` already route their own failures
+        # through _format_download_error; `revisions`/`diagnose` did not, so a
+        # 401 from a deleted namespace surfaced as a raw httpx.HTTPStatusError
+        # traceback. Deliberately narrow — only huggingface_hub's typed error
+        # families are caught, so a genuine bug (TypeError, KeyError, ...) still
+        # bubbles up with its traceback intact rather than being flattened into
+        # a tidy but undebuggable message. NotImplementedError is the one
+        # non-HF addition: it is this package's own "unsupported input" signal
+        # (the dataset/space repo_type gate, rejected HF kwargs), an expected
+        # refusal the user must act on, not a defect.
+        from .errors import EntryNotFoundError, HfHubHTTPError
+        try:
+            handlers[args.command](args)
+        except (HfHubHTTPError, EntryNotFoundError, NotImplementedError) as e:
+            _exit_with_download_error(e)
         return
     if args.command in ("registry", "models"):
         if not hasattr(args, "func"):
@@ -943,6 +1043,8 @@ def main():
             args.func(args)
         except ConsoleError as e:
             _handle_console_error(e)
+        except NotImplementedError as e:
+            _exit_with_download_error(e)
         return
     parser.print_help()
     sys.exit(1)

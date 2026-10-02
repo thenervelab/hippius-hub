@@ -130,7 +130,7 @@ git commit -m "chore: add respx (python) and proptest (rust) dev deps"
 
 ## Phase 1 — Tier 1 Critical (ship-blockers)
 
-### Task 1.1: Add `timeout=` to the OCI bearer token request [C1]
+### Task 1.1: Add `timeout=` to the registry bearer token request [C1]
 
 **Files:**
 - Test: `tests/test_auth_timeout.py` (create)
@@ -771,14 +771,14 @@ Closes: audit D3"
 
 ## Phase 2 — Tier 2 High
 
-### Task 2.1: OCI `If-Match` for manifest PUT (or fail-fast) [H1]
+### Task 2.1: the registry `If-Match` for manifest PUT (or fail-fast) [H1]
 
 **Files:**
 - Modify: `hippius_hub/file_upload.py:240-305, 308-416`
 - Modify: `hippius_hub/_oci.py` (extend `fetch_manifest` to return digest)
 - Test: `tests/test_upload_if_match.py` (create)
 
-**Step 1: Decide policy.** This task uses *optimistic concurrency*. If we discover Harbor doesn't support `If-Match` on manifests, we fall back to "single-writer-per-revision, fail-fast on concurrent PUT" — but try If-Match first; the OCI distribution spec section 4.4 includes it.
+**Step 1: Decide policy.** This task uses *optimistic concurrency*. If we discover the registry doesn't support `If-Match` on manifests, we fall back to "single-writer-per-revision, fail-fast on concurrent PUT" — but try If-Match first; the registry distribution spec section 4.4 includes it.
 
 **Step 2: Extend `fetch_manifest` to also return the `Docker-Content-Digest` header**
 
@@ -1792,7 +1792,7 @@ Closes: audit L5 (Rust)"
 
 ## Phase 4 — Tier 4 Low / nits
 
-### Task 4.1: Hash token before keying OCI cache [M3]
+### Task 4.1: Hash token before keying the registry cache [M3]
 
 **Files:**
 - Modify: `hippius_hub/auth.py:163-200`
@@ -1808,7 +1808,7 @@ def _token_cache_key(repo_id: str, push: bool, token: Optional[str]) -> tuple:
 
 Replace `cache_key = (repo_id, push, token)` with `cache_key = _token_cache_key(repo_id, push, token)`.
 
-Commit: `fix(auth): hash token before keying the OCI bearer cache (closes M3)`
+Commit: `fix(auth): hash token before keying the registry bearer cache (closes M3)`
 
 ---
 
