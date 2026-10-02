@@ -24,16 +24,38 @@ from tests.respx_fixtures import MOCK_REGISTRY, token_route
 
 REPO = "acme/model"
 
-# Chunk digests (bare hex, exactly as chunk_and_hash_native returns them). X is
-# shared by both files; Y is A-only, Z is B-only.
+# Chunk digests (bare hex). X is shared by both files; Y is A-only, Z is B-only.
 HX, HY, HZ = "a" * 64, "b" * 64, "d" * 64
 
-# Per basename: (whole_file_hex, [(chunk_hex, offset, size), ...]) — the exact shape
-# chunk_and_hash_native returns. Both files begin with the shared chunk X.
+# Per basename: (whole_file_hex, [(chunk_hex, offset, length), ...]).
+# That triple is one batch item from chunk_stream_native. Both files begin
+# with the shared chunk X.
 _FILES = {
     "a.bin": ("1" * 64, [(HX, 0, 40), (HY, 40, 60)]),
     "b.bin": ("2" * 64, [(HX, 0, 40), (HZ, 40, 50)]),
 }
+
+
+class _FakeChunkStream:
+    """One-batch stub of the native stream. finish() requires a full drain."""
+
+    def __init__(self, chunks, whole_hex):
+        self._chunks = list(chunks)
+        self._whole = whole_hex
+        self._drained = False
+
+    def next_batch(self):
+        if self._chunks:
+            batch = self._chunks
+            self._chunks = []
+            return batch
+        self._drained = True
+        return None
+
+    def finish(self):
+        if not self._drained:
+            raise RuntimeError("chunk stream not finished; drain next_batch to None first")
+        return self._whole
 
 
 def _wire(monkeypatch):
@@ -41,9 +63,11 @@ def _wire(monkeypatch):
     monkeypatch.setattr("hippius_hub.constants.DEFAULT_REGISTRY_URL", MOCK_REGISTRY)
     monkeypatch.setattr("hippius_hub.auth.DEFAULT_REGISTRY_URL", MOCK_REGISTRY)
 
-    monkeypatch.setattr(
-        file_upload, "chunk_and_hash_native", lambda path, avg: _FILES[os.path.basename(path)]
-    )
+    def _stream(path, avg):
+        whole, chunks = _FILES[os.path.basename(path)]
+        return _FakeChunkStream(chunks, whole)
+
+    monkeypatch.setattr(file_upload, "chunk_stream_native", _stream)
 
     packs_seen = []
 
