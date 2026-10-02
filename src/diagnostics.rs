@@ -440,8 +440,8 @@ mod tests {
 
     #[test]
     fn split_ranges_empty_or_zero() {
-        assert!(split_ranges(0, 4).is_empty());
-        assert!(split_ranges(100, 0).is_empty());
+        assert_eq!(split_ranges(0, 4), vec![]);
+        assert_eq!(split_ranges(100, 0), vec![]);
     }
 
     #[test]
@@ -469,11 +469,8 @@ mod tests {
         assert_eq!(r, vec![(0, 0), (1, 1), (2, 2)]);
     }
 
+    // mbps short-circuits to literal 0.0 for zero-duration; exact equality is the contract.
     #[test]
-    #[expect(
-        clippy::float_cmp,
-        reason = "mbps short-circuits to literal 0.0 for zero-duration; testing exact equality is the contract"
-    )]
     fn mbps_zero_duration_is_zero() {
         assert_eq!(mbps(1000, Duration::from_secs(0)), 0.0);
     }

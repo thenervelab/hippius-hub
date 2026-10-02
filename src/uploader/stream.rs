@@ -279,7 +279,7 @@ mod chunk_stream_tests {
 
         // The refusal must not have consumed the stream: draining still works.
         let streamed = drain(&mut core);
-        assert!(!streamed.is_empty());
+        assert_ne!(streamed, ChunkList::new());
         assert!(core.finish().is_ok());
         std::fs::remove_file(&path).unwrap_or(());
     }
