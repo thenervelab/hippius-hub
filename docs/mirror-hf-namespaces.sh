@@ -66,36 +66,89 @@ read_me() {
   me_login=$(printf '%s\n' "$me_out" | awk '/^Login:/ { print $2; exit }')
 }
 
+# Harbor answers HTTP 200 for a bad password and puts "actions":[] in the token.
+# A password it accepts has a granted action, such as "actions":["pull".
+robot_accepted() {
+  cred=$1
+  ns=$2
+  case $ns in
+    ""|*[!A-Za-z0-9._-]*) return 1 ;;
+    [A-Za-z0-9]*) ;;
+    *) return 1 ;;
+  esac
+  probe_cfg=$(mktemp)
+  probe_body=$(mktemp)
+  chmod 600 "$probe_cfg" "$probe_body"
+  awk 'NR==1 { sub(/\r$/, ""); printf "header = \"Authorization: %s\"\n", $0; exit }' "$cred" > "$probe_cfg"
+  printf '%s\n' \
+    "url = \"https://registry.hippius.com/service/token?service=harbor-registry&scope=repository:${ns}/probe:pull\"" \
+    "silent" \
+    "show-error" \
+    "max-time = 20" \
+    "output = \"${probe_body}\"" \
+    'write-out = "%{http_code}"' >> "$probe_cfg"
+  code=$(curl --config "$probe_cfg" || true)
+  rm -f "$probe_cfg"
+  probe_cfg=
+  if [ "$code" != "200" ]; then
+    rm -f "$probe_body"
+    probe_body=
+    return 1
+  fi
+  tok=$(awk -F'"' '
+    {
+      for (i = 1; i < NF; i++) if ($i == "token") { print $(i + 2); exit }
+    }
+  ' "$probe_body")
+  rm -f "$probe_body"
+  probe_body=
+  [ -n "$tok" ] || return 1
+  payload=${tok#*.}
+  payload=${payload%%.*}
+  payload=$(printf '%s' "$payload" | tr '_-' '/+')
+  case $((${#payload} % 4)) in
+    2) payload="${payload}==" ;;
+    3) payload="${payload}=" ;;
+  esac
+  decoded=$(printf '%s' "$payload" | openssl base64 -d -A 2>/dev/null) || return 1
+  printf '%s' "$decoded" | grep -q '"actions":[[:space:]]*\["'
+}
+
 # Publicity uses the console token, not the robot password. A login file that
-# merely starts with robot$<namespace>+ is not enough.
+# merely starts with robot$<namespace>+ is not enough, and neither is the right
+# username with the wrong password.
 require_known_robot() {
   ns=$1
   # copy_list keeps the repo list in the global `file`. Do not reuse that name.
   cred=$2
-  if [ "$fresh_ns" = "$ns" ]; then
-    return 0
-  fi
-  robot_matches "$cred" "$ns" || {
-    echo "Saved login for $ns is missing." >&2
-    exit 1
-  }
-  read_me
-  if [ "$me_project" = "$ns" ] && [ -n "$me_login" ] && [ "$robot_user" = "$me_login" ]; then
-    return 0
-  fi
-  # Match the whole "        login=<user>" line. A prefix of a real key is not a login.
-  if hippius-hub registry keys list | awk -v u="$robot_user" '
-    {
-      line = $0
-      sub(/^[[:space:]]*login=/, "", line)
-      if (line == u) found = 1
+  if [ "$fresh_ns" != "$ns" ]; then
+    robot_matches "$cred" "$ns" || {
+      echo "Saved login for $ns is missing." >&2
+      exit 1
     }
-    END { exit !found }
-  '; then
-    return 0
+    read_me
+    known=0
+    if [ "$me_project" = "$ns" ] && [ -n "$me_login" ] && [ "$robot_user" = "$me_login" ]; then
+      known=1
+    elif hippius-hub registry keys list | awk -v u="$robot_user" '
+      {
+        line = $0
+        sub(/^[[:space:]]*login=/, "", line)
+        if (line == u) found = 1
+      }
+      END { exit !found }
+    '; then
+      known=1
+    fi
+    if [ "$known" != 1 ]; then
+      echo "The saved registry login for $ns is not a login for that project. Stopped before changing visibility or copying." >&2
+      exit 1
+    fi
   fi
-  echo "The saved registry login for $ns is not a login for that project. Stopped before changing visibility or copying." >&2
-  exit 1
+  if ! robot_accepted "$cred" "$ns"; then
+    echo "The saved registry login for $ns was rejected by the registry. Stopped before changing visibility or copying." >&2
+    exit 1
+  fi
 }
 
 show_provlog() {
@@ -126,6 +179,13 @@ cleanup() {
   [ -n "$pubf" ] && rm -f "$privf" "$pubf"
   [ -n "$token_before" ] && rm -f "$token_before"
   [ -n "$orig_token" ] && rm -f "$orig_token"
+  if [ -n "$probe_cfg" ]; then
+    rm -f "$probe_cfg"
+  fi
+  if [ -n "$probe_body" ]; then
+    rm -f "$probe_body"
+  fi
+  true
 }
 
 wait_active() {
@@ -315,7 +375,7 @@ if [ -n "$public_ns" ] && [ "$public_ns" = "$private_ns" ]; then
   exit 2
 fi
 
-for cmd in hf hippius-hub openssl; do
+for cmd in hf hippius-hub openssl curl; do
   if ! command -v "$cmd" >/dev/null 2>&1; then
     echo "missing '$cmd'" >&2
     exit 1
@@ -333,6 +393,8 @@ token_before=
 orig_token=
 last_created=0
 fresh_ns=
+probe_cfg=
+probe_body=
 me_project=
 me_login=
 me_public=

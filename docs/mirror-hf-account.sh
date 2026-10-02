@@ -30,9 +30,57 @@ read_me() {
   me_login=$(printf '%s\n' "$me_out" | awk '/^Login:/ { print $2; exit }')
 }
 
+# Harbor answers HTTP 200 for a bad password and puts "actions":[] in the token.
+# A password it accepts has a granted action, such as "actions":["pull".
+robot_accepted() {
+  cred=$1
+  ns=$2
+  case $ns in
+    ""|*[!A-Za-z0-9._-]*) return 1 ;;
+    [A-Za-z0-9]*) ;;
+    *) return 1 ;;
+  esac
+  probe_cfg=$(mktemp)
+  probe_body=$(mktemp)
+  chmod 600 "$probe_cfg" "$probe_body"
+  awk 'NR==1 { sub(/\r$/, ""); printf "header = \"Authorization: %s\"\n", $0; exit }' "$cred" > "$probe_cfg"
+  printf '%s\n' \
+    "url = \"https://registry.hippius.com/service/token?service=harbor-registry&scope=repository:${ns}/probe:pull\"" \
+    "silent" \
+    "show-error" \
+    "max-time = 20" \
+    "output = \"${probe_body}\"" \
+    'write-out = "%{http_code}"' >> "$probe_cfg"
+  code=$(curl --config "$probe_cfg" || true)
+  rm -f "$probe_cfg"
+  probe_cfg=
+  if [ "$code" != "200" ]; then
+    rm -f "$probe_body"
+    probe_body=
+    return 1
+  fi
+  tok=$(awk -F'"' '
+    {
+      for (i = 1; i < NF; i++) if ($i == "token") { print $(i + 2); exit }
+    }
+  ' "$probe_body")
+  rm -f "$probe_body"
+  probe_body=
+  [ -n "$tok" ] || return 1
+  payload=${tok#*.}
+  payload=${payload%%.*}
+  payload=$(printf '%s' "$payload" | tr '_-' '/+')
+  case $((${#payload} % 4)) in
+    2) payload="${payload}==" ;;
+    3) payload="${payload}=" ;;
+  esac
+  decoded=$(printf '%s' "$payload" | openssl base64 -d -A 2>/dev/null) || return 1
+  printf '%s' "$decoded" | grep -q '"actions":[[:space:]]*\["'
+}
+
 # Publicity uses the console token, not the robot password. Require the saved
-# login to be the active project's robot or one of its keys before changing
-# visibility or copying.
+# login to be the active project's robot or one of its keys, and require the
+# registry to accept the password, before changing visibility or copying.
 require_known_robot() {
   ns=$1
   cred=$2
@@ -42,12 +90,10 @@ require_known_robot() {
     exit 1
   }
   read_me
+  known=0
   if [ "$me_project" = "$ns" ] && [ -n "$me_login" ] && [ "$robot_user" = "$me_login" ]; then
-    return 0
-  fi
-  # The login line is "        login=<user>". Match the whole name. A prefix of
-  # a real key, such as robot$ns+smoke for robot$ns+smoke-hourly, is not a login.
-  if hippius-hub registry keys list | awk -v u="$robot_user" '
+    known=1
+  elif hippius-hub registry keys list | awk -v u="$robot_user" '
     {
       line = $0
       sub(/^[[:space:]]*login=/, "", line)
@@ -55,10 +101,16 @@ require_known_robot() {
     }
     END { exit !found }
   '; then
-    return 0
+    known=1
   fi
-  echo "The saved registry login for $ns is not a login for that project. Stopped before changing visibility or copying." >&2
-  exit 1
+  if [ "$known" != 1 ]; then
+    echo "The saved registry login for $ns is not a login for that project. Stopped before changing visibility or copying." >&2
+    exit 1
+  fi
+  if ! robot_accepted "$cred" "$ns"; then
+    echo "The saved registry login for $ns was rejected by the registry. Stopped before changing visibility or copying." >&2
+    exit 1
+  fi
 }
 
 robot_matches() {
@@ -99,7 +151,7 @@ case $only in
     ;;
 esac
 
-for cmd in hf hippius-hub openssl; do
+for cmd in hf hippius-hub openssl curl; do
   if ! command -v "$cmd" >/dev/null 2>&1; then
     echo "missing '$cmd'. Install with: pip install \"hippius_hub>=0.7\" \"huggingface_hub>=1,<2\"" >&2
     exit 1
@@ -110,8 +162,10 @@ list=$(mktemp)
 pubf=$(mktemp)
 privf=$(mktemp)
 work=
-trap 'rm -f "$list" "$pubf" "$privf"; [ -n "$work" ] && [ -d "$work" ] && rm -rf "$work"' EXIT
-trap 'rm -f "$list" "$pubf" "$privf"; [ -n "$work" ] && [ -d "$work" ] && rm -rf "$work"; exit 1' TERM
+probe_cfg=
+probe_body=
+trap 'rm -f "$list" "$pubf" "$privf"; [ -n "$probe_cfg" ] && rm -f "$probe_cfg"; [ -n "$probe_body" ] && rm -f "$probe_body"; [ -n "$work" ] && [ -d "$work" ] && rm -rf "$work"' EXIT
+trap 'rm -f "$list" "$pubf" "$privf"; [ -n "$probe_cfg" ] && rm -f "$probe_cfg"; [ -n "$probe_body" ] && rm -f "$probe_body"; [ -n "$work" ] && [ -d "$work" ] && rm -rf "$work"; exit 1' TERM
 
 hf repos ls --limit 0 --format agent > "$list"
 
