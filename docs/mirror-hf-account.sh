@@ -27,6 +27,38 @@ read_me() {
   }
   me_project=$(printf '%s\n' "$me_out" | awk '/^Project:/ { print $2; exit }')
   me_public=$(printf '%s\n' "$me_out" | awk '/^Public:/ { print $2; exit }')
+  me_login=$(printf '%s\n' "$me_out" | awk '/^Login:/ { print $2; exit }')
+}
+
+# Publicity uses the console token, not the robot password. Require the saved
+# login to be the active project's robot or one of its keys before changing
+# visibility or copying.
+require_known_robot() {
+  ns=$1
+  cred=$2
+  robot_matches "$cred" "$ns" || {
+    echo "No registry login for $ns is saved in ~/.cache/hippius/hub/token." >&2
+    echo "If 'hippius-hub registry me' shows $ns, run 'hippius-hub registry rotate-token' and rerun." >&2
+    exit 1
+  }
+  read_me
+  if [ "$me_project" = "$ns" ] && [ -n "$me_login" ] && [ "$robot_user" = "$me_login" ]; then
+    return 0
+  fi
+  # The login line is "        login=<user>". Match the whole name. A prefix of
+  # a real key, such as robot$ns+smoke for robot$ns+smoke-hourly, is not a login.
+  if hippius-hub registry keys list | awk -v u="$robot_user" '
+    {
+      line = $0
+      sub(/^[[:space:]]*login=/, "", line)
+      if (line == u) found = 1
+    }
+    END { exit !found }
+  '; then
+    return 0
+  fi
+  echo "The saved registry login for $ns is not a login for that project. Stopped before changing visibility or copying." >&2
+  exit 1
 }
 
 robot_matches() {
@@ -77,7 +109,9 @@ done
 list=$(mktemp)
 pubf=$(mktemp)
 privf=$(mktemp)
-trap 'rm -f "$list" "$pubf" "$privf"' EXIT
+work=
+trap 'rm -f "$list" "$pubf" "$privf"; [ -n "$work" ] && [ -d "$work" ] && rm -rf "$work"' EXIT
+trap 'rm -f "$list" "$pubf" "$privf"; [ -n "$work" ] && [ -d "$work" ] && rm -rf "$work"; exit 1' TERM
 
 hf repos ls --limit 0 --format agent > "$list"
 
@@ -161,11 +195,7 @@ if [ "$me_project" != "$namespace" ]; then
   exit 1
 fi
 token_path=${HOME}/.cache/hippius/hub/token
-if ! robot_matches "$token_path" "$namespace"; then
-  echo "No registry login for $namespace is saved in ~/.cache/hippius/hub/token." >&2
-  echo "If 'hippius-hub registry me' shows $namespace, run 'hippius-hub registry rotate-token' and rerun." >&2
-  exit 1
-fi
+require_known_robot "$namespace" "$token_path"
 if [ "$target" = "public" ]; then
   want_flag=True
 else

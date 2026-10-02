@@ -63,6 +63,39 @@ read_me() {
   }
   me_project=$(printf '%s\n' "$me_out" | awk '/^Project:/ { print $2; exit }')
   me_public=$(printf '%s\n' "$me_out" | awk '/^Public:/ { print $2; exit }')
+  me_login=$(printf '%s\n' "$me_out" | awk '/^Login:/ { print $2; exit }')
+}
+
+# Publicity uses the console token, not the robot password. A login file that
+# merely starts with robot$<namespace>+ is not enough.
+require_known_robot() {
+  ns=$1
+  # copy_list keeps the repo list in the global `file`. Do not reuse that name.
+  cred=$2
+  if [ "$fresh_ns" = "$ns" ]; then
+    return 0
+  fi
+  robot_matches "$cred" "$ns" || {
+    echo "Saved login for $ns is missing." >&2
+    exit 1
+  }
+  read_me
+  if [ "$me_project" = "$ns" ] && [ -n "$me_login" ] && [ "$robot_user" = "$me_login" ]; then
+    return 0
+  fi
+  # Match the whole "        login=<user>" line. A prefix of a real key is not a login.
+  if hippius-hub registry keys list | awk -v u="$robot_user" '
+    {
+      line = $0
+      sub(/^[[:space:]]*login=/, "", line)
+      if (line == u) found = 1
+    }
+    END { exit !found }
+  '; then
+    return 0
+  fi
+  echo "The saved registry login for $ns is not a login for that project. Stopped before changing visibility or copying." >&2
+  exit 1
 }
 
 show_provlog() {
@@ -73,11 +106,14 @@ show_provlog() {
 restore_login() {
   [ "$swapped" = 1 ] || return 0
   if [ "$had_token" = 1 ]; then
-    cp "$orig_token" "$token_path"
-    chmod 600 "$token_path"
+    if [ -f "$orig_token" ]; then
+      cp "$orig_token" "$token_path"
+      chmod 600 "$token_path"
+    fi
   else
     rm -f "$token_path"
   fi
+  swapped=0
 }
 
 cleanup() {
@@ -148,6 +184,7 @@ ensure_robot() {
       exit 1
     fi
     stash_login "$token_path" "$ns"
+    fresh_ns=$ns
     return 0
   fi
   if robot_matches "$token_path" "$ns"; then
@@ -181,6 +218,7 @@ set_visibility() {
       else
         echo "Setting $ns to $want."
       fi
+      require_known_robot "$ns" "$stash_dir/$ns"
       hippius-hub registry publicity "$want"
       read_me
       if [ "$me_project" != "$ns" ] || [ "$me_public" != "$want_flag" ]; then
@@ -225,6 +263,7 @@ copy_list() {
   ns=$1
   file=$2
   activate_ns "$ns"
+  require_known_robot "$ns" "$token_path"
   while IFS= read -r repo_id; do
     [ -n "$repo_id" ] || continue
     name=${repo_id##*/}
@@ -293,7 +332,9 @@ privf=
 token_before=
 orig_token=
 last_created=0
+fresh_ns=
 me_project=
+me_login=
 me_public=
 cache=${HOME}/.cache/hippius/hub
 token_path=$cache/token
@@ -307,6 +348,8 @@ token_before=$(mktemp)
 orig_token=$(mktemp)
 chmod 600 "$provlog" "$token_before" "$orig_token"
 trap cleanup EXIT
+# dash does not run an EXIT trap on SIGTERM. Restore the previous login anyway.
+trap 'cleanup; exit 1' TERM
 
 hf repos ls --limit 0 --format agent > "$list"
 
