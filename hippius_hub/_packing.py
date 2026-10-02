@@ -10,6 +10,7 @@ those digests back into the file-ordered chunk list that becomes the pointer blo
 Kept pure so the packing invariants (order preservation, exact coverage, pack-size
 bounds) are property-tested without a registry — see tests/test_packing.py.
 """
+
 import json
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
@@ -58,6 +59,98 @@ class PackPlan:
     new_packs: Tuple[NewPack, ...]
 
 
+class PackAccumulator:
+    """Incremental `plan_packs`: feed chunks in file order, packs complete as
+    ~`pack_size` of NEW bytes accumulate, so uploads start before chunking ends.
+
+    Invariant: for any chunk sequence, feeding all chunks then `finish()` yields
+    a `PackPlan` identical to `plan_packs(chunks, dedup_index, pack_size)` —
+    `plan_packs` is literally implemented that way, and the equivalence is
+    property-tested in tests/test_packing.py. The prior-revision dedup index is
+    read, never mutated. A digest appearing twice in this file is stored once
+    (first new-pack occurrence); later pointer entries reuse that pack offset.
+
+    `finish()` flushes the final partial pack and is idempotent; `feed()` after
+    `finish()` raises RuntimeError (the plan is already sealed).
+
+    Not thread-safe; feed from one thread.
+    """
+
+    def __init__(self, dedup_index: Dict[str, DedupEntry], pack_size: int) -> None:
+        if pack_size <= 0:
+            raise ValueError(f"pack_size must be positive, got {pack_size}")
+        self._dedup_index = dedup_index
+        self._pack_size = pack_size
+        self._planned: List[PlannedChunk] = []
+        self._new_packs: List[NewPack] = []
+        self._cur_ranges: List[Tuple[int, int]] = []
+        self._cur_offset = 0  # byte offset within the pack currently being built
+        self._plan: Optional[PackPlan] = None
+        # digest -> the PlannedChunk of its first new occurrence; a repeat
+        # re-appends that same entry (frozen, so it is safe to share).
+        self._seen: Dict[str, PlannedChunk] = {}
+
+    def feed(self, chunk: Tuple[str, int, int]) -> List[NewPack]:
+        """Plan one (chunk_digest, size, file_offset); return packs just completed.
+
+        A pack closes once it reaches `pack_size`, so it may overshoot by at most
+        the last chunk added (bounded by fastcdc's 16 MiB max chunk); packs have
+        no minimum. At most one pack completes per feed.
+        """
+        if self._plan is not None:
+            raise RuntimeError("feed() after finish(): the pack plan is sealed")
+        digest, size, file_offset = chunk
+        hit = self._dedup_index.get(digest)
+        if hit is not None:
+            pack_digest, pack_offset = hit
+            self._planned.append(
+                PlannedChunk(digest, size, pack_offset, pack_digest=pack_digest)
+            )
+            return []
+        first = self._seen.get(digest)
+        if first is not None:
+            if first.size != size:
+                raise ValueError(
+                    f"chunk digest {digest} size {size} != first occurrence {first.size}"
+                )
+            self._planned.append(first)
+            return []
+        # First occurrence of this digest → append to the open pack. Its index
+        # is `len(self._new_packs)` because the open pack is appended on close.
+        first = PlannedChunk(
+            digest, size, self._cur_offset, new_pack_index=len(self._new_packs)
+        )
+        self._planned.append(first)
+        self._seen[digest] = first
+        self._cur_ranges.append((file_offset, size))
+        self._cur_offset += size
+        if self._cur_offset >= self._pack_size:
+            return [self._close()]
+        return []
+
+    def _close(self) -> NewPack:
+        pack = NewPack(tuple(self._cur_ranges))
+        self._new_packs.append(pack)
+        self._cur_ranges = []
+        self._cur_offset = 0
+        return pack
+
+    def finish(self) -> PackPlan:
+        """Flush the final partial pack (if any) and return the sealed plan.
+
+        Prefix property: the packs returned by `feed()` form a prefix of
+        `finish().new_packs`, in order; any final partial pack is
+        `new_packs[-1]` and was never returned by `feed()` — so a streaming
+        caller that already handled `n_emitted` packs from `feed()` must
+        submit exactly `new_packs[n_emitted:]` after `finish()`.
+        """
+        if self._plan is None:
+            if self._cur_ranges:
+                self._close()
+            self._plan = PackPlan(tuple(self._planned), tuple(self._new_packs))
+        return self._plan
+
+
 def plan_packs(
     chunks: List[Tuple[str, int, int]],
     dedup_index: Dict[str, DedupEntry],
@@ -66,39 +159,14 @@ def plan_packs(
     """Partition file-ordered `chunks` into reused refs and new packs.
 
     `chunks` is (chunk_digest, size, file_offset) in file order. `dedup_index` maps
-    a chunk digest to the (pack_digest, pack_offset) where it already lives. A pack
-    closes once it reaches `pack_size`, so it may overshoot by at most the last
-    chunk added (bounded by fastcdc's 16 MiB max chunk); packs have no minimum.
+    a chunk digest to the (pack_digest, pack_offset) where it already lives.
+    Thin batch wrapper over `PackAccumulator` — see its docstring for the pack
+    boundary and self-dedup semantics.
     """
-    if pack_size <= 0:
-        raise ValueError(f"pack_size must be positive, got {pack_size}")
-    planned: List[PlannedChunk] = []
-    new_packs: List[Tuple[Tuple[int, int], ...]] = []
-    cur_ranges: List[Tuple[int, int]] = []
-    cur_offset = 0  # byte offset within the pack currently being built
-
-    def close() -> None:
-        nonlocal cur_ranges, cur_offset
-        if cur_ranges:
-            new_packs.append(tuple(cur_ranges))
-            cur_ranges = []
-            cur_offset = 0
-
-    for digest, size, file_offset in chunks:
-        hit = dedup_index.get(digest)
-        if hit is not None:
-            pack_digest, pack_offset = hit
-            planned.append(PlannedChunk(digest, size, pack_offset, pack_digest=pack_digest))
-            continue
-        # New chunk → append to the pack currently open. Its eventual index is
-        # `len(new_packs)` because the open pack is appended on close().
-        planned.append(PlannedChunk(digest, size, cur_offset, new_pack_index=len(new_packs)))
-        cur_ranges.append((file_offset, size))
-        cur_offset += size
-        if cur_offset >= pack_size:
-            close()
-    close()
-    return PackPlan(tuple(planned), tuple(NewPack(r) for r in new_packs))
+    acc = PackAccumulator(dedup_index, pack_size)
+    for chunk in chunks:
+        acc.feed(chunk)
+    return acc.finish()
 
 
 def resolve_pointer_chunks(
@@ -118,7 +186,11 @@ def resolve_pointer_chunks(
         )
     out: List[Tuple[str, int, str, int]] = []
     for pc in plan.planned:
-        pack_digest = pc.pack_digest if pc.new_pack_index is None else new_pack_digests[pc.new_pack_index]
+        pack_digest = (
+            pc.pack_digest
+            if pc.new_pack_index is None
+            else new_pack_digests[pc.new_pack_index]
+        )
         out.append((pc.chunk_digest, pc.size, pack_digest, pc.pack_offset))
     return tuple(out)
 

@@ -1,0 +1,61 @@
+# Isolated. Namespace harbor-staging only. Never namespace harbor.
+# Secret harbor-staging-s3 must exist (created by install-hippius-s3.sh).
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: hippius-s3-contract
+  namespace: harbor-staging
+spec:
+  backoffLimit: 1
+  ttlSecondsAfterFinished: 86400
+  activeDeadlineSeconds: 1200
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: contract
+          image: python:3.12-slim-bookworm
+          env:
+            - name: HARBOR_S3_BUCKET
+              valueFrom:
+                secretKeyRef:
+                  name: harbor-staging-s3
+                  key: HARBOR_S3_BUCKET
+            - name: AWS_ACCESS_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: harbor-staging-s3
+                  key: REGISTRY_STORAGE_S3_ACCESSKEY
+            - name: AWS_SECRET_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: harbor-staging-s3
+                  key: REGISTRY_STORAGE_S3_SECRETKEY
+            - name: HARBOR_S3_ENDPOINT
+              valueFrom:
+                secretKeyRef:
+                  name: harbor-staging-s3
+                  key: HARBOR_S3_ENDPOINT
+            - name: PIP_DISABLE_PIP_VERSION_CHECK
+              value: "1"
+          resources:
+            requests:
+              cpu: "1"
+              memory: 512Mi
+            limits:
+              cpu: "2"
+              memory: 1Gi
+          volumeMounts:
+            - name: script
+              mountPath: /contract
+          command:
+            - /bin/sh
+            - -c
+            - |
+              set -eu
+              pip install --no-cache-dir boto3
+              python /contract/hippius_s3_contract.py
+      volumes:
+        - name: script
+          configMap:
+            name: hippius-s3-contract

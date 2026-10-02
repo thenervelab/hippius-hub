@@ -1,0 +1,131 @@
+# Isolated Harbor 2.15, S3 driver → hippius-s3-prod gateway.
+# NEVER pass -n harbor. NEVER bucket hippius-juicefs-data.
+# Chart 1.19.0 ignores s3.forcepathstyle and omits s3.secure=false;
+# extraEnvVars are the real knobs (same as prod overlay).
+
+expose:
+  type: clusterIP
+  tls:
+    enabled: false
+  clusterIP:
+    name: harbor
+    ports:
+      httpPort: 80
+
+externalURL: http://harbor.harbor-staging.svc.cluster.local
+
+database:
+  type: internal
+redis:
+  type: internal
+
+persistence:
+  enabled: true
+  resourcePolicy: keep
+  persistentVolumeClaim:
+    registry:
+      storageClass: "-"
+      size: 1Gi
+    jobservice:
+      jobLog:
+        storageClass: ceph-block
+        size: 2Gi
+    database:
+      storageClass: ceph-block
+      size: 10Gi
+    redis:
+      storageClass: ceph-block
+      size: 2Gi
+    trivy:
+      storageClass: ceph-block
+      size: 2Gi
+  imageChartStorage:
+    disableredirect: true
+    type: s3
+    s3:
+      existingSecret: harbor-staging-s3
+      region: us-east-1
+      bucket: REPLACE_ME_BUCKET
+      regionendpoint: http://gateway.hippius-s3-prod.svc.cluster.local:8080
+      encrypt: false
+      secure: false
+      v4auth: true
+      # 64 MiB. 16 MiB (2026-08-25) made unique 1 GiB worse (56.4 vs 65.1):
+      # Harbor uploads MPU parts serially, so extra parts added wall time
+      # and did not overlap with the digest body.
+      chunksize: "67108864"
+      # Default 32 MiB. A 64–75 MiB pack then Move's via UploadPartCopy of
+      # 32 MiB ranges (GET+PUT, enqueue download) instead of one CopyObject
+      # alias (~0.06s). 5 GiB, matching the prod overlay (PR #92): the threshold
+      # must clear the largest blob meant for the alias path, not just a pack.
+      # Do not helm-upgrade ns harbor for this.
+      multipartcopythresholdsize: "5368709120"
+
+registry:
+  replicas: 3
+  registry:
+    # BestEffort (no requests) left the digest PUT CPU-starved under 16
+    # concurrent 64 MiB bodies. Do not helm-upgrade ns harbor for this.
+    resources:
+      requests:
+        cpu: "2"
+        memory: 2Gi
+      limits:
+        cpu: "4"
+        memory: 4Gi
+    extraEnvVars:
+      - name: REGISTRY_STORAGE_S3_FORCEPATHSTYLE
+        value: "true"
+      - name: REGISTRY_STORAGE_S3_SECURE
+        value: "false"
+      # Chart 1.19.0 also renders s3.multipartcopythresholdsize into
+      # config.yml. Keep the env so a kubectl-only patch (no helm, because
+      # jobservice RWO Multi-Attach) still takes effect.
+      - name: REGISTRY_STORAGE_S3_MULTIPARTCOPYTHRESHOLDSIZE
+        value: "5368709120"
+  controller:
+    resources:
+      requests:
+        cpu: 500m
+        memory: 512Mi
+      limits:
+        cpu: "1"
+        memory: 1Gi
+    extraEnvVars:
+      - name: REGISTRY_STORAGE_S3_FORCEPATHSTYLE
+        value: "true"
+      - name: REGISTRY_STORAGE_S3_SECURE
+        value: "false"
+      - name: REGISTRY_STORAGE_S3_MULTIPARTCOPYTHRESHOLDSIZE
+        value: "5368709120"
+
+trivy:
+  enabled: false
+
+metrics:
+  enabled: false
+
+portal:
+  replicas: 1
+core:
+  replicas: 3
+  # BestEffort (no requests) left manifest PUT at ~1.5s in the sequential
+  # tail after the pack wave. Do not helm-upgrade ns harbor for this.
+  resources:
+    requests:
+      cpu: "1"
+      memory: 1Gi
+    limits:
+      cpu: "2"
+      memory: 2Gi
+jobservice:
+  replicas: 1
+nginx:
+  replicas: 3
+  resources:
+    requests:
+      cpu: "1"
+      memory: 512Mi
+    limits:
+      cpu: "2"
+      memory: 1Gi

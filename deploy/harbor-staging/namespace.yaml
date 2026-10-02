@@ -1,0 +1,9 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: harbor-staging
+  labels:
+    app.kubernetes.io/name: harbor-staging
+    app.kubernetes.io/part-of: hippius-hub-arm-c
+    hippius.io/do-not-touch: production
+    hippius.io/purpose: harbor-s3-speed-test

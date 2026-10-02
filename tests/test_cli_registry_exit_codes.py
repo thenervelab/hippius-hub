@@ -82,3 +82,20 @@ def test_exit_code_constants_are_outside_bash_reserved_range():
     # And distinct from the _format_download_error codes (10-16).
     assert cli.EXIT_NAMESPACE_TAKEN not in range(1, 17)
     assert cli.EXIT_INVALID_REPO_FORMAT not in range(1, 17)
+
+
+def test_repo_not_found_constant_matches_typed_dispatch():
+    """`EXIT_REPO_NOT_FOUND` is the one named constant that deliberately sits
+    INSIDE the 10-16 dispatch range: `revisions` / `repos delete` set it inline
+    for the same condition `_format_download_error` reports for
+    `RepositoryNotFoundError`. Pin both the documented value and the identity
+    so neither side can drift from the other.
+    """
+    import httpx
+    from hippius_hub.errors import RepositoryNotFoundError
+
+    assert cli.EXIT_REPO_NOT_FOUND == 11
+    err = RepositoryNotFoundError(
+        "gone", response=httpx.Response(404, request=httpx.Request("GET", "about:blank")))
+    _, code = cli._format_download_error(err)
+    assert code == cli.EXIT_REPO_NOT_FOUND

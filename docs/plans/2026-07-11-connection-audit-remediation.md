@@ -4,7 +4,7 @@
 
 **Goal:** Remediate all 20 surviving findings from the 2026-07-11 connection/perf audit — closing the upload/download stall-timeout gaps, adding cancellation, fixing correctness/robustness edges, and landing the perf micro-wins — each with tests, and benchmarks for the perf items.
 
-**Architecture:** Two planes. The Rust data plane (`hippius_core`, `src/*.rs`) does byte transfer over process-global reqwest clients; the Python control plane (`hippius_hub/*.py`) does OCI/Harbor metadata over a pooled `httpx.Client`. The audit's core theme is *upload/download plane divergence*: the download plane is well-guarded, the upload plane is not. Fixes restore parity.
+**Architecture:** Two planes. The Rust data plane (`hippius_core`, `src/*.rs`) does byte transfer over process-global reqwest clients; the Python control plane (`hippius_hub/*.py`) does the registry/the registry metadata over a pooled `httpx.Client`. The audit's core theme is *upload/download plane divergence*: the download plane is well-guarded, the upload plane is not. Fixes restore parity.
 
 **Tech stack:** Rust (tokio, reqwest 0.12, pyo3 0.29, tokio-util, sha2), Python 3.9+ (httpx, pytest, respx, hypothesis), maturin bridge.
 
@@ -102,7 +102,7 @@ Commit per phase (or per finding where a phase groups several). Never squash cor
 
 ## Phase 6 — L2: plain-blob retry session (`uploader.rs`, `lib.rs`, `file_upload.py`)
 
-Make the plain path symmetric with the pack path: `upload_blob_native(uploads_url, path, digest, auth_token)` does POST-init + PUT-with-digest inside `try_upload_blob_once`, so each retry re-inits. Update `file_upload.py:84-92` to pass `uploads_url` + `digest` instead of pre-POSTing. Test: retry after a mid-PUT reset re-inits and succeeds (mock). Commit `fix(upload): re-init the OCI upload session per retry on the plain path`.
+Make the plain path symmetric with the pack path: `upload_blob_native(uploads_url, path, digest, auth_token)` does POST-init + PUT-with-digest inside `try_upload_blob_once`, so each retry re-inits. Update `file_upload.py:84-92` to pass `uploads_url` + `digest` instead of pre-POSTing. Test: retry after a mid-PUT reset re-inits and succeeds (mock). Commit `fix(upload): re-init the registry upload session per retry on the plain path`.
 
 ## Phase 7 — L7: diagnostics DNS (`src/diagnostics.rs`)
 
@@ -116,7 +116,7 @@ Thread `CancellationToken` into `ChunkedDownloader::download`, `PackAssembler::a
 
 - **M2:** on a 401 from a blob/manifest PUT (Python side, and surfaced from Rust), call `clear_oci_token_cache()` + re-fetch (`use_cache=False`) and retry once with the fresh token. Wire into `file_upload.py` (manifest PUT + blob paths) and `file_download.py`.
 - **critic#3:** `diagnose.py:100` pass `endpoint=endpoint` into `get_oci_bearer_token`.
-- Tests: respx 401→refresh→200 for upload + download; diagnose custom-endpoint token uses the custom registry. Commit `fix(auth): refresh the OCI token on 401 mid-operation; thread endpoint through diagnose`.
+- Tests: respx 401→refresh→200 for upload + download; diagnose custom-endpoint token uses the custom registry. Commit `fix(auth): refresh the registry token on 401 mid-operation; thread endpoint through diagnose`.
 
 ## Phase 10 — L3: control-plane retry
 

@@ -15,9 +15,9 @@ import tempfile
 import threading
 import time
 import warnings
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from pathlib import Path
-from typing import BinaryIO, Dict, List, Optional, Tuple, Union
+from typing import Any, BinaryIO, Callable, Dict, List, Optional, Tuple, Union
 
 import httpx
 from huggingface_hub import CommitInfo
@@ -26,7 +26,7 @@ from tqdm import tqdm
 
 from . import _http
 from ._oci import fetch_manifest, group_files, layer_title, parse_pointer_v2
-from ._packing import plan_packs, pointer_v2_bytes, resolve_pointer_chunks
+from ._packing import PackAccumulator, pointer_v2_bytes, resolve_pointer_chunks
 from .auth import call_with_oci_token_refresh
 from .constants import (
     ARTIFACT_TYPE_CHUNKED_V2,
@@ -59,7 +59,7 @@ from .file_download import _oci_repo_path, _validate_repo_type
 
 try:
     from .hippius_core import (
-        chunk_and_hash_native,
+        chunk_stream_native,
         hash_file_native,
         pack_upload_native,
         upload_blob_native,
@@ -187,6 +187,47 @@ def _ensure_config_blob_uploaded(registry: str, repo_id: str, oci_token: str) ->
     with _config_blob_lock:
         _config_blob_present.add(cache_key)
     return digest, size
+
+
+def _start_config_blob_upload(registry: str, repo_id: str, oci_token: str) -> Callable[[], tuple]:
+    """Run `_ensure_config_blob_uploaded` on a side thread; return its join.
+
+    The returned callable blocks until the worker finishes and then returns the
+    `(digest, size)` tuple — or re-raises the worker's exception, unchanged, on the
+    caller's thread (so a 401 still reaches `call_with_oci_token_refresh`). Call it
+    BEFORE assembling the manifest; never call it on an error path, where the
+    worker is simply abandoned.
+
+    A bare daemon thread, not a ThreadPoolExecutor: the executor's
+    workers are NON-daemon, and `concurrent.futures.thread._python_exit`
+    joins them at interpreter shutdown. `shutdown(wait=False)` therefore
+    only makes `upload_file` return early — the CLI *process* still
+    blocks for the full config HEAD/PUT retry budget (minutes against a
+    dead registry) before it can exit, so Ctrl-C still looks hung.
+    `cancel_futures` cannot help either: this future has already started.
+    A daemon thread is abandoned at exit instead.
+
+    The try/except is load-bearing: a thread's exception is otherwise dropped
+    by `threading.excepthook`, never re-raised. It is stored and re-raised at
+    the join, not swallowed."""
+    result: Dict[str, Any] = {}
+
+    def _run() -> None:
+        try:
+            result["value"] = _ensure_config_blob_uploaded(registry, repo_id, oci_token)
+        except BaseException as exc:  # surfaced on the caller's thread at the join
+            result["error"] = exc
+
+    thread = threading.Thread(target=_run, daemon=True, name="hippius-config-blob")
+    thread.start()
+
+    def _join() -> tuple:
+        thread.join()
+        if "error" in result:
+            raise result["error"]
+        return result["value"]
+
+    return _join
 
 
 def _ensure_bytes_blob_uploaded(registry: str, repo_id: str, oci_token: str, data: bytes, digest: str) -> None:
@@ -337,15 +378,21 @@ def _upload_file_chunked_v2(
     (per `dedup_index`) are referenced by range into their existing packs — only
     NEW chunks are packed and uploaded. The manifest lists the pointer plus every
     pack it references (new and reused) so each stays GC-safe. Pointer written
-    last, like v1, so a crash leaves only unreferenced packs for GC."""
-    whole_hex, chunk_metas = chunk_and_hash_native(abs_path, resolve_cdc_avg_size())
-    chunks = [(f"sha256:{h}", size, offset) for h, offset, size in chunk_metas]
+    last, like v1, so a crash leaves only unreferenced packs for GC.
+
+    Streaming: chunk metadata is pulled batch-by-batch from the native pipeline
+    (`chunk_stream_native`) and fed straight into a `PackAccumulator`, so each
+    completed pack uploads WHILE later chunks are still being hashed — phase 1
+    (CDC + hashing) overlaps the network instead of preceding it. The plan, and
+    therefore the pointer and manifest, are byte-identical to the former batch
+    path (`plan_packs` IS feed-all-then-finish on the same accumulator)."""
     # Intra-batch dedup (C2): in a folder upload, plan against a LIVE snapshot that
     # already includes chunks earlier files in this same push have stored — not just
     # the prior revision's static index.
     if live_index is not None:
         dedup_index, pack_sizes = live_index.snapshot()
-    plan = plan_packs(chunks, dedup_index, resolve_pack_size())
+    stream = chunk_stream_native(abs_path, resolve_cdc_avg_size())
+    acc = PackAccumulator(dedup_index, resolve_pack_size())
     uploads_url = f"{registry}/v2/{oci_repo}/blobs/uploads/"
 
     # Shared across all files: a thread blocks here BEFORE the native call
@@ -364,11 +411,39 @@ def _upload_file_chunked_v2(
         return f"sha256:{hex_digest}"
 
     # Packs are independent blobs → upload in parallel (the round-trip win: ~K/16
-    # pack PUTs instead of K chunk PUTs). Order is preserved so digests line up
-    # with plan.new_packs for resolve_pointer_chunks. The gate above caps the
-    # cross-file total even though this pool is per-file.
+    # pack PUTs instead of K chunk PUTs), submitted AS the accumulator completes
+    # them so uploads overlap the remaining chunking. `futures` stays aligned with
+    # `plan.new_packs`: feed() emits a strict prefix of finish().new_packs, so the
+    # collected digests line up for resolve_pointer_chunks. The gate above caps
+    # the cross-file total even though this pool is per-file.
+    chunk_count = 0
+    futures: List[Future[str]] = []
     with ThreadPoolExecutor(max_workers=resolve_upload_workers()) as executor:
-        new_pack_digests = list(executor.map(_upload_pack, plan.new_packs))
+        try:
+            while (batch := stream.next_batch()) is not None:
+                # Native triples are (hex, offset, len); the accumulator consumes
+                # (digest, size, offset) — same reorder the batch path applied.
+                for h, offset, size in batch:
+                    chunk_count += 1
+                    for new_pack in acc.feed((f"sha256:{h}", size, offset)):
+                        futures.append(executor.submit(_upload_pack, new_pack))
+            plan = acc.finish()
+            # Only the final partial pack (if any) was not emitted by feed().
+            for new_pack in plan.new_packs[len(futures):]:
+                futures.append(executor.submit(_upload_pack, new_pack))
+            whole_hex = stream.finish()  # never blocks: producer joined at EOF
+            new_pack_digests = [f.result() for f in futures]
+        except BaseException:
+            # A failed pack upload (f.result()), a poisoned stream (next_batch
+            # raises), or Ctrl-C: cancel whatever hasn't started — the same
+            # early-exit executor.map used to perform — then let the with-block
+            # join the in-flight uploads (bounded by the gate) before the
+            # ORIGINAL exception propagates unchanged. Secondary failures on
+            # already-running packs are dropped, matching the folder fan-out's
+            # fail-fast. Dropping `stream` unwinds the producer thread.
+            for f in futures:
+                f.cancel()
+            raise
 
     pointer_chunks = resolve_pointer_chunks(plan, new_pack_digests)
     pointer_bytes = pointer_v2_bytes(whole_hex, file_size, pointer_chunks)
@@ -400,7 +475,7 @@ def _upload_file_chunked_v2(
             LAYER_TITLE_KEY: repo_title.replace("\\", "/"),
             FILE_SIZE_KEY: str(file_size),
             FILE_DIGEST_KEY: f"sha256:{whole_hex}",
-            CHUNK_COUNT_KEY: str(len(chunk_metas)),
+            CHUNK_COUNT_KEY: str(chunk_count),
         },
     }
     # One pack layer per referenced pack, in first-appearance order (deterministic).
@@ -924,6 +999,10 @@ def _finalize_upload_manifest(
 
     merged_layers = _merge_layers(existing_layers, new_layers, delete_titles=delete_titles)
 
+    # Sequential on purpose: the folder file fan-out has already finished.
+    # `upload_file` overlaps this PUT with its pack wave; overlapping here
+    # would hide only the merge above, not the files. Folder uploads get
+    # none of the unique-1-GiB 1.27× (`upload_file` only).
     config_digest, config_size = _ensure_config_blob_uploaded(registry, oci_repo, oci_token)
     manifest = _assemble_manifest(
         config_digest, config_size, merged_layers, commit_message, commit_description
@@ -1064,6 +1143,14 @@ def upload_file(
                 dedup_index, pack_sizes = _build_dedup_index(
                     existing, registry, oci_repo, oci_token, exclude_packs=exclude_packs
                 )
+            # The empty `{}` config blob does not depend on pack digests.
+            # Start it before the pack wave so its Harbor digest-PUT overlaps
+            # the layer uploads instead of sitting in the sequential tail
+            # (pointer → config → manifest). `upload_folder` does not: it
+            # still calls `_ensure_config_blob_uploaded` after the file
+            # fan-out in `_finalize_upload_manifest`. The 1.27× unique-1-GiB
+            # figure is this path only.
+            join_config_blob = _start_config_blob_upload(registry, oci_repo, oci_token)
             new_layers = _upload_file_layers(
                 file_path, path_in_repo, registry, oci_repo, oci_token, dedup_index, pack_sizes
             )
@@ -1071,8 +1158,11 @@ def upload_file(
             existing_layers = existing.manifest.get("layers", []) if existing else []
             prev_digest = _prev_digest_or_warn(existing, repo_id, revision)
             merged_layers = _merge_layers(existing_layers, new_layers)
-
-            config_digest, config_size = _ensure_config_blob_uploaded(registry, oci_repo, oci_token)
+            # Join BEFORE the manifest is assembled or PUT. Harbor runs
+            # `validation.disabled: true`, so a manifest naming a config blob that
+            # has not landed is accepted and only fails at pull time. On the error
+            # path we never reach here: the thread is simply abandoned.
+            config_digest, config_size = join_config_blob()
             manifest = _assemble_manifest(
                 config_digest, config_size, merged_layers, commit_message, commit_description
             )

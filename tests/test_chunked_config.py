@@ -11,9 +11,13 @@ import pytest
 from hippius_hub.constants import (
     DEFAULT_CDC_AVG_SIZE,
     DEFAULT_CHUNK_THRESHOLD,
+    DEFAULT_PACK_SIZE,
+    FASTCDC_MAXIMUM_MAX,
+    MAX_PACK_BYTES,
     resolve_cdc_avg_size,
     resolve_chunk_threshold,
     resolve_chunked_write_enabled,
+    resolve_pack_size,
     resolve_verify_hash,
 )
 
@@ -71,6 +75,26 @@ def test_chunked_write_unrecognized_value_raises(monkeypatch, value):
         resolve_chunked_write_enabled()
 
 
+def test_pack_size_default_fits_reader_cap_with_cdc_overshoot(monkeypatch):
+    monkeypatch.delenv("HIPPIUS_PACK_SIZE", raising=False)
+    value = resolve_pack_size()
+    assert value == DEFAULT_PACK_SIZE
+    assert value + FASTCDC_MAXIMUM_MAX <= MAX_PACK_BYTES
+
+
+def test_pack_size_rejects_target_that_overshoots_reader_cap(monkeypatch):
+    # Exactly MAX_PACK_BYTES would produce packs of MAX + 16 MiB - 1 that
+    # the reader refuses. The guard is pack_size + 16 MiB <= MAX, not
+    # pack_size <= MAX.
+    monkeypatch.setenv("HIPPIUS_PACK_SIZE", str(MAX_PACK_BYTES))
+    with pytest.raises(ValueError, match="overshoot"):
+        resolve_pack_size()
+    monkeypatch.setenv(
+        "HIPPIUS_PACK_SIZE", str(MAX_PACK_BYTES - FASTCDC_MAXIMUM_MAX)
+    )
+    assert resolve_pack_size() == MAX_PACK_BYTES - FASTCDC_MAXIMUM_MAX
+
+
 def test_empty_write_gate_defaults_enabled(monkeypatch):
     # An empty/whitespace `HIPPIUS_CHUNKED_WRITE=` in a profile falls back to the
     # default, which is ON as of 0.6.0.
@@ -89,3 +113,38 @@ def test_verify_hash_enabled_by_default(monkeypatch):
 def test_verify_hash_disabled_by_falsy_values(monkeypatch, value):
     monkeypatch.setenv("HIPPIUS_VERIFY_HASH", value)
     assert resolve_verify_hash() is False
+
+
+_PACK_CAP = MAX_PACK_BYTES - FASTCDC_MAXIMUM_MAX
+
+
+@pytest.mark.parametrize("raw", [str(_PACK_CAP - 1), str(_PACK_CAP), "1", str(DEFAULT_PACK_SIZE)])
+def test_pack_size_accepts_values_up_to_and_including_the_cap(monkeypatch, raw):
+    monkeypatch.setenv("HIPPIUS_PACK_SIZE", raw)
+    assert resolve_pack_size() == int(raw)
+
+
+@pytest.mark.parametrize("raw", [str(_PACK_CAP + 1), str(MAX_PACK_BYTES + 1), str(2**40)])
+def test_pack_size_rejects_every_value_over_the_cap(monkeypatch, raw):
+    monkeypatch.setenv("HIPPIUS_PACK_SIZE", raw)
+    with pytest.raises(ValueError, match="overshoot"):
+        resolve_pack_size()
+
+
+@pytest.mark.parametrize("raw", ["0", "-1", "-67108864"])
+def test_pack_size_rejects_non_positive_values(monkeypatch, raw):
+    monkeypatch.setenv("HIPPIUS_PACK_SIZE", raw)
+    with pytest.raises(ValueError, match="positive"):
+        resolve_pack_size()
+
+
+@pytest.mark.parametrize("raw", ["64M", "abc", "1.5", "0x40", " "])
+def test_pack_size_rejects_non_numeric_values(monkeypatch, raw):
+    monkeypatch.setenv("HIPPIUS_PACK_SIZE", raw)
+    with pytest.raises(ValueError):
+        resolve_pack_size()
+
+
+def test_pack_size_blank_falls_back_to_the_default(monkeypatch):
+    monkeypatch.setenv("HIPPIUS_PACK_SIZE", "")
+    assert resolve_pack_size() == DEFAULT_PACK_SIZE

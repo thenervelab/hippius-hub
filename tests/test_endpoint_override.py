@@ -28,7 +28,8 @@ def test_hf_hub_url_uses_endpoint_override():
     assert url == "https://alt.example.com/v2/foo/bar/manifests/main"
 
 
-def test_hf_hub_url_endpoint_combines_with_repo_type():
+def test_hf_hub_url_endpoint_combines_with_repo_type(monkeypatch):
+    monkeypatch.setenv("HIPPIUS_EXPERIMENTAL_REPO_TYPES", "1")
     url = hf_hub_url(
         "foo/bar", "x.bin",
         endpoint="https://alt.example.com",

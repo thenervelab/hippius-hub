@@ -8,7 +8,7 @@ Portable benchmark that times a single-file download with both clients from the 
 python3 -m venv .venv
 .venv/bin/pip install -r requirements.txt   # → hippius_hub==0.3.0 + its deps
 
-export HIPPIUS_TEST_USER='robot$...'
+export HIPPIUS_TEST_USER='<registry-login>'
 export HIPPIUS_TEST_PASS='...'
 
 .venv/bin/python bench.py --seed --size 5    # first run, uploads blob then benches
@@ -30,17 +30,17 @@ Uploads a synthetic blob to the Hippius registry so the bench has something to d
 1. **Generate `--size` GiB of bytes locally.** Done via `os.urandom(4 MiB)` repeated to fill the target size — high-entropy enough that the registry won't compress it on the wire, fast because we generate one block and `f.write(block[:n])` it in a loop.
 2. **Upload via `hippius_hub.upload_file`.** Internally this:
    - Calls the Rust `hash_file_native` to SHA256 the file (returns hash + size).
-   - `HEAD /v2/{repo}/blobs/sha256:{digest}` — skip-if-exists check.
-   - `POST /v2/{repo}/blobs/uploads/` to initiate, gets a `Location` URL back.
-   - Streams the file via Rust `upload_blob_native` (16-way parallel chunked PUT) and finishes with `?digest=sha256:...`.
-   - Fetches the existing OCI manifest at the revision (or builds an empty one), merges the new layer in, `PUT /v2/{repo}/manifests/{revision}` with the updated manifest.
+   - A skip-if-exists check against the content digest.
+   - Initiates an upload session and gets back the URL to stream to.
+   - Streams the file via Rust `upload_blob_native` (16-way parallel chunked PUT) and finalises against the digest.
+   - Fetches the revision's existing metadata (or builds an empty one), merges the new entry in, and commits the updated revision.
    - Returns a `huggingface_hub.CommitInfo` instance.
 
 This step is **skipped on subsequent runs** — once `test/bench:{N}gb/model.bin` exists on the registry, the blob persists. Re-seed only when you want fresh bytes.
 
 ### 3. Benchmark loop
 
-For each client (`huggingface_hub` first, then `hippius_hub`) the script runs `--runs` downloads (default 2) into a **fresh `cache_dir`** per run. After each download the cache dir is `shutil.rmtree`'d. The local-disk wipe matters: it means any speedup observed on the second pull is the **server's edge cache** (ATS in front of Harbor / CloudFront in front of HF), not OS page cache or local FS reuse.
+For each client (`huggingface_hub` first, then `hippius_hub`) the script runs `--runs` downloads (default 2) into a **fresh `cache_dir`** per run. After each download the cache dir is `shutil.rmtree`'d. The local-disk wipe matters: it means any speedup observed on the second pull is the **server's edge cache** (the registry's edge cache / CloudFront in front of HF), not OS page cache or local FS reuse.
 
 #### huggingface_hub side
 
@@ -71,14 +71,14 @@ hippius_download(
 
 Identical Python signature to HF's. Internally:
 
-1. **Auth resolution** — pulls the saved Basic/Bearer auth header, exchanges it for an OCI bearer token via `registry.hippius.com/service/token?service=harbor-registry&scope=repository:test/bench:pull` (cached for the JWT's `exp` claim with 30s leeway).
-2. **Manifest fetch** — `GET /v2/test/bench/manifests/5gb` returns the OCI manifest JSON. The script walks `manifest.layers[]` looking for the one with `annotations["org.opencontainers.image.title"] == "model.bin"`. That layer's `digest` is the blob's SHA256.
-3. **Blob fetch** — calls the Rust `download_file_native(url, dest, token, chunk_size, verify_hash=False)`:
-   - HEAD the blob URL to get `Content-Length`.
+1. **Auth resolution** — pulls the saved Basic/Bearer auth header and exchanges it for a short-lived bearer token scoped to `test/bench:pull` (cached for the JWT's `exp` claim with 30s leeway).
+2. **Metadata fetch** — reads the revision's file list for `test/bench:5gb` and resolves the entry named `model.bin` to its SHA256 digest.
+3. **Content fetch** — calls the Rust `download_file_native(url, dest, token, chunk_size, verify_hash=False)`:
+   - HEAD the content URL to get `Content-Length`.
    - Pre-allocate the destination file at full size (`set_len`).
    - Spawn up to 16 concurrent `Range:`-request tasks, each streaming its slice **directly to the right offset** in the pre-allocated file (no temp files, no assembly phase).
    - Each chunk has up to 3 retries with exponential backoff.
-4. **Cache placement** — Python moves the temp file to `{cache_dir}/models--test--bench/blobs/sha256:{digest}` and creates a symlink at `snapshots/5gb/model.bin` (HF's exact layout). Returns the symlink path.
+4. **Cache placement** — Python moves the temp file into the content-addressed cache at `{cache_dir}/models--test--bench/blobs/sha256:{digest}` and creates a symlink at `snapshots/5gb/model.bin` (HF's exact layout). Returns the symlink path.
 
 The cache layout matching is intentional: `huggingface_hub.scan_cache_dir(cache_dir=hippius_cache)` parses it cleanly, and consumers like `transformers.AutoConfig.from_pretrained(...)` find files the same way they would for HF-downloaded ones.
 
@@ -108,7 +108,7 @@ Three tables printed to stdout (with `print()`, no markdown for terminal viewing
 Env vars (auth — required):
 
 ```
-HIPPIUS_TEST_USER + HIPPIUS_TEST_PASS    Harbor Basic auth (typical: a robot account)
+HIPPIUS_TEST_USER + HIPPIUS_TEST_PASS    Registry Basic auth (typical: a scoped key)
 HIPPIUS_TEST_TOKEN                       Alternative: a pre-minted Bearer token
 ```
 
@@ -135,7 +135,7 @@ The `hippius_hub` calls are the exact same signatures `huggingface_hub` exposes 
 - `≈ 1.0×` — either no cache is in path, or both pulls hit warm cache (e.g. a recent seed populated the cache before run 1).
 - `< 1.0×` — first run was anomalously fast (cache had a recent hit from someone else), or the second pull hit a cold node in a multi-server pool.
 
-**Warm-vs-warm cross-client ratio** is the fairest single number: both clients are running against their respective warm caches, so this isolates the difference between (a) the client's parallelism/protocol efficiency and (b) the registry's edge bandwidth. Note that this is *not* purely a client comparison — geo-routing differences between CloudFront edges and ATS POPs are folded in.
+**Warm-vs-warm cross-client ratio** is the fairest single number: both clients are running against their respective warm caches, so this isolates the difference between (a) the client's parallelism/protocol efficiency and (b) the registry's edge bandwidth. Note that this is *not* purely a client comparison — geo-routing differences between CloudFront edges and the registry's own POPs are folded in.
 
 ## Reproducibility
 
@@ -147,6 +147,6 @@ The `hippius_hub` calls are the exact same signatures `huggingface_hub` exposes 
 
 - **Single-machine measurement.** Network conditions, edge POP routing, and server load all vary minute-to-minute. For a defensible number, run 3-5 times and take the median.
 - **Server bandwidth is in the measurement.** This is a *full pipeline* benchmark — not isolated client throughput. A faster client served by a slower CDN will look slow; a slower client served by a faster CDN will look fast.
-- **First-pull-after-seed is already warm.** If you ran `--seed` right before benchmarking, the registry's ATS may have cached the blob during the PUT (write-through). Both pulls then hit warm cache and the warm-speedup will look ~1.0×. To see a true cold pull, wait long enough for the cache to evict (registry-dependent, often hours) or use a different revision.
+- **First-pull-after-seed is already warm.** If you ran `--seed` right before benchmarking, the registry's edge cache may have retained the blob during the PUT (write-through). Both pulls then hit warm cache and the warm-speedup will look ~1.0×. To see a true cold pull, wait long enough for the cache to evict (registry-dependent, often hours) or use a different revision.
 - **Memory needs.** `hf_xet` (HF 1.x's Rust downloader) keeps working buffers in RAM. On a 1 GB-RAM VPS with no swap, a 5 GiB download will OOM-kill the process. Add ≥ 4 GiB swap, or run on a host with more RAM.
 - **Disk needs.** Peak working set is one full file at a time (we wipe between runs). 5 GiB seed + 5 GiB download = 10 GiB. With `--seed` running concurrently with the first download phase: same, 10 GiB peak. Plan accordingly.

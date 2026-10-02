@@ -37,7 +37,11 @@ _REPO_TYPE_CASES = [
 
 
 @pytest.fixture
-def per_type_repo(request, logged_in):
+def per_type_repo(request, logged_in, monkeypatch):
+    # dataset/space mapping is gated off by default; the CI robot DOES hold
+    # grants on the seeded `datasets`/`spaces` projects, so opt in here to
+    # keep the full round-trip exercised.
+    monkeypatch.setenv("HIPPIUS_EXPERIMENTAL_REPO_TYPES", "1")
     repo_type, repo_id = request.param
     return {"repo_type": repo_type, "repo_id": repo_id}
 

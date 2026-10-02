@@ -31,6 +31,127 @@ the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html
   the misleading "repository not found" (11) the previous `RepositoryNotFoundError`
   produced.
 
+## [0.7.2] — 2026-09-07
+
+Pointer and pack formats are unchanged; 0.7.0 clients read 0.7.2 uploads and
+vice versa. One client-side behaviour change: `repo_type="dataset"` and
+`"space"` are refused by default (see Changed).
+
+### Changed
+
+- Intra-file chunked-v2 packing stores a repeated chunk digest once (first
+  new-pack occurrence). Previously a digest appearing twice in one file was
+  packed twice. Pointer format is unchanged: both entries point at the same
+  pack offset.
+- Pack upload single-flights concurrent PUTs of the same pack bytes, and a
+  digest this process has already landed is HEADed before it is re-sent, so
+  Harbor is not asked twice for identical content.
+- Large-file uploads start the empty OCI config blob (`{}`) in parallel with
+  the pack wave. It does not depend on pack digests; previously it sat in
+  the sequential tail after packs (pointer → config → manifest). The side
+  thread is a daemon: Ctrl-C returns immediately, and a config-blob failure
+  fails the upload before any manifest PUT.
+- `repo_type="dataset"` / `"space"` are refused up front with a
+  `NotImplementedError` telling the caller to omit `repo_type`. Those types map
+  to shared registry namespaces that customer access keys hold no grants on, so
+  every real call 401'd and surfaced as a misleading "repository not found".
+  Set `HIPPIUS_EXPERIMENTAL_REPO_TYPES=1` to opt back in (the e2e suite does).
+  Cache-side `repo_type` handling is unchanged, and `hf_hub_download` checks
+  the local cache before the gate, so cached dataset/space files still resolve
+  with `local_files_only`.
+
+### Fixed
+
+- Pack download no longer `Vec::with_capacity` of the registry-declared size.
+  The buffer `try_reserve`s arrived bytes (initial cap `min(declared, 64 MiB)`).
+  Presigned query strings are stripped from pack error messages. `HIPPIUS_PACK_SIZE`
+  is rejected if `pack_size + 16 MiB` would exceed the 1 GiB reader cap.
+- Unsupported `--repo-type` values in `revisions` and `registry repos delete`
+  print a one-line error and exit 1 instead of a traceback.
+
+### Dependencies
+
+- fastcdc 3.2.1 → 4.0.1 (chunk boundaries verified byte-identical), tokio
+  1.53.1, indicatif 0.18.6 and the rest of the rust-runtime group; pytest 9.1.1
+  in the smoke suite; GitHub Actions: checkout v7.0.1, setup-python v7.0.0,
+  cargo-deny-action v2.1.1, action-gh-release v3.0.2.
+
+## [0.7.0] — 2026-08-11
+
+No API, CLI, or environment-variable changes. Artifacts are byte-identical to
+0.6.1 and both versions read each other's uploads (see Compatibility).
+
+### Changed
+
+- **Faster large-file uploads.** Chunks are hashed on a worker pool instead of
+  serially, and packs upload while the rest of the file is still being chunked —
+  previously nothing was sent until the whole file had been read and hashed.
+  Chunk+hash 551 → 762 MiB/s (1.38x); e2e at a throttled 200 MiB/s 13.87 s →
+  10.68 s. Against production the gain is smaller since transfer dominates:
+  1 GiB 39.5 s → 36.7 s, 200 MiB 55.0 s → 43.4 s.
+- **Faster verified downloads.** With `HIPPIUS_VERIFY_HASH` on (default), the
+  whole-file digest is now computed as chunks land instead of by re-reading the
+  finished file. Same digest and guarantee, no second pass.
+- **Progress messages are plain ASCII** — emoji prefixes removed.
+- **Errors carry their full cause chain** (`message` + `caused by: ...`), instead
+  of a debug dump that dropped the underlying reason.
+
+### Fixed
+
+- `hippius-hub revisions` no longer prints an `httpx` traceback when the registry
+  answers `401` — a private repository, or a namespace that does not exist or was
+  deleted outright. It now prints one actionable line pointing at
+  `hippius-hub login`. A missing or deleted repo *inside* a namespace you can
+  already reach reported cleanly in 0.6.1 too; only the namespace-level 401 path
+  was broken. Both paths now exit with the documented not-found code `11`
+  (`EXIT_REPO_NOT_FOUND` / `RepositoryNotFoundError`). 0.6.1 exited `1` on
+  both — deliberately on the 404, incidentally on the 401 via the uncaught
+  exception — so a wrapper that tests `$? -eq 1` for a missing repo must be
+  updated.
+- A crashed hashing task no longer retries. It was treated as transient I/O and
+  retried three times, re-downloading up to three ~64 MiB packs before failing.
+- Unrecoverable upload sessions report the real cause instead of a fabricated
+  `503`. Recovery behaviour (fresh session per retry) is unchanged.
+- Malformed `Content-Range` is reported as a bad server response, not a local I/O
+  error. Retry behaviour unchanged.
+- Invalid chunk digests fail immediately, naming the pack and chunk.
+
+### Security
+
+- `quinn-proto` bumped past **RUSTSEC-2026-0185**. It was never in this crate's
+  build graph (no HTTP/3), so shipped wheels were unaffected; this keeps the
+  advisory scanner clean.
+- `thiserror` bumped to 2.x.
+
+### Internal
+
+- The three largest Rust transfer modules were split into module directories and
+  shared transport constants consolidated; verified pure moves.
+- Added enforced Rust formatting, `unsafe_code = "forbid"`, upload benchmark
+  harnesses, and hourly production smoke tests against the published wheel.
+
+### Compatibility
+
+- **Wire format unchanged.** Verified against production: the same file uploaded
+  by 0.6.1 and 0.7.0 produced identical pointer and pack digests, on both a 1 GiB
+  chunked-v2 upload and a 200 MiB plain blob. Both directions round-trip
+  byte-identically.
+- No changes to CLI commands or flags, to any `HIPPIUS_*` variable or its
+  default, or to the Python API. Cache layout remains `huggingface_hub`-identical.
+
+## [0.6.1] — 2026-07-16
+
+### Added
+
+- **`hippius-hub registry repos delete <project>/<repo>`** — a CLI command to
+  delete a whole repository, mirroring `hf repos delete`. Supports
+  `--repo-type`, `--token`, `--missing-ok`, and `-y/--yes`, and prompts for
+  confirmation otherwise. Wraps the existing `delete_repo()` (registry admin API),
+  which requires `admin`/`push-delete` rights on the project — previously the
+  only way to remove a repo was the Python API. Deleting via the console
+  artifact endpoint only cleared artifacts and left an empty repo behind; this
+  removes the repository itself.
+
 ## [0.6.0] — 2026-07-13
 
 ### Changed (behavioral default — read before upgrading producers)
@@ -54,7 +175,7 @@ the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 ### Added
 
 - **Resumable plain-blob uploads.** A large file below the chunk threshold now
-  streams to the registry in bounded OCI `PATCH` chunks (`HIPPIUS_UPLOAD_CHUNK_SIZE`,
+  streams to the registry in bounded `PATCH` chunks (`HIPPIUS_UPLOAD_CHUNK_SIZE`,
   default 16 MiB); on any transient failure the client `GET`s the registry's
   committed offset and resumes from there, so a mid-upload disconnect costs at most
   one chunk of re-send instead of the whole layer. Falls back to the monolithic
@@ -87,7 +208,7 @@ the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html
   `Dockerfile.receiver`, `deploy/receiver/`) and the client multipart upload
   route it fronted (`upload_blob_multipart_native`, `HIPPIUS_RECEIVER_URL`,
   `HIPPIUS_MULTIPART_*`, the `diagnose-upload` CLI and its upload throughput
-  probe). Chunking pushes chunk blobs straight to Harbor, so the receiver is
+  probe). Chunking pushes chunks straight to the registry, so the receiver is
   superseded. The download `diagnose` command and its probe are unchanged.
 
 ### Changed
@@ -150,7 +271,7 @@ the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html
   - `diagnose` bounds DNS resolution and tries every resolved address (a dead
     first IPv6 no longer produces a false-negative), and its token fetch honors
     `--endpoint`.
-  - `models list`/`show` no longer crash on a null `format` field; the Harbor
+  - `models list`/`show` no longer crash on a null `format` field; the registry
     whoami/create/delete admin calls use the same 30s timeout as their siblings;
     a wedged `docker login` is bounded to 60s; a folder of only-small files no
     longer builds the chunked-v2 dedup index it never consults.
@@ -167,7 +288,7 @@ the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html
   - Each download body read has a default-on 30s idle timeout (overridable by
     `HIPPIUS_READ_TIMEOUT`), so a peer that dribbles then stalls mid-body is cut
     promptly rather than only after the 5-minute per-chunk total timeout.
-  - The plain blob upload re-initiates its OCI upload session on every retry, so a
+  - The single-object upload re-initiates its upload session on every retry, so a
     transient failure no longer re-PUTs a session the failed attempt consumed.
   - The legacy Range downloader bounds its live chunk tasks to a spawn window
     (drain-as-they-land) instead of eager-spawning one task per chunk; the pack
@@ -187,7 +308,7 @@ the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html
   whole report. The size-probe HEAD also gained a request timeout.
 - A missing upload-init `Location` header now raises a clear error instead of a
   `TypeError`.
-- A non-numeric JWT `exp` claim is rejected instead of poisoning the OCI token
+- A non-numeric JWT `exp` claim is rejected instead of poisoning the registry token
   cache with a persistent `TypeError`.
 - `HippiusApi` no longer drops the constructor token when a call passes
   `token=None` explicitly.
@@ -200,8 +321,8 @@ the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 
 A consolidation release that lands the 45-finding security/correctness audit
 remediation, plus four rounds of post-review hardening (race fixes, supply-chain
-gates, clippy enforcement, ~400 LOC of new respx coverage for `console.py` and
-`_harbor.py`).
+gates, clippy enforcement, ~400 LOC of new respx coverage for the console and
+registry admin clients).
 
 The version jumps from `0.4.x` to `0.5.0` because this release contains breaking
 changes — most are intentional security/correctness fixes, but downstream users
@@ -362,7 +483,7 @@ should expect to update calling code. See **Migration** below.
 
 ### Added
 
-- **OCI `If-Match` header on manifest PUT** (`hippius_hub/file_upload.py`) —
+- **`If-Match` header on the revision commit** (`hippius_hub/file_upload.py`) —
   the registry-side closure of the audit H1 finding.
 - **`ConcurrentManifestUpdateError`** — typed exception in `hippius_hub.errors`.
 - **`TokenInput` typed dispatch** (`hippius_hub/_token.py`) — HF's three-state
@@ -380,8 +501,8 @@ should expect to update calling code. See **Migration** below.
 - **149+ Python tests** (was ~70) covering token-cache key separation,
   anonymous downloads, concurrent uploads, dry-run short-circuit, atomic
   token writes, atomic symlink replacement, the full CLI exit-code matrix
-  via subprocess, and the previously-untested `console.py` (28 functions,
-  38 tests) and `_harbor.py` (10 functions, 21 tests).
+  via subprocess, and the previously-untested console client (28 functions,
+  38 tests) and registry admin client (10 functions, 21 tests).
 - **CI supply-chain gates**:
   - `cargo deny check` (advisories + licenses + bans + sources) — see
     `deny.toml` for the policy.
@@ -423,7 +544,7 @@ should expect to update calling code. See **Migration** below.
 - **H2**: CLI `login` no longer `.strip()`s tokens with embedded whitespace.
 - **L6**: `download_file_native` no longer uses `""` as an in-band "skipped
   verify" sentinel; covered above under Breaking changes.
-- **M3**: OCI bearer-token cache key now hashes the token value, so two
+- **M3**: registry bearer-token cache key now hashes the token value, so two
   users hitting the same repo with different tokens get distinct cache
   entries (previously the second user got the first user's JWT).
 - **M4**: Malformed JWT payloads now emit a typed `UserWarning` instead of
@@ -445,7 +566,7 @@ should expect to update calling code. See **Migration** below.
   observable at a non-`0o600` mode.
 - **`_create_symlink` TOCTOU** closed; concurrent downloaders no longer
   race on the snapshot symlink.
-- **OCI token cache key** now hashes the token before use; raw bearer JWTs
+- **Registry token cache key** now hashes the token before use; raw bearer JWTs
   no longer appear in the in-memory cache as part of the key.
 
 ### Documented deferrals
