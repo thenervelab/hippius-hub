@@ -12,11 +12,13 @@ import hashlib
 import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pytest
 
 import _revisions
+import _sweep
 import hippius_hub
 from hippius_hub import console
 
@@ -66,8 +68,8 @@ def test_01_cleanup_old_revisions(
     candidates = [r.name for r in refs.tags] + [b.name for b in refs.branches]
     stale = [r for r in candidates if (ts := _revisions.parse_timestamp(r)) and ts < retention_cutoff]
 
-    deleted = 0
-    unreachable = []
+    accepted = []
+    pending = []
     for revision in stale:
         try:
             console.delete_artifact(qualified_repo, revision)
@@ -75,11 +77,44 @@ def test_01_cleanup_old_revisions(
             # 404 = the model indexer never saw this tag, or a previous run
             # already reaped it. Either way it is not occupying storage.
             # Anything else (timeout surfaces as status 0, permissions as 403)
-            # leaves the revision in place, so it counts toward the backlog.
+            # may leave the revision in place. It counts toward the backlog
+            # only when a re-list still shows it after the settle window: the
+            # client often times out while Harbor is about to delete the tag.
             if e.status_code != 404:
-                unreachable.append(f"{revision} ({e})")
+                pending.append((revision, e))
             continue
-        deleted += 1
+        accepted.append(revision)
+
+    def list_names():
+        refs_now = hippius_hub.list_repo_refs(smoke_repo)
+        return {item.name for item in refs_now.tags} | {item.name for item in refs_now.branches}
+
+    listed = list_names() if (accepted or pending) else set()
+    pending_names = [revision for revision, _error in pending]
+    false_success, still_pending = _sweep.judge_immediate(accepted, pending_names, listed)
+    # The console API answers 204 when Harbor 404s, so a raised-exception check
+    # cannot see a delete that did not remove the tag. Only a delete that
+    # returned is held to this. A timeout is not a reported success.
+    shown = ", ".join(false_success[:20])
+    if len(false_success) > 20:
+        shown += f" (+{len(false_success) - 20} more)"
+    assert not false_success, (
+        f"delete_artifact reported success but {len(false_success)} tag(s) are "
+        f"still listed on {smoke_repo}: {shown}. The console token's Harbor "
+        f"project does not own this repo, or the API swallowed a Harbor 404."
+    )
+
+    still = _sweep.wait_until_unlisted(
+        list_names,
+        still_pending,
+        settle_seconds=_sweep.SETTLE_SECONDS,
+        poll_seconds=_sweep.SETTLE_POLL_SECONDS,
+        monotonic=time.monotonic,
+        sleep=time.sleep,
+    )
+    errors = {revision: error for revision, error in pending}
+    unreachable = [f"{revision} ({errors[revision]})" for revision in still]
+    deleted = len(accepted) + (len(pending_names) - len(still))
 
     print(
         f"Cleanup: deleted {deleted}/{len(stale)} stale smoke revisions from "
@@ -87,21 +122,6 @@ def test_01_cleanup_old_revisions(
     )
     if unreachable:
         print(f"Cleanup could not delete {len(unreachable)}: " + "; ".join(unreachable))
-
-    # The console API answers 204 when Harbor 404s, so a raised-exception check
-    # cannot see a delete that did not remove the tag.
-    if stale:
-        refs_after = hippius_hub.list_repo_refs(smoke_repo)
-        still_there = {r.name for r in refs_after.tags} | {b.name for b in refs_after.branches}
-        remaining = [r for r in stale if r in still_there]
-        shown = ", ".join(remaining[:20])
-        if len(remaining) > 20:
-            shown += f" (+{len(remaining) - 20} more)"
-        assert not remaining, (
-            f"delete_artifact reported success but {len(remaining)} tag(s) are "
-            f"still listed on {smoke_repo}: {shown}. The console token's Harbor "
-            f"project does not own this repo, or the API swallowed a Harbor 404."
-        )
 
     assert len(unreachable) < STALE_BACKLOG_LIMIT, (
         f"{len(unreachable)} stale smoke revisions in {smoke_repo} could not be "
