@@ -1,0 +1,38 @@
+# Overlay for: helm upgrade harbor harbor/harbor --version 1.19.0 -n harbor --reuse-values -f this
+# Removes the last two single points of failure the Redis cutover left in Harbor.
+# Steps: README.md, "HA overlay".
+
+# Job logs go to Harbor's Postgres instead of a file volume. The chart mounts the
+# harbor-jobservice PVC only while "file" is a logger, and that PVC is
+# ReadWriteOnce: on 2026-10-22 the Redis cutover's rollout deadlocked for 10 minutes
+# because the new jobservice pod could not attach it while the old pod held it, and
+# RollingUpdate keeps the old pod until the new one is Ready. The chart's only other
+# fix, a top-level updateStrategy of Recreate, also applies to the registry and
+# would make every registry rollout an outage. With no volume there is nothing to
+# deadlock on. The sweeper still deletes job logs after loggerSweeperDuration (14d).
+jobservice:
+  jobLoggers:
+    - database
+
+# Two registry pods, kept on different nodes when possible. The node1 preference
+# was for JuiceFS (filesystem storage shared node1's mount pod; see the runbook),
+# and since the S3 flip the registry mounts only an emptyDir, so the pin only made
+# node1 a single point of failure. nodeAffinity: null is required: --reuse-values
+# deep-merges maps, so without it the old node1 preference survives next to this.
+# Preferred, not required: two nodes run at 94-97% memory requested, and a second
+# registry on the same node beats one that cannot schedule.
+# overlay-filesystem-rollback.yaml puts back 1 replica and the node1 preference,
+# which filesystem storage still needs.
+registry:
+  replicas: 2
+  affinity:
+    nodeAffinity: null
+    podAntiAffinity:
+      preferredDuringSchedulingIgnoredDuringExecution:
+        - weight: 100
+          podAffinityTerm:
+            topologyKey: kubernetes.io/hostname
+            labelSelector:
+              matchLabels:
+                app: harbor
+                component: registry
