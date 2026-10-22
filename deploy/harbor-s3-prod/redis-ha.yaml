@@ -1,0 +1,99 @@
+# Redis for prod Harbor: 1 master + 2 replicas and 3 Sentinels, one of each per node.
+# kubectl apply -n harbor -f this, then overlay-redis-ha.yaml. Order and cutover:
+# README.md, "Redis HA cutover".
+#
+# Why: the chart's internal Redis is a single StatefulSet pod on an RWO volume. On
+# 2026-10-22 node4 went NotReady with harbor-redis-0 on it; the pod sat Terminating
+# (a StatefulSet never replaces a pod it cannot confirm dead), every harbor-core
+# crash-looped on "failed to initialize cache", and the registry served 502 until
+# the pod was force-deleted and its VolumeAttachment removed by hand.
+#
+# Managed by the redis-operator already in the cluster (redis-operator-system,
+# quay.io/opstree/redis-operator:v0.23.0). The separate RedisSentinel CR, not
+# RedisReplication's embedded spec.sentinel: in v0.23.0 the embedded Sentinel pod
+# template takes no affinity, so all three Sentinels could land on one node.
+#
+# Services the operator creates, and who uses which:
+#   harbor-redis-ha-sentinel:26379        Harbor core, jobservice, registry, trivy
+#                                         (redis+sentinel, master set myMaster)
+#   harbor-redis-ha-master:6379           harbor-warmer, which speaks plain Redis.
+#                                         The operator moves the role=master label
+#                                         after a failover, so this follows it
+#                                         with a reconcile of lag. README step 6
+#                                         checks that it does.
+#
+# No password, same as the chart's internal Redis today. Both are ClusterIP only.
+# Redis 7.2, the line Harbor ships (goharbor/redis-photon:v2.15.0 is 7.2.11). Not
+# 7.0: a 7.2 DUMP payload does not RESTORE into 7.0, so the cutover key copy fails.
+apiVersion: redis.redis.opstreelabs.in/v1beta2
+kind: RedisReplication
+metadata:
+  name: harbor-redis-ha
+  namespace: harbor
+spec:
+  clusterSize: 3
+  kubernetesConfig:
+    image: quay.io/opstree/redis:v7.2.16
+    imagePullPolicy: IfNotPresent
+    resources:
+      requests:
+        cpu: 100m
+        memory: 128Mi
+      limits:
+        memory: 512Mi
+  # Required, not preferred: two copies on one node is the outage this file exists
+  # to prevent. 6 untainted workers (k8s-v3-node1..5, node6-cache), so 3 fit with
+  # up to 3 nodes down.
+  affinity:
+    podAntiAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:
+      - labelSelector:
+          matchLabels:
+            app: harbor-redis-ha
+        topologyKey: kubernetes.io/hostname
+  pdb:
+    enabled: true
+    maxUnavailable: 1
+  storage:
+    volumeClaimTemplate:
+      spec:
+        storageClassName: ceph-block
+        accessModes: [ReadWriteOnce]
+        resources:
+          requests:
+            storage: 5Gi
+---
+apiVersion: redis.redis.opstreelabs.in/v1beta2
+kind: RedisSentinel
+metadata:
+  name: harbor-redis-ha
+  namespace: harbor
+spec:
+  clusterSize: 3
+  kubernetesConfig:
+    image: quay.io/opstree/redis-sentinel:v7.2.16
+    imagePullPolicy: IfNotPresent
+    resources:
+      requests:
+        cpu: 50m
+        memory: 64Mi
+      limits:
+        memory: 128Mi
+  affinity:
+    podAntiAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:
+      - labelSelector:
+          matchLabels:
+            app: harbor-redis-ha-sentinel
+        topologyKey: kubernetes.io/hostname
+  pdb:
+    enabled: true
+    maxUnavailable: 1
+  redisSentinelConfig:
+    redisReplicationName: harbor-redis-ha
+    masterGroupName: myMaster
+    quorum: "2"
+    # The operator defaults, written out so a failover's timing is readable here:
+    # 5s to declare the master down, then up to 10s to promote a replica.
+    downAfterMilliseconds: "5000"
+    failoverTimeout: "10000"
