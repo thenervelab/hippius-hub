@@ -36,3 +36,13 @@ registry:
               matchLabels:
                 app: harbor
                 component: registry
+
+# Sign registry tokens with a fixed certificate. Without secretName the chart runs
+# genCA on every helm upgrade, so during the rolling restart old and new core pods
+# hold different keys and each rejects tokens the other issued: on 2026-10-22 the
+# revision 7 rollout turned live pushes into "401 unauthorized ... action: push" for
+# about a minute. harbor-token-service is created by hand (README, "Token
+# certificate"); it holds a private key, so it is never in git. Rotate it before
+# its not-after date.
+core:
+  secretName: harbor-token-service
