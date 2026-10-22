@@ -1,0 +1,36 @@
+# Lets the x509-certificate-exporter (thenervelab/hippius-otel,
+# k8s/values/x509.yaml, ServiceAccount monitoring/x509-certificate-exporter) read
+# Secrets in harbor, so it can export the expiry of harbor-token-service (README,
+# "Token certificate") for the HarborTokenCert* alerts.
+#
+# kubectl apply -f this, by hand like the rest of this directory. It lives here,
+# not in hippius-otel's chart, because hippius-otel's deploy account cannot manage
+# RBAC in harbor: its first deploy failed on exactly this Role (2026-10-22). The
+# grant belongs to the namespace that owns the Secrets anyway.
+#
+# list and watch cannot be narrowed by resourceNames, so this reads every Secret in
+# harbor. The exporter only exports harbor-token-service (its includeSecrets).
+# Remove both objects if the exporter is ever removed.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: x509-certificate-exporter
+  namespace: harbor
+rules:
+  - apiGroups: [""]
+    resources: [secrets]
+    verbs: [get, list, watch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: x509-certificate-exporter
+  namespace: harbor
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: x509-certificate-exporter
+subjects:
+  - kind: ServiceAccount
+    name: x509-certificate-exporter
+    namespace: monitoring
