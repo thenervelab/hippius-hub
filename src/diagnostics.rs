@@ -469,13 +469,15 @@ mod tests {
         assert_eq!(r, vec![(0, 0), (1, 1), (2, 2)]);
     }
 
+    // mbps returns the literal 0.0 for a zero duration, so the test wants exact
+    // equality. Comparing bits says so without a float `==`, which clippy versions
+    // disagree on flagging (an #[expect] fails on whichever one stays quiet).
     #[test]
-    #[expect(
-        clippy::float_cmp,
-        reason = "mbps returns literal 0.0 for a zero duration; exact equality is the contract"
-    )]
     fn mbps_zero_duration_is_zero() {
-        assert_eq!(mbps(1000, Duration::from_secs(0)), 0.0);
+        assert_eq!(
+            mbps(1000, Duration::from_secs(0)).to_bits(),
+            0.0_f64.to_bits()
+        );
     }
 
     #[test]
