@@ -32,6 +32,13 @@ metadata:
   namespace: harbor
 spec:
   clusterSize: 3
+  # The opstree image runs Redis as uid 1000 and a fresh ceph-block volume is
+  # root-owned, so without fsGroup Redis cannot create appendonlydir and exits
+  # ("Permission denied"). Same values as the RedisCluster in hippius-s3-staging
+  # and the operator's own e2e manifests.
+  podSecurityContext:
+    runAsUser: 1000
+    fsGroup: 1000
   kubernetesConfig:
     image: quay.io/opstree/redis:v7.2.16
     imagePullPolicy: IfNotPresent
