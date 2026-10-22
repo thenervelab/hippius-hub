@@ -18,7 +18,7 @@
 redis:
   type: external
   external:
-    addr: harbor-redis-sentinel-sentinel.harbor.svc.cluster.local:26379
+    addr: harbor-redis-ha-sentinel.harbor.svc.cluster.local:26379
     sentinelMasterSet: myMaster
     coreDatabaseIndex: "0"
     jobserviceDatabaseIndex: "1"

@@ -14,12 +14,13 @@
 # template takes no affinity, so all three Sentinels could land on one node.
 #
 # Services the operator creates, and who uses which:
-#   harbor-redis-sentinel-sentinel:26379  Harbor core, jobservice, registry, trivy
+#   harbor-redis-ha-sentinel:26379        Harbor core, jobservice, registry, trivy
 #                                         (redis+sentinel, master set myMaster)
 #   harbor-redis-ha-master:6379           harbor-warmer, which speaks plain Redis.
 #                                         The operator moves the role=master label
 #                                         after a failover, so this follows it
-#                                         with a reconcile of lag.
+#                                         with a reconcile of lag. README step 6
+#                                         checks that it does.
 #
 # No password, same as the chart's internal Redis today. Both are ClusterIP only.
 # Redis 7.2, the line Harbor ships (goharbor/redis-photon:v2.15.0 is 7.2.11). Not
@@ -65,7 +66,7 @@ spec:
 apiVersion: redis.redis.opstreelabs.in/v1beta2
 kind: RedisSentinel
 metadata:
-  name: harbor-redis
+  name: harbor-redis-ha
   namespace: harbor
 spec:
   clusterSize: 3
@@ -83,7 +84,7 @@ spec:
       requiredDuringSchedulingIgnoredDuringExecution:
       - labelSelector:
           matchLabels:
-            app: harbor-redis-sentinel
+            app: harbor-redis-ha-sentinel
         topologyKey: kubernetes.io/hostname
   pdb:
     enabled: true

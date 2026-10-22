@@ -37,8 +37,8 @@ entries and job stats. Cut over when the Job Service dashboard shows no running 
 # 1. Create the new Redis. Wait for a master and three pods on three nodes.
 kubectl apply -n harbor -f redis-ha.yaml
 kubectl -n harbor get redisreplication harbor-redis-ha -o jsonpath='{.status.masterNode}'
-kubectl -n harbor get pods -l 'app in (harbor-redis-ha,harbor-redis-sentinel)' -o wide
-kubectl -n harbor exec harbor-redis-sentinel-0 -- \
+kubectl -n harbor get pods -l 'app in (harbor-redis-ha,harbor-redis-ha-sentinel)' -o wide
+kubectl -n harbor exec harbor-redis-ha-sentinel-0 -- \
   redis-cli -p 26379 SENTINEL get-master-addr-by-name myMaster
 
 # 2. Copy every key from the old Redis (db0 core, db1 jobservice, db2 registry,
@@ -65,6 +65,9 @@ helm upgrade harbor harbor/harbor --version 1.19.0 -n harbor --reuse-values \
    errors; a `docker pull` through the registry works.
 6. Failover drill: delete the pod named by `.status.masterNode`. Within about 15s
    Sentinel names a new master, `/v2/` stays 401, and `harbor-core` does not restart.
+   `kubectl -n harbor get endpoints harbor-redis-ha-master` must now list the new
+   master's IP: harbor-warmer reaches Redis only through that Service. If it still
+   lists the old pod, the warmer is writing to a replica; stop and fix before step 7.
 7. Once stable: delete PVC `data-harbor-redis-0`.
 
 Rollback before step 7: `helm upgrade ... --reuse-values --set redis.type=internal`
