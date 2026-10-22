@@ -1,0 +1,26 @@
+# Overlay for: helm upgrade harbor harbor/harbor --version 1.19.0 -n harbor --reuse-values -f this
+# Apply redis-ha.yaml first and wait for a master. Cutover steps: README.md,
+# "Redis HA cutover".
+#
+# Points core, jobservice, registry and trivy at the Sentinels in redis-ha.yaml.
+# Setting type external makes the chart delete its own harbor-redis StatefulSet and
+# Service; the data-harbor-redis-0 PVC stays until removed by hand.
+#
+# Database indexes are the chart's external defaults (core 0, jobservice 1,
+# registry 2, trivy 5), the same ones the internal Redis uses, so keys copied
+# across land where Harbor looks for them. Core must stay 0: the chart notes the
+# library Harbor uses cannot be configured otherwise.
+#
+# One Sentinel address, not three: it is the operator's ClusterIP Service in front
+# of all three Sentinels, and a Sentinel client only needs one to answer to learn
+# the master.
+
+redis:
+  type: external
+  external:
+    addr: harbor-redis-sentinel-sentinel.harbor.svc.cluster.local:26379
+    sentinelMasterSet: myMaster
+    coreDatabaseIndex: "0"
+    jobserviceDatabaseIndex: "1"
+    registryDatabaseIndex: "2"
+    trivyAdapterIndex: "5"
