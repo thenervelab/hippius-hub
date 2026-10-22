@@ -15,23 +15,49 @@ the §1 gate against `gateway.hippius-s3-prod` has passed.
 | `overlay-filesystem-rollback.yaml` | §8 | Back to JuiceFS. Restores the same replica counts and affinity as the flip. |
 | `redis-ha.yaml` | Redis HA cutover | Operator-managed Redis for Harbor: 1 master + 2 replicas and 3 Sentinels, each pinned to a different node. |
 | `overlay-redis-ha.yaml` | Redis HA cutover | Points Harbor at the Sentinels. Removes the chart's single-pod Redis. |
+| `overlay-ha.yaml` | HA overlay | Job logs to Postgres instead of a ReadWriteOnce volume; 2 registry pods spread across nodes. |
 
-Never `helm upgrade` / `helm uninstall` in ns `harbor` except the flip in that runbook
-and the Redis HA cutover below.
+Never `helm upgrade` / `helm uninstall` in ns `harbor` except the flip in that runbook,
+the Redis HA cutover and the HA overlay below.
 Never bucket `hippius-juicefs-data`. Never a copy threshold above 5 GiB.
 
-Both overlays use `--reuse-values`, so they compose: a later S3 flip or rollback keeps
-Redis external, and the Redis cutover keeps the S3 storage settings.
+The overlays compose with `--reuse-values`: a later S3 flip or rollback keeps Redis
+external, and the Redis cutover keeps the S3 storage settings.
 
-## Redis HA cutover
+**`--reuse-values` reuses the last *successful* revision, not the latest one.** If
+`helm history harbor -n harbor` ends in `failed`, it silently drops everything that
+revision applied. On 2026-10-22 revision 6 (the Redis cutover) was marked failed by a
+`--wait` timeout while fully applied, and a `--reuse-values` dry run on top of it
+re-added the chart's `harbor-redis` and pointed Harbor back at it. Always read a
+`--dry-run=server` first. If the last revision is failed, pass its values explicitly:
+`--reset-values -f <(helm get values harbor -n harbor --revision N) -f <overlay>`.
+That output holds the DB and admin passwords: keep it on disk only, never in git.
+
+## Redis HA cutover (done 2026-10-22)
 
 Why: on 2026-10-22 node4 went NotReady with `harbor-redis-0` on it. The pod sat
 `Terminating`, every `harbor-core` crash-looped on `failed to initialize cache`, and
 the registry served 502 until the pod was force-deleted and its VolumeAttachment
 removed by hand. `redis-ha.yaml` has the details.
 
-Keys written to the old Redis between step 2 and the end of step 3 are lost: cache
-entries and job stats. Cut over when the Job Service dashboard shows no running jobs.
+Applied as written below. What differed from the plan, for whoever does this again:
+
+- `redis-ha.yaml` first ran without `podSecurityContext`. Both the Redis pods
+  (`appendonlydir: Permission denied`) and the Sentinels (`sentinel.conf is not
+  writable`) crash-looped. `kubectl apply --dry-run=server` validates the schema only
+  and never starts a pod. Fixed in #123 and #124.
+- Step 3 deadlocked for 10 minutes on jobservice: its ReadWriteOnce log volume could
+  not attach to the new pod while the old pod held it. Unblocked by switching that
+  Deployment to `Recreate` by hand. `overlay-ha.yaml` removes the volume so it cannot
+  recur. Helm marked the revision failed on the `--wait` timeout although every
+  resource was applied, which is the trap described above.
+- Key copy: counts matched in every DB (db0 12,062, db1 538, db2 2,543, db3 2).
+- Failover drill, 13:22Z: Sentinel promoted a replica in 8s. 3 of 75 `/v2/` probes
+  timed out and every `/api/v2.0/ping` returned 200. No Harbor pod restarted. The
+  operator moved `harbor-redis-ha-master` to the new master; harbor-warmer, which
+  uses that Service, saw errors for about 27s and recovered without a restart.
+- `data-harbor-redis-0` was deleted after the drill. There is no rollback to the
+  chart's Redis with data: `--set redis.type=internal` would start it empty.
 
 ```sh
 # 1. Create the new Redis. Wait for a master and three pods on three nodes.
@@ -49,27 +75,36 @@ kubectl -n harbor exec harbor-redis-0 -- sh -c 'for db in 0 1 2 3 5; do
   echo "db$db old=$(redis-cli -n $db dbsize) new=$(redis-cli -h harbor-redis-ha-master -n $db dbsize)"
 done'
 
-# 3. Switch Harbor. Read the dry run's redis URLs before the real one.
+# 3. Switch Harbor.
 helm upgrade harbor harbor/harbor --version 1.19.0 -n harbor --reuse-values \
-  -f overlay-redis-ha.yaml --dry-run | grep -E '_REDIS_URL|redis_url|sentinelMasterSet'
-helm upgrade harbor harbor/harbor --version 1.19.0 -n harbor --reuse-values \
-  -f overlay-redis-ha.yaml
+  -f overlay-redis-ha.yaml --wait --timeout 10m
 
-# 4. Point harbor-warmer at the master Service. Its REDIS_URL is in
-#    thenervelab/harbor-warmer k8s/deployment.yaml:
-#    redis://harbor-redis-ha-master:6379/3
+# 4. Merge thenervelab/harbor-warmer#1: its CI applies REDIS_URL
+#    redis://harbor-redis-ha-master:6379/3.
 ```
 
-5. Verify: `curl -s -o /dev/null -w '%{http_code}' https://registry.hippius.com/v2/`
-   is 401; `harbor-core`, `harbor-jobservice` and `harbor-trivy` logs show no Redis
-   errors; a `docker pull` through the registry works.
-6. Failover drill: delete the pod named by `.status.masterNode`. Within about 15s
-   Sentinel names a new master, `/v2/` stays 401, and `harbor-core` does not restart.
-   `kubectl -n harbor get endpoints harbor-redis-ha-master` must now list the new
-   master's IP: harbor-warmer reaches Redis only through that Service. If it still
-   lists the old pod, the warmer is writing to a replica; stop and fix before step 7.
-7. Once stable: delete PVC `data-harbor-redis-0`.
+5. Verify: `/v2/` is 401, `/api/v2.0/ping` is 200, and the core, jobservice, registry
+   and trivy logs show no Redis errors.
+6. Failover drill: delete the pod named by `.status.masterNode`, then check that the
+   endpoints of `harbor-redis-ha-master` list the new master.
+7. Delete PVC `data-harbor-redis-0`.
 
-Rollback before step 7: `helm upgrade ... --reuse-values --set redis.type=internal`
-brings the chart's Redis back on its retained PVC, which still has the keys as of
-step 2. Point harbor-warmer back at `redis://harbor-redis:6379/3`.
+## HA overlay
+
+`overlay-ha.yaml` sends job logs to Postgres and runs two registry pods. It restarts
+core (the chart regenerates its token certificate on every upgrade), jobservice and the
+registry, each as a rolling update.
+
+```sh
+helm history harbor -n harbor --max 1    # last revision failed? see the trap above
+helm upgrade harbor harbor/harbor --version 1.19.0 -n harbor --reuse-values \
+  -f overlay-ha.yaml --dry-run=server     # expect: no harbor-redis, registry replicas 2
+helm upgrade harbor harbor/harbor --version 1.19.0 -n harbor --reuse-values \
+  -f overlay-ha.yaml --wait --timeout 10m
+```
+
+Verify: two registry pods on different nodes, `/v2/` is 401, and a job log opens in
+the UI. The chart stops managing the old `harbor-jobservice` PVC but keeps it
+(`resourcePolicy: keep`). Once a new job's log reads back from the database, delete it:
+`kubectl -n harbor delete pvc harbor-jobservice`. It only held file job logs, which
+the sweeper deletes after 14 days anyway.
