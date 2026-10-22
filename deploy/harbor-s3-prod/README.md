@@ -16,6 +16,7 @@ the §1 gate against `gateway.hippius-s3-prod` has passed.
 | `redis-ha.yaml` | Redis HA cutover | Operator-managed Redis for Harbor: 1 master + 2 replicas and 3 Sentinels, each pinned to a different node. |
 | `overlay-redis-ha.yaml` | Redis HA cutover | Points Harbor at the Sentinels. Removes the chart's single-pod Redis. |
 | `overlay-ha.yaml` | HA overlay | Job logs to Postgres instead of a ReadWriteOnce volume; 2 registry pods spread across nodes. |
+| `x509-exporter-rbac.yaml` | Token certificate | Role + RoleBinding letting hippius-otel's x509-certificate-exporter read Secrets in harbor, for the token-cert expiry alerts. |
 
 Never `helm upgrade` / `helm uninstall` in ns `harbor` except the flip in that runbook,
 the Redis HA cutover and the HA overlay below.
@@ -131,3 +132,8 @@ invalidates every outstanding token once, which clients get past by logging in a
 generate a new key and certificate, replace the Secret's two keys, then
 `kubectl -n harbor rollout restart deploy/harbor-core`. Core reads the key through a
 `subPath` mount, which does not follow Secret updates, so the restart is what applies it.
+
+Its expiry is alerted by `HarborTokenCertExpiringSoon` (30 days), `HarborTokenCertExpired`
+and `HarborTokenCertMetricMissing` in thenervelab/hippius-otel
+`alerting/rules/hippius-harbor.yaml`. The exporter reads the Secret through
+`x509-exporter-rbac.yaml` in this directory, applied by hand.
