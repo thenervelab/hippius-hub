@@ -91,9 +91,9 @@ helm upgrade harbor harbor/harbor --version 1.19.0 -n harbor --reuse-values \
 
 ## HA overlay
 
-`overlay-ha.yaml` sends job logs to Postgres and runs two registry pods. It restarts
-core (the chart regenerates its token certificate on every upgrade), jobservice and the
-registry, each as a rolling update.
+`overlay-ha.yaml` sends job logs to Postgres, runs two registry pods, and signs tokens
+with the fixed certificate in `harbor-token-service` (below). Each change rolls out as a
+rolling update.
 
 ```sh
 helm history harbor -n harbor --max 1    # last revision failed? see the trap above
@@ -108,3 +108,26 @@ the UI. The chart stops managing the old `harbor-jobservice` PVC but keeps it
 (`resourcePolicy: keep`). Once a new job's log reads back from the database, delete it:
 `kubectl -n harbor delete pvc harbor-jobservice`. It only held file job logs, which
 the sweeper deletes after 14 days anyway.
+
+## Token certificate
+
+Core signs registry tokens with the key in Secret `harbor-token-service`
+(`core.secretName` in `overlay-ha.yaml`). Without it the chart generates a new key on
+every `helm upgrade`, and during the rollout old and new core pods reject each other's
+tokens: pushes fail with `401 unauthorized ... action: push`, as they did for about a
+minute during revision 7 on 2026-10-22.
+
+The Secret holds a private key, so it is created by hand and never committed. It was
+created on 2026-10-22 from the certificate revision 7 had generated:
+
+```sh
+kubectl -n harbor get secret harbor-core -o json | jq '{apiVersion:"v1", kind:"Secret",
+  type:"kubernetes.io/tls", metadata:{name:"harbor-token-service", namespace:"harbor"},
+  data:{"tls.crt":.data["tls.crt"], "tls.key":.data["tls.key"]}}' | kubectl apply -f -
+```
+
+**It expires 2027-10-22 13:57:06Z** (annotation `hippius.io/not-after`). Rotating it
+invalidates every outstanding token once, which clients get past by logging in again:
+generate a new key and certificate, replace the Secret's two keys, then
+`kubectl -n harbor rollout restart deploy/harbor-core`. Core reads the key through a
+`subPath` mount, which does not follow Secret updates, so the restart is what applies it.
