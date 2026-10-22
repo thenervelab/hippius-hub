@@ -16,11 +16,11 @@
 
 #![expect(
     clippy::cast_possible_truncation,
-    reason = "Duration::as_millis() returns u128; for any real network probe the value fits in u64 with vast margin (584M years)"
+    reason = "as_millis() is u128, but any real probe duration fits u64 (584M years)"
 )]
 #![expect(
     clippy::cast_precision_loss,
-    reason = "bytes/seconds folded into f64 MB/s for display; the precision loss is below the resolution we'd ever print"
+    reason = "f64 MB/s is for display; the precision loss is below what we print"
 )]
 
 use std::collections::BTreeMap;
@@ -174,7 +174,7 @@ fn collect_request_ids(headers: &reqwest::header::HeaderMap, out: &mut BTreeMap<
 
 #[expect(
     clippy::too_many_lines,
-    reason = "linear DNS -> TCP -> TLS -> HEAD -> single-stream -> parallel pipeline; splitting hides the phase ordering that makes this readable"
+    reason = "linear DNS -> TCP -> TLS -> HEAD -> single -> parallel; splitting hides the order"
 )]
 pub async fn probe_blob(
     blob_url: &str,
@@ -472,7 +472,7 @@ mod tests {
     #[test]
     #[expect(
         clippy::float_cmp,
-        reason = "mbps short-circuits to literal 0.0 for zero duration; exact equality is the contract"
+        reason = "mbps returns literal 0.0 for a zero duration; exact equality is the contract"
     )]
     fn mbps_zero_duration_is_zero() {
         assert_eq!(mbps(1000, Duration::from_secs(0)), 0.0);
