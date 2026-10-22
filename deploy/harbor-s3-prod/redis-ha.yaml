@@ -77,6 +77,13 @@ metadata:
   namespace: harbor
 spec:
   clusterSize: 3
+  # Sentinel rewrites /etc/redis/sentinel.conf as it runs. The operator's init
+  # container writes that file into an emptyDir as root, so Sentinel (uid 1000)
+  # exits with "sentinel.conf is not writable". Running the whole pod as 1000
+  # makes the init container create it as the same user.
+  podSecurityContext:
+    runAsUser: 1000
+    fsGroup: 1000
   kubernetesConfig:
     image: quay.io/opstree/redis-sentinel:v7.2.16
     imagePullPolicy: IfNotPresent
