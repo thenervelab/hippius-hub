@@ -18,6 +18,14 @@
 # Ready. Expect a lease handoff of about 15s (lease db9c8771.cnpg.io), not a
 # Postgres failover.
 #
+# The anti-affinity selects app.kubernetes.io/name=cloudnative-pg. That is the
+# pod-template label and the selector on Deployment cnpg-controller-manager in
+# the published cnpg-1.28.0.yaml. Postgres pods the operator creates use
+# app.kubernetes.io/name=postgresql. The published plugin-barman-cloud v0.11.0
+# manifest labels Deployment barman-cloud pods app: barman-cloud, so this rule
+# does not include them. The live Deployment was not re-read. Do not change
+# the selector.
+#
 # Leave barman-cloud at 1 replica. It is leader-elect with strategy Recreate and
 # it archives WAL. It does not promote. Do not change its strategy to RollingUpdate.
 apiVersion: apps/v1

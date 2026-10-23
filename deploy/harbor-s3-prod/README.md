@@ -125,11 +125,16 @@ Cordon `k8s-v3-node4` before this upgrade if that node should not take a new pod
 Do not drain it. The registry Deployment stays on `RollingUpdate`. With 2 replicas
 the default is maxSurge 1 and maxUnavailable 0, so the rollout starts a third pod
 before it removes one. That pod requests 2 CPU and 2Gi and must fit on a node that
-is not already running a registry. The chart has no maxSurge field. If the third
-pod stays Pending, `--wait` marks the revision failed and the next `--reuse-values`
-drops this overlay and can bring back the single-pod Redis. Delete the registry
-pod on node4 only after another registry pod is Ready, and do that before `--wait`
-gives up. Verify: two jobservice pods on different nodes, two registry pods on
+is not already running a registry. The chart has no maxSurge field. That spare
+node is a standing precondition of every later `helm upgrade` as well: the htpasswd
+re-salt rolls the registry every time. If that third pod stays Pending, `--wait`
+marks the revision failed and the next `--reuse-values` drops this overlay and can
+bring back the single-pod Redis. Delete the registry pod on node4 only after
+another registry pod is Ready, and do that before `--wait` gives up. jobservice
+has the same required anti-affinity and `RollingUpdate`, and the chart sets no CPU
+or memory request on it. The re-salt does not change its template, so a routine
+upgrade does not surge it. A change to its own template does, and that extra pod
+only needs a free node. Verify: two jobservice pods on different nodes, two registry pods on
 different nodes, `/v2/` is 401, and a job log opens in the UI. The chart already
 stopped managing the old `harbor-jobservice` PVC. Once a new job's log reads back
 from the database, delete it: `kubectl -n harbor delete pvc harbor-jobservice`.

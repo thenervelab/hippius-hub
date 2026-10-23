@@ -8,8 +8,14 @@
 # Refuses unless the last Harbor revision is deployed. A failed revision makes
 # the next --reuse-values drop that revision's values and put the chart Redis back.
 # Refuses if this overlay would change Trivy's volumeClaimTemplates.
+#
+# render_check.rb's reuse-merge port documents Helm 4.3.0 (bec5b06). The guard
+# this script trusts is the server dry-run below. It does not refuse when
+# `helm version` is something else. The version is printed so the operator can see it.
 set -euo pipefail
 cd "$(dirname "$0")"
+
+echo "helm $(helm version --short)" >&2
 
 context=$(kubectl config current-context)
 if [ "$context" != "hippius" ]; then

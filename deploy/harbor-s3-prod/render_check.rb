@@ -245,7 +245,8 @@ end
 # --reuse-values coalesces the new file with the previous user values, deletes a
 # null whose previous value was non-nil, replaces the chart values with the old
 # coalesced values, then coalesces again. A missing key is copied back. An empty
-# list is not. helm template does not do this.
+# list is not. helm template does not do this. This port documents Helm 4.3.0.
+# The server dry-run in upgrade.sh is what the guard trusts.
 
 def deep_copy(obj)
   Marshal.load(Marshal.dump(obj))
