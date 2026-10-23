@@ -1,0 +1,38 @@
+# Strategic merge patch for the CNPG operator. Not a Helm release.
+# Apply by hand, after the Harbor upgrades. README.md, "CNPG operator".
+#
+# The stock cnpg-1.28.0.yaml hardcodes replicas: 1 and has no affinity. A later
+# kubectl apply of that file sets replicas back to 1. Re-apply this patch after
+# any stock apply. Do not replace this with a full Deployment: that would wipe
+# the container spec. Do not helm install. Do not run `kubectl cnpg install
+# generate` (that moves off image 1.28.0 and rolls every Cluster).
+#
+# First apply, while the live deployment is still 1 replica with no affinity:
+#   kubectl scale deployment/cnpg-controller-manager -n cnpg-system --replicas=2
+#   wait until both pods are Ready (the leader's template has not changed)
+#   kubectl patch deployment/cnpg-controller-manager -n cnpg-system \
+#     --type=strategic --patch-file=cnpg-controller-ha.yaml
+# Scaling first means a second copy of the current leader exists before the
+# affinity change rolls the template. At 2 replicas the default 25%/25% strategy
+# is maxSurge 1 and maxUnavailable 0, so the old leader stays until a new pod is
+# Ready. Expect a lease handoff of about 15s (lease db9c8771.cnpg.io), not a
+# Postgres failover.
+#
+# Leave barman-cloud at 1 replica. It is leader-elect with strategy Recreate and
+# it archives WAL. It does not promote. Do not change its strategy to RollingUpdate.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cnpg-controller-manager
+  namespace: cnpg-system
+spec:
+  replicas: 2
+  template:
+    spec:
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchLabels:
+                  app.kubernetes.io/name: cloudnative-pg
+              topologyKey: kubernetes.io/hostname
