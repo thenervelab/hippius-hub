@@ -137,9 +137,11 @@ trap above.
 
 `persistence.enabled: false` does not change S3 registry storage and does not touch
 external Postgres or Redis. With database job logs, the jobservice volume stays an
-emptyDir. `upgrade-trivy-emptydir.sh` dry-runs both renders and refuses if anything
-other than Trivy's volume differs (secret checksums and the htpasswd re-salt are
-ignored). It does not delete or apply.
+emptyDir. `upgrade-trivy-emptydir.sh` dry-runs the deployed release with no overlay file
+and refuses unless that render already has this HA overlay. It then dry-runs
+the emptyDir file and refuses if anything other than Trivy's volume differs
+(secret checksums and the htpasswd re-salt are ignored). It does not delete or
+apply.
 
 Node4 must still be Ready. Cordoned is fine. Do not delete the VolumeAttachment by hand.
 
