@@ -13,7 +13,7 @@ the §1 gate against `gateway.hippius-s3-prod` has passed.
 | `harbor_link_objects.py`, `link-objects-job.yaml` | §4a | Generate the `_layers` and `_manifests/revisions` link objects from Harbor's Postgres. `plan`, then `apply`, then `verify`. |
 | `harbor_reachability_sweep.py`, `reachability-sweep-job.yaml` | §0.10, §7a | Ranged GET of every artifact's manifest and one layer through Harbor. Baseline before anything changes; again under the freeze. |
 | `overlay-filesystem-rollback.yaml` | §8 | Back to JuiceFS. Restores the same replica counts and affinity as the flip. |
-| `redis-ha.yaml` | Redis HA cutover | Operator-managed Redis for Harbor: 1 master + 2 replicas and 3 Sentinels, each pinned to a different node. |
+| `redis-ha.yaml` | Sentinel quorum | 1 master + 2 replicas, and 5 Sentinels at quorum 3, pinned to node1, node2, node3, node5, and node6-cache. `check-redis-ha.sh` diffs and does not apply. |
 | `overlay-redis-ha.yaml` | Redis HA cutover | Points Harbor at the Sentinels. Removes the chart's single-pod Redis. |
 | `overlay-ha.yaml` | HA overlay | Job logs to Postgres instead of a ReadWriteOnce volume; 2 registry pods spread across nodes. |
 | `x509-exporter-rbac.yaml` | Token certificate | Role + RoleBinding letting hippius-otel's x509-certificate-exporter read Secrets in harbor, for the token-cert expiry alerts. |

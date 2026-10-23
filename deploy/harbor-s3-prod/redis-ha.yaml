@@ -1,6 +1,27 @@
-# Redis for prod Harbor: 1 master + 2 replicas and 3 Sentinels, one of each per node.
-# kubectl apply -n harbor -f this, then overlay-redis-ha.yaml. Order and cutover:
-# README.md, "Redis HA cutover".
+# Redis for prod Harbor: 1 master + 2 replicas, and 5 Sentinels at quorum 3.
+# kubectl apply -n harbor -f this. The Harbor cutover that points clients at it
+# already happened (overlay-redis-ha.yaml, 2026-10-22). README.md, "Sentinel quorum".
+#
+# One apply sets Sentinel clusterSize and quorum together. The operator writes
+# QUORUM into the pod env at start and does not rewrite a running Sentinel. The
+# StatefulSet creates the new ordinals and waits until they are Ready before it
+# rolls the old pods, so sentinel-3 and sentinel-4 come up at quorum 3 while
+# sentinel-0..2 are still serving at quorum 2, and only then do 2, 1, and 0 roll.
+# Raising quorum while clusterSize is still 3 is the bad order: that rolls the
+# only three before the new ones exist.
+#
+# With 5 Sentinels the majority is 3. Quorum 2 would let two declare the master
+# down and take a third vote from a Sentinel that can still reach it. Quorum 3
+# makes that gate match the majority.
+#
+# Hostname affinity leaves out k8s-v3-node4 (kernel 6.8.0-147 reboot-looped, and
+# it is the node to cordon). A Sentinel asks for 64Mi, so node6-cache can hold
+# one. Required pod anti-affinity stays, so the five pins are one pod per node.
+# If a new pod stays Pending the roll stalls and the old three keep serving: stop
+# there. Do not delete the Redis master during the apply. Every reconcile runs
+# SENTINEL RESET. Diff the live RedisReplication against this file first so an
+# apply does not revert drift on the data pods. check-redis-ha.sh does that check
+# and does not apply.
 #
 # Why: the chart's internal Redis is a single StatefulSet pod on an RWO volume. On
 # 2026-10-22 node4 went NotReady with harbor-redis-0 on it; the pod sat Terminating
@@ -76,7 +97,7 @@ metadata:
   name: harbor-redis-ha
   namespace: harbor
 spec:
-  clusterSize: 3
+  clusterSize: 5
   # Sentinel rewrites /etc/redis/sentinel.conf as it runs. The operator's init
   # container writes that file into an emptyDir as root, so Sentinel (uid 1000)
   # exits with "sentinel.conf is not writable". Running the whole pod as 1000
@@ -93,7 +114,23 @@ spec:
         memory: 64Mi
       limits:
         memory: 128Mi
+  # Required node list plus required pod anti-affinity: one Sentinel on each
+  # named node, and none on node4. Do not add node4 here while it is still on
+  # kernel 6.8.0-147. PDB stays maxUnavailable 1 only. Do not also set
+  # minAvailable on this object.
   affinity:
+    nodeAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:
+        nodeSelectorTerms:
+        - matchExpressions:
+          - key: kubernetes.io/hostname
+            operator: In
+            values:
+            - k8s-v3-node1
+            - k8s-v3-node2
+            - k8s-v3-node3
+            - k8s-v3-node5
+            - k8s-v3-node6-cache
     podAntiAffinity:
       requiredDuringSchedulingIgnoredDuringExecution:
       - labelSelector:
@@ -106,7 +143,7 @@ spec:
   redisSentinelConfig:
     redisReplicationName: harbor-redis-ha
     masterGroupName: myMaster
-    quorum: "2"
+    quorum: "3"
     # The operator defaults, written out so a failover's timing is readable here:
     # 5s to declare the master down, then up to 10s to promote a replica.
     downAfterMilliseconds: "5000"
