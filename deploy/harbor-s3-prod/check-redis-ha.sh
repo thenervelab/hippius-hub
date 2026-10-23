@@ -48,8 +48,43 @@ if [ "$context" != "hippius" ]; then
   exit 1
 fi
 
+live=$(mktemp)
 diff_out=$(mktemp)
-trap 'rm -f "$diff_out"' EXIT
+trap 'rm -f "$live" "$diff_out"' EXIT
+kubectl get redisreplication harbor-redis-ha -n harbor -o json >"$live"
+ruby -rjson -ryaml -e '
+def walk(file, live, prefix, out)
+  return unless file.is_a?(Hash)
+  file.each do |k, v|
+    path = "#{prefix}.#{k}"
+    if !live.is_a?(Hash) || !live.key?(k)
+      out << "#{path} missing on the live object"
+    elsif v != live[k]
+      if v.is_a?(Hash) && live[k].is_a?(Hash)
+        walk(v, live[k], path, out)
+      else
+        out << path
+      end
+    end
+  end
+end
+docs = []
+YAML.load_stream(File.read(ARGV[0])) { |d| docs << d if d.is_a?(Hash) }
+rep = docs.find { |d| d["kind"] == "RedisReplication" }
+live = JSON.parse(File.read(ARGV[1]))
+out = []
+walk(rep["spec"], live["spec"], "spec", out)
+unless out.empty?
+  warn "refusing: RedisReplication spec differs from the file"
+  out.each { |line| warn "  #{line}" }
+  exit 1
+end
+warn "RedisReplication spec matches the file"
+' redis-ha.yaml "$live"
+
+# A custom KUBECTL_EXTERNAL_DIFF can print a diff with no kind in the header,
+# which would hide a RedisReplication change from the grep below.
+unset KUBECTL_EXTERNAL_DIFF
 set +e
 kubectl diff -n harbor -f redis-ha.yaml >"$diff_out"
 code=$?
@@ -62,8 +97,10 @@ if [ "$code" -eq 0 ]; then
   echo "cluster already matches redis-ha.yaml. Not applying."
   exit 0
 fi
-if grep -E '^diff .*RedisReplication' "$diff_out"; then
-  echo "refusing: applying this file would change RedisReplication. Not applying." >&2
+# A changed RedisReplication is in the diff body even when the diff header
+# does not name the kind. Sentinel diffs do not contain this line.
+if grep -n 'kind: RedisReplication' "$diff_out"; then
+  echo "refusing: kubectl diff would change RedisReplication. Not applying." >&2
   exit 1
 fi
 echo "RedisReplication is unchanged. Sentinel diff:"

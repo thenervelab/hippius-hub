@@ -1,6 +1,7 @@
 # Redis for prod Harbor: 1 master + 2 replicas, and 5 Sentinels at quorum 3.
 # kubectl apply -n harbor -f this. The Harbor cutover that points clients at it
-# already happened (overlay-redis-ha.yaml, 2026-10-22). README.md, "Sentinel quorum".
+# already happened (overlay-redis-ha.yaml, 2026-10-22). Apply notes are the
+# comments below. Do not follow the old cutover's failover drill during this apply.
 #
 # One apply sets Sentinel clusterSize and quorum together. The operator writes
 # QUORUM into the pod env at start and does not rewrite a running Sentinel. The
