@@ -12,7 +12,7 @@ the §1 gate against `gateway.hippius-s3-prod` has passed.
 | `copy-blobs-job.yaml` | §4 | Online rclone copy of `blobs/**/data`, `--size-only`, re-runnable for catch-up. |
 | `harbor_link_objects.py`, `link-objects-job.yaml` | §4a | Generate the `_layers` and `_manifests/revisions` link objects from Harbor's Postgres. `plan`, then `apply`, then `verify`. |
 | `harbor_reachability_sweep.py`, `reachability-sweep-job.yaml` | §0.10, §7a | Ranged GET of every artifact's manifest and one layer through Harbor. Baseline before anything changes; again under the freeze. |
-| `overlay-filesystem-rollback.yaml` | §8 | Back to JuiceFS. Restores the same replica counts and affinity as the flip. |
+| `overlay-filesystem-rollback.yaml` | §8 | Back to JuiceFS. Sets `persistence.enabled: true` so the registry asks for the claim. The claim has to already exist. |
 | `redis-ha.yaml` | Redis HA cutover | Operator-managed Redis for Harbor: 1 master + 2 replicas and 3 Sentinels, each pinned to a different node. |
 | `overlay-redis-ha.yaml` | Redis HA cutover | Points Harbor at the Sentinels. Removes the chart's single-pod Redis. |
 | `overlay-ha.yaml` | HA overlay | Job logs to Postgres instead of a ReadWriteOnce volume; 2 registry pods spread across nodes. |
@@ -122,9 +122,15 @@ helm upgrade harbor harbor/harbor --version 1.19.0 -n harbor --reuse-values \
 ```
 
 Cordon `k8s-v3-node4` before this upgrade if that node should not take a new pod.
-Do not drain it. Verify: two jobservice pods on different nodes, two registry pods on
-different nodes, `/v2/` is 401, and a job log opens in the UI. If one of a pair is
-still on node4, delete that pod only after the other is Ready. The chart already
+Do not drain it. The registry Deployment stays on `RollingUpdate`. With 2 replicas
+the default is maxSurge 1 and maxUnavailable 0, so the rollout starts a third pod
+before it removes one. That pod requests 2 CPU and 2Gi and must fit on a node that
+is not already running a registry. The chart has no maxSurge field. If the third
+pod stays Pending, `--wait` marks the revision failed and the next `--reuse-values`
+drops this overlay and can bring back the single-pod Redis. Delete the registry
+pod on node4 only after another registry pod is Ready, and do that before `--wait`
+gives up. Verify: two jobservice pods on different nodes, two registry pods on
+different nodes, `/v2/` is 401, and a job log opens in the UI. The chart already
 stopped managing the old `harbor-jobservice` PVC. Once a new job's log reads back
 from the database, delete it: `kubectl -n harbor delete pvc harbor-jobservice`.
 

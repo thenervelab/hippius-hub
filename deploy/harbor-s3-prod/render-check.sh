@@ -10,6 +10,9 @@ if grep -E -n 'htpasswd|BEGIN |PRIVATE KEY|^[[:space:]]*password:' overlay-ha.ya
 fi
 
 ruby render_check.rb trivy-overlay overlay-trivy-emptydir.yaml
+# helm template merges -f files only. It does not do helm upgrade --reuse-values,
+# which copies a nulled key back from the previous release. reuse-merge checks that.
+ruby render_check.rb reuse-merge overlay-ha.yaml overlay-filesystem-rollback.yaml
 
 before=$(mktemp)
 after=$(mktemp)

@@ -57,6 +57,19 @@ def preferred_terms(deploy)
   anti["preferredDuringSchedulingIgnoredDuringExecution"]
 end
 
+def list_cleared?(value)
+  value.nil? || (value.is_a?(Array) && value.empty?)
+end
+
+def node_affinity_cleared?(aff)
+  node = aff && aff["nodeAffinity"]
+  return true if node.nil?
+  return false unless node.is_a?(Hash)
+  allowed = ["preferredDuringSchedulingIgnoredDuringExecution"]
+  return false unless (node.keys - allowed).empty?
+  list_cleared?(node["preferredDuringSchedulingIgnoredDuringExecution"])
+end
+
 def assert_required(deploy, component, label)
   terms = required_terms(deploy)
   die "#{label}: required anti-affinity missing" unless terms.is_a?(Array) && !terms.empty?
@@ -86,15 +99,14 @@ def check_upgrade1(docs)
   logs = vols.find { |v| v["name"] == "job-logs" }
   die "job-logs volume is not an emptyDir: #{logs.inspect}" unless logs.is_a?(Hash) && logs.key?("emptyDir") && !logs.key?("persistentVolumeClaim")
   assert_required(job, "jobservice", "jobservice")
-  die "jobservice still has a preferred anti-affinity" unless preferred_terms(job).nil?
+  die "jobservice still has a preferred anti-affinity" unless list_cleared?(preferred_terms(job))
 
   reg = idx["Deployment/harbor-registry"]
   die "registry replicas #{reg.dig("spec", "replicas").inspect}" unless reg.dig("spec", "replicas") == 2
   die "registry strategy #{reg.dig("spec", "strategy").inspect}" unless reg.dig("spec", "strategy", "type") == "RollingUpdate"
   assert_required(reg, "registry", "registry")
-  die "registry preferred anti-affinity survived" unless preferred_terms(reg).nil?
-  node_aff = affinity_of(reg) && affinity_of(reg)["nodeAffinity"]
-  die "registry nodeAffinity survived: #{node_aff.inspect}" unless node_aff.nil?
+  die "registry preferred anti-affinity survived" unless list_cleared?(preferred_terms(reg))
+  die "registry nodeAffinity survived: #{affinity_of(reg) && affinity_of(reg)["nodeAffinity"].inspect}" unless node_affinity_cleared?(affinity_of(reg))
 
   core = idx["Deployment/harbor-core"]
   nginx = idx["Deployment/harbor-nginx"]
@@ -102,7 +114,7 @@ def check_upgrade1(docs)
     name = deploy.dig("metadata", "name")
     pref = preferred_terms(deploy)
     die "#{name}: preferred anti-affinity missing" unless pref.is_a?(Array) && !pref.empty?
-    die "#{name}: required anti-affinity must stay unset" unless required_terms(deploy).nil?
+    die "#{name}: required anti-affinity must stay unset" unless list_cleared?(required_terms(deploy))
     die "#{name}: replicas dropped to #{deploy.dig("spec", "replicas")}" unless deploy.dig("spec", "replicas").to_i >= 5
   end
 
@@ -228,6 +240,185 @@ def check_trivy_overlay(path)
   die "persistence.enabled is #{inner["enabled"].inspect}" unless inner["enabled"] == false
 end
 
+# Helm 4.3.0 reuseValues (bec5b06, pkg/action/upgrade.go) plus
+# coalesceTablesFullKey (pkg/chart/common/util/coalesce.go).
+# --reuse-values coalesces the new file with the previous user values, deletes a
+# null whose previous value was non-nil, replaces the chart values with the old
+# coalesced values, then coalesces again. A missing key is copied back. An empty
+# list is not. helm template does not do this.
+
+def deep_copy(obj)
+  Marshal.load(Marshal.dump(obj))
+end
+
+def clean_nil_values(map)
+  return unless map.is_a?(Hash)
+  map.keys.each do |key|
+    val = map[key]
+    if val.nil?
+      map.delete(key)
+    elsif val.is_a?(Hash)
+      clean_nil_values(val)
+    end
+  end
+end
+
+def coalesce_tables(dst, src)
+  return dst if src.nil?
+  return src if dst.nil?
+  src_original_non_nil = {}
+  src.each { |key, val| src_original_non_nil[key] = true unless val.nil? }
+  dst.each { |key, val| src[key] = nil if val.nil? }
+  src.each do |key, val|
+    if dst.key?(key) && dst[key].nil? && src_original_non_nil[key]
+      dst.delete(key)
+    elsif !dst.key?(key)
+      dst[key] = val
+    elsif val.is_a?(Hash) && dst[key].is_a?(Hash)
+      coalesce_tables(dst[key], val)
+    end
+  end
+  dst
+end
+
+def coalesce_values_into(chart_map, user_map)
+  return unless chart_map.is_a?(Hash) && user_map.is_a?(Hash)
+  chart_map.each do |key, val|
+    if user_map.key?(key)
+      value = user_map[key]
+      if value.nil?
+        user_map.delete(key)
+      elsif value.is_a?(Hash) && val.is_a?(Hash)
+        clean_nil_values(val)
+        coalesce_tables(value, val)
+      end
+    else
+      next if val.nil?
+      clean_nil_values(val) if val.is_a?(Hash)
+      user_map[key] = val
+    end
+  end
+end
+
+def coalesce_values(chart_values, user_values)
+  user = deep_copy(user_values)
+  chart = deep_copy(chart_values)
+  coalesce_values_into(chart, user)
+  user
+end
+
+def reuse_values(chart_values, current_config, overlay)
+  old_vals = coalesce_values(chart_values, current_config)
+  new_vals = coalesce_tables(deep_copy(overlay), deep_copy(current_config))
+  coalesce_values(old_vals, new_vals)
+end
+
+def value_at(obj, path)
+  path.each do |key|
+    return nil unless obj.is_a?(Hash)
+    obj = obj[key]
+  end
+  obj
+end
+
+def harbor_chart_defaults
+  {
+    "persistence" => {"enabled" => true},
+    "registry" => {"affinity" => {}, "podDisruptionBudget" => {"enabled" => false, "minAvailable" => 1}},
+    "jobservice" => {"affinity" => {}, "podDisruptionBudget" => {"enabled" => false, "minAvailable" => 1}},
+    "core" => {"affinity" => {}, "podDisruptionBudget" => {"enabled" => false, "minAvailable" => 1}},
+    "nginx" => {"affinity" => {}, "podDisruptionBudget" => {"enabled" => false, "minAvailable" => 1}},
+  }
+end
+
+def deployed_registry_preferred
+  [{
+    "weight" => 100,
+    "podAffinityTerm" => {
+      "topologyKey" => "kubernetes.io/hostname",
+      "labelSelector" => {"matchLabels" => {"app" => "harbor", "component" => "registry"}},
+    },
+  }]
+end
+
+def deployed_node_pin
+  {
+    "preferredDuringSchedulingIgnoredDuringExecution" => [{
+      "weight" => 100,
+      "preference" => {
+        "matchExpressions" => [{
+          "key" => "kubernetes.io/hostname",
+          "operator" => "In",
+          "values" => ["k8s-v3-node1"],
+        }],
+      },
+    }],
+  }
+end
+
+def deployed_user_config(with_pin)
+  affinity = {
+    "podAntiAffinity" => {
+      "preferredDuringSchedulingIgnoredDuringExecution" => deployed_registry_preferred,
+    },
+  }
+  affinity["nodeAffinity"] = deployed_node_pin if with_pin
+  {
+    "registry" => {"replicas" => 2, "affinity" => affinity},
+    "jobservice" => {"jobLoggers" => ["database"]},
+    "persistence" => {"enabled" => true},
+    "core" => {"secretName" => "harbor-token-service", "replicas" => 5},
+    "nginx" => {"replicas" => 5},
+  }
+end
+
+def assert_reuse_cleared(label, rendered)
+  preferred = value_at(rendered, ["registry", "affinity", "podAntiAffinity", "preferredDuringSchedulingIgnoredDuringExecution"])
+  die "#{label}: registry preferred came back #{preferred.inspect}" unless list_cleared?(preferred)
+  required = value_at(rendered, ["registry", "affinity", "podAntiAffinity", "requiredDuringSchedulingIgnoredDuringExecution"])
+  die "#{label}: registry required rule missing" unless required.is_a?(Array) && !required.empty?
+  node = value_at(rendered, ["registry", "affinity", "nodeAffinity"])
+  die "#{label}: node1 pin came back #{node.inspect}" unless node_affinity_cleared?({"nodeAffinity" => node})
+  job_preferred = value_at(rendered, ["jobservice", "affinity", "podAntiAffinity", "preferredDuringSchedulingIgnoredDuringExecution"])
+  die "#{label}: jobservice preferred came back #{job_preferred.inspect}" unless list_cleared?(job_preferred)
+  core_min = value_at(rendered, ["core", "podDisruptionBudget", "minAvailable"])
+  core_max = value_at(rendered, ["core", "podDisruptionBudget", "maxUnavailable"])
+  die "#{label}: core PDB minAvailable #{core_min.inspect} maxUnavailable #{core_max.inspect}" unless core_min.nil? && core_max == 1
+  reg_min = value_at(rendered, ["registry", "podDisruptionBudget", "minAvailable"])
+  reg_max = value_at(rendered, ["registry", "podDisruptionBudget", "maxUnavailable"])
+  die "#{label}: registry PDB minAvailable #{reg_min.inspect} maxUnavailable #{reg_max.inspect}" unless reg_min == 1 && reg_max.nil?
+end
+
+def check_reuse_merge(overlay_path, rollback_path)
+  # The port has to keep restoring a null, or this check can no longer see the bug.
+  probe_chart = {"registry" => {"affinity" => {}}}
+  probe_config = {"registry" => {"affinity" => {"podAntiAffinity" => {"preferredDuringSchedulingIgnoredDuringExecution" => [{"weight" => 100}]}}}}
+  probe_overlay = {"registry" => {"affinity" => {"podAntiAffinity" => {"preferredDuringSchedulingIgnoredDuringExecution" => nil}}}}
+  probe = reuse_values(probe_chart, probe_config, probe_overlay)
+  probe_preferred = value_at(probe, ["registry", "affinity", "podAntiAffinity", "preferredDuringSchedulingIgnoredDuringExecution"])
+  die "reuse-merge port no longer restores a nulled list" unless probe_preferred.is_a?(Array) && probe_preferred.length == 1
+
+  overlay = YAML.load_file(overlay_path)
+  die "overlay-ha is not a map" unless overlay.is_a?(Hash)
+  chart = harbor_chart_defaults
+  assert_reuse_cleared("pin still in user values", reuse_values(chart, deployed_user_config(true), overlay))
+  assert_reuse_cleared("pin already dropped from user values", reuse_values(chart, deployed_user_config(false), overlay))
+  stored = harbor_chart_defaults
+  stored["registry"]["affinity"] = {
+    "nodeAffinity" => deployed_node_pin,
+    "podAntiAffinity" => {"preferredDuringSchedulingIgnoredDuringExecution" => deployed_registry_preferred},
+  }
+  assert_reuse_cleared("pin only in stored chart values", reuse_values(stored, deployed_user_config(false), overlay))
+
+  rollback = YAML.load_file(rollback_path)
+  die "filesystem rollback is not a map" unless rollback.is_a?(Hash)
+  after_trivy = {"persistence" => {"enabled" => false, "imageChartStorage" => {"type" => "s3"}}}
+  merged = reuse_values(harbor_chart_defaults, after_trivy, rollback)
+  enabled = value_at(merged, ["persistence", "enabled"])
+  storage_type = value_at(merged, ["persistence", "imageChartStorage", "type"])
+  die "filesystem rollback leaves persistence.enabled #{enabled.inspect} with type #{storage_type.inspect}" unless enabled == true && storage_type == "filesystem"
+end
+
 cmd = ARGV.shift
 case cmd
 when "upgrade1"
@@ -242,6 +433,9 @@ when "trivy-diff"
 when "trivy-overlay"
   die "usage: render_check.rb trivy-overlay FILE" unless ARGV.length == 1
   check_trivy_overlay(ARGV[0])
+when "reuse-merge"
+  die "usage: render_check.rb reuse-merge OVERLAY-HA ROLLBACK" unless ARGV.length == 2
+  check_reuse_merge(ARGV[0], ARGV[1])
 else
   die "unknown command #{cmd.inspect}"
 end

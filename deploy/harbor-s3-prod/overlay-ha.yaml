@@ -16,8 +16,10 @@
 # set updateStrategy to Recreate: that key is shared with the registry and would
 # make every registry rollout an outage. Each pod runs maxJobWorkers (chart
 # default 10), so two pods is up to 20 concurrent jobs.
-# preferred is null so a leftover soft rule cannot survive --reuse-values next
-# to the required one. maxUnavailable is null so the chart default cannot pair
+# preferred is an empty list so a leftover soft rule cannot survive
+# --reuse-values next to the required one. Helm 4.3 deletes a null when the
+# previous user value is non-nil, then copies that old list back from the
+# stored chart values. maxUnavailable is null so the chart default cannot pair
 # with minAvailable: the template prints both, and the API rejects that.
 jobservice:
   replicas: 2
@@ -25,7 +27,7 @@ jobservice:
     - database
   affinity:
     podAntiAffinity:
-      preferredDuringSchedulingIgnoredDuringExecution: null
+      preferredDuringSchedulingIgnoredDuringExecution: []
       requiredDuringSchedulingIgnoredDuringExecution:
         - labelSelector:
             matchLabels:
@@ -39,19 +41,22 @@ jobservice:
 
 # Two registry pods that cannot land on the same node. The node1 preference was
 # for JuiceFS. Since the S3 flip the registry mounts only an emptyDir, and the
-# pin made node1 a single point of failure. nodeAffinity: null is required:
-# --reuse-values deep-merges maps, so without it the old node1 preference
-# survives. preferredDuringSchedulingIgnoredDuringExecution: null for the same
-# reason. Requests are 2 CPU and 2Gi. A RollingUpdate of 2 replicas surges by 1,
-# so that extra pod has to fit on a node that is not already running a registry.
+# pin made node1 a single point of failure. Clear the pin with an empty
+# preferredDuringSchedulingIgnoredDuringExecution list. nodeAffinity: null does
+# not: Helm 4.3 deletes the null and copies the old map back while that map is
+# still in the saved user values. The pod anti-affinity preferred list is empty
+# for the same reason. Requests are 2 CPU and 2Gi. A RollingUpdate of 2 replicas
+# surges by 1, so that extra pod has to fit on a node that is not already
+# running a registry.
 # overlay-filesystem-rollback.yaml puts back 1 replica and the node1 preference,
 # which filesystem storage still needs.
 registry:
   replicas: 2
   affinity:
-    nodeAffinity: null
+    nodeAffinity:
+      preferredDuringSchedulingIgnoredDuringExecution: []
     podAntiAffinity:
-      preferredDuringSchedulingIgnoredDuringExecution: null
+      preferredDuringSchedulingIgnoredDuringExecution: []
       requiredDuringSchedulingIgnoredDuringExecution:
         - labelSelector:
             matchLabels:
