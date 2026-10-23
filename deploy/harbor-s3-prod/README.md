@@ -12,14 +12,17 @@ the §1 gate against `gateway.hippius-s3-prod` has passed.
 | `copy-blobs-job.yaml` | §4 | Online rclone copy of `blobs/**/data`, `--size-only`, re-runnable for catch-up. |
 | `harbor_link_objects.py`, `link-objects-job.yaml` | §4a | Generate the `_layers` and `_manifests/revisions` link objects from Harbor's Postgres. `plan`, then `apply`, then `verify`. |
 | `harbor_reachability_sweep.py`, `reachability-sweep-job.yaml` | §0.10, §7a | Ranged GET of every artifact's manifest and one layer through Harbor. Baseline before anything changes; again under the freeze. |
-| `overlay-filesystem-rollback.yaml` | §8 | Back to JuiceFS. Restores the same replica counts and affinity as the flip. |
+| `overlay-filesystem-rollback.yaml` | §8 | Back to JuiceFS. Sets `persistence.enabled: true` so the registry asks for the claim. The claim has to already exist. |
 | `redis-ha.yaml` | Redis HA cutover | Operator-managed Redis for Harbor: 1 master + 2 replicas and 3 Sentinels, each pinned to a different node. |
 | `overlay-redis-ha.yaml` | Redis HA cutover | Points Harbor at the Sentinels. Removes the chart's single-pod Redis. |
 | `overlay-ha.yaml` | HA overlay | Job logs to Postgres instead of a ReadWriteOnce volume; 2 registry pods spread across nodes. |
 | `x509-exporter-rbac.yaml` | Token certificate | Role + RoleBinding letting hippius-otel's x509-certificate-exporter read Secrets in harbor, for the token-cert expiry alerts. |
+| `upgrade.sh`, `render-check.sh` | HA overlay | `upgrade.sh` is a dry-run guard: last revision must be `deployed`, and this overlay must not change Trivy's volume. It does not apply. `render-check.sh` renders locally and does not contact the cluster. |
+| `overlay-trivy-emptydir.yaml` | Trivy emptyDir | Second upgrade only, after the HA overlay is `deployed`. `persistence.enabled: false`. |
+| `cnpg-controller-ha.yaml` | CNPG operator | Strategic-merge patch: 2 replicas and required anti-affinity. Applied by hand, not by Helm. |
 
 Never `helm upgrade` / `helm uninstall` in ns `harbor` except the flip in that runbook,
-the Redis HA cutover and the HA overlay below.
+the Redis HA cutover, the HA overlay, and the Trivy emptyDir upgrade below.
 Never bucket `hippius-juicefs-data`. Never a copy threshold above 5 GiB.
 
 The overlays compose with `--reuse-values`: a later S3 flip or rollback keeps Redis
@@ -92,23 +95,116 @@ helm upgrade harbor harbor/harbor --version 1.19.0 -n harbor --reuse-values \
 
 ## HA overlay
 
-`overlay-ha.yaml` sends job logs to Postgres, runs two registry pods, and signs tokens
-with the fixed certificate in `harbor-token-service` (below). Each change rolls out as a
-rolling update.
+`overlay-ha.yaml` sends job logs to Postgres, runs two jobservice pods and two registry
+pods that cannot share a node, prefers to spread the five core and five nginx pods, and
+signs tokens with the fixed certificate in `harbor-token-service` (below). Core and
+nginx replicas stay 5 from the release values. This file does not set them, and it does
+not set `persistence.enabled`.
+
+PodDisruptionBudgets: `maxUnavailable: 1` and `minAvailable: null` on core and nginx.
+`minAvailable: 1` only on registry and jobservice. The chart default `minAvailable: 1`
+still renders unless it is null, and the API rejects a PDB that sets both fields.
+`updateStrategy` stays `RollingUpdate`. `Recreate` is shared with the registry.
+
+Every `helm upgrade` re-salts the registry htpasswd and rolls the registry. With two
+replicas that is a rolling restart. Do not put the password or a hash in git.
+`core.secretName` is set, so the upgrade does not mint a new token CA.
+
+`render-check.sh` renders the chart locally (no cluster). `upgrade.sh` is the prod
+dry-run. It refuses unless `helm history` ends in `deployed`, and it refuses if the
+rendered Trivy StatefulSet would change `volumeClaimTemplates`. It does not apply.
 
 ```sh
-helm history harbor -n harbor --max 1    # last revision failed? see the trap above
-helm upgrade harbor harbor/harbor --version 1.19.0 -n harbor --reuse-values \
-  -f overlay-ha.yaml --dry-run=server     # expect: no harbor-redis, registry replicas 2
+./render-check.sh
+./upgrade.sh
 helm upgrade harbor harbor/harbor --version 1.19.0 -n harbor --reuse-values \
   -f overlay-ha.yaml --wait --timeout 10m
 ```
 
-Verify: two registry pods on different nodes, `/v2/` is 401, and a job log opens in
-the UI. The chart stops managing the old `harbor-jobservice` PVC but keeps it
-(`resourcePolicy: keep`). Once a new job's log reads back from the database, delete it:
-`kubectl -n harbor delete pvc harbor-jobservice`. It only held file job logs, which
-the sweeper deletes after 14 days anyway.
+Cordon `k8s-v3-node4` before this upgrade if that node should not take a new pod.
+Do not drain it. The registry Deployment stays on `RollingUpdate`. With 2 replicas
+the default is maxSurge 1 and maxUnavailable 0, so the rollout starts a third pod
+before it removes one. That pod requests 2 CPU and 2Gi and must fit on a node that
+is not already running a registry. The chart has no maxSurge field. That spare
+node is a standing precondition of every later `helm upgrade` as well: the htpasswd
+re-salt rolls the registry every time. If that third pod stays Pending, `--wait`
+marks the revision failed and the next `--reuse-values` drops this overlay and can
+bring back the single-pod Redis. Delete the registry pod on node4 only after
+another registry pod is Ready, and do that before `--wait` gives up. jobservice
+has the same required anti-affinity and `RollingUpdate`, and the chart sets no CPU
+or memory request on it. The re-salt does not change its template, so a routine
+upgrade does not surge it. A change to its own template does, and that extra pod
+only needs a free node. Verify: two jobservice pods on different nodes, two registry pods on
+different nodes, `/v2/` is 401, and a job log opens in the UI. The chart already
+stopped managing the old `harbor-jobservice` PVC. Once a new job's log reads back
+from the database, delete it: `kubectl -n harbor delete pvc harbor-jobservice`.
+
+## Trivy emptyDir
+
+Second upgrade. Do this only after the HA overlay revision is `deployed`. Trivy is a
+StatefulSet, so `volumeClaimTemplates` cannot be patched. One upgrade that removes
+them is rejected and the revision is marked `failed`, which arms the `--reuse-values`
+trap above.
+
+`persistence.enabled: false` does not change S3 registry storage and does not touch
+external Postgres or Redis. With database job logs, the jobservice volume stays an
+emptyDir. `upgrade-trivy-emptydir.sh` dry-runs the deployed release with no overlay file
+and refuses unless that render already has this HA overlay. It then dry-runs
+the emptyDir file and refuses if anything other than Trivy's volume differs
+(secret checksums and the htpasswd re-salt are ignored). It does not delete or
+apply.
+
+Node4 must still be Ready. Cordoned is fine. Do not delete the VolumeAttachment by hand.
+
+```sh
+./upgrade-trivy-emptydir.sh
+kubectl -n harbor delete sts harbor-trivy --cascade=orphan
+kubectl -n harbor delete pod harbor-trivy-0
+# wait until the pod and its VolumeAttachment are gone
+helm upgrade harbor harbor/harbor --version 1.19.0 -n harbor --reuse-values \
+  -f overlay-ha.yaml -f overlay-trivy-emptydir.yaml --wait --timeout 10m
+# new pod Ready, volume emptyDir, not on node4, then:
+kubectl -n harbor delete pvc data-harbor-trivy-0
+```
+
+The PVC delete is one-way. Trivy re-downloads its DB on the next scan. Do not delete
+the PVC before the emptyDir pod is Ready. Do not scale Trivy above 1.
+
+## CNPG operator
+
+The operator is cluster-wide (Harbor, S3, Arion, indexer). It is not a Helm release.
+`cnpg-controller-ha.yaml` is a strategic-merge patch: `replicas: 2` and required
+hostname anti-affinity on `app.kubernetes.io/name=cloudnative-pg`. A later
+`kubectl apply` of the stock `cnpg-1.28.0.yaml` sets replicas back to 1. Re-apply
+this patch after that. Do not `helm install` it and do not run
+`kubectl cnpg install generate`.
+
+Scale first, then patch, so a second copy of the current leader exists before the
+template rolls. At 2 replicas the default strategy is maxSurge 1 and maxUnavailable 0.
+Expect a lease handoff of about 15s, not a Postgres failover. Leave `barman-cloud` at
+1 replica.
+
+```sh
+kubectl scale deployment/cnpg-controller-manager -n cnpg-system --replicas=2
+kubectl -n cnpg-system rollout status deployment/cnpg-controller-manager
+kubectl patch deployment/cnpg-controller-manager -n cnpg-system \
+  --type=strategic --patch-file=cnpg-controller-ha.yaml
+```
+
+Confirm two Ready pods on different nodes and that `harbor-postgres` primary is still
+`harbor-postgres-2`.
+
+## Sentinel quorum
+
+Not this overlay. `redis-ha.yaml` is applied by hand, in one apply: Sentinel
+`clusterSize: 5` and `quorum: "3"` together, with required hostname affinity for
+`k8s-v3-node1`, `node2`, `node3`, `node5`, and `node6-cache`. Leave node4 out. Stop
+if the file does not already contain those settings. Do not raise quorum while
+`clusterSize` is still 3: that rolls the only three Sentinels before the new ones
+exist. With 5 Sentinels the majority is 3, so quorum stays 3. `RedisReplication`
+stays at 3. Do not delete the Redis master during the apply. Every reconcile runs
+`SENTINEL RESET`. If a new Sentinel stays Pending, stop. The old three are still
+serving.
 
 ## Token certificate
 
