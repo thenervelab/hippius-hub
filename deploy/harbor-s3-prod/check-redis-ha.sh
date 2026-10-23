@@ -82,8 +82,9 @@ end
 warn "RedisReplication spec matches the file"
 ' redis-ha.yaml "$live"
 
-# A custom KUBECTL_EXTERNAL_DIFF can print a diff with no kind in the header,
-# which would hide a RedisReplication change from the grep below.
+# The walk above is the guard. It refuses on any RedisReplication spec path
+# that differs, and it prints paths, not values. Unset a custom diff so the
+# backstop below sees the default header.
 unset KUBECTL_EXTERNAL_DIFF
 set +e
 kubectl diff -n harbor -f redis-ha.yaml >"$diff_out"
@@ -97,9 +98,11 @@ if [ "$code" -eq 0 ]; then
   echo "cluster already matches redis-ha.yaml. Not applying."
   exit 0
 fi
-# A changed RedisReplication is in the diff body even when the diff header
-# does not name the kind. Sentinel diffs do not contain this line.
-if grep -n 'kind: RedisReplication' "$diff_out"; then
+# Backstop only. Default kubectl diff headers look like
+# redis.redis.opstreelabs.in.v1beta2.RedisReplication.harbor.harbor-redis-ha
+# and do not contain the literal "kind: RedisReplication". A sentinel hunk's
+# redisReplicationName does not contain RedisReplication.
+if grep -n 'RedisReplication' "$diff_out"; then
   echo "refusing: kubectl diff would change RedisReplication. Not applying." >&2
   exit 1
 fi

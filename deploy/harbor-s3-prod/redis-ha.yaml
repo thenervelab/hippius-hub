@@ -4,12 +4,18 @@
 # comments below. Do not follow the old cutover's failover drill during this apply.
 #
 # One apply sets Sentinel clusterSize and quorum together. The operator writes
-# QUORUM into the pod env at start and does not rewrite a running Sentinel. The
-# StatefulSet creates the new ordinals and waits until they are Ready before it
-# rolls the old pods, so sentinel-3 and sentinel-4 come up at quorum 3 while
-# sentinel-0..2 are still serving at quorum 2, and only then do 2, 1, and 0 roll.
-# Raising quorum while clusterSize is still 3 is the bad order: that rolls the
-# only three before the new ones exist.
+# QUORUM into the pod env at start and does not rewrite a running Sentinel.
+# Operator v0.23.0 (internal/k8sutils/statefulset.go generateStatefulSetsDef)
+# never sets podManagementPolicy, and this file does not set
+# kubernetesConfig.updateStrategy, so the StatefulSet keeps the API default
+# OrderedReady. That field is immutable once set. Do not set Parallel.
+# Kubernetes creates a missing higher ordinal and, under OrderedReady, returns
+# before any destructive update. The rolling loop then deletes one old pod
+# from the highest ordinal down, and only after that pod is healthy, so
+# sentinel-3 and sentinel-4 come up at quorum 3 while sentinel-0..2 are still
+# serving at quorum 2, and only then do 2, 1, and 0 get deleted. The live
+# StatefulSet was not read for this note. Raising quorum while clusterSize is
+# still 3 is the bad order: that rolls the only three before the new ones exist.
 #
 # With 5 Sentinels the majority is 3. Quorum 2 would let two declare the master
 # down and take a third vote from a Sentinel that can still reach it. Quorum 3
@@ -18,11 +24,13 @@
 # Hostname affinity leaves out k8s-v3-node4 (kernel 6.8.0-147 reboot-looped, and
 # it is the node to cordon). A Sentinel asks for 64Mi, so node6-cache can hold
 # one. Required pod anti-affinity stays, so the five pins are one pod per node.
-# If a new pod stays Pending the roll stalls and the old three keep serving: stop
-# there. Do not delete the Redis master during the apply. Every reconcile runs
-# SENTINEL RESET. Diff the live RedisReplication against this file first so an
-# apply does not revert drift on the data pods. check-redis-ha.sh does that check
-# and does not apply.
+# This file sets no toleration. A taint on one of those five hostnames,
+# including node6-cache, leaves the new pod Pending. OrderedReady then stalls
+# and the old three keep serving at quorum 2: stop. Do not add a toleration
+# to force it on. Do not delete the Redis master during the apply. Every
+# reconcile runs SENTINEL RESET. Diff the live RedisReplication against this
+# file first so an apply does not revert drift on the data pods.
+# check-redis-ha.sh does that check and does not apply.
 #
 # Why: the chart's internal Redis is a single StatefulSet pod on an RWO volume. On
 # 2026-10-22 node4 went NotReady with harbor-redis-0 on it; the pod sat Terminating
@@ -71,8 +79,11 @@ spec:
       limits:
         memory: 512Mi
   # Required, not preferred: two copies on one node is the outage this file exists
-  # to prevent. 6 untainted workers (k8s-v3-node1..5, node6-cache), so 3 fit with
-  # up to 3 nodes down.
+  # to prevent. No nodeAffinity on this object. Adding one rolls the RWO data
+  # pods, and check-redis-ha.sh forbids it. Cordon k8s-v3-node4 before the
+  # Sentinel apply. A cordon does not evict the pods already running, and it is
+  # what keeps a new data pod off node4. The 2026-10-22 audit named six workers
+  # (k8s-v3-node1..5, node6-cache). This file does not assert that they are untainted.
   affinity:
     podAntiAffinity:
       requiredDuringSchedulingIgnoredDuringExecution:
