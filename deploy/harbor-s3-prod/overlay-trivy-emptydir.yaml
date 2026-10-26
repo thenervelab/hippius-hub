@@ -1,0 +1,16 @@
+# Second Harbor upgrade only. Never pass this file to the first upgrade.
+#
+# Trivy is a StatefulSet. volumeClaimTemplates are immutable, so Helm rejects an
+# in-place removal, marks the revision failed, and the next --reuse-values drops
+# the failed revision's values. Delete the StatefulSet with --cascade=orphan and
+# delete the pod before upgrading. Order: README.md, "Trivy emptyDir".
+#
+# This key does not switch registry storage (that is imageChartStorage.type, and
+# prod is s3) and it does not touch external Postgres or Redis. With job logs on
+# the database, the jobservice volume is already an emptyDir. Do not add anything
+# else to this file: upgrade-trivy-emptydir.sh refuses a diff that is not Trivy's
+# volume. Do not scale Trivy. The vulnerability DB is not warm on the PVC; Trivy
+# downloads it on scan. EmptyDir removes the ReadWriteOnce stick. A NotReady node
+# still costs the toleration window (about 300s) before the pod is replaced.
+persistence:
+  enabled: false

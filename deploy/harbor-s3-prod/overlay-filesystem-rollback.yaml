@@ -2,6 +2,12 @@
 # JuiceFS PVC must still exist. Anything pushed during the S3 window is not on JuiceFS.
 
 persistence:
+  # After overlay-trivy-emptydir.yaml, enabled: false is in the release and
+  # --reuse-values keeps it. The registry mounts this claim only when enabled
+  # is true and the type is filesystem. Left unset, the rollback renders an
+  # emptyDir. This does not create the volume. The claim has to already exist,
+  # and it does not: harbor-registry was deleted and the filesystem was destroyed.
+  enabled: true
   resourcePolicy: keep
   persistentVolumeClaim:
     registry:
