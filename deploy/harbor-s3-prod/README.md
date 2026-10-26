@@ -121,16 +121,19 @@ helm upgrade harbor harbor/harbor --version 1.19.0 -n harbor --reuse-values \
   -f overlay-ha.yaml --wait --timeout 10m
 ```
 
-Cordon `k8s-v3-node4` before this upgrade if that node should not take a new pod.
-Do not drain it. The registry Deployment stays on `RollingUpdate`. With 2 replicas
-the default is maxSurge 1 and maxUnavailable 0, so the rollout starts a third pod
-before it removes one. That pod requests 2 CPU and 2Gi and must fit on a node that
-is not already running a registry. The chart has no maxSurge field. That spare
-node is a standing precondition of every later `helm upgrade` as well: the htpasswd
-re-salt rolls the registry every time. If that third pod stays Pending, `--wait`
-marks the revision failed and the next `--reuse-values` drops this overlay and can
-bring back the single-pod Redis. Delete the registry pod on node4 only after
-another registry pod is Ready, and do that before `--wait` gives up. jobservice
+Leave `k8s-v3-node4` in the pool. It is healthy, so this upgrade does not cordon it
+and does not move a running pod off it by hand. Do not drain it. The registry
+Deployment stays on `RollingUpdate`. With 2 replicas the default is maxSurge 1 and
+maxUnavailable 0, so the rollout starts a third pod before it removes one. That pod
+requests 2 CPU and 2Gi and must fit on a node that is not already running a
+registry. Node4 being schedulable does not by itself provide that seat: if a
+registry pod is already there, the third pod has to land on a different node. The
+chart has no maxSurge field. That spare node is a standing precondition of every
+later `helm upgrade` as well: the htpasswd re-salt rolls the registry every time.
+If that third pod stays Pending, make 2 CPU and 2Gi available on a node that is
+not already running a registry, before `--wait` marks the revision failed. A failed revision makes the next `--reuse-values` drop this overlay and
+can bring back the single-pod Redis. Do not delete a registry pod to make the
+third one fit. jobservice
 has the same required anti-affinity and `RollingUpdate`, and the chart sets no CPU
 or memory request on it. The re-salt does not change its template, so a routine
 upgrade does not surge it. A change to its own template does, and that extra pod
@@ -140,6 +143,19 @@ stopped managing the old `harbor-jobservice` PVC. Once a new job's log reads bac
 from the database, delete it: `kubectl -n harbor delete pvc harbor-jobservice`.
 
 ## Trivy emptyDir
+
+Trivy is Harbor's vulnerability scanner. It is not on the push or pull path. Harbor
+core hands an image to the one `harbor-trivy` pod, and that pod checks it against a
+vulnerability database kept on its own disk. The disk is a ReadWriteOnce volume on
+whichever node the pod started on. If that node dies, the volume stays attached and
+the pod cannot start anywhere else. Scans stop. Push and pull keep working.
+
+This upgrade does not add a second scanner. The chart runs Trivy as a StatefulSet,
+and a second replica would get a second disk with the same stick. The change is
+`persistence.enabled: false`, which swaps the disk for an empty directory on the
+one pod. If its node dies, Kubernetes replaces the pod on another node after the
+NotReady wait (about 300s) and Trivy downloads the database again on the next scan.
+The database on the current disk is not warm.
 
 Second upgrade. Do this only after the HA overlay revision is `deployed`. Trivy is a
 StatefulSet, so `volumeClaimTemplates` cannot be patched. One upgrade that removes
@@ -154,7 +170,7 @@ the emptyDir file and refuses if anything other than Trivy's volume differs
 (secret checksums and the htpasswd re-salt are ignored). It does not delete or
 apply.
 
-Node4 must still be Ready. Cordoned is fine. Do not delete the VolumeAttachment by hand.
+Node4 stays in the pool. The new pod may land there. Do not delete the VolumeAttachment by hand.
 
 ```sh
 ./upgrade-trivy-emptydir.sh
@@ -163,7 +179,7 @@ kubectl -n harbor delete pod harbor-trivy-0
 # wait until the pod and its VolumeAttachment are gone
 helm upgrade harbor harbor/harbor --version 1.19.0 -n harbor --reuse-values \
   -f overlay-ha.yaml -f overlay-trivy-emptydir.yaml --wait --timeout 10m
-# new pod Ready, volume emptyDir, not on node4, then:
+# new pod Ready, data volume is emptyDir, then:
 kubectl -n harbor delete pvc data-harbor-trivy-0
 ```
 
@@ -191,20 +207,13 @@ kubectl patch deployment/cnpg-controller-manager -n cnpg-system \
   --type=strategic --patch-file=cnpg-controller-ha.yaml
 ```
 
-Confirm two Ready pods on different nodes and that `harbor-postgres` primary is still
-`harbor-postgres-2`.
+Confirm two Ready pods on different nodes, and that the Harbor Postgres primary did
+not move.
 
-## Sentinel quorum
+## Sentinels
 
-Not this overlay. `redis-ha.yaml` is applied by hand, in one apply: Sentinel
-`clusterSize: 5` and `quorum: "3"` together, with required hostname affinity for
-`k8s-v3-node1`, `node2`, `node3`, `node5`, and `node6-cache`. Leave node4 out. Stop
-if the file does not already contain those settings. Do not raise quorum while
-`clusterSize` is still 3: that rolls the only three Sentinels before the new ones
-exist. With 5 Sentinels the majority is 3, so quorum stays 3. `RedisReplication`
-stays at 3. Do not delete the Redis master during the apply. Every reconcile runs
-`SENTINEL RESET`. If a new Sentinel stays Pending, stop. The old three are still
-serving.
+Leave the three Sentinels and quorum 2 as they are. This upgrade does not apply a
+larger Sentinel count.
 
 ## Token certificate
 
