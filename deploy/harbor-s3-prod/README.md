@@ -113,6 +113,8 @@ replicas that is a rolling restart. Do not put the password or a hash in git.
 `render-check.sh` renders the chart locally (no cluster). `upgrade.sh` is the prod
 dry-run. It refuses unless `helm history` ends in `deployed`, and it refuses if the
 rendered Trivy StatefulSet would change `volumeClaimTemplates`. It does not apply.
+On 2026-10-26 the last line was revision 8, `deployed`. Revision 6 is the old
+`failed` line and is not the one `--reuse-values` reads.
 
 ```sh
 ./render-check.sh
@@ -121,24 +123,29 @@ helm upgrade harbor harbor/harbor --version 1.19.0 -n harbor --reuse-values \
   -f overlay-ha.yaml --wait --timeout 10m
 ```
 
-Leave `k8s-v3-node4` in the pool. It is healthy, so this upgrade does not cordon it
-and does not move a running pod off it by hand. Do not drain it. The registry
-Deployment stays on `RollingUpdate`. With 2 replicas the default is maxSurge 1 and
-maxUnavailable 0, so the rollout starts a third pod before it removes one. That pod
-requests 2 CPU and 2Gi and must fit on a node that is not already running a
-registry. Node4 being schedulable does not by itself provide that seat: if a
-registry pod is already there, the third pod has to land on a different node. The
-chart has no maxSurge field. That spare node is a standing precondition of every
-later `helm upgrade` as well: the htpasswd re-salt rolls the registry every time.
-If that third pod stays Pending, make 2 CPU and 2Gi available on a node that is
-not already running a registry, before `--wait` marks the revision failed. A failed revision makes the next `--reuse-values` drop this overlay and
-can bring back the single-pod Redis. Do not delete a registry pod to make the
-third one fit. jobservice
-has the same required anti-affinity and `RollingUpdate`, and the chart sets no CPU
-or memory request on it. The re-salt does not change its template, so a routine
-upgrade does not surge it. A change to its own template does, and that extra pod
-only needs a free node. Verify: two jobservice pods on different nodes, two registry pods on
-different nodes, `/v2/` is 401, and a job log opens in the UI. The chart already
+Leave `k8s-v3-node4` in the pool. On 2026-10-26 it was Ready, not cordoned, and
+still on kernel 6.8.0-147. This upgrade does not cordon it and does not move a
+running pod off it by hand. Do not drain it. Cordon would push the surge onto the
+tighter nodes. The registry Deployment stays on `RollingUpdate`. With 2 replicas
+the default is maxSurge 1 and maxUnavailable 0, so the rollout starts a third pod
+before it removes one. That pod requests 2 CPU and 2Gi and must fit on a node that
+is not already running a registry. The two registry pods are on node1 and node4, so
+the third one cannot use either. On that date the request headroom for it existed
+on node2, node3, node5, and node6-cache. node6-cache had about 4Gi of memory
+requests left, and node2 had 6 pod slots left of 110. The chart has no maxSurge
+field. That spare node is a standing precondition of every later `helm upgrade` as
+well: the htpasswd re-salt rolls the registry every time. If that third pod stays
+Pending, make 2 CPU and 2Gi available on a node that is not already running a
+registry, before `--wait` marks the revision failed. A failed revision makes the
+next `--reuse-values` drop this overlay and can bring back the single-pod Redis.
+Do not delete a registry pod to make the third one fit. jobservice has the same
+required anti-affinity and `RollingUpdate`, and the chart sets no CPU or memory
+request on it. The one jobservice pod is on node4, its log volume is already an
+emptyDir, and the re-salt does not change its template. This upgrade does change
+that template, because the anti-affinity is new, so it does surge one extra pod.
+A later upgrade that does not touch the jobservice template does not. Verify: two
+jobservice pods on different nodes, two registry pods on different nodes, `/v2/`
+is 401, and a job log opens in the UI. The chart already
 stopped managing the old `harbor-jobservice` PVC. Once a new job's log reads back
 from the database, delete it: `kubectl -n harbor delete pvc harbor-jobservice`.
 
@@ -170,7 +177,7 @@ the emptyDir file and refuses if anything other than Trivy's volume differs
 (secret checksums and the htpasswd re-salt are ignored). It does not delete or
 apply.
 
-Node4 stays in the pool. The new pod may land there. Do not delete the VolumeAttachment by hand.
+Node4 stays in the pool. On 2026-10-26 `harbor-trivy-0` is on node4 and its data volume is PVC `data-harbor-trivy-0`. The new pod may land there. Do not delete the VolumeAttachment by hand.
 
 ```sh
 ./upgrade-trivy-emptydir.sh
@@ -208,7 +215,8 @@ kubectl patch deployment/cnpg-controller-manager -n cnpg-system \
 ```
 
 Confirm two Ready pods on different nodes, and that the Harbor Postgres primary did
-not move.
+not move. On 2026-10-26 the primary is `harbor-postgres-2` on node2, and the single
+controller pod is on node5.
 
 ## Sentinels
 
