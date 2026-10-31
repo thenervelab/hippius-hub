@@ -82,7 +82,11 @@ CASES = {
                         _raise(ValueError("bad credentials")), "Login failed"),
     "login, password-stdin without username": (["login", "--password-stdin"], None, None,
                                                "needs --username"),
+    "download, failure": (["download", "org/m", "f.bin"], f"{CLI}.hippius_hub_download",
+                          _raise(ValueError("boom")), "Operation failed"),
+    "no command": ([], None, None, "usage:"),
     "registry without subcommand": (["registry"], None, None, "usage:"),
+    "models without subcommand": (["models"], None, None, "usage:"),
 }
 
 

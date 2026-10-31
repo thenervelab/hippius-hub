@@ -877,7 +877,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
 
 def _cmd_download(args):
-    print(f"Downloading {args.filename} from {args.repo_id} (revision: {args.revision})...")
+    _err(f"Downloading {args.filename} from {args.repo_id} (revision: {args.revision})...")
     if args.chunk_size is not None:
         os.environ["HIPPIUS_CHUNK_SIZE"] = str(args.chunk_size)
     if args.verify_hash:
