@@ -86,38 +86,6 @@ jobs:
           .venv/bin/maturin develop --release
           .venv/bin/pip install -e ".[test]"
 
-      # Supply-chain gate (Python side). Before auditing we bump the
-      # known-vulnerable transitive dev-tool deps (pip itself, pygments
-      # via pytest's traceback rendering, idna/urllib3/requests via
-      # huggingface_hub's transitive surface, setuptools pulled in by the
-      # build/test env) to current-stable so CVEs
-      # that affect only our test environment — not shipped users —
-      # don't gate merges. New CVEs that survive the upgrade ARE
-      # surfaced and DO fail CI: pip-audit returns non-zero on any
-      # vulnerability finding regardless of `--strict`.
-      #
-      # `--skip-editable` excludes the in-tree hippius_hub install
-      # (`pip install -e ".[test]"` above) from the audit. Without it,
-      # pip-audit can't resolve the current local version on PyPI
-      # because each release-bump commit predates the PyPI upload.
-      #
-      # We deliberately do NOT pass `--strict`: it upgrades the
-      # "skipped editable" log line into a fatal error, defeating
-      # `--skip-editable` entirely. `--strict` only affects warning
-      # severity (e.g. "couldn't fetch metadata for package X");
-      # actual CVE detection is non-zero regardless, which is the
-      # signal we care about.
-      - name: Python supply-chain audit
-        run: |
-          .venv/bin/pip install --upgrade \
-            'idna>=3.15' \
-            'pygments>=2.20.0' \
-            'requests>=2.33.0' \
-            'setuptools>=83.0.0' \
-            'urllib3>=2.7.0'
-          .venv/bin/pip install pip-audit==2.10.0
-          .venv/bin/pip-audit --skip-editable
-
       # Runs on every trigger (PR, push to main, tag push, release,
       # dispatch). The `addopts = "-m 'not expensive'"` default in
       # pyproject.toml automatically excludes the expensive marker
@@ -174,3 +142,73 @@ jobs:
           HIPPIUS_TEST_ALLOW_PROD_MUTATION: ${{ secrets.HIPPIUS_TEST_ALLOW_PROD_MUTATION }}
           HIPPIUS_TEST_ALLOW_TOKEN_ROTATE: ${{ secrets.HIPPIUS_TEST_ALLOW_TOKEN_ROTATE }}
         run: .venv/bin/pytest -v -m expensive
+
+  # Supply-chain gate (Python side), in its own job on Python 3.13 rather than
+  # in `e2e` on 3.10. filelock (a huggingface_hub dependency, and pip-audit's own
+  # through CacheControl) has no release that fixes its 2026-10 advisories and
+  # still installs on 3.10: 4.2.1 fixes them, and every release from 4.1.1 on
+  # needs 3.11, so a 3.10 audit fails on filelock 4.1.0 with nothing to upgrade
+  # to. Ignoring those advisories would hide them on 3.11+ too; auditing on 3.13
+  # keeps them gating. Python 3.10 reached end of life in 2026-10, and its users
+  # cannot get a fixed filelock from any release. The tests stay on 3.10.
+  python-audit:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
+        with:
+          python-version: '3.13'
+
+      # `pip install -e .` builds the Rust extension through maturin.
+      - name: Set up Rust toolchain
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8  # stable @ 2026-05-27
+        with:
+          toolchain: stable
+
+      # Same packages as the `e2e` job's venv (maturin, the runtime
+      # dependencies and the test extras), resolved for 3.13.
+      - name: Install hippius_hub with test extras
+        run: |
+          python -m venv .venv
+          .venv/bin/pip install --upgrade pip maturin
+          .venv/bin/pip install -e ".[test]"
+
+      # Supply-chain gate (Python side). Before auditing we bump the
+      # known-vulnerable transitive dev-tool deps (pip itself, pygments
+      # via pytest's traceback rendering, idna/urllib3/requests via
+      # huggingface_hub's transitive surface, setuptools pulled in by the
+      # build/test env) to current-stable so CVEs
+      # that affect only our test environment — not shipped users —
+      # don't gate merges. New CVEs that survive the upgrade ARE
+      # surfaced and DO fail CI: pip-audit returns non-zero on any
+      # vulnerability finding regardless of `--strict`.
+      #
+      # `--skip-editable` excludes the in-tree hippius_hub install
+      # (`pip install -e ".[test]"` above) from the audit. Without it,
+      # pip-audit can't resolve the current local version on PyPI
+      # because each release-bump commit predates the PyPI upload.
+      #
+      # We deliberately do NOT pass `--strict`: it upgrades the
+      # "skipped editable" log line into a fatal error, defeating
+      # `--skip-editable` entirely. `--strict` only affects warning
+      # severity (e.g. "couldn't fetch metadata for package X");
+      # actual CVE detection is non-zero regardless, which is the
+      # signal we care about.
+      - name: Python supply-chain audit
+        run: |
+          .venv/bin/pip install --upgrade \
+            'idna>=3.15' \
+            'pygments>=2.20.0' \
+            'requests>=2.33.0' \
+            'setuptools>=83.0.0' \
+            'urllib3>=2.7.0'
+          .venv/bin/pip install pip-audit==2.10.0
+          .venv/bin/pip-audit --skip-editable
