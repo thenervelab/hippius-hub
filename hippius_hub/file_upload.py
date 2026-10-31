@@ -25,6 +25,7 @@ from huggingface_hub.utils import filter_repo_objects
 from tqdm import tqdm
 
 from . import _http
+from ._logging import progress
 from ._oci import fetch_manifest, group_files, layer_title, parse_pointer_v2
 from ._packing import PackAccumulator, pointer_v2_bytes, resolve_pointer_chunks
 from .auth import call_with_oci_token_refresh
@@ -468,7 +469,7 @@ def _upload_file_layers(
         # skip feedback the pre-chunking uploader emitted (dropped in the chunked
         # refactor); users and test_idempotency both read it as proof that "upload
         # only the bytes we're missing" is working.
-        tqdm.write(f"✅ Already published (skipped): {repo_title}")
+        progress(f"✅ Already published (skipped): {repo_title}")
     return [_build_layer(sha256_hash, size, repo_title)]
 
 
@@ -663,7 +664,7 @@ def _put_manifest(
         # riding out the same registry blip don't retry in lockstep and re-storm
         # a recovering registry.
         delay = backoff * (0.5 + random.random() * 0.5)
-        tqdm.write(
+        progress(
             f"⏳ Manifest PUT for {revision} — {reason}; retrying in {delay:.1f}s "
             f"[attempt {attempt + 1}/{MANIFEST_PUT_MAX_RETRIES + 1}]"
         )
@@ -898,11 +899,11 @@ def _upload_one_file(
     """
     abs_path = os.path.join(base_dir, rel_path)
     repo_title = f"{path_in_repo}/{rel_path}" if path_in_repo else rel_path
-    tqdm.write(f"🚀 Uploading: {repo_title} ({os.path.getsize(abs_path)} bytes)...")
+    progress(f"🚀 Uploading: {repo_title} ({os.path.getsize(abs_path)} bytes)...")
     layers = _upload_file_layers(
         abs_path, repo_title, registry, oci_repo, oci_token, dedup_index, pack_sizes
     )
-    tqdm.write(f"✅ Uploaded: {repo_title}")
+    progress(f"✅ Uploaded: {repo_title}")
     return layers
 
 
@@ -946,7 +947,7 @@ def _finalize_upload_manifest(
         config_digest, config_size, merged_layers, commit_message, commit_description
     )
 
-    print(f"📝 Publishing OCI Manifest for {revision}...")
+    progress(f"📝 Publishing OCI Manifest for {revision}...")
     resp = _put_manifest(registry, oci_repo, revision, oci_token, manifest, if_match=prev_digest)
     return _build_commit_info(registry, repo_id, revision, resp, commit_message, commit_description)
 
@@ -1002,7 +1003,7 @@ def _commit_with_blob_reupload(run_commit, *, repo_id: str, revision: str) -> Co
         except ManifestBlobUnknownError as exc:
             exclude_packs.update(exc.missing_digests)
             named = ", ".join(exc.missing_digests) or "a referenced blob"
-            tqdm.write(
+            progress(
                 f"↻ {repo_id}:{revision} — registry lost {named} after commit; "
                 f"re-uploading and retrying [{reupload + 1}/{max_retries}]"
             )
@@ -1214,7 +1215,7 @@ def upload_folder(
 
         new_layers = []
         if filtered:
-            print(f"📦 Preparing to upload {len(filtered)} file(s) to {repo_id}:{revision}...")
+            progress(f"📦 Preparing to upload {len(filtered)} file(s) to {repo_id}:{revision}...")
             with ThreadPoolExecutor(max_workers=max_workers) as executor:
                 futures = [
                     executor.submit(
@@ -1256,7 +1257,7 @@ def upload_folder(
         )
         # Count logical files uploaded, not manifest layers: a chunked file expands
         # to a pointer + K chunk layers, so len(new_layers) would overcount.
-        print(f"🎉 Successfully pushed {len(filtered)} file(s) to {repo_id}:{revision}")
+        progress(f"🎉 Successfully pushed {len(filtered)} file(s) to {repo_id}:{revision}")
         return commit_info
 
     return _commit_with_blob_reupload(

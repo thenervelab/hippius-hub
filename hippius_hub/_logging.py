@@ -1,12 +1,19 @@
-"""Opt-in verbose logging for the transport layer.
+"""Progress lines and opt-in verbose logging, both on stderr.
 
-Quiet by default. `configure_logging()` attaches a stderr handler only when
-verbose logging is requested (HIPPIUS_DEBUG / RUST_LOG set; the CLI flips
-HIPPIUS_DEBUG on for `--verbose`). Output stays on stderr so it never pollutes
-stdout, where the diagnose report and progress bars live.
+`progress()` prints the per-transfer status lines (`Downloading ...`,
+`Uploaded: ...`) that are on by default. `configure_logging()` attaches a stderr
+handler only when verbose logging is requested (HIPPIUS_DEBUG / RUST_LOG set; the
+CLI flips HIPPIUS_DEBUG on for `--verbose`).
+
+Neither writes to stdout: stdout belongs to the caller. A script running
+`hippius-hub download ... > out` or a Python program printing its own results
+must not get transfer chatter mixed in (issue #137). The diagnose report is the
+one CLI output on stdout.
 """
 import logging
 import sys
+
+from tqdm import tqdm
 
 from .constants import debug_enabled
 
@@ -24,3 +31,12 @@ def configure_logging() -> logging.Logger:
             )
             logger.addHandler(handler)
     return logger
+
+
+def progress(msg: str) -> None:
+    """Print one progress line to stderr.
+
+    `tqdm.write` rather than `print` so the line lands above a live `tqdm` bar
+    (the folder upload's) instead of through it.
+    """
+    tqdm.write(msg, file=sys.stderr)

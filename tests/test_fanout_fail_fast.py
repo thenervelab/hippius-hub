@@ -140,7 +140,7 @@ def test_upload_folder_refreshes_token_on_worker_401(monkeypatch, tmp_path):
     assert next(tokens, "exhausted") == "exhausted", "exactly two mints: initial + one refresh"
 
 
-def test_upload_folder_reuploads_on_persistent_blob_unknown(monkeypatch, tmp_path):
+def test_upload_folder_reuploads_on_persistent_blob_unknown(monkeypatch, tmp_path, capsys):
     # Folder uploads must self-heal like upload_file: a durable MANIFEST_BLOB_UNKNOWN at
     # finalize (a blob the registry lost — GC reap / a commit that never landed) re-runs
     # the WHOLE fan-out so every blob is re-PUT, bounded, then commits. The folder path
@@ -176,6 +176,9 @@ def test_upload_folder_reuploads_on_persistent_blob_unknown(monkeypatch, tmp_pat
     assert result == "commit-ok", "the folder upload must re-run and commit on the re-upload"
     assert len(finalize_calls) == 2, "a durable BLOB_UNKNOWN must trigger exactly one folder re-upload"
     assert len(fanout_runs) == 6, "the whole 3-file fan-out must re-run so every lost blob is re-PUT"
+    captured = capsys.readouterr()
+    assert captured.out == ""  # the retry notice is progress, on stderr (#137)
+    assert "re-uploading and retrying" in captured.err
 
 
 def test_l10_dedup_index_skipped_for_small_only_folder(monkeypatch, tmp_path):

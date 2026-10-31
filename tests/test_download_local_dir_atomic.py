@@ -46,7 +46,7 @@ def test_failed_local_dir_download_leaves_no_temp_siblings(tmp_path, monkeypatch
     assert leftovers == [], f"temp files leaked into the local dir: {leftovers}"
 
 
-def test_successful_local_dir_download_writes_dest(tmp_path, monkeypatch):
+def test_successful_local_dir_download_writes_dest(tmp_path, monkeypatch, capsys):
     def _ok(*, url, dest_path, **kwargs):
         with open(dest_path, "wb") as f:
             f.write(b"payload")
@@ -60,6 +60,9 @@ def test_successful_local_dir_download_writes_dest(tmp_path, monkeypatch):
     assert out == str(dest)
     assert dest.read_bytes() == b"payload"
     assert sorted(p.name for p in tmp_path.iterdir()) == ["model.bin"]
+    captured = capsys.readouterr()
+    assert captured.out == ""  # stdout stays the caller's (#137)
+    assert "Downloading model.bin" in captured.err
 
 
 def test_local_dir_download_rejects_digest_mismatch(tmp_path, monkeypatch):

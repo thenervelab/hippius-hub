@@ -26,6 +26,11 @@ the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html
   moves to stderr too. A failed `keys create ... > key.txt`
   leaves key.txt empty instead of holding the error text. Exit codes are
   unchanged. Scripts that read error text from stdout now read stderr.
+- Transfer progress lines from the library (`Downloading <file> (parallel)...`,
+  `Uploading:` / `Uploaded:` / `Already published`, `Publishing OCI Manifest`,
+  `Successfully pushed`, and the retry notices) print on stderr instead of
+  stdout, beside the progress bars, for `hf_hub_download` / `upload_folder` /
+  `upload_file` callers and the CLI alike. Stdout is left to the caller.
 
 ### Added
 
