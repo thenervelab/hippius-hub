@@ -177,3 +177,54 @@ def test_login_password_and_password_stdin_are_exclusive(capsys):
 
     assert exc.value.code == 2
     assert "not allowed with argument" in capsys.readouterr().err
+
+
+# ----- with the real `login()`: its "saved" notice must not reach stdout -----
+
+@pytest.fixture
+def real_login_tmp_cache(monkeypatch, tmp_path):
+    """Keep the real `auth.login`, writing the token under `tmp_path`."""
+    monkeypatch.setattr("hippius_hub.auth.DEFAULT_CACHE_DIR", str(tmp_path))
+    monkeypatch.setattr("hippius_hub.auth.TOKEN_PATH", str(tmp_path / "token"))
+    monkeypatch.setattr(cli.shutil, "which", lambda _name: None)
+    return tmp_path / "token"
+
+
+def test_provision_with_real_login_keeps_stdout_to_secret(monkeypatch, capsys,
+                                                          real_login_tmp_cache):
+    monkeypatch.setattr(cli.console, "provision", lambda ns: {
+        "project_name": ns, "plan_name": "free", "storage_quota_bytes": 1024,
+        "robot_login": LOGIN, "robot_secret": SECRET, "registry_url": f"https://{HOST}",
+    })
+
+    cli.cmd_registry_provision(argparse.Namespace(namespace="myns", docker_login=False))
+
+    _assert_secret_alone_on_stdout(capsys.readouterr())
+    assert real_login_tmp_cache.exists()
+
+
+def test_rotate_token_with_real_login_keeps_stdout_to_secret(monkeypatch, capsys,
+                                                             real_login_tmp_cache):
+    monkeypatch.setattr(cli.console, "rotate_robot",
+                        lambda: {"robot_login": LOGIN, "robot_secret": SECRET})
+    monkeypatch.setattr(cli.console, "me", lambda: {"registry_url": f"https://{HOST}"})
+
+    cli.cmd_registry_rotate(argparse.Namespace(docker_login=False))
+
+    _assert_secret_alone_on_stdout(capsys.readouterr())
+    assert real_login_tmp_cache.exists()
+
+
+def test_rotate_token_fetches_host_before_issuing_secret(monkeypatch):
+    """A failing `me()` must stop the rotation before a secret is issued."""
+    def failing_me():
+        raise cli.ConsoleError(503, "unavailable")
+
+    def must_not_rotate():
+        raise AssertionError("rotate_robot ran although me() failed")
+
+    monkeypatch.setattr(cli.console, "me", failing_me)
+    monkeypatch.setattr(cli.console, "rotate_robot", must_not_rotate)
+
+    with pytest.raises(cli.ConsoleError):
+        cli.cmd_registry_rotate(argparse.Namespace(docker_login=False))

@@ -15,6 +15,10 @@ the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html
   `docker login ... -p '<secret>'` command; all suggested logins read the secret
   from stdin. Scripts that grepped a `Secret:` line out of stdout now read stdout
   whole (`> key.txt`).
+- `login()` prints its "Token successfully saved" notice on stderr, so it no
+  longer follows the secret on stdout in `provision` / `rotate-token`.
+- `registry rotate-token` fetches the registry host before issuing the new
+  secret, so a failure there no longer leaves an issued secret unprinted.
 
 ### Added
 

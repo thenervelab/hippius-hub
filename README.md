@@ -81,8 +81,8 @@ The registry secret is printed **once** on first provision. If you lose it, rota
 Every command that issues a secret (`registry provision`, `rotate-token`, `keys create`, `keys rotate`) prints the secret alone on stdout and its other output (login name, next steps) on stderr. Redirect stdout to a private file and pass the file on stdin, so the secret never sits in your terminal, shell history or an agent transcript:
 
 ```bash
-hippius-hub registry keys create agent-push --role push-delete --expires-days 1 > key.txt
-chmod 600 key.txt
+# umask 077: the file is created private, with no readable window before a chmod.
+(umask 077; hippius-hub registry keys create agent-push --role push-delete --expires-days 1 > key.txt)
 hippius-hub login --username 'robot$myns+agent-push' --password-stdin < key.txt
 docker login registry.hippius.com -u 'robot$myns+agent-push' --password-stdin < key.txt
 ```
@@ -472,7 +472,7 @@ gh secret set MATTERMOST_WEBHOOK_URL       # same webhook hippius-s3 posts its s
 
 ```bash
 # On the workstation where you're already logged in:
-hippius-hub registry keys create ci-e2e --role push --expires-days 90 > key.txt
+(umask 077; hippius-hub registry keys create ci-e2e --role push --expires-days 90 > key.txt)
 gh secret set HIPPIUS_TEST_PASS < key.txt   # the secret never reaches the terminal
 # Logged into project test: HIPPIUS_TEST_USER / HIPPIUS_TEST_PASS.
 # Logged into project veggies-test: HIPPIUS_SMOKE_USER / HIPPIUS_SMOKE_PASS.

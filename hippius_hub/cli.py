@@ -317,12 +317,12 @@ def cmd_registry_me(_args):
 
 def cmd_registry_rotate(args):
     """Issue a fresh docker robot secret (`hippius-hub registry rotate-token`)."""
+    # `me()` runs first: once the new secret is issued nothing may fail before it is
+    # printed, or the secret is lost and the old one already stops working.
+    host = _registry_host(console.me()['registry_url'])
     res = console.rotate_robot()
     _err("✅ New docker secret issued (hippius-hub's own login is saved for you).")
-    # Printed before `console.me()`: the secret exists only in this response, so a
-    # failure fetching the registry host must not lose it.
     _print_secret(res['robot_login'], res['robot_secret'])
-    host = _registry_host(console.me()['registry_url'])
     _maybe_docker_login(host, res['robot_login'], res['robot_secret'], auto=args.docker_login)
 
 
