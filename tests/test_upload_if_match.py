@@ -394,7 +394,7 @@ def test_manifest_put_rides_out_a_lag_longer_than_the_old_budget(tmp_path, monke
 
 
 @respx.mock
-def test_manifest_put_retries_5xx_then_succeeds(tmp_path, monkeypatch):
+def test_manifest_put_retries_5xx_then_succeeds(tmp_path, monkeypatch, capsys):
     """A 503 (registry redeploy/overload) is transient and retried, like in Rust."""
     from hippius_hub.file_upload import upload_file
 
@@ -421,6 +421,9 @@ def test_manifest_put_retries_5xx_then_succeeds(tmp_path, monkeypatch):
 
     assert put_route.call_count == 2
     assert sleeps == [0.5]
+    captured = capsys.readouterr()
+    assert captured.out == ""  # the retry notice is progress, on stderr (#137)
+    assert "retrying in 0.5s" in captured.err
 
 
 @respx.mock

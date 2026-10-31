@@ -81,6 +81,13 @@ def _chunked_manifest() -> dict:
     }
 
 
+def _assert_progress_on_stderr_only(capsys, filename):
+    """The `Downloading ...` line goes to stderr; stdout stays the caller's (#137)."""
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert f"Downloading {filename}" in captured.err
+
+
 def _mock_chunked():
     token_route(respx.mock)
     respx.get(f"{MOCK_REGISTRY}/v2/{REPO}/manifests/main").mock(
@@ -94,7 +101,9 @@ def _mock_chunked():
 
 
 @respx.mock
-def test_chunked_file_routes_to_native_pack_assembler(monkeypatched_registry, monkeypatch, tmp_path):
+def test_chunked_file_routes_to_native_pack_assembler(
+    monkeypatched_registry, monkeypatch, tmp_path, capsys
+):
     _mock_chunked()
 
     calls = []
@@ -127,6 +136,7 @@ def test_chunked_file_routes_to_native_pack_assembler(monkeypatched_registry, mo
     assert open(out, "rb").read() == FILE_BYTES
     blob = os.path.join(tmp_path, "models--acme--model", "blobs", f"sha256:{FILE_DIGEST}")
     assert os.path.exists(blob)
+    _assert_progress_on_stderr_only(capsys, "big.bin")
 
 
 @respx.mock
@@ -221,7 +231,7 @@ def test_repeated_chunk_yields_two_targets_over_one_pack_range(
 
 
 @respx.mock
-def test_chunked_file_to_local_dir(monkeypatched_registry, monkeypatch, tmp_path):
+def test_chunked_file_to_local_dir(monkeypatched_registry, monkeypatch, tmp_path, capsys):
     _mock_chunked()
     monkeypatch.setattr(
         file_download,
@@ -236,10 +246,13 @@ def test_chunked_file_to_local_dir(monkeypatched_registry, monkeypatch, tmp_path
     )
     assert out == str(local / "big.bin")
     assert (local / "big.bin").read_bytes() == FILE_BYTES
+    _assert_progress_on_stderr_only(capsys, "big.bin")
 
 
 @respx.mock
-def test_plain_file_does_not_touch_pack_assembler(monkeypatched_registry, monkeypatch, tmp_path):
+def test_plain_file_does_not_touch_pack_assembler(
+    monkeypatched_registry, monkeypatch, tmp_path, capsys
+):
     # A plain (pre-chunking) manifest must keep the single-blob Range path and
     # never call the pack assembler.
     payload = b"Z" * 42
@@ -274,6 +287,7 @@ def test_plain_file_does_not_touch_pack_assembler(monkeypatched_registry, monkey
         cache_dir=str(tmp_path), token="tok",
     )
     assert open(out, "rb").read() == payload
+    _assert_progress_on_stderr_only(capsys, "file.txt")
 
 
 @respx.mock

@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Dict, Optional, Union
 
 from . import _http
+from ._logging import progress
 from ._oci import FileGroup, fetch_manifest, group_files, parse_pointer_v2
 from .auth import call_with_oci_token_refresh
 from .constants import (
@@ -490,7 +491,7 @@ def _download_to_cache(
     os.close(fd)
 
     # 2. Concurrent download via the Rust engine
-    print(f"Downloading {filename} (parallel)...")
+    progress(f"Downloading {filename} (parallel)...")
     verify_hash = resolve_verify_hash()
     try:
         # Audit L6 (Phase 3.12): download_file_native now returns
@@ -570,7 +571,7 @@ def _download_to_local_dir(blob_url, dest_file, oci_token, target_digest, conten
     parent = os.path.dirname(dest_file)
     if parent:
         os.makedirs(parent, exist_ok=True)
-    print(f"Downloading {os.path.basename(dest_file)} (parallel)...")
+    progress(f"Downloading {os.path.basename(dest_file)} (parallel)...")
     # Per-call unique temp sibling in the destination directory so the final
     # `os.replace` is an atomic same-filesystem rename. mkstemp returns
     # (fd, path); close the fd because the Rust download opens the file by path.
@@ -710,7 +711,7 @@ def _download_chunked_to_cache(
     fd, temp_path = tempfile.mkstemp(dir=blobs_dir, prefix=f"tmp_{safe_name}_")
     os.close(fd)
 
-    print(f"Downloading {filename} (parallel)...")
+    progress(f"Downloading {filename} (parallel)...")
     try:
         computed = _pull_chunks(group, registry, oci_repo, temp_path, oci_token, manifest)
     except BaseException:
@@ -744,7 +745,7 @@ def _download_chunked_to_local_dir(group, registry, oci_repo, dest_file, oci_tok
     parent = os.path.dirname(dest_file)
     if parent:
         os.makedirs(parent, exist_ok=True)
-    print(f"Downloading {os.path.basename(dest_file)} (parallel)...")
+    progress(f"Downloading {os.path.basename(dest_file)} (parallel)...")
     fd, temp_path = tempfile.mkstemp(
         dir=parent or ".", prefix=f".tmp_{os.path.basename(dest_file)}_"
     )
