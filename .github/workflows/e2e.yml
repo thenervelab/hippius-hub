@@ -173,12 +173,12 @@ jobs:
         with:
           toolchain: stable
 
-      # Same install as the `e2e` job, so the audit sees the same packages
-      # (runtime dependencies plus the test extras), resolved for 3.13.
+      # Same packages as the `e2e` job's venv (maturin, the runtime
+      # dependencies and the test extras), resolved for 3.13.
       - name: Install hippius_hub with test extras
         run: |
           python -m venv .venv
-          .venv/bin/pip install --upgrade pip
+          .venv/bin/pip install --upgrade pip maturin
           .venv/bin/pip install -e ".[test]"
 
       # Supply-chain gate (Python side). Before auditing we bump the
