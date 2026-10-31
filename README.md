@@ -78,7 +78,7 @@ In practice the API token is all you save by hand. `hippius-hub registry provisi
 
 The registry secret is printed **once** on first provision. If you lose it, rotate with `hippius-hub registry rotate-token` (also re-writes the local cache).
 
-Every command that issues a secret (`registry provision`, `rotate-token`, `keys create`, `keys rotate`) prints the secret alone on stdout and its other output (login name, next steps) on stderr. Redirect stdout to a private file and pass the file on stdin, so the secret never sits in your terminal, shell history or an agent transcript:
+Every command that issues a secret (`registry provision`, `rotate-token`, `keys create`, `keys rotate`) prints the secret alone on stdout and its other output (login name, next steps) on stderr. Redirect stdout to a private file and pass the file on stdin, so the secret never sits in your terminal, shell history or an agent transcript. Errors from every command go to stderr with a nonzero exit, so a failed command leaves `key.txt` empty rather than holding the error text:
 
 ```bash
 # umask 077: the file is created private, with no readable window before a chmod.

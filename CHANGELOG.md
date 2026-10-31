@@ -19,6 +19,12 @@ the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html
   longer follows the secret on stdout in `provision` / `rotate-token`.
 - `registry rotate-token` fetches the registry host before issuing the new
   secret, so a failure there no longer leaves an issued secret unprinted.
+- Every CLI error goes to stderr with a nonzero exit, never to stdout: API
+  errors of `registry` / `models`, typed `download` / `upload` / `revisions` /
+  `diagnose` errors, `login` failures, and the help printed when `registry` or
+  `models` is run without a subcommand. A failed `keys create ... > key.txt`
+  leaves key.txt empty instead of holding the error text. Exit codes are
+  unchanged. Scripts that read error text from stdout now read stderr.
 
 ### Added
 

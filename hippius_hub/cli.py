@@ -60,6 +60,17 @@ def _fmt_params(n) -> str:
     return f"{n:,}"
 
 
+def _err(msg: str = "") -> None:
+    """Print one line to stderr.
+
+    Every error message goes here, never to stdout: a command whose stdout is
+    redirected (`registry keys create ... > key.txt`) must not leave the error text
+    in the file in place of the output, where a later `--password-stdin < key.txt`
+    would send it as the password (issue #132).
+    """
+    print(msg, file=sys.stderr)
+
+
 def _print_json(obj: Any):
     print(json.dumps(obj, indent=2, sort_keys=True, default=str))
 
@@ -177,13 +188,8 @@ def cmd_registry_check(args):
     if res.get("available"):
         print(f"✅ {args.name} is available")
     else:
-        print(f"❌ {res.get('message') or 'taken'}")
+        _err(f"❌ {res.get('message') or 'taken'}")
         sys.exit(EXIT_NAMESPACE_TAKEN)
-
-
-def _err(msg: str = "") -> None:
-    """Print one line to stderr."""
-    print(msg, file=sys.stderr)
 
 
 def _registry_host(url: str) -> str:
@@ -374,17 +380,17 @@ def cmd_registry_repos_delete(args):
     except RepositoryNotFoundError:
         # delete_repo raises this (not an httpx error) only when no credential
         # could be resolved for the Harbor admin call.
-        print("❌ Not logged in. Run `hippius-hub login` first.")
+        _err("❌ Not logged in. Run `hippius-hub login` first.")
         sys.exit(1)
     except httpx.HTTPStatusError as e:
         status = e.response.status_code
         if status == 403:
-            print("❌ Deleting a repository requires admin permissions on the "
-                  "project; the current credentials can't delete it.")
+            _err("❌ Deleting a repository requires admin permissions on the "
+                 "project; the current credentials can't delete it.")
             sys.exit(1)
         if status == 404:
-            print(f"❌ Repository not found: {args.repo_id} "
-                  f"(pass --missing-ok to ignore).")
+            _err(f"❌ Repository not found: {args.repo_id} "
+                 f"(pass --missing-ok to ignore).")
             sys.exit(EXIT_REPO_NOT_FOUND)
         raise
     print(f"✅ Repo deleted: {args.repo_id}")
@@ -393,9 +399,9 @@ def cmd_registry_repos_delete(args):
 def cmd_registry_artifacts(args):
     """List artifacts inside one repository (`hippius-hub registry artifacts`)."""
     if "/" not in args.repo:
-        print(f"❌ Repo must be '<project>/<repo>', got '{args.repo}'.")
-        print("   Example: hippius-hub registry artifacts myorg/my-models")
-        print("   (run `hippius-hub registry me` to see your project name)")
+        _err(f"❌ Repo must be '<project>/<repo>', got '{args.repo}'.")
+        _err("   Example: hippius-hub registry artifacts myorg/my-models")
+        _err("   (run `hippius-hub registry me` to see your project name)")
         sys.exit(EXIT_INVALID_REPO_FORMAT)
     res = console.list_artifacts(args.repo, page=args.page, page_size=args.page_size)
     if not res:
@@ -442,7 +448,8 @@ def _resolve_plan_id(plan_arg: str) -> int:
         if p.get("name", "").lower() == plan_arg.lower():
             return p["id"]
     avail = ", ".join(p.get("name", "?") for p in plans) or "(no plans)"
-    raise SystemExit(f"❌ Unknown plan: {plan_arg!r}. Available: {avail}")
+    _err(f"❌ Unknown plan: {plan_arg!r}. Available: {avail}")
+    sys.exit(1)
 
 
 def cmd_registry_subscribe(args):
@@ -577,7 +584,7 @@ def cmd_models_show(args):
     """Show one model's versions or a specific reference (`hippius-hub models show`)."""
     parts = args.repo_id.split("/", 1)
     if len(parts) != 2:
-        print("❌ repo_id must be <project>/<repo>")
+        _err("❌ repo_id must be <project>/<repo>")
         sys.exit(EXIT_INVALID_REPO_FORMAT)
     project, repo = parts
     if args.reference:
@@ -627,7 +634,7 @@ def cmd_revisions(args):
     oci_token = get_oci_bearer_token(oci_repo, resolve_token_value(None), push=False)
     tags = _list_tags(registry, oci_repo, oci_token)
     if tags is None:
-        print("❌ Repository not found.")
+        _err("❌ Repository not found.")
         # 11, not 1: this is exactly the RepositoryNotFoundError condition the
         # exit-code contract in `_format_download_error` documents. It answered
         # 1 here, so a wrapper could not tell "this repo is gone" apart from any
@@ -926,11 +933,11 @@ def _read_password_stdin() -> str:
     if password.endswith("\r"):
         password = password[:-1]
     if not password:
-        print("❌ --password-stdin read an empty password from stdin.")
+        _err("❌ --password-stdin read an empty password from stdin.")
         sys.exit(1)
     if "\n" in password:
-        print("❌ --password-stdin read more than one line. Pass only the secret, e.g. the "
-              "stdout of `hippius-hub registry keys create`.")
+        _err("❌ --password-stdin read more than one line. Pass only the secret, e.g. the "
+             "stdout of `hippius-hub registry keys create`.")
         sys.exit(1)
     return password
 
@@ -945,7 +952,7 @@ def _cmd_login(args):
     token = args.token
     if args.password_stdin:
         if not username:
-            print("❌ --password-stdin needs --username (the login printed with the secret).")
+            _err("❌ --password-stdin needs --username (the login printed with the secret).")
             sys.exit(1)
         password = _read_password_stdin()
     if not token and not (username and password):
@@ -964,14 +971,14 @@ def _cmd_login(args):
     try:
         login(username=username, password=password, token=token)
     except ValueError as e:
-        print(f"❌ Login failed: {e}")
+        _err(f"❌ Login failed: {e}")
         sys.exit(1)
 
 
 def _exit_with_download_error(e: Exception) -> None:
     """Print `_format_download_error`'s message and exit with its code."""
     msg, code = _format_download_error(e)
-    print(msg)
+    _err(msg)
     sys.exit(code)
 
 
@@ -985,12 +992,12 @@ def _handle_console_error(e: ConsoleError) -> None:
     without parsing JSON in the CLI layer.
     """
     if e.status_code == 401:
-        print("❌ Not logged in. Run `hippius-hub login --hippius-token <token>` "
-              "(get one from https://console.hippius.com).")
+        _err("❌ Not logged in. Run `hippius-hub login --hippius-token <token>` "
+             "(get one from https://console.hippius.com).")
     elif e.status_code == 404:
-        print(f"❌ Not found: {e.body}")
+        _err(f"❌ Not found: {e.body}")
     else:
-        print(f"❌ {e}")
+        _err(f"❌ {e}")
     sys.exit(1)
 
 
@@ -1037,7 +1044,7 @@ def main():
         return
     if args.command in ("registry", "models"):
         if not hasattr(args, "func"):
-            parser.print_help()
+            parser.print_help(sys.stderr)
             sys.exit(1)
         try:
             args.func(args)
@@ -1046,7 +1053,7 @@ def main():
         except NotImplementedError as e:
             _exit_with_download_error(e)
         return
-    parser.print_help()
+    parser.print_help(sys.stderr)
     sys.exit(1)
 
 

@@ -105,7 +105,7 @@ def test_cli_registry_artifacts_rejects_single_segment(cli_env):
 
     r = run_cli(["registry", "artifacts", "no-slash"], env=cli_env, check=False)
     assert r.returncode == EXIT_INVALID_REPO_FORMAT
-    assert "<project>/<repo>" in r.stdout
+    assert "<project>/<repo>" in r.stderr
 
 
 # ---------- models ----------

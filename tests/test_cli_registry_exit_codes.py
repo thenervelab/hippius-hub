@@ -33,7 +33,9 @@ def test_namespace_taken_exits_17(monkeypatch, capsys):
         cli.cmd_registry_check(args)
     assert exc.value.code == 17
     assert exc.value.code == cli.EXIT_NAMESPACE_TAKEN
-    out = capsys.readouterr().out
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    out = captured.err
     assert "already taken" in out
 
 
@@ -56,7 +58,9 @@ def test_invalid_repo_format_in_artifacts_exits_18(capsys):
         cli.cmd_registry_artifacts(args)
     assert exc.value.code == 18
     assert exc.value.code == cli.EXIT_INVALID_REPO_FORMAT
-    out = capsys.readouterr().out
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    out = captured.err
     assert "must be '<project>/<repo>'" in out
 
 
@@ -71,7 +75,9 @@ def test_invalid_repo_format_in_models_show_exits_18(capsys):
     with pytest.raises(SystemExit) as exc:
         cli.cmd_models_show(args)
     assert exc.value.code == 18
-    out = capsys.readouterr().out
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    out = captured.err
     assert "<project>/<repo>" in out
 
 

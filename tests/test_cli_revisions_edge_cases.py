@@ -163,7 +163,7 @@ def test_revisions_404_exits_11(monkeypatched_registry, capsys):
         cli.cmd_revisions(_revisions_args())
     assert exc.value.code == 11
     assert exc.value.code == cli.EXIT_REPO_NOT_FOUND
-    assert "not found" in capsys.readouterr().out.lower()
+    assert "not found" in capsys.readouterr().err.lower()
 
 
 @respx.mock
@@ -218,7 +218,7 @@ def test_main_renders_typed_errors_as_clean_exit(monkeypatch, capsys, exc, expec
     assert got.value.code == expected_code
     captured = capsys.readouterr()
     assert "Traceback" not in captured.out and "Traceback" not in captured.err
-    assert "❌" in captured.out
+    assert "❌" in captured.err
 
 
 @pytest.mark.parametrize("repo_type, match", [

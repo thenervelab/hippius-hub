@@ -136,8 +136,8 @@ def test_download_typed_error_routes_to_exit_code(
         f"expected exit {expected_code} for {exc_expr!r}, got "
         f"{proc.returncode}.\nstdout:\n{proc.stdout}\nstderr:\n{proc.stderr}"
     )
-    assert error_label in proc.stdout, (
-        f"expected '{error_label}' in stdout, got:\n{proc.stdout}"
+    assert error_label in proc.stderr, (
+        f"expected '{error_label}' in stderr, got:\n{proc.stderr}"
     )
 
 
@@ -168,7 +168,7 @@ def test_registry_check_taken_exits_17():
         f"expected exit 17, got {proc.returncode}.\n"
         f"stdout:\n{proc.stdout}\nstderr:\n{proc.stderr}"
     )
-    assert "already taken" in proc.stdout
+    assert "already taken" in proc.stderr
 
 
 def test_registry_artifacts_malformed_repo_exits_18():
@@ -188,7 +188,7 @@ def test_registry_artifacts_malformed_repo_exits_18():
         f"expected exit 18, got {proc.returncode}.\n"
         f"stdout:\n{proc.stdout}\nstderr:\n{proc.stderr}"
     )
-    assert "<project>/<repo>" in proc.stdout
+    assert "<project>/<repo>" in proc.stderr
 
 
 def test_models_show_malformed_repo_exits_18():
@@ -232,4 +232,4 @@ def test_unknown_exception_falls_through_to_1():
         f"unmapped exception should exit 1, got {proc.returncode}.\n"
         f"stdout:\n{proc.stdout}\nstderr:\n{proc.stderr}"
     )
-    assert "Operation failed" in proc.stdout
+    assert "Operation failed" in proc.stderr
