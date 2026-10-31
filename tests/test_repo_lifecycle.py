@@ -95,7 +95,7 @@ def test_cli_repos_delete_roundtrip(tmp_path, cli_env, logged_in, test_repo):
 
     r = run_cli(["registry", "repos", "delete", repo_id, "--yes"],
                 env=cli_env, check=False)
-    if r.returncode == 1 and "admin permissions" in r.stdout:
+    if r.returncode == 1 and "admin permissions" in r.stderr:
         delete_repo(repo_id, missing_ok=True)  # best-effort cleanup
         pytest.skip("credentials lack Harbor project_admin; can't exercise CLI delete")
     assert r.returncode == 0, f"stdout={r.stdout!r} stderr={r.stderr!r}"
@@ -110,7 +110,7 @@ def test_cli_repos_delete_missing_ok_is_silent(cli_env, test_repo):
     ghost = f"{test_repo.split('/')[0]}/ghost-{uuid.uuid4().hex[:8]}"
     r = run_cli(["registry", "repos", "delete", ghost, "--yes", "--missing-ok"],
                 env=cli_env, check=False)
-    if r.returncode == 1 and "admin permissions" in r.stdout:
+    if r.returncode == 1 and "admin permissions" in r.stderr:
         pytest.skip("credentials lack Harbor project_admin; can't exercise CLI delete")
     assert r.returncode == 0, f"stdout={r.stdout!r} stderr={r.stderr!r}"
 

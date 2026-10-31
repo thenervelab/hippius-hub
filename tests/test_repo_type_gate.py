@@ -233,8 +233,8 @@ def test_cli_unsupported_repo_type_exits_1_without_traceback(
     assert got.value.code == 1
     captured = capsys.readouterr()
     assert "Traceback" not in captured.out and "Traceback" not in captured.err
-    assert "❌" in captured.out
-    assert match in captured.out
+    assert "❌" in captured.err
+    assert match in captured.err
     assert respx.calls.call_count == 0, "the CLI contacted the registry before the gate"
 
 
@@ -248,7 +248,7 @@ def test_cli_revisions_inline_not_found_reaches_the_shell_as_11(monkeypatch, cap
     with pytest.raises(SystemExit) as got:
         cli.main()
     assert got.value.code == cli.EXIT_REPO_NOT_FOUND == 11
-    assert "not found" in capsys.readouterr().out.lower()
+    assert "not found" in capsys.readouterr().err.lower()
 
 
 def test_cli_repos_delete_404_reaches_the_shell_as_11(monkeypatch, capsys):
@@ -262,7 +262,7 @@ def test_cli_repos_delete_404_reaches_the_shell_as_11(monkeypatch, capsys):
     with pytest.raises(SystemExit) as got:
         cli.main()
     assert got.value.code == cli.EXIT_REPO_NOT_FOUND == 11
-    assert "not found" in capsys.readouterr().out.lower()
+    assert "not found" in capsys.readouterr().err.lower()
 
 
 def test_cli_typed_not_found_from_diagnose_reaches_the_shell_as_11(monkeypatch, capsys):
@@ -282,7 +282,7 @@ def test_cli_typed_not_found_from_diagnose_reaches_the_shell_as_11(monkeypatch, 
     assert got.value.code == cli.EXIT_REPO_NOT_FOUND == 11
     captured = capsys.readouterr()
     assert "Traceback" not in captured.err
-    assert "Repository not found" in captured.out
+    assert "Repository not found" in captured.err
 
 
 def test_format_download_error_renders_the_gate_refusal_as_exit_1():

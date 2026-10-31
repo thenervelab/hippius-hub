@@ -25,7 +25,7 @@ There are **two credentials** the user might need:
   ```bash
   hippius-hub login --username '<printed-login>' --password-stdin < key.txt     # writes ~/.cache/hippius/hub/token
   ```
-  Commands that issue a secret (`registry provision`, `rotate-token`, `keys create`, `keys rotate`) print the secret alone on stdout and everything else (login name, hints) on stderr, so `(umask 077; ... > key.txt)` captures exactly the secret in a private file and keeps it out of the terminal and agent transcripts. Pass it on stdin (`--password-stdin < key.txt`, also for `docker login`), never as an argument.
+  Commands that issue a secret (`registry provision`, `rotate-token`, `keys create`, `keys rotate`) print the secret alone on stdout and everything else (login name, hints) on stderr, so `(umask 077; ... > key.txt)` captures exactly the secret in a private file and keeps it out of the terminal and agent transcripts. Pass it on stdin (`--password-stdin < key.txt`, also for `docker login`), never as an argument. Every error goes to stderr with a nonzero exit, so a failed command leaves `key.txt` empty.
   Or in Python: `login(token="...")` (HF-shape positional) / `login(username=..., password=...)`.
 
 `hippius-hub registry provision <ns> --docker-login` does both: provisions the namespace and runs `docker login` so subsequent oras/docker commands work without extra steps. Requires docker CLI on PATH.

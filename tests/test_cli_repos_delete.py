@@ -101,7 +101,7 @@ def test_dataset_repo_type_refused_cleanly_via_main(monkeypatch, capsys):
     assert got.value.code == 1
     captured = capsys.readouterr()
     assert "Traceback" not in captured.out and "Traceback" not in captured.err
-    assert "Omit repo_type" in captured.out
+    assert "Omit repo_type" in captured.err
 
 
 # ---------- error mapping ----------
@@ -119,7 +119,7 @@ def test_403_maps_to_admin_message_exit_1(monkeypatch, capsys):
     with pytest.raises(SystemExit) as ei:
         cli.cmd_registry_repos_delete(_args(yes=True))
     assert ei.value.code == 1
-    assert "admin permissions" in capsys.readouterr().out
+    assert "admin permissions" in capsys.readouterr().err
 
 
 def test_404_maps_to_not_found_exit_11(monkeypatch, capsys):
@@ -130,7 +130,7 @@ def test_404_maps_to_not_found_exit_11(monkeypatch, capsys):
         cli.cmd_registry_repos_delete(_args(yes=True))
     assert ei.value.code == 11
     assert ei.value.code == cli.EXIT_REPO_NOT_FOUND
-    assert "not found" in capsys.readouterr().out.lower()
+    assert "not found" in capsys.readouterr().err.lower()
 
 
 def test_other_http_status_bubbles(monkeypatch):
@@ -150,4 +150,4 @@ def test_no_credentials_maps_to_login_hint_exit_1(monkeypatch, capsys):
     with pytest.raises(SystemExit) as ei:
         cli.cmd_registry_repos_delete(_args(yes=True))
     assert ei.value.code == 1
-    assert "login" in capsys.readouterr().out.lower()
+    assert "login" in capsys.readouterr().err.lower()
