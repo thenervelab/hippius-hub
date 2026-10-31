@@ -7,8 +7,8 @@ CLI flips HIPPIUS_DEBUG on for `--verbose`).
 
 Neither writes to stdout: stdout belongs to the caller. A script running
 `hippius-hub download ... > out` or a Python program printing its own results
-must not get transfer chatter mixed in (issue #137). The diagnose report is the
-one CLI output on stdout.
+must not get transfer chatter mixed in (issue #137). Command results, such as
+the CLI's listings and the diagnose report, are what goes to stdout.
 """
 import logging
 import sys
