@@ -181,21 +181,53 @@ def cmd_registry_check(args):
         sys.exit(EXIT_NAMESPACE_TAKEN)
 
 
+def _err(msg: str = "") -> None:
+    """Print one line to stderr."""
+    print(msg, file=sys.stderr)
+
+
+def _registry_host(url: str) -> str:
+    """Strip the scheme from a registry URL, leaving the host `docker login` takes."""
+    return url.replace("https://", "").replace("http://", "")
+
+
+def _print_secret(user: str, secret: str) -> None:
+    """Print a newly issued registry secret alone on stdout; its label goes to stderr.
+
+    Every command that mints a secret (`registry provision`, `rotate-token`,
+    `keys create`, `keys rotate`) writes the secret and nothing else to stdout, and
+    its own messages to stderr. `cmd > key.txt` then captures exactly the secret,
+    ready for `--password-stdin < key.txt`, while the login name and the hints stay
+    on screen. The secret is never part of a suggested command line: a command the
+    user or an agent copies would put it in shell history and in agent transcripts.
+    """
+    _err(f"  Login:  {user}")
+    _err("  Secret: written alone to stdout, shown only ONCE. Redirect stdout to a")
+    _err("          private file to keep it (cmd > key.txt).")
+    sys.stderr.flush()
+    print(secret, flush=True)
+
+
+def _print_docker_login_hint(host: str, user: str) -> None:
+    """Show how to log docker in with the secret read from stdin."""
+    _err("To enable `docker push`/`pull`, pass the secret on stdin, not as an argument:")
+    _err(f"  docker login {host} -u '{user}' --password-stdin < key.txt")
+
+
 def _maybe_docker_login(host: str, user: str, secret: str, *, auto: bool):
     # Always persist creds to hippius-hub's own cache (~/.cache/hippius/hub/token).
     # The robot secret is shown only once by the API; if we don't save it here the
-    # user has to rerun `hippius-hub login --username --password` by hand before
-    # the next upload/download, which is a footgun.
+    # user has to rerun `hippius-hub login --username --password-stdin` by hand
+    # before the next upload/download, which is a footgun.
     login(username=user, password=secret)
 
     if not auto:
-        print("\nTo also enable `docker push`/`pull`, run:")
-        print(f"  docker login {host} -u '{user}' -p '<secret-printed-above>'")
+        _print_docker_login_hint(host, user)
         return
     if not shutil.which("docker"):
-        print("\nℹ️  docker CLI not found in PATH — skipping `docker login`.")
-        print("    hippius-hub's own auth is set up; only `docker push`/`pull` will be unavailable.")
-        print(f"    Run manually if you install docker later: docker login {host} -u '{user}' -p '...'")
+        _err("ℹ️  docker CLI not found in PATH — skipping `docker login`.")
+        _err("    hippius-hub's own auth is set up; only `docker push`/`pull` will be unavailable.")
+        _print_docker_login_hint(host, user)
         return
     try:
         p = subprocess.run(
@@ -206,13 +238,13 @@ def _maybe_docker_login(host: str, user: str, secret: str, *, auto: bool):
             timeout=60,
         )
     except subprocess.TimeoutExpired:
-        print("⚠️  docker login timed out (docker daemon unresponsive) — hippius auth "
-              "is already saved; run `docker login` manually if you need docker push/pull.")
+        _err("⚠️  docker login timed out (docker daemon unresponsive) — hippius auth "
+             "is already saved; run `docker login` manually if you need docker push/pull.")
         return
     if p.returncode == 0:
-        print(f"✅ docker login {host} OK")
+        _err(f"✅ docker login {host} OK")
     else:
-        print(f"⚠️  docker login failed: {p.stderr.decode().strip()}")
+        _err(f"⚠️  docker login failed: {p.stderr.decode().strip()}")
 
 
 def cmd_registry_provision(args):
@@ -221,44 +253,42 @@ def cmd_registry_provision(args):
         res = console.provision(args.namespace)
     except ConsoleError as e:
         if e.status_code == 402:
-            print(f"❌ Not enough credits: {e.body}")
+            _err(f"❌ Not enough credits: {e.body}")
         elif e.status_code == 409:
-            print(f"❌ {e.body}")
+            _err(f"❌ {e.body}")
         elif e.status_code == 202:
-            print("⏳ Project is still being created. Poll `hippius-hub registry status`.")
+            _err("⏳ Project is still being created. Poll `hippius-hub registry status`.")
         else:
-            print(f"❌ {e}")
+            _err(f"❌ {e}")
         sys.exit(1)
 
     if res.get("idempotent"):
-        print(f"ℹ️  Project '{res['project_name']}' already exists ({res.get('plan_name')} plan).")
-        print("    Run `hippius-hub registry rotate-token` to get fresh docker credentials.")
+        _err(f"ℹ️  Project '{res['project_name']}' already exists ({res.get('plan_name')} plan).")
+        _err("    Run `hippius-hub registry rotate-token` to get fresh docker credentials.")
         return
 
     if res.get("pending"):
-        print(f"⏳ {res.get('message') or 'Provisioning started in the background.'}")
+        _err(f"⏳ {res.get('message') or 'Provisioning started in the background.'}")
         if res.get("details"):
-            print(f"   {res['details']}")
-        print("    Poll `hippius-hub registry status`.")
+            _err(f"   {res['details']}")
+        _err("    Poll `hippius-hub registry status`.")
         return
 
     # A stuck row that the server self-recovered on this POST. The robot
     # secret stays encrypted at rest, so it's not in the response — we
     # tell the user to rotate to get a fresh one.
     if res.get("recovered"):
-        print(f"✅ Recovered '{res['project_name']}' — now {res.get('status')}.")
-        print(f"   {res.get('message') or 'Run `hippius-hub registry rotate-token` to get docker credentials.'}")
+        _err(f"✅ Recovered '{res['project_name']}' — now {res.get('status')}.")
+        _err(f"   {res.get('message') or 'Run `hippius-hub registry rotate-token` to get docker credentials.'}")
         return
 
     # Fresh provision: creds are returned exactly once.
-    print(f"✅ Created '{res['project_name']}' on the {res['plan_name']} plan.")
-    print(f"   Quota: {_fmt_bytes(res.get('storage_quota_bytes'))}")
-    print()
-    print("Docker credentials (save these — the secret is only shown ONCE):")
-    print(f"  Login:    {res['robot_login']}")
-    print(f"  Secret:   {res['robot_secret']}")
-    print(f"  Registry: {res['registry_url']}")
-    host = res['registry_url'].replace("https://", "").replace("http://", "")
+    _err(f"✅ Created '{res['project_name']}' on the {res['plan_name']} plan.")
+    _err(f"   Quota: {_fmt_bytes(res.get('storage_quota_bytes'))}")
+    _err(f"   Registry: {res['registry_url']}")
+    _err("Docker credentials (hippius-hub's own login is saved for you):")
+    _print_secret(res['robot_login'], res['robot_secret'])
+    host = _registry_host(res['registry_url'])
     _maybe_docker_login(host, res['robot_login'], res['robot_secret'], auto=args.docker_login)
 
 
@@ -288,11 +318,11 @@ def cmd_registry_me(_args):
 def cmd_registry_rotate(args):
     """Issue a fresh docker robot secret (`hippius-hub registry rotate-token`)."""
     res = console.rotate_robot()
-    print("✅ New docker secret issued.")
-    print(f"  Login:  {res['robot_login']}")
-    print(f"  Secret: {res['robot_secret']}")
-    me = console.me()
-    host = me['registry_url'].replace("https://", "").replace("http://", "")
+    _err("✅ New docker secret issued (hippius-hub's own login is saved for you).")
+    # Printed before `console.me()`: the secret exists only in this response, so a
+    # failure fetching the registry host must not lose it.
+    _print_secret(res['robot_login'], res['robot_secret'])
+    host = _registry_host(console.me()['registry_url'])
     _maybe_docker_login(host, res['robot_login'], res['robot_secret'], auto=args.docker_login)
 
 
@@ -480,18 +510,26 @@ def cmd_registry_keys_list(_args):
         _print_key_row(r)
 
 
+def _print_hub_login_hint(user: str) -> None:
+    """Show how to save a key for `upload`/`download` with the secret read from stdin."""
+    _err("To use this key for `upload`/`download`, pass the secret on stdin:")
+    _err(f"  hippius-hub login --username '{user}' --password-stdin < key.txt")
+
+
 def cmd_registry_keys_create(args):
     """Create a new role-scoped API key (`hippius-hub registry keys create`)."""
     res = console.create_key(args.name, args.role, expires_days=args.expires_days)
-    print(f"✅ Key '{res['name']}' created — role={res['role']}")
-    print(f"  Login:  {res['login']}")
-    print(f"  Secret: {res['secret']}")
-    print("  ⚠ Save the secret now — it won't be shown again. Rotate to recover.")
-    print()
-    print(f"  docker login: {res['docker_login_cmd']}")
+    _err(f"✅ Key '{res['name']}' created — role={res['role']}")
+    _print_secret(res["login"], res["secret"])
+    _err("  Lost it? `hippius-hub registry keys rotate <key-number>` issues a new one.")
+    # `docker_login_cmd` embeds the secret (`docker login HOST -u USER -p SECRET`),
+    # so only its host is used and the command itself is never printed.
+    host = res["docker_login_cmd"].split(" ")[2]
     if args.docker_login:
-        host = res["docker_login_cmd"].split(" ")[2]
         _maybe_docker_login(host, res["login"], res["secret"], auto=True)
+        return
+    _print_hub_login_hint(res["login"])
+    _print_docker_login_hint(host, res["login"])
 
 
 def cmd_registry_keys_show(args):
@@ -503,10 +541,9 @@ def cmd_registry_keys_show(args):
 def cmd_registry_keys_rotate(args):
     """Rotate the secret for one API key (`hippius-hub registry keys rotate`)."""
     res = console.rotate_key(args.key_id)
-    print(f"✅ Key '{res['name']}' rotated")
-    print(f"  Login:  {res['login']}")
-    print(f"  Secret: {res['secret']}")
-    print("  ⚠ Save the secret now — it won't be shown again.")
+    _err(f"✅ Key '{res['name']}' rotated")
+    _print_secret(res["login"], res["secret"])
+    _print_hub_login_hint(res["login"])
 
 
 def cmd_registry_keys_revoke(args):
@@ -682,9 +719,15 @@ def _build_parser() -> argparse.ArgumentParser:
     dg.add_argument("--verbose", action="store_true", help="Enable verbose transport logging")
 
     # Login: accepts EITHER docker registry creds OR a Hippius API token.
-    l = sub.add_parser("login", help="Save credentials. Use --hippius-token for the console API, --username/--password for the docker registry, or --token for either.")
+    l = sub.add_parser("login", help="Save credentials. Use --hippius-token for the console API, --username with --password-stdin for the docker registry, or --token for either.")
     l.add_argument("--username")
-    l.add_argument("--password")
+    lpw = l.add_mutually_exclusive_group()
+    lpw.add_argument("--password",
+                     help="Registry password or key secret. Visible in shell history and "
+                          "the process list; prefer --password-stdin.")
+    lpw.add_argument("--password-stdin", action="store_true",
+                     help="Read the password from stdin (one line, trailing newline "
+                          "dropped), e.g. `< key.txt`")
     l.add_argument("--token", help="Legacy docker-registry token")
     l.add_argument("--hippius-token", help="API token from console.hippius.com")
 
@@ -870,6 +913,28 @@ def _cmd_diagnose(args):
         print(format_report(report))
 
 
+def _read_password_stdin() -> str:
+    """Read a secret from stdin for `login --password-stdin`.
+
+    Drops only the line ending a file or `echo` adds (`docker login --password-stdin`
+    does the same); any other whitespace is part of the secret, see
+    `test_cli_login_no_strip`.
+    """
+    password = sys.stdin.read()
+    if password.endswith("\n"):
+        password = password[:-1]
+    if password.endswith("\r"):
+        password = password[:-1]
+    if not password:
+        print("❌ --password-stdin read an empty password from stdin.")
+        sys.exit(1)
+    if "\n" in password:
+        print("❌ --password-stdin read more than one line. Pass only the secret, e.g. the "
+              "stdout of `hippius-hub registry keys create`.")
+        sys.exit(1)
+    return password
+
+
 def _cmd_login(args):
     if args.hippius_token:
         console.save_api_token(args.hippius_token)
@@ -878,6 +943,11 @@ def _cmd_login(args):
     username = args.username
     password = args.password
     token = args.token
+    if args.password_stdin:
+        if not username:
+            print("❌ --password-stdin needs --username (the login printed with the secret).")
+            sys.exit(1)
+        password = _read_password_stdin()
     if not token and not (username and password):
         print("Get your API token from https://console.hippius.com, then run:")
         print("  hippius-hub login --hippius-token <token>")

@@ -7,6 +7,20 @@ the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 
 ## [Unreleased]
 
+### Changed
+
+- `registry provision`, `registry rotate-token`, `registry keys create` and
+  `registry keys rotate` print the new secret alone on stdout, once, and every
+  other line on stderr. `keys create` no longer prints the API's
+  `docker login ... -p '<secret>'` command; all suggested logins read the secret
+  from stdin. Scripts that grepped a `Secret:` line out of stdout now read stdout
+  whole (`> key.txt`).
+
+### Added
+
+- `hippius-hub login --password-stdin` reads the registry password from stdin
+  (one line, trailing newline dropped), so it stays out of argv and shell history.
+
 ## [0.7.2] — 2026-09-07
 
 Pointer and pack formats are unchanged; 0.7.0 clients read 0.7.2 uploads and

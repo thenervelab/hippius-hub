@@ -64,7 +64,7 @@ There are **two kinds of credentials**, depending on what you're doing:
 | For… | Use | Where |
 |---|---|---|
 | `registry` and `models` CLI commands (manage your namespace, list models, …) | **API token** from [console.hippius.com/dashboard/settings](https://console.hippius.com/dashboard/settings) | `hippius-hub login --hippius-token <token>` → `~/.cache/hippius/hub/api_token` |
-| `download` / `upload` (model and artifact transfer) | Registry credentials | `hippius-hub login --username <you> --password <secret>` → `~/.cache/hippius/hub/token` |
+| `download` / `upload` (model and artifact transfer) | Registry credentials | `hippius-hub login --username <you> --password-stdin < key.txt` → `~/.cache/hippius/hub/token` |
 
 In Python:
 
@@ -77,6 +77,15 @@ login(username="me", password="pwd")   # Basic auth (registry creds)
 In practice the API token is all you save by hand. `hippius-hub registry provision <namespace>` mints the docker credentials *and* writes them into `~/.cache/hippius/hub/token` for you, so the next `upload`/`download` works without a second `hippius-hub login` step. Pass `--docker-login` to also run `docker login` so `docker push`/`pull` work; either way, hippius-hub's own auth is persisted.
 
 The registry secret is printed **once** on first provision. If you lose it, rotate with `hippius-hub registry rotate-token` (also re-writes the local cache).
+
+Every command that issues a secret (`registry provision`, `rotate-token`, `keys create`, `keys rotate`) prints the secret alone on stdout and its other output (login name, next steps) on stderr. Redirect stdout to a private file and pass the file on stdin, so the secret never sits in your terminal, shell history or an agent transcript:
+
+```bash
+hippius-hub registry keys create agent-push --role push-delete --expires-days 1 > key.txt
+chmod 600 key.txt
+hippius-hub login --username 'robot$myns+agent-push' --password-stdin < key.txt
+docker login registry.hippius.com -u 'robot$myns+agent-push' --password-stdin < key.txt
+```
 
 ## Onboard from the terminal (no UI required)
 
@@ -121,7 +130,7 @@ The full `registry` sub-tree:
 | `registry subscriptions` | List your current subscriptions (synced from chain every ~3 min) |
 | `registry unsubscribe <sub-id>` | Cancel a subscription by its on-chain `SubscriptionId`. 30-day grace before the project is hard-deleted; re-subscribe within that window to keep everything. |
 | `registry keys list` | List this project's scoped API keys |
-| `registry keys create <name> --role read\|push\|push-delete\|admin [--expires-days N] [--docker-login]` | Mint a scoped key; login and secret printed **once**. Roles: `read`=pull/list, `push`=+push/create, `push-delete`=+delete, `admin`=full project |
+| `registry keys create <name> --role read\|push\|push-delete\|admin [--expires-days N] [--docker-login]` | Mint a scoped key; the secret is printed **once**, alone on stdout (login and hints on stderr). Roles: `read`=pull/list, `push`=+push/create, `push-delete`=+delete, `admin`=full project |
 | `registry keys show <id>` / `rotate <id>` / `revoke <id>` | Inspect a key (no secret) / rotate its secret / delete it (irreversible) |
 
 ## Search the AI model index
@@ -463,7 +472,8 @@ gh secret set MATTERMOST_WEBHOOK_URL       # same webhook hippius-s3 posts its s
 
 ```bash
 # On the workstation where you're already logged in:
-hippius-hub registry keys create ci-e2e --role push --expires-days 90
+hippius-hub registry keys create ci-e2e --role push --expires-days 90 > key.txt
+gh secret set HIPPIUS_TEST_PASS < key.txt   # the secret never reaches the terminal
 # Logged into project test: HIPPIUS_TEST_USER / HIPPIUS_TEST_PASS.
 # Logged into project veggies-test: HIPPIUS_SMOKE_USER / HIPPIUS_SMOKE_PASS.
 ```

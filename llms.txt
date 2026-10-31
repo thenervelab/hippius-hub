@@ -23,8 +23,9 @@ There are **two credentials** the user might need:
   ```
 - **Registry credentials** (for `download` / `upload` / `docker push` / `oras push`). Issued by `hippius-hub registry provision <namespace>` (printed once) or rotated with `hippius-hub registry rotate-token`. Store with:
   ```bash
-  hippius-hub login --username '<printed-login>' --password <secret>     # writes ~/.cache/hippius/hub/token
+  hippius-hub login --username '<printed-login>' --password-stdin < key.txt     # writes ~/.cache/hippius/hub/token
   ```
+  Commands that issue a secret (`registry provision`, `rotate-token`, `keys create`, `keys rotate`) print the secret alone on stdout and everything else (login name, hints) on stderr, so `> key.txt` captures exactly the secret and keeps it out of the terminal and agent transcripts. Pass it on stdin (`--password-stdin < key.txt`, also for `docker login`), never as an argument.
   Or in Python: `login(token="...")` (HF-shape positional) / `login(username=..., password=...)`.
 
 `hippius-hub registry provision <ns> --docker-login` does both: provisions the namespace and runs `docker login` so subsequent oras/docker commands work without extra steps. Requires docker CLI on PATH.
@@ -100,7 +101,7 @@ hippius-hub registry repos [--page N --page-size M]
 hippius-hub registry artifacts <repo> [--page N --page-size M]
 hippius-hub registry usage                       # storage used + 7-day history
 hippius-hub registry keys list                                # per-project scoped API keys
-hippius-hub registry keys create <name> --role read|push|push-delete|admin [--expires-days N] [--docker-login]   # login + secret printed once
+hippius-hub registry keys create <name> --role read|push|push-delete|admin [--expires-days N] [--docker-login] > key.txt   # secret alone on stdout, once; login + hints on stderr
 hippius-hub registry keys show|rotate|revoke <key-id>         # inspect / rotate secret / delete
 
 # --- AI model index (server-side parser: GGUF, safetensors, ONNX, Diffusers) ---
