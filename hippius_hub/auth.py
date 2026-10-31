@@ -9,6 +9,7 @@ import base64
 import hashlib
 import json
 import os
+import sys
 import tempfile
 import threading
 import time
@@ -217,7 +218,9 @@ def login(
         raise ValueError("Either username/password or token must be provided")
 
     _atomic_write_secret(TOKEN_PATH, auth_str)
-    print(f"Token successfully saved to {TOKEN_PATH}")
+    # stderr: the CLI commands that issue a secret call this right after printing the
+    # secret, and their stdout must hold the secret alone (`cmd > key.txt`).
+    print(f"Token successfully saved to {TOKEN_PATH}", file=sys.stderr)
 
 
 def logout(token_name: str = None):

@@ -153,7 +153,7 @@ require_known_robot() {
 
 show_provlog() {
   [ -n "$provlog" ] && [ -f "$provlog" ] || return 0
-  grep -v 'Secret:' "$provlog" >&2 || true
+  cat "$provlog" >&2
 }
 
 restore_login() {
@@ -217,7 +217,9 @@ ensure_robot() {
   else
     : > "$token_before"
   fi
-  if ! hippius-hub registry provision "$ns" >"$provlog" 2>&1; then
+  # stdout carries only the robot secret, which provision already saves to the token
+  # cache; the log keeps stderr, where every message goes, so it never holds the secret.
+  if ! hippius-hub registry provision "$ns" 2>"$provlog" >/dev/null; then
     show_provlog
     exit 1
   fi
