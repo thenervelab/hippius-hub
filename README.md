@@ -8,11 +8,11 @@ The CLI also wraps the Hippius console API: register a namespace, manage docker 
 
 > **`hippius_hub` is replaced by [`huggingface_hub`](https://github.com/huggingface/huggingface_hub).** 0.8.0 is the final release. Everything here depends on the Hippius registry (Harbor), which shuts down on **YYYY-MM-DD**; after that date this package stops working. The Hippius Hub serves the Hugging Face Hub API, so the stock client talks to it directly. See [Migrating to huggingface_hub](#migrating-to-huggingface_hub).
 
-<!-- TODO(GeorgiosDelkos, #159): fill in the shutdown date and the Hub URL here and in hippius_hub/_sunset.py before tagging the release. -->
+<!-- TODO(GeorgiosDelkos, #159): fill in the shutdown-date and Hub-URL placeholders here, in llms.txt and in hippius_hub/_sunset.py before tagging; release.yml refuses to publish while they are present. -->
 
 ## Migrating to huggingface_hub
 
-Three changes: point `huggingface_hub` at the Hippius Hub with `HF_ENDPOINT`, use a `hip_` API key as the token, and import from `huggingface_hub` instead of `hippius_hub`. The full plan, including how Harbor repositories move to the Hub, is in the [parity and migration plan](https://github.com/thenervelab/hippius-hub-rust/blob/fc31435e90712b971d9714a3ef1f11bee20e87f6/docs/plans/2026-10-30-python-hub-parity-and-migration.md).
+Three changes: point `huggingface_hub` at the Hippius Hub with `HF_ENDPOINT`, use a `hip_` API key as the token, and import from `huggingface_hub` instead of `hippius_hub`. A longer user guide will follow; this section is the reference until then.
 
 ```bash
 pip install huggingface_hub
@@ -79,11 +79,11 @@ What else changes:
 
 - Repo ids stay the same. `main` stays `main`; other Harbor tags become git tags on the Hub, so `revision="v1"` keeps working.
 - The cache moves from `~/.cache/hippius/hub` to `huggingface_hub`'s cache (`~/.cache/huggingface/hub` by default), so the first download after the switch fetches again.
-- `HippiusApi` becomes `huggingface_hub.HfApi`. Errors were already `huggingface_hub`'s own classes, so `except` clauses keep working.
+- `HippiusApi` becomes `huggingface_hub.HfApi`. The errors re-exported from `huggingface_hub` (`RepositoryNotFoundError`, `RevisionNotFoundError`, `EntryNotFoundError`, `HfHubHTTPError`, ...) are the same classes, so `except` clauses naming them keep working. The Hippius-only ones in `hippius_hub.errors` (`MalformedManifestError`, `UnsupportedLayoutError`, `ManifestTooLargeError`, ...) have no counterpart; drop those clauses.
 - The `hippius-hub` CLI becomes `hf` (installed with `huggingface_hub`): `hf download`, `hf upload`, `hf auth login`. `hippius-hub registry` (namespaces, docker credentials, keys) has no equivalent on the Hub; `hip_` keys come from the Hippius console.
-- `hippius_hub._oci`, `hippius_hub._harbor`, `login`/`logout`/`whoami` and `hippius-hub registry` talk to Harbor directly and stop working on the shutdown date. Until then they warn.
+- `hippius_hub._oci`, `hippius_hub._harbor`, `login`/`logout`/`whoami` and the `hippius-hub registry` commands depend on Harbor and stop working on the shutdown date. Until then, calling them from your code warns, and `hippius-hub registry` prints a notice on stderr.
 
-Until you migrate, importing `hippius_hub` emits one `FutureWarning` with these steps. To silence it (and the per-call notices), set a standard warnings filter before the import: `warnings.filterwarnings("ignore", "hippius_hub", FutureWarning)`, or `PYTHONWARNINGS=ignore:hippius_hub:FutureWarning`.
+Until you migrate, importing `hippius_hub` emits one `FutureWarning` with these steps. To silence it and the per-call warnings, set a standard warnings filter before the import: `warnings.filterwarnings("ignore", "hippius_hub", FutureWarning)`, or `PYTHONWARNINGS=ignore:hippius_hub:FutureWarning`.
 
 ## Quickstart
 

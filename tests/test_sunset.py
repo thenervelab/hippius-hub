@@ -10,6 +10,7 @@ import os
 import re
 import subprocess
 import sys
+import warnings
 
 import httpx
 import pytest
@@ -47,7 +48,7 @@ def test_import_warns_once_with_migration_steps():
     assert "FutureWarning" in stderr
     for step in (
         f"stops working on {_sunset.HARBOR_SHUTDOWN_DATE}",
-        f"HF_ENDPOINT={_sunset.HUB_URL}",
+        f"export HF_ENDPOINT={_sunset.HUB_URL} before Python starts",
         "hip_ API key as the token",
         "replace `hippius_hub` imports with `huggingface_hub`",
         _sunset.MIGRATION_GUIDE_URL,
@@ -82,9 +83,26 @@ def test_login_and_logout_warn(tmp_path, monkeypatch):
 
 
 def test_whoami_warns_before_resolving_credentials():
-    with pytest.warns(FutureWarning, match=_notice("hippius_hub.whoami()")):
+    with pytest.warns(FutureWarning, match=_notice("hippius_hub.whoami()")) as record:
         with pytest.raises(LocalTokenNotFoundError):
             auth.whoami(token=False)
+
+    # stacklevel names the caller's line, so a user can find the call to migrate.
+    assert record[0].filename == __file__
+
+
+@respx.mock
+def test_internal_harbor_calls_do_not_warn_again():
+    """whoami calls _harbor.harbor_whoami; only whoami's own notice reaches the user."""
+    respx.get(f"{HARBOR}/api/v2.0/users/current").mock(
+        return_value=httpx.Response(200, json={"username": "me", "user_id": 1})
+    )
+
+    with warnings.catch_warnings(record=True) as record:
+        warnings.simplefilter("always")
+        auth.whoami(token="Bearer x", endpoint=HARBOR)
+
+    assert [str(w.message).split(" depends on")[0] for w in record] == ["hippius_hub.whoami()"]
 
 
 @respx.mock

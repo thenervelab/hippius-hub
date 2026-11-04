@@ -18,12 +18,15 @@ the README.
   the migration steps: set `HF_ENDPOINT` to the Hippius Hub, use a `hip_` API
   key as the token, and replace `hippius_hub` imports with `huggingface_hub`.
 - `login()`, `logout()`, `whoami()`, the `hippius_hub._harbor` helpers and the
-  `hippius_hub._oci` manifest requests each emit a `FutureWarning` saying they
-  stop working on the shutdown date and what to use instead.
-- `hippius-hub registry ...` prints the same notice on stderr before it runs.
-- Silence all of these with the standard warnings filter, set before the
+  `hippius_hub._oci` manifest requests, called from your code, each emit a
+  `FutureWarning` saying they stop working on the shutdown date and what to use
+  instead. Calls made inside hippius_hub (a plain `hf_hub_download`) do not add
+  to the import warning.
+- Silence these warnings with the standard warnings filter, set before the
   import: `warnings.filterwarnings("ignore", "hippius_hub", FutureWarning)` or
   `PYTHONWARNINGS=ignore:hippius_hub:FutureWarning`.
+- `hippius-hub registry ...` prints the notice as a line on stderr before it
+  runs; it is not a warning and the filter does not hide it.
 
 ### Changed
 
