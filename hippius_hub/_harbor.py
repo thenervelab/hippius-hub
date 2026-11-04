@@ -3,13 +3,23 @@
 Kept separate from auth.py to isolate HTTP plumbing from token management.
 Each helper takes the caller's auth header verbatim so the caller controls
 credential resolution (saved token, env var, fresh login, etc.).
+
+The Harbor admin API goes away with Harbor; every `harbor_*` helper warns (see
+`_sunset`). The Hippius Hub does not serve it; `huggingface_hub.HfApi` covers the
+repository operations.
 """
 import base64
 from typing import Optional
 
-from . import _http
+from . import _http, _sunset
 from .constants import DEFAULT_HTTP_TIMEOUT, resolve_registry
 from .errors import LocalTokenNotFoundError
+
+_SURFACE = "hippius_hub._harbor"
+_INSTEAD = (
+    "Use huggingface_hub against the Hippius Hub: HfApi.whoami, create_repo, "
+    "delete_repo and repo_info with HF_ENDPOINT set and a hip_ API key."
+)
 
 
 def _base(endpoint: Optional[str]) -> str:
@@ -39,6 +49,7 @@ def harbor_whoami(auth_header: str, endpoint: Optional[str] = None) -> dict:
     returns 401 because robots aren't users. Detect via the Basic auth username
     prefix and synthesize a dict — robots have no email/fullname to report.
     """
+    _sunset.warn_shutdown(_SURFACE, _INSTEAD)
     username = _decode_basic_username(auth_header)
     if username is not None and username.startswith("robot$"):
         return {
@@ -91,6 +102,7 @@ def harbor_create_project(
 
     Raises httpx.HTTPStatusError on failure. 409 means the project already exists.
     """
+    _sunset.warn_shutdown(_SURFACE, _INSTEAD)
     resp = _http.client().post(
         f"{_base(endpoint)}/api/v2.0/projects",
         headers=_headers(auth_header, json=True),
@@ -120,6 +132,7 @@ def harbor_get_project(
     flag on ModelInfo) should treat FORBIDDEN as "unknown" rather than
     inferring private/public from absent data.
     """
+    _sunset.warn_shutdown(_SURFACE, _INSTEAD)
     resp = _http.client().get(
         f"{_base(endpoint)}/api/v2.0/projects/{project_name}",
         headers=_headers(auth_header),
@@ -141,6 +154,7 @@ def harbor_delete_project(
     missing_ok: bool = False,
 ) -> None:
     """Delete a Harbor project; with `missing_ok=True`, 404 is swallowed."""
+    _sunset.warn_shutdown(_SURFACE, _INSTEAD)
     resp = _http.client().delete(
         f"{_base(endpoint)}/api/v2.0/projects/{project_name}",
         headers=_headers(auth_header),
@@ -163,6 +177,7 @@ def harbor_get_repository(
     Harbor repository names can contain `/` (e.g. project=test, repo=foo/bar).
     Harbor encodes those as `%2F` in the URL.
     """
+    _sunset.warn_shutdown(_SURFACE, _INSTEAD)
     encoded = repo_name.replace("/", "%2F")
     resp = _http.client().get(
         f"{_base(endpoint)}/api/v2.0/projects/{project_name}/repositories/{encoded}",
@@ -186,6 +201,7 @@ def harbor_delete_repository(
     missing_ok: bool = False,
 ) -> None:
     """Delete a Harbor repository under `project_name`; with `missing_ok=True`, 404 is swallowed."""
+    _sunset.warn_shutdown(_SURFACE, _INSTEAD)
     encoded = repo_name.replace("/", "%2F")
     resp = _http.client().delete(
         f"{_base(endpoint)}/api/v2.0/projects/{project_name}/repositories/{encoded}",
@@ -210,6 +226,7 @@ def harbor_get_artifact(
     with_tag: bool = True,
 ) -> Optional[dict]:
     """Return Harbor artifact info (covers per-revision metadata: push_time, etc.)."""
+    _sunset.warn_shutdown(_SURFACE, _INSTEAD)
     encoded = repo_name.replace("/", "%2F")
     params = {
         "with_label": str(with_label).lower(),

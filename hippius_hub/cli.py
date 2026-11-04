@@ -15,7 +15,7 @@ import sys
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
-from . import __version__
+from . import __version__, _sunset
 from .auth import get_oci_bearer_token, login, resolve_token_value
 from .constants import resolve_registry
 from .file_download import _oci_repo_path, _validate_repo_type, hippius_hub_download
@@ -1043,6 +1043,15 @@ def main():
             _exit_with_download_error(e)
         return
     if args.command in ("registry", "models"):
+        # A plain stderr line, not a warning: a CLI user wants the text, not the
+        # `file:line: FutureWarning:` prefix. `models` reads the console's model index,
+        # not Harbor, so it gets no notice beyond the import warning.
+        if args.command == "registry":
+            _err(_sunset.shutdown_notice(
+                "hippius-hub registry",
+                "hip_ API keys come from the Hippius console; manage repositories with the "
+                "`hf` CLI from huggingface_hub with HF_ENDPOINT set.",
+            ))
         if not hasattr(args, "func"):
             parser.print_help(sys.stderr)
             sys.exit(1)
