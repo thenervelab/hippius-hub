@@ -3,6 +3,9 @@
 Centralizes manifest fetch, layer iteration, and the OCI v2 accept header
 so the same plumbing isn't reimplemented in each module that touches the
 registry.
+
+The OCI registry goes away with Harbor; the manifest requests here warn (see
+`_sunset`). The Hippius Hub serves the Hugging Face Hub API instead.
 """
 import json
 from dataclasses import dataclass
@@ -10,7 +13,7 @@ from typing import List, Optional, Tuple
 
 import httpx
 
-from . import _http
+from . import _http, _sunset
 from .constants import (
     CHUNK_COUNT_KEY,
     CHUNKED_LAYOUT_V2,
@@ -27,6 +30,12 @@ from .errors import (
     MalformedManifestError,
     RevisionNotFoundError,
     UnsupportedLayoutError,
+)
+
+_SURFACE = "hippius_hub._oci"
+_INSTEAD = (
+    "Use huggingface_hub against the Hippius Hub (hf_hub_download, HfApi.model_info) "
+    "with HF_ENDPOINT set and a hip_ API key."
 )
 
 
@@ -96,6 +105,7 @@ def fetch_manifest(
     the PUT as `If-Match` to get optimistic-concurrency rejection (412) when
     a racing writer has advanced the revision.
     """
+    _sunset.warn_shutdown(_SURFACE, _INSTEAD)
     # Retry transient blips (audit L3): fetch_manifest runs before every upload and
     # download, so a 503/429 during a Harbor rolling redeploy would otherwise abort
     # the whole operation — while the same status on any data-plane blob request is
@@ -125,6 +135,7 @@ def head_manifest(
     oci_token: str,
 ) -> httpx.Response:
     """HEAD the OCI manifest for `repo_id:revision` (used for cheap existence checks)."""
+    _sunset.warn_shutdown(_SURFACE, _INSTEAD)
     return _http.client().head(
         manifest_url(registry, repo_id, revision),
         headers=oci_headers(oci_token),

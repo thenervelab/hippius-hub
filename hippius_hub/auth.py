@@ -16,7 +16,7 @@ import time
 import warnings
 from typing import Literal, Optional, Union
 
-from . import _http
+from . import _http, _sunset
 from .constants import (
     DEFAULT_CACHE_DIR,
     DEFAULT_HTTP_TIMEOUT,
@@ -206,6 +206,10 @@ def login(
     than 0o600 — the previous write-then-chmod pattern left a transient
     world-readable window between open() and chmod().
     """
+    _sunset.warn_shutdown(
+        "hippius_hub.login()",
+        "Use huggingface_hub.login(token='hip_...') with HF_ENDPOINT set to the Hippius Hub.",
+    )
     os.makedirs(DEFAULT_CACHE_DIR, exist_ok=True)
 
     auth_str = ""
@@ -226,6 +230,7 @@ def login(
 def logout(token_name: str = None):
     """Remove the saved token file. `token_name` is accepted for HF parity
     but ignored (we only store one set of credentials)."""
+    _sunset.warn_shutdown("hippius_hub.logout()", "Use huggingface_hub.logout().")
     if os.path.exists(TOKEN_PATH):
         os.remove(TOKEN_PATH)
 
@@ -300,6 +305,10 @@ def whoami(token=None, *, endpoint: str = None) -> dict:
     boundary, removing the trailing `else: raise TypeError` that used to live
     inline here.
     """
+    _sunset.warn_shutdown(
+        "hippius_hub.whoami()",
+        "Use huggingface_hub.whoami() with HF_ENDPOINT set to the Hippius Hub.",
+    )
     from ._harbor import harbor_whoami
     from ._token import from_hf, Anonymous, UseStored, Literal as TokenLiteral
 

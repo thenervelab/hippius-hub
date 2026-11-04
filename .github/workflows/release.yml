@@ -29,6 +29,17 @@ jobs:
         with:
           persist-credentials: false
 
+      # The 0.8.0 shutdown notices ship with placeholder values for the date and the
+      # Hub URL (issue thenervelab/hippius-hub-rust#159). Fail the build, and so the
+      # publish that needs it, until both are filled in.
+      - name: Refuse placeholder shutdown notices
+        shell: bash
+        run: |
+          if git grep -n -e 'YYYY-MM-DD' -e 'HUB-URL-TBD' -- hippius_hub README.md llms.txt; then
+            echo "::error::Fill in the shutdown date and Hub URL in hippius_hub/_sunset.py, README.md and llms.txt"
+            exit 1
+          fi
+
       - name: Set up Python
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
         with:

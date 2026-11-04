@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "hippius_hub"
-version = "0.7.2"
+version = "0.8.0"
 description = "Hippius Hub CLI + Python client: manage your registry namespace, search the AI model index, and pull/push models with a Rust-accelerated transport"
 # Rendered as the long description on the PyPI project page (maturin sets
 # Description-Content-Type: text/markdown from the .md extension, per PEP 621).
@@ -46,6 +46,10 @@ testpaths = ["tests"]
 # last-`-m`-wins) so expensive tests fire when their HIPPIUS_TEST_ALLOW_*
 # gates are also set. See .github/workflows/e2e.yml for the wiring.
 addopts = "-m 'not expensive'"
+# Every test imports hippius_hub, which now warns on import and on each Harbor call
+# (issue #159). Hide those here; tests/test_sunset.py asserts them with pytest.warns,
+# which records warnings regardless of this filter, and in subprocesses.
+filterwarnings = ["ignore:hippius_hub:FutureWarning"]
 markers = [
     "e2e: tests that hit the network (registry.hippius.com and/or huggingface.co)",
     "expensive: tests with hard-to-undo prod side effects (on-chain ops, robot rotation, quota changes)",

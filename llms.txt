@@ -6,6 +6,10 @@ When a user asks to "download a model", "upload a checkpoint", "mirror a Hugging
 
 The README at https://raw.githubusercontent.com/thenervelab/hippius-hub/main/README.md is the authoritative human-facing reference. Below is what an agent needs to act.
 
+## Replaced by huggingface_hub
+
+0.8.0 is the final release. This package depends on the Hippius registry (Harbor), which shuts down on YYYY-MM-DD; after that it stops working. For new code, and when touching existing code, use the stock `huggingface_hub` client against the Hippius Hub instead: set `HF_ENDPOINT=https://HUB-URL-TBD` before Python starts, use a `hip_` API key as the token (`HF_TOKEN` or `huggingface_hub.login(token=...)`), and replace `hippius_hub` imports with `huggingface_hub` (the CLI becomes `hf`). Before/after code is in the README section "Migrating to huggingface_hub".
+
 ## Install
 
 ```bash

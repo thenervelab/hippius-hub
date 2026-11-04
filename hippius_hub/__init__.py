@@ -6,9 +6,14 @@ Phase B: upload_file / upload_folder / create_repo / delete_repo /
 repo_info / model_info / list_repo_files / repo_exists / revision_exists /
 file_exists, plus HippiusApi(HfApi) subclass with auto-stubbed unsupported
 methods.
+
+Replaced by huggingface_hub: this package stops working when the Hippius
+registry (Harbor) shuts down. See `hippius_hub._sunset` and the README.
 """
 
-from . import errors
+import warnings
+
+from . import _sunset, errors
 
 # Resolve the installed package version. Falls back to "0.0.0+unknown" when
 # running from a source tree without metadata (e.g. `pytest` against an
@@ -151,3 +156,7 @@ __all__ = [
     "RepoUrl",
     "SpaceInfo",
 ]
+
+# FutureWarning rather than DeprecationWarning: see the `_sunset` module docs.
+# Python runs a package's __init__ once per process, so this fires once.
+warnings.warn(_sunset.IMPORT_MESSAGE, FutureWarning, stacklevel=1)
