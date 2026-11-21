@@ -1,32 +1,90 @@
 # Overlay for: helm upgrade harbor harbor/harbor --version 1.19.0 -n harbor --reuse-values -f this
-# Removes the last two single points of failure the Redis cutover left in Harbor.
-# Steps: README.md, "HA overlay".
+# Spread Harbor so one node is not the registry or the job queue.
+# Steps: README.md, "HA overlay". Run upgrade.sh before the real upgrade.
+#
+# Do not set persistence.enabled in this file. Trivy is a StatefulSet and its
+# volumeClaimTemplates are immutable. Folding that change into this upgrade makes
+# the API reject it, Helm marks the revision failed, and the next --reuse-values
+# drops these values (that is how harbor-redis came back on 2026-10-22). The
+# emptyDir switch is overlay-trivy-emptydir.yaml, a second upgrade, after this
+# one is deployed.
 
-# Job logs go to Harbor's Postgres instead of a file volume. The chart mounts the
-# harbor-jobservice PVC only while "file" is a logger, and that PVC is
-# ReadWriteOnce: on 2026-10-22 the Redis cutover's rollout deadlocked for 10 minutes
-# because the new jobservice pod could not attach it while the old pod held it, and
-# RollingUpdate keeps the old pod until the new one is Ready. The chart's only other
-# fix, a top-level updateStrategy of Recreate, also applies to the registry and
-# would make every registry rollout an outage. With no volume there is nothing to
-# deadlock on. The sweeper still deletes job logs after loggerSweeperDuration (14d).
+# Two jobservice pods, required to land on different nodes. The log volume is
+# already an emptyDir: the chart mounts the harbor-jobservice PVC only while
+# "file" is a logger, and the only logger here is the database. Two replicas do
+# not bring the ReadWriteOnce deadlock back. Do not add "file" back, and do not
+# set updateStrategy to Recreate: that key is shared with the registry and would
+# make every registry rollout an outage. Each pod runs maxJobWorkers (chart
+# default 10), so two pods is up to 20 concurrent jobs.
+# preferred is an empty list so a leftover soft rule cannot survive
+# --reuse-values next to the required one. Helm 4.3 deletes a null when the
+# previous user value is non-nil, then copies that old list back from the
+# stored chart values. maxUnavailable is null so the chart default cannot pair
+# with minAvailable: the template prints both, and the API rejects that.
 jobservice:
+  replicas: 2
   jobLoggers:
     - database
+  affinity:
+    podAntiAffinity:
+      preferredDuringSchedulingIgnoredDuringExecution: []
+      requiredDuringSchedulingIgnoredDuringExecution:
+        - labelSelector:
+            matchLabels:
+              app: harbor
+              component: jobservice
+          topologyKey: kubernetes.io/hostname
+  podDisruptionBudget:
+    enabled: true
+    minAvailable: 1
+    maxUnavailable: null
 
-# Two registry pods, kept on different nodes when possible. The node1 preference
-# was for JuiceFS (filesystem storage shared node1's mount pod; see the runbook),
-# and since the S3 flip the registry mounts only an emptyDir, so the pin only made
-# node1 a single point of failure. nodeAffinity: null is required: --reuse-values
-# deep-merges maps, so without it the old node1 preference survives next to this.
-# Preferred, not required: two nodes run at 94-97% memory requested, and a second
-# registry on the same node beats one that cannot schedule.
+# Two registry pods that cannot land on the same node. The node1 preference was
+# for JuiceFS. Since the S3 flip the registry mounts only an emptyDir, and the
+# pin made node1 a single point of failure. Clear the pin with an empty
+# preferredDuringSchedulingIgnoredDuringExecution list. nodeAffinity: null does
+# not: Helm 4.3 deletes the null and copies the old map back while that map is
+# still in the saved user values. The pod anti-affinity preferred list is empty
+# for the same reason. Requests are 2 CPU and 2Gi. A RollingUpdate of 2 replicas
+# surges by 1, so that extra pod has to fit on a node that is not already
+# running a registry.
 # overlay-filesystem-rollback.yaml puts back 1 replica and the node1 preference,
 # which filesystem storage still needs.
 registry:
   replicas: 2
   affinity:
-    nodeAffinity: null
+    nodeAffinity:
+      preferredDuringSchedulingIgnoredDuringExecution: []
+    podAntiAffinity:
+      preferredDuringSchedulingIgnoredDuringExecution: []
+      requiredDuringSchedulingIgnoredDuringExecution:
+        - labelSelector:
+            matchLabels:
+              app: harbor
+              component: registry
+          topologyKey: kubernetes.io/hostname
+  podDisruptionBudget:
+    enabled: true
+    minAvailable: 1
+    maxUnavailable: null
+
+# Sign registry tokens with a fixed certificate. Without secretName the chart runs
+# genCA on every helm upgrade, so during the rolling restart old and new core pods
+# hold different keys and each rejects tokens the other issued: on 2026-10-22 the
+# revision 7 rollout turned live pushes into "401 unauthorized ... action: push" for
+# about a minute. harbor-token-service is created by hand (README, "Token
+# certificate"); it holds a private key, so it is never in git. Rotate it before
+# its not-after date. Do not set secretName back to null.
+#
+# Preferred anti-affinity, not required. Five core pods with a required rule need
+# five nodes that can take one, and node3 is not one of them. minAvailable is null
+# on purpose: the chart default is 1, the template prints it unless it is null,
+# and a PDB with both minAvailable and maxUnavailable is rejected. maxUnavailable
+# 1 on 5 replicas. Replicas themselves stay at 5 from the release values; this
+# file does not set them.
+core:
+  secretName: harbor-token-service
+  affinity:
     podAntiAffinity:
       preferredDuringSchedulingIgnoredDuringExecution:
         - weight: 100
@@ -35,14 +93,27 @@ registry:
             labelSelector:
               matchLabels:
                 app: harbor
-                component: registry
+                component: core
+      requiredDuringSchedulingIgnoredDuringExecution: null
+  podDisruptionBudget:
+    enabled: true
+    maxUnavailable: 1
+    minAvailable: null
 
-# Sign registry tokens with a fixed certificate. Without secretName the chart runs
-# genCA on every helm upgrade, so during the rolling restart old and new core pods
-# hold different keys and each rejects tokens the other issued: on 2026-10-22 the
-# revision 7 rollout turned live pushes into "401 unauthorized ... action: push" for
-# about a minute. harbor-token-service is created by hand (README, "Token
-# certificate"); it holds a private key, so it is never in git. Rotate it before
-# its not-after date.
-core:
-  secretName: harbor-token-service
+# Same spread and PDB as core. Five nginx pods, preferred anti-affinity only.
+nginx:
+  affinity:
+    podAntiAffinity:
+      preferredDuringSchedulingIgnoredDuringExecution:
+        - weight: 100
+          podAffinityTerm:
+            topologyKey: kubernetes.io/hostname
+            labelSelector:
+              matchLabels:
+                app: harbor
+                component: nginx
+      requiredDuringSchedulingIgnoredDuringExecution: null
+  podDisruptionBudget:
+    enabled: true
+    maxUnavailable: 1
+    minAvailable: null
