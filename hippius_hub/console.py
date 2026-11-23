@@ -71,16 +71,23 @@ def _headers(token: Optional[str] = None, *, require: bool = True) -> dict:
 def _request(method: str, path: str, *, token: Optional[str] = None,
              json_body: Any = None, params: Optional[dict] = None,
              require_auth: bool = True, base_url: Optional[str] = None) -> Any:
-    """Send one HTTP request to the console API and decode the JSON response."""
+    """Send one HTTP request to the console API and decode the JSON response.
+
+    api.hippius.com answers through Cloudflare. A dropped read or a 502 is the
+    usual blip, so this uses the same control-plane retry as manifest and token
+    fetches. A 4xx is returned on the first attempt.
+    """
     url = (base_url or DEFAULT_API_URL).rstrip("/") + path
     try:
-        r = _http.client().request(
-            method,
-            url,
-            headers=_headers(token, require=require_auth),
-            json=json_body,
-            params=params,
-            timeout=DEFAULT_HTTP_TIMEOUT,
+        r = _http.request_with_retry(
+            lambda: _http.client().request(
+                method,
+                url,
+                headers=_headers(token, require=require_auth),
+                json=json_body,
+                params=params,
+                timeout=DEFAULT_HTTP_TIMEOUT,
+            )
         )
     except httpx.RequestError as e:
         raise ConsoleError(0, f"network error: {e}")

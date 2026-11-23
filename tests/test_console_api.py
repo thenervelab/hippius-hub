@@ -109,13 +109,66 @@ def test_request_sends_token_header(monkeypatched_console_api, with_token):
 @respx.mock
 def test_request_raises_console_error_on_401(monkeypatched_console_api, with_token):
     """4xx responses must raise ConsoleError carrying status + decoded body."""
-    respx.get(f"{MOCK_API}/api/registry/me/").mock(
+    route = respx.get(f"{MOCK_API}/api/registry/me/").mock(
         return_value=httpx.Response(401, json={"detail": "expired"}),
     )
     with pytest.raises(ConsoleError) as exc:
         console.me()
     assert exc.value.status_code == 401
     assert exc.value.body == {"detail": "expired"}
+    assert route.call_count == 1
+
+
+@respx.mock
+def test_request_retries_cloudflare_502_then_succeeds(
+    monkeypatched_console_api, with_token, monkeypatch,
+):
+    """A 502 from api.hippius.com is retried. A 401 is not."""
+    monkeypatch.setattr("hippius_hub._http.time.sleep", lambda _delay: None)
+    route = respx.post(f"{MOCK_API}/api/registry/keys/5/rotate/").mock(
+        side_effect=[
+            httpx.Response(502, json={"error_name": "origin_bad_gateway"}),
+            httpx.Response(200, json={"id": 5, "secret": "rotated"}),
+        ]
+    )
+    assert console.rotate_key(5) == {"id": 5, "secret": "rotated"}
+    assert route.call_count == 2
+
+
+@respx.mock
+def test_request_retries_read_timeout_then_succeeds(
+    monkeypatched_console_api, with_token, monkeypatch,
+):
+    """A dropped read is retried, then the successful response is returned."""
+    monkeypatch.setattr("hippius_hub._http.time.sleep", lambda _delay: None)
+    n = {"c": 0}
+
+    def respond(_request):
+        n["c"] += 1
+        if n["c"] == 1:
+            raise httpx.ReadTimeout("The read operation timed out")
+        return httpx.Response(204)
+
+    route = respx.delete(f"{MOCK_API}/api/registry/keys/5/").mock(side_effect=respond)
+    console.revoke_key(5)
+    assert route.call_count == 2
+
+
+@respx.mock
+def test_request_read_timeout_exhausts_as_status_0(
+    monkeypatched_console_api, with_token, monkeypatch,
+):
+    """Once the retry budget is spent, a dropped read is still ConsoleError 0."""
+    monkeypatch.setattr("hippius_hub._http.time.sleep", lambda _delay: None)
+
+    def respond(_request):
+        raise httpx.ReadTimeout("The read operation timed out")
+
+    route = respx.delete(f"{MOCK_API}/api/registry/keys/5/").mock(side_effect=respond)
+    with pytest.raises(ConsoleError) as exc:
+        console.revoke_key(5)
+    assert exc.value.status_code == 0
+    assert route.call_count == 4
 
 
 @respx.mock
