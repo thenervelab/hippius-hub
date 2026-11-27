@@ -13,6 +13,7 @@ import pytest
 from hippius_hub import hippius_hub_upload, snapshot_download
 
 from tests._helpers import sha256_of_file, write_test_file
+from tests._hub import MOVES_TO_W12
 
 
 pytestmark = pytest.mark.e2e
@@ -31,6 +32,7 @@ def _seed_repo(tmp_path, test_repo, revision, names_to_size):
     return expected
 
 
+@MOVES_TO_W12
 def test_snapshot_download_local_dir_writes_outside_cache(
     tmp_path, cache_dir, logged_in, test_repo, revision,
 ):
@@ -54,6 +56,7 @@ def test_snapshot_download_local_dir_writes_outside_cache(
     )
 
 
+@MOVES_TO_W12
 def test_snapshot_download_local_files_only_hit(
     tmp_path, cache_dir, logged_in, test_repo, revision,
 ):
@@ -74,6 +77,7 @@ def test_snapshot_download_local_files_only_hit(
     assert os.path.exists(os.path.join(snap, "o.bin"))
 
 
+@MOVES_TO_W12
 def test_snapshot_download_force_download_replaces_files(
     tmp_path, cache_dir, logged_in, test_repo, revision,
 ):
@@ -95,6 +99,7 @@ def test_snapshot_download_force_download_replaces_files(
     assert os.path.getmtime(os.path.realpath(target)) >= mtime_before
 
 
+@MOVES_TO_W12
 def test_snapshot_download_max_workers_serial_still_works(
     tmp_path, cache_dir, logged_in, test_repo, revision,
 ):
@@ -112,6 +117,7 @@ def test_snapshot_download_max_workers_serial_still_works(
         assert sha256_of_file(os.path.join(snap, name)) == want
 
 
+@MOVES_TO_W12
 def test_snapshot_download_dry_run_returns_dir_without_writing(
     tmp_path, cache_dir, logged_in, test_repo, revision,
 ):

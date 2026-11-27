@@ -23,11 +23,13 @@ import pytest
 from hippius_hub import hippius_hub_upload, snapshot_download
 
 from tests._helpers import write_test_file
+from tests._hub import MOVES_TO_W12
 
 
 pytestmark = pytest.mark.e2e
 
 
+@MOVES_TO_W12
 def test_snapshot_dry_run_materializes_no_files(
     tmp_path, cache_dir, logged_in, test_repo, revision,
 ):

@@ -3,11 +3,13 @@ import pytest
 from hippius_hub import hippius_hub_upload, hf_hub_download
 
 from tests._helpers import sha256_of_file, write_test_file
+from tests._hub import MOVES_TO_W12
 
 
 pytestmark = pytest.mark.e2e
 
 
+@MOVES_TO_W12
 def test_upload_skips_existing_blob(tmp_path, logged_in, test_repo, revision, capsys):
     src_dir = tmp_path / "skip"
     src_dir.mkdir()
@@ -25,6 +27,7 @@ def test_upload_skips_existing_blob(tmp_path, logged_in, test_repo, revision, ca
     assert combined.count("Already published (skipped)") >= 2
 
 
+@MOVES_TO_W12
 def test_download_cache_hit_skips_blob_download(
     tmp_path, cache_dir, logged_in, test_repo, revision, monkeypatch
 ):

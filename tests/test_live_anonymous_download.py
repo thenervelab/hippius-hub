@@ -23,6 +23,7 @@ from hippius_hub import hippius_hub_upload, hf_hub_download
 from hippius_hub.errors import GatedRepoError, HfHubHTTPError, RepositoryNotFoundError
 
 from tests._helpers import sha256_of_file, write_test_file
+from tests._hub import MOVES_TO_W12
 
 
 # Status codes the live registry returns when the test repo is private
@@ -37,6 +38,7 @@ _PRIVATE_REPO_STATUS_CODES = {401, 403, 404}
 pytestmark = pytest.mark.e2e
 
 
+@MOVES_TO_W12
 def test_token_false_can_pull_public_file(
     tmp_path, cache_dir, logged_in, test_repo, revision,
 ):

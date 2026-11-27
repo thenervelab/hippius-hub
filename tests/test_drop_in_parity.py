@@ -23,6 +23,7 @@ import huggingface_hub
 import pytest
 
 import hippius_hub
+from tests._hub import MOVES_TO_W12
 
 
 HF_REFERENCE_REPO = "hf-internal-testing/tiny-random-gpt2"
@@ -92,12 +93,16 @@ def parity_seed():
     shutil.rmtree(seed_dir, ignore_errors=True)
 
 
-@pytest.fixture(params=["hippius", "hf"], ids=["hippius", "hf"])
-def client(request, parity_seed):
+@pytest.fixture(params=[pytest.param("hippius", marks=MOVES_TO_W12), "hf"], ids=["hippius", "hf"])
+def client(request):
     """Backend under test. Each parametrization yields a module + context
     dict so test bodies are backend-agnostic. The HF parametrization
-    runs even without Hippius creds — it only needs public HF access."""
+    runs even without Hippius creds — it only needs public HF access.
+
+    `parity_seed` is requested only for the hippius parametrization: its upload
+    is what moves to W12, and the HF one must not fail with it."""
     if request.param == "hippius":
+        parity_seed = request.getfixturevalue("parity_seed")
         if parity_seed is None:
             pytest.skip("HIPPIUS_TEST_USER/PASS or HIPPIUS_TEST_TOKEN not set")
         return {

@@ -24,6 +24,7 @@ from hippius_hub.errors import EntryNotFoundError, LocalEntryNotFoundError
 from hippius_hub.file_download import _cache_dirname, _oci_repo_path
 
 from tests._helpers import sha256_of_file, write_test_file
+from tests._hub import MOVES_TO_W12
 
 
 # ---------- repo_type mapping helpers ----------
@@ -114,6 +115,7 @@ def test_try_to_load_from_cache_miss(tmp_path):
     assert result is None
 
 
+@MOVES_TO_W12
 @pytest.mark.e2e
 def test_try_to_load_from_cache_hit(tmp_path, cache_dir, logged_in, test_repo, revision):
     src = tmp_path / "cached.bin"
@@ -222,6 +224,7 @@ def test_hf_hub_url_rejects_unknown_repo_type():
 
 # ---------- hf_hub_download new kwargs ----------
 
+@MOVES_TO_W12
 @pytest.mark.e2e
 def test_hf_hub_download_local_dir(tmp_path, logged_in, test_repo, revision):
     src = tmp_path / "ld.bin"
@@ -237,6 +240,7 @@ def test_hf_hub_download_local_dir(tmp_path, logged_in, test_repo, revision):
     assert sha256_of_file(out) == expected
 
 
+@MOVES_TO_W12
 @pytest.mark.e2e
 def test_hf_hub_download_force_download_rewrites_blob(tmp_path, cache_dir, logged_in, test_repo, revision):
     src = tmp_path / "fd.bin"
@@ -289,6 +293,7 @@ def test_hf_hub_download_dry_run_raises_not_implemented(tmp_path):
         )
 
 
+@MOVES_TO_W12
 @pytest.mark.e2e
 def test_hf_hub_download_local_files_only_hit(tmp_path, cache_dir, logged_in, test_repo, revision):
     src = tmp_path / "lfo.bin"
@@ -312,6 +317,7 @@ def test_hf_hub_download_rejects_unknown_repo_type(tmp_path):
         )
 
 
+@MOVES_TO_W12
 @pytest.mark.e2e
 def test_hf_hub_download_subfolder(tmp_path, cache_dir, logged_in, test_repo, revision):
     src_dir = tmp_path / "tree"
@@ -330,6 +336,7 @@ def test_hf_hub_download_subfolder(tmp_path, cache_dir, logged_in, test_repo, re
 
 # ---------- snapshot_download ----------
 
+@MOVES_TO_W12
 @pytest.mark.e2e
 def test_snapshot_download_full(tmp_path, cache_dir, logged_in, test_repo, revision):
     src_dir = tmp_path / "snap"
@@ -348,6 +355,7 @@ def test_snapshot_download_full(tmp_path, cache_dir, logged_in, test_repo, revis
         assert sha256_of_file(os.path.join(snap_path, name)) == want
 
 
+@MOVES_TO_W12
 @pytest.mark.e2e
 def test_snapshot_download_allow_patterns(tmp_path, cache_dir, logged_in, test_repo, revision):
     src_dir = tmp_path / "snap"
@@ -368,6 +376,7 @@ def test_snapshot_download_allow_patterns(tmp_path, cache_dir, logged_in, test_r
     assert not os.path.exists(os.path.join(snap_path, "ignore.txt"))
 
 
+@MOVES_TO_W12
 @pytest.mark.e2e
 def test_snapshot_download_ignore_patterns(tmp_path, cache_dir, logged_in, test_repo, revision):
     src_dir = tmp_path / "snap"
@@ -429,6 +438,7 @@ def test_logout_when_no_token_is_a_noop(tmp_path, monkeypatch):
     logout()
 
 
+@MOVES_TO_W12
 @pytest.mark.e2e
 def test_whoami_returns_hf_shape(logged_in):
     result = whoami()
@@ -442,6 +452,7 @@ def test_whoami_returns_hf_shape(logged_in):
 
 # ---------- existing-Entry typed errors ----------
 
+@MOVES_TO_W12
 @pytest.mark.e2e
 def test_missing_filename_raises_typed_error(tmp_path, cache_dir, logged_in, test_repo, revision):
     src = tmp_path / "present.bin"

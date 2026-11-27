@@ -19,6 +19,7 @@ from hippius_hub import (
 )
 
 from tests._helpers import run_cli, write_test_file
+from tests._hub import MOVES_TO_W12
 
 
 pytestmark = pytest.mark.e2e
@@ -50,6 +51,7 @@ def disposable_repo(logged_in, test_repo):
         pass
 
 
+@MOVES_TO_W12
 def test_create_upload_delete_roundtrip(tmp_path, disposable_repo):
     """The full lifecycle. After delete_repo, repo_exists must flip to False —
     proves both that the create code path produces a usable repo and that
@@ -76,6 +78,7 @@ def test_create_upload_delete_roundtrip(tmp_path, disposable_repo):
     assert repo_exists(disposable_repo) is False
 
 
+@MOVES_TO_W12
 def test_cli_repos_delete_roundtrip(tmp_path, cli_env, logged_in, test_repo):
     """The `registry repos delete <repo> --yes` CLI command must remove a repo
     end-to-end. Set up (create + upload) uses the Python API; the delete goes
@@ -115,6 +118,7 @@ def test_cli_repos_delete_missing_ok_is_silent(cli_env, test_repo):
     assert r.returncode == 0, f"stdout={r.stdout!r} stderr={r.stderr!r}"
 
 
+@MOVES_TO_W12
 def test_delete_missing_repo_missing_ok_true_is_silent(logged_in, test_repo):
     """When `missing_ok=True`, deleting a never-pushed repo must not raise —
     this is the HF semantic and the wrapper around `harbor_delete_repository`."""

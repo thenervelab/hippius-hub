@@ -33,6 +33,7 @@ from hippius_hub import (
 from hippius_hub.errors import HfHubHTTPError, RepositoryNotFoundError, RevisionNotFoundError
 
 from tests._helpers import write_test_file
+from tests._hub import MOVES_TO_W12
 
 
 # ---------- signature parity ----------
@@ -123,6 +124,7 @@ def test_repo_exists_false_for_unknown(logged_in):
     assert repo_exists("test/definitely-not-here-zzz") is False
 
 
+@MOVES_TO_W12
 @pytest.mark.e2e
 def test_revision_exists_true(tmp_path, logged_in, test_repo, revision):
     src = tmp_path / "rev.bin"
@@ -136,6 +138,7 @@ def test_revision_exists_false(logged_in, test_repo):
     assert revision_exists(test_repo, "does-not-exist-9999") is False
 
 
+@MOVES_TO_W12
 @pytest.mark.e2e
 def test_file_exists_after_upload(tmp_path, logged_in, test_repo, revision):
     src = tmp_path / "fe.bin"
@@ -147,6 +150,7 @@ def test_file_exists_after_upload(tmp_path, logged_in, test_repo, revision):
 
 # ---------- list_repo_files ----------
 
+@MOVES_TO_W12
 @pytest.mark.e2e
 def test_list_repo_files_returns_titles(tmp_path, logged_in, test_repo, revision):
     src_dir = tmp_path / "tree"
@@ -170,6 +174,7 @@ def test_list_repo_files_revision_not_found(logged_in, test_repo):
 
 # ---------- repo_info / model_info ----------
 
+@MOVES_TO_W12
 @pytest.mark.e2e
 def test_model_info_shape(tmp_path, logged_in, test_repo, revision):
     src = tmp_path / "mi.bin"
@@ -188,6 +193,7 @@ def test_model_info_shape(tmp_path, logged_in, test_repo, revision):
     assert sibling.blob_id and sibling.blob_id.startswith("sha256:")
 
 
+@MOVES_TO_W12
 @pytest.mark.e2e
 def test_repo_info_alias_works(tmp_path, logged_in, test_repo, revision):
     src = tmp_path / "ri.bin"
@@ -197,6 +203,7 @@ def test_repo_info_alias_works(tmp_path, logged_in, test_repo, revision):
     assert isinstance(info, ModelInfo)
 
 
+@MOVES_TO_W12
 @pytest.mark.e2e
 def test_repo_info_last_modified_from_manifest(tmp_path, logged_in, test_repo, revision):
     """lastModified/createdAt fall back to the manifest's upload timestamp."""
@@ -303,6 +310,7 @@ def test_normalize_oci_timestamp_to_hf_form():
     assert _normalize_oci_timestamp("not-a-date") is None
 
 
+@MOVES_TO_W12
 @pytest.mark.e2e
 def test_list_repo_refs_includes_uploaded_revision(tmp_path, logged_in, test_repo):
     import uuid
@@ -342,6 +350,7 @@ def test_list_repo_refs_unknown_repo_raises(logged_in):
 
 # ---------- upload_file ----------
 
+@MOVES_TO_W12
 @pytest.mark.e2e
 def test_upload_file_returns_commit_info(tmp_path, logged_in, test_repo, revision):
     src = tmp_path / "u.bin"
@@ -362,6 +371,7 @@ def test_upload_file_returns_commit_info(tmp_path, logged_in, test_repo, revisio
     assert "/commit/" in ci.commit_url
 
 
+@MOVES_TO_W12
 @pytest.mark.e2e
 def test_upload_file_accepts_bytes(tmp_path, logged_in, test_repo, revision, cache_dir):
     payload = b"hello hippius via bytes upload\n" * 16
@@ -379,6 +389,7 @@ def test_upload_file_accepts_bytes(tmp_path, logged_in, test_repo, revision, cac
         assert f.read() == payload
 
 
+@MOVES_TO_W12
 @pytest.mark.e2e
 def test_upload_file_accepts_binary_io(tmp_path, logged_in, test_repo, revision, cache_dir):
     payload = b"binary-io stream content\n" * 8
@@ -395,6 +406,7 @@ def test_upload_file_accepts_binary_io(tmp_path, logged_in, test_repo, revision,
         assert f.read() == payload
 
 
+@MOVES_TO_W12
 @pytest.mark.e2e
 def test_upload_file_merges_into_existing_manifest(tmp_path, logged_in, test_repo, revision):
     """A second upload_file to the same revision should keep the first file."""
@@ -411,6 +423,7 @@ def test_upload_file_merges_into_existing_manifest(tmp_path, logged_in, test_rep
     assert "b.bin" in files
 
 
+@MOVES_TO_W12
 @pytest.mark.e2e
 def test_upload_file_replaces_same_title(tmp_path, logged_in, test_repo, revision, cache_dir):
     """Uploading the same path_in_repo twice replaces, doesn't duplicate."""
@@ -428,6 +441,7 @@ def test_upload_file_replaces_same_title(tmp_path, logged_in, test_repo, revisio
 
 # ---------- upload_folder ----------
 
+@MOVES_TO_W12
 @pytest.mark.e2e
 def test_upload_folder_returns_commit_info_and_filters(tmp_path, logged_in, test_repo, revision):
     folder = tmp_path / "f"
@@ -450,6 +464,7 @@ def test_upload_folder_returns_commit_info_and_filters(tmp_path, logged_in, test
     assert "tmp.log" not in files
 
 
+@MOVES_TO_W12
 @pytest.mark.e2e
 def test_upload_folder_delete_patterns(tmp_path, logged_in, test_repo, revision):
     """delete_patterns drops matching titles from the existing manifest."""
@@ -478,6 +493,7 @@ def test_upload_folder_delete_patterns(tmp_path, logged_in, test_repo, revision)
 
 # ---------- create_repo / delete_repo ----------
 
+@MOVES_TO_W12
 @pytest.mark.e2e
 def test_create_repo_exist_ok_returns_repo_url(logged_in, test_repo):
     url = create_repo(test_repo, exist_ok=True)
@@ -485,6 +501,7 @@ def test_create_repo_exist_ok_returns_repo_url(logged_in, test_repo):
     assert str(url).endswith(test_repo)
 
 
+@MOVES_TO_W12
 @pytest.mark.e2e
 def test_create_repo_exist_ok_false_raises_on_existing(logged_in, test_repo):
     """The test repo already has a populated 'main' manifest, so this should raise."""
@@ -555,6 +572,7 @@ def test_upload_file_run_as_future_still_raises(tmp_path):
 
 # ---------- backward compat: hippius_hub_upload ----------
 
+@MOVES_TO_W12
 @pytest.mark.e2e
 def test_hippius_hub_upload_single_file_still_works(tmp_path, logged_in, test_repo, revision, cache_dir):
     src = tmp_path / "bc.bin"
@@ -566,6 +584,7 @@ def test_hippius_hub_upload_single_file_still_works(tmp_path, logged_in, test_re
     assert sha256_of_file(out) == expected
 
 
+@MOVES_TO_W12
 @pytest.mark.e2e
 def test_hippius_hub_upload_folder_still_works(tmp_path, logged_in, test_repo, revision):
     folder = tmp_path / "bcf"
@@ -580,6 +599,7 @@ def test_hippius_hub_upload_folder_still_works(tmp_path, logged_in, test_repo, r
 
 # ---------- HF scan_cache_dir on our layout (plan open question #4) ----------
 
+@MOVES_TO_W12
 @pytest.mark.e2e
 def test_hf_scan_cache_dir_recognizes_our_cache(tmp_path, cache_dir, logged_in, test_repo, revision):
     """huggingface_hub.scan_cache_dir should parse our cache layout cleanly."""

@@ -28,6 +28,7 @@ from hippius_hub.constants import (
 from hippius_hub.file_download import _oci_repo_path
 
 from tests._helpers import sha256_of_file, write_test_file
+from tests._hub import MOVES_TO_W12
 
 pytestmark = pytest.mark.e2e
 
@@ -37,6 +38,7 @@ def _pack_layer_count(registry, oci_repo, revision, token) -> int:
     return sum(1 for lyr in result.manifest["layers"] if lyr.get("mediaType") == PACK_MEDIA_TYPE)
 
 
+@MOVES_TO_W12
 def test_chunked_v2_live_roundtrip(tmp_path, cache_dir, logged_in, test_repo, revision, monkeypatch):
     if not resolve_chunked_write_enabled():
         pytest.skip("HIPPIUS_CHUNKED_WRITE not enabled; the chunked-v2 write path is opt-in")
@@ -96,6 +98,7 @@ def test_chunked_v2_live_roundtrip(tmp_path, cache_dir, logged_in, test_repo, re
     assert sha256_of_file(out2) == expected2
 
 
+@MOVES_TO_W12
 def test_chunked_v2_many_packs_ordering(tmp_path, cache_dir, logged_in, test_repo, revision, monkeypatch):
     """Cross-pack ordering + PackAssembler under real fanout, at ~8 MiB of movement.
 
