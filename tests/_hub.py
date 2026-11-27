@@ -21,6 +21,7 @@ MOVES_TO_W12 = pytest.mark.xfail(
     strict=True,
     reason=(
         "Moves to W12: needs a model push, which the hub refuses from this client "
-        "(test_hub_refuses_push.py), or the Harbor API, which does not take a hip_ key"
+        "(test_hub_refuses_push.py), the Harbor API, which does not take a hip_ key, "
+        "or a revision of the e2e repo, which the hub lists only for Harbor imports"
     ),
 )

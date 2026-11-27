@@ -3,7 +3,7 @@
 The localhost test `test_anonymous_download.py` pins the C2 invariants
 (no Authorization header on token-service request, no docker-config
 fallback) against respx. This file is the live counterpart: pulls a
-public file from `test/e2e-client` with `token=False` and asserts the
+public file from the e2e repo with `token=False` and asserts the
 download succeeds.
 
 If the test repo isn't actually public (or the registry rejects the
@@ -46,7 +46,7 @@ def test_token_false_can_pull_public_file(
 
     Uses `logged_in` for the upload — anonymous WRITE is never
     supported. The download then uses `token=False` to verify the
-    anonymous pull path works against `test/e2e-client`. If the repo
+    anonymous pull path works against the e2e repo. If the repo
     is private, the registry returns 401/403 and the test skips with
     a precise diagnostic rather than a generic failure.
     """

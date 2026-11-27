@@ -69,9 +69,10 @@ def test_oci_call_with_garbage_token_fails(tmp_path, monkeypatch, test_repo):
     """A bogus docker-registry token must make a PUSH fail loudly with an auth
     error (401/403) — not a silent success or a hang.
 
-    Why push and not pull: a public repo issues anonymous pull tokens even with
-    garbage credentials (the registry drops the bogus Authorization header and
-    treats the request as anonymous).
+    Why push and not pull: on a public repo the registry issues anonymous pull
+    tokens even with garbage credentials (it drops the bogus Authorization header
+    and treats the request as anonymous), so only a push shows that auth is
+    evaluated whatever the repo's visibility.
     The push scope, however, requires authenticated identity, so the token
     endpoint refuses it for an invalid Basic header. This is the genuine
     "auth is actually evaluated" signal.
@@ -138,8 +139,10 @@ def test_readonly_key_cannot_push(
 
     Weaker while the e2e repo is on the hub: the hub refuses this client's pushes to
     every caller, and learns a new Harbor robot only at its next sync (every 5
-    minutes), so this passes without the role being what refused it. W12 replaces
-    it with a role check of a `hip_` key."""
+    minutes), so this passes without the role being what refused it. The key is
+    also made in the console token's project, not the e2e repo's namespace
+    (`hippius-infra`), so it has no grant there at all. W12 replaces this with a
+    role check of a `hip_` key."""
     import base64
     from hippius_hub import auth
 

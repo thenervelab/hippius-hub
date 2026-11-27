@@ -449,7 +449,7 @@ The smoke suite behaves the opposite way on purpose: missing credentials are a *
 | `HIPPIUS_TEST_USER`          | recommended | e2e            | `hippius-infra`. Any username not starting with `robot$` works: the hub reads only the password. Paired with HIPPIUS_TEST_PASS. |
 | `HIPPIUS_TEST_PASS`          | recommended | e2e            | The `hippius-infra` sub-key, scoped to write on namespace `hippius-infra`. |
 | `HIPPIUS_SMOKE_KEY`          | required    | smoke          | The same `hippius-infra` sub-key as HIPPIUS_TEST_PASS. |
-| `HIPPIUS_TEST_CONSOLE_TOKEN` | recommended | e2e            | console.hippius.com API token for the `veggies-test` account. |
+| `HIPPIUS_TEST_CONSOLE_TOKEN` | recommended | e2e            | console.hippius.com API token for the `veggies-test` account. It stays on that account: the console tests call api.hippius.com, not the registry, and only the registry key moved to `hippius-infra`. |
 | `MATTERMOST_WEBHOOK_URL`     | optional    | smoke          | Where the hourly failure alert is posted. Unset means no notification — the run still goes red in the Actions UI. |
 
 Set them in repo settings under **Settings → Secrets and variables → Actions → Repository secrets**, or via the CLI:

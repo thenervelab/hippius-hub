@@ -114,6 +114,7 @@ def test_hippius_api_implements_phase_a_b_methods():
 
 # ---------- existence checks ----------
 
+@MOVES_TO_W12
 @pytest.mark.e2e
 def test_repo_exists_true_for_test_repo(logged_in, test_repo):
     assert repo_exists(test_repo) is True
@@ -500,9 +501,12 @@ def test_create_repo_exist_ok_returns_repo_url(logged_in, test_repo):
     assert str(url).endswith(test_repo)
 
 
+@MOVES_TO_W12
 @pytest.mark.e2e
 def test_create_repo_exist_ok_false_raises_on_existing(logged_in, test_repo):
-    """The test repo already has a populated 'main' manifest, so this should raise."""
+    """A repo with a populated 'main' manifest exists, so this should raise. The e2e
+    repo lists no manifest to this client (tests/_hub.py), so create_repo sees an
+    empty repo and does not raise."""
     with pytest.raises(HfHubHTTPError):
         create_repo(test_repo, exist_ok=False)
 

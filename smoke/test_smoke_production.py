@@ -128,10 +128,12 @@ def test_05_private_repo_needs_the_key(client_path, smoke_key, private_repo):
     were public, the key would never be checked. The repo lists no revisions to this
     client, keyed or not: it was made through the Hugging Face API, and the hub serves
     over OCI only what the Harbor import kept (module docstring). So the keyed call is
-    checked for being answered, not for its content.
+    checked for being answered without an error, not for its content: no smoke test
+    reads private content with the key, a gap until the client is retired (W12).
     """
     with pytest.raises(hippius_hub.RepositoryNotFoundError):
         hippius_hub.list_repo_refs(private_repo, token=False)
 
-    refs = hippius_hub.list_repo_refs(private_repo, token=smoke_key)
-    assert refs is not None, f"{private_repo}: list_repo_refs with HIPPIUS_SMOKE_KEY returned None"
+    # Raises RepositoryNotFoundError, or an auth error, unless the hub took the key and
+    # its scope can see the repo.
+    hippius_hub.list_repo_refs(private_repo, token=smoke_key)
