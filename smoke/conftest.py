@@ -20,19 +20,12 @@ resolves `hippius_hub` *through* the repo root, so dropping that entry made all
 what actually keeps the two suites apart; this file just refuses to run against
 the wrong client.
 """
-import hashlib
 import os
-import uuid
-from datetime import datetime
-from datetime import timedelta
-from datetime import timezone
 from pathlib import Path
 
 import pytest
 
-import _revisions
 import hippius_hub
-from hippius_hub import auth, console
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 IN_TREE_PACKAGE = REPO_ROOT / "hippius_hub"
@@ -64,13 +57,6 @@ def _assert_published_wheel():
     return installed
 
 
-# Revisions older than this are swept by test_01. Hourly runs each push a fresh
-# ~100 MiB blob (content must be unique per run — see `model_dir`), so without
-# a sweep the test namespace grows ~2.4 GB/day. Six hours keeps the last few
-# runs around for post-mortem inspection.
-REVISION_RETENTION_HOURS = int(os.environ.get("HIPPIUS_SMOKE_RETENTION_HOURS", "6"))
-
-
 @pytest.fixture(scope="session")
 def client_path():
     """Absolute path of the hippius_hub package actually under test."""
@@ -78,136 +64,33 @@ def client_path():
 
 
 @pytest.fixture(scope="session")
-def smoke_repo():
-    """Namespace the smoke run pushes to.
+def smoke_key():
+    """The `hip_` key the private read uses, passed as `token=` the way a user would.
 
-    Defaults to `veggies-test/e2e-client`, the Harbor project that owns
-    `HIPPIUS_TEST_CONSOLE_TOKEN`. The console API deletes only inside the
-    caller's project, so a push into `test/e2e-client` (the e2e robot's
-    project) can never be swept. Smoke revisions are still prefixed `smoke-`.
+    A key and not a login: `hippius-hub login` writes `~/.docker/config.json`, and the
+    suite must not change the runner's (or a developer's) stored credentials.
+
+    Missing is a hard failure, not a skip: a smoke suite that silently skips is
+    indistinguishable from a green one, which is the failure this job exists to catch.
     """
-    return os.environ.get("HIPPIUS_SMOKE_REPO", "veggies-test/e2e-client")
-
-
-@pytest.fixture(scope="session")
-def qualified_repo(smoke_repo):
-    """`<project>/<repo>` as the console API wants it. Identical to `smoke_repo`
-    for a two-segment repo id; kept as its own fixture so a deeper repo path
-    doesn't silently produce a malformed console URL."""
-    project, _, tail = smoke_repo.partition("/")
-    if not tail:
-        pytest.fail(f"HIPPIUS_SMOKE_REPO must be '<project>/<repo>', got {smoke_repo!r}")
-    return f"{project}/{tail}"
-
-
-@pytest.fixture(scope="session")
-def session_revision():
-    return _revisions.build(uuid.uuid4().hex[:6])
-
-
-@pytest.fixture(scope="session")
-def logged_in(client_path, tmp_path_factory, smoke_repo):
-    """Authenticate against the production registry.
-
-    Writes the credential to an ephemeral token file rather than the real
-    `~/.cache/hippius/hub/token`, so running this suite on a workstation
-    doesn't clobber a developer's existing login (same approach as
-    `scripts/bench.py`).
-
-    Missing credentials are a hard failure, not a skip: a smoke suite that
-    silently skips is indistinguishable from a green one, which is exactly the
-    failure mode this job exists to prevent.
-    """
-    # Never HIPPIUS_TEST_*. That robot's project is `test`, and the console
-    # token cannot delete what it pushes.
-    user = os.environ.get("HIPPIUS_SMOKE_USER")
-    password = os.environ.get("HIPPIUS_SMOKE_PASS")
-    token = os.environ.get("HIPPIUS_SMOKE_TOKEN")
-    if not token and not (user and password):
+    key = os.environ.get("HIPPIUS_SMOKE_KEY")
+    if not key:
         raise RuntimeError(
-            f"Smoke repo is {smoke_repo}. Set HIPPIUS_SMOKE_USER + "
-            "HIPPIUS_SMOKE_PASS, or HIPPIUS_SMOKE_TOKEN, to a push robot in "
-            "that Harbor project. Do not use HIPPIUS_TEST_*: that robot is "
-            "scoped to project test, and the console token cannot delete there."
+            "Set HIPPIUS_SMOKE_KEY to a hip_ key that may read the private repo in "
+            "HIPPIUS_SMOKE_PRIVATE_REPO (veggies-test/e2e-client by default), and nothing "
+            "more. README, 'Production smoke tests', says how to make one."
         )
-
-    token_file = tmp_path_factory.mktemp("hippius-smoke") / "token"
-    with pytest.MonkeyPatch.context() as mp:
-        mp.setattr(auth, "TOKEN_PATH", str(token_file))
-        auth.login(username=user, password=password, token=token)
-        yield str(token_file)
+    return key
 
 
 @pytest.fixture(scope="session")
-def console_logged_in(tmp_path_factory):
-    """Persist the console API token to an ephemeral path. Only test_01
-    (revision sweep) needs it — the console API is how a single tag gets
-    deleted without nuking the whole repository."""
-    api_token = os.environ.get("HIPPIUS_TEST_CONSOLE_TOKEN")
-    if not api_token:
-        pytest.skip("HIPPIUS_TEST_CONSOLE_TOKEN not set — cannot sweep old revisions")
-
-    token_file = tmp_path_factory.mktemp("hippius-smoke-console") / "api_token"
-    with pytest.MonkeyPatch.context() as mp:
-        mp.setattr(console, "API_TOKEN_PATH", str(token_file))
-        console.save_api_token(api_token)
-        yield str(token_file)
+def private_repo():
+    """A private repo of ours on the hub, which the key may read and anonymous may not."""
+    return os.environ.get("HIPPIUS_SMOKE_PRIVATE_REPO", "veggies-test/e2e-client")
 
 
-@pytest.fixture(scope="session")
-def retention_cutoff():
-    return datetime.now(timezone.utc) - timedelta(hours=REVISION_RETENTION_HOURS)
-
-
-@pytest.fixture(scope="session")
-def model_size_bytes():
-    return int(os.environ.get("HIPPIUS_SMOKE_MODEL_MB", "100")) * 1024 * 1024
-
-
-@pytest.fixture(scope="session")
-def model_dir(tmp_path_factory, model_size_bytes, session_revision):
-    """A model-shaped folder: a tiny `config.json` plus a ~100 MiB weights file.
-
-    The weights are freshly random every run, never seeded deterministically.
-    Two reasons: (1) OCI blobs are content-addressed, so identical bytes would
-    dedup server-side and the "upload" would become a no-op HEAD — the suite
-    would go green without ever pushing a byte; (2) a fixed seed produces
-    colliding digests across runs, which can wedge permanently against a
-    half-GC'd blob of the same digest.
-
-    Returns (path, {relative_name: sha256}).
-    """
-    root = tmp_path_factory.mktemp("model")
-    (root / "config.json").write_text(
-        '{"model_type": "hippius-smoke", "hidden_size": 4096}\n'
-    )
-
-    weights = root / "model.safetensors"
-    digest = hashlib.sha256()
-    block = 8 * 1024 * 1024
-    remaining = model_size_bytes
-    with open(weights, "wb") as f:
-        while remaining > 0:
-            chunk = os.urandom(min(block, remaining))
-            f.write(chunk)
-            digest.update(chunk)
-            remaining -= len(chunk)
-
-    expected = {
-        "config.json": hashlib.sha256((root / "config.json").read_bytes()).hexdigest(),
-        "model.safetensors": digest.hexdigest(),
-    }
-    print(
-        f"Generated smoke model for {session_revision}: "
-        f"{model_size_bytes / (1024 * 1024):.0f} MiB weights, "
-        f"sha256={expected['model.safetensors'][:12]}..."
-    )
-    return root, expected
-
-
-@pytest.fixture(scope="session")
-def download_cache(tmp_path_factory):
-    """A cold cache per run. Reusing the runner's default cache would let a
-    previously-downloaded blob satisfy the download without a network fetch,
-    turning the read half of the smoke test into a local file check."""
-    return str(tmp_path_factory.mktemp("cache"))
+@pytest.fixture
+def download_cache(tmp_path):
+    """A cold cache per test. A warm one would let a cached blob satisfy the download
+    without a network fetch, turning the read check into a local file check."""
+    return str(tmp_path / "cache")

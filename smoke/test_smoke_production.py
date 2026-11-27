@@ -1,12 +1,16 @@
 """Hourly production smoke suite for the published hippius_hub client.
 
-Answers one question every hour: can a user who just ran `pip install
-hippius_hub` push a 100 MiB model to registry.hippius.com and pull it back
-byte-for-byte? Everything else here exists to make a failure legible.
+Answers one question every hour: can a user who just ran `pip install hippius_hub`
+still read models from registry.hippius.com?
 
-Tests are numbered because they share session state and run in file order:
-the sweep runs first (so a wedged namespace doesn't grow unbounded), then the
-client sanity checks, then upload, then download.
+Since the registry's projects moved from Harbor to the hub (production cutover plan,
+hippius-hub-rust docs/plans/2026-11-18-production-cutover-plan.md, W11), this client's
+reads are the part it keeps: the hub serves them through the same OCI paths. It refuses
+the client's model pushes to a moved project, with a message pointing at huggingface_hub
+(plan D2), so this suite no longer pushes. The hub's own write path is tested by its
+end-to-end suite (hippius-hub-rust crates/hub-e2e), not here.
+
+Every test is read-only and needs no cleanup: they share nothing and run in any order.
 """
 import hashlib
 import shutil
@@ -16,22 +20,15 @@ from pathlib import Path
 
 import pytest
 
-import _revisions
 import hippius_hub
-from hippius_hub import console
 
-
-# How many stale revisions may survive a sweep before we call it broken.
-#
-# The sweep is the one part of this suite that talks to api.hippius.com; every
-# other test is registry-only. That API times out often enough in CI that
-# failing on a single bad DELETE would page the channel most hours and train
-# everyone to ignore it (see the pre-existing `test_artifact_delete` failures
-# in e2e.yml on main). So a transient failure is reported and tolerated, and
-# only a *sustained* one fails: at hourly runs with a 6h retention window,
-# roughly one revision goes stale per run, so a backlog this size means the
-# sweep has been failing for about a day — which is worth waking someone for.
-STALE_BACKLOG_LIMIT = 24
+# A public artifact of ours on the hub (project `hipc-vm-test`, moved in cohort 0), pinned
+# by its manifest digest so a moved tag cannot change what is checked. Read with the
+# published client on 27 November 2026: one 37-byte file.
+PUBLIC_REPO = "hipc-vm-test/hello-artifact"
+PUBLIC_REVISION = "sha256:22461a02a2956ed5a51b281055364445692c1ef2b4c6848de36482ed9f718167"
+PUBLIC_FILE = "artifact.txt"
+PUBLIC_FILE_SHA256 = "26ebdb5222ed0f0dbc06821493ba9824c673d785711e00ead5549b80921347ec"
 
 
 def _sha256_of_file(path) -> str:
@@ -42,87 +39,17 @@ def _sha256_of_file(path) -> str:
     return digest.hexdigest()
 
 
-def test_01_cleanup_old_revisions(
-    logged_in, console_logged_in, smoke_repo, qualified_repo, retention_cutoff
-):
-    """Delete `smoke-*` revisions older than the retention window.
-
-    Each run pushes ~100 MiB of fresh, non-dedupable bytes; without this the
-    namespace grows ~2.4 GB/day. Only revisions whose name parses as one of
-    ours are touched, so e2e revisions in the same repo are never at risk.
-
-    Fails on a sustained backlog, not on one bad DELETE — see
-    STALE_BACKLOG_LIMIT for why.
-    """
-    try:
-        refs = hippius_hub.list_repo_refs(smoke_repo)
-    except hippius_hub.RepositoryNotFoundError:
-        # First run against a brand-new namespace: `upload_folder` creates the
-        # repo, so there is genuinely nothing to sweep yet. Skipping (rather
-        # than failing) keeps the very first run from going red, and still
-        # shows up in the report if the repo later disappears for real.
-        pytest.skip(f"{smoke_repo} does not exist yet — nothing to sweep")
-
-    candidates = [r.name for r in refs.tags] + [b.name for b in refs.branches]
-    stale = [r for r in candidates if (ts := _revisions.parse_timestamp(r)) and ts < retention_cutoff]
-
-    deleted = 0
-    unreachable = []
-    for revision in stale:
-        try:
-            console.delete_artifact(qualified_repo, revision)
-        except console.ConsoleError as e:
-            # 404 = the model indexer never saw this tag, or a previous run
-            # already reaped it. Either way it is not occupying storage.
-            # Anything else (timeout surfaces as status 0, permissions as 403)
-            # leaves the revision in place, so it counts toward the backlog.
-            if e.status_code != 404:
-                unreachable.append(f"{revision} ({e})")
-            continue
-        deleted += 1
-
-    print(
-        f"Cleanup: deleted {deleted}/{len(stale)} stale smoke revisions from "
-        f"{smoke_repo} (older than {retention_cutoff.isoformat()})"
-    )
-    if unreachable:
-        print(f"Cleanup could not delete {len(unreachable)}: " + "; ".join(unreachable))
-
-    # The console API answers 204 when Harbor 404s, so a raised-exception check
-    # cannot see a delete that did not remove the tag.
-    if stale:
-        refs_after = hippius_hub.list_repo_refs(smoke_repo)
-        still_there = {r.name for r in refs_after.tags} | {b.name for b in refs_after.branches}
-        remaining = [r for r in stale if r in still_there]
-        shown = ", ".join(remaining[:20])
-        if len(remaining) > 20:
-            shown += f" (+{len(remaining) - 20} more)"
-        assert not remaining, (
-            f"delete_artifact reported success but {len(remaining)} tag(s) are "
-            f"still listed on {smoke_repo}: {shown}. The console token's Harbor "
-            f"project does not own this repo, or the API swallowed a Harbor 404."
-        )
-
-    assert len(unreachable) < STALE_BACKLOG_LIMIT, (
-        f"{len(unreachable)} stale smoke revisions in {smoke_repo} could not be "
-        f"deleted, past the {STALE_BACKLOG_LIMIT} threshold — the sweep has been "
-        f"failing for roughly a day and the namespace is growing ~100 MiB/hour. "
-        f"Check that the console API is up and that HIPPIUS_TEST_CONSOLE_TOKEN "
-        f"belongs to the Harbor project in {smoke_repo}.\n" + "\n".join(unreachable)
-    )
-
-
-def test_02_published_client_loads(client_path):
+def test_01_published_client_loads(client_path):
     """The wheel under test is the one from PyPI, and its Rust extension
     imports. A broken abi3 wheel (wrong tag, missing .so) fails right here
-    instead of surfacing as a confusing upload error three tests later."""
+    instead of surfacing as a confusing download error later."""
     from hippius_hub import hippius_core
 
     assert hippius_core is not None
     print(f"Testing hippius_hub {hippius_hub.__version__} from {client_path}")
 
 
-def test_03_cli_entrypoint(client_path):
+def test_02_cli_entrypoint(client_path):
     """`hippius-hub --version` runs. The console script is declared in
     pyproject; a packaging change that drops it breaks every user's install
     while the Python API keeps working, so it needs its own check.
@@ -149,86 +76,60 @@ def test_03_cli_entrypoint(client_path):
     )
 
 
-def test_04_whoami(logged_in):
-    """Credentials are accepted by production. Isolating auth from the upload
-    means an expired CI robot secret reads as 'auth failed', not '100 MiB
-    upload failed'."""
-    identity = hippius_hub.whoami()
+def test_03_anonymous_download(client_path, download_cache):
+    """An anonymous user lists and downloads a public file, byte for byte.
 
-    assert identity, "whoami() returned an empty response — authentication against production failed."
-    assert identity.get("name"), (
-        f"whoami() returned no username: {identity!r} — the registry accepted "
-        f"the request but did not identify the caller."
-    )
-    print(f"Authenticated as {identity['name']}")
-
-
-def test_05_upload_model(logged_in, smoke_repo, session_revision, model_dir):
-    """Push the 100 MiB model folder at a fresh revision."""
-    root, _ = model_dir
-
-    commit = hippius_hub.upload_folder(
-        repo_id=smoke_repo,
-        folder_path=str(root),
-        revision=session_revision,
-    )
-
-    assert commit is not None, (
-        "upload_folder returned None — the manifest PUT did not produce a commit."
-    )
-    print(f"Uploaded {smoke_repo}@{session_revision}")
-
-
-def test_06_manifest_lists_uploaded_files(logged_in, smoke_repo, session_revision, model_dir):
-    """The revision's manifest names both files. Catches the case where the
-    blobs land but the manifest is written with a missing or mangled
-    `org.opencontainers.image.title` annotation — the upload looks fine and
-    every subsequent download 404s."""
-    _, expected = model_dir
-
-    listed = set(hippius_hub.list_repo_files(smoke_repo, revision=session_revision))
-
-    missing = set(expected) - listed
-    assert not missing, (
-        f"Manifest for {smoke_repo}@{session_revision} is missing {sorted(missing)} "
-        f"— uploaded blobs are not addressable by filename. Listed: {sorted(listed)}"
-    )
-
-
-def test_07_download_model(logged_in, smoke_repo, session_revision, model_dir, download_cache):
-    """Pull both files back into a cold cache and verify byte-for-byte.
-
-    The hash comparison is the assertion that matters: it proves the whole
-    chunked round-trip (CDC split, pack upload, ranged concurrent GET,
-    reassembly at offset) preserved the bytes, not just that some file of the
-    right length arrived.
+    `token=False` is the client's anonymous mode: it does not fall back to a
+    stored login, so this is what a user with no account gets.
     """
-    _, expected = model_dir
+    files = hippius_hub.list_repo_files(PUBLIC_REPO, revision=PUBLIC_REVISION, token=False)
+    assert files == [PUBLIC_FILE], (
+        f"{PUBLIC_REPO}@{PUBLIC_REVISION} lists {files}, expected [{PUBLIC_FILE!r}]."
+    )
 
-    for filename, want in expected.items():
-        local = hippius_hub.hf_hub_download(
-            repo_id=smoke_repo,
-            filename=filename,
-            revision=session_revision,
-            cache_dir=download_cache,
-        )
-        got = _sha256_of_file(local)
-        assert got == want, (
-            f"Downloaded {filename} from {smoke_repo}@{session_revision} does not "
-            f"match what was uploaded: sha256 {got[:16]}... != {want[:16]}... — "
-            f"the round-trip corrupted or truncated the file."
-        )
-        print(f"Round-tripped {filename} (sha256={want[:12]}...)")
+    local = hippius_hub.hf_hub_download(
+        repo_id=PUBLIC_REPO,
+        filename=PUBLIC_FILE,
+        revision=PUBLIC_REVISION,
+        token=False,
+        cache_dir=download_cache,
+    )
+    got = _sha256_of_file(local)
+    assert got == PUBLIC_FILE_SHA256, (
+        f"Downloaded {PUBLIC_FILE} from {PUBLIC_REPO}@{PUBLIC_REVISION} has sha256 "
+        f"{got[:16]}..., expected {PUBLIC_FILE_SHA256[:16]}... — the registry served "
+        f"different bytes for a pinned digest."
+    )
 
 
-def test_08_missing_file_raises(logged_in, smoke_repo, session_revision, download_cache):
+def test_04_missing_file_raises(client_path, download_cache):
     """A file that isn't in the manifest raises EntryNotFoundError rather than
-    hanging or returning an empty file. Cheap, but it's the difference between
-    a user seeing a clear error and a silently zero-byte model."""
+    hanging or returning an empty file."""
     with pytest.raises(hippius_hub.EntryNotFoundError):
         hippius_hub.hf_hub_download(
-            repo_id=smoke_repo,
+            repo_id=PUBLIC_REPO,
             filename="definitely-not-in-this-revision.bin",
-            revision=session_revision,
+            revision=PUBLIC_REVISION,
+            token=False,
             cache_dir=download_cache,
         )
+
+
+def test_05_private_read_needs_the_key(client_path, smoke_key, private_repo):
+    """A private repo is hidden from anonymous users and readable with a `hip_` key.
+
+    The anonymous half is what makes the keyed half mean something: if the repo
+    were public, the key would never be checked.
+    """
+    with pytest.raises(hippius_hub.RepositoryNotFoundError):
+        hippius_hub.list_repo_refs(private_repo, token=False)
+
+    refs = hippius_hub.list_repo_refs(private_repo, token=smoke_key)
+    revisions = [r.name for r in refs.branches] + [t.name for t in refs.tags]
+    assert revisions, (
+        f"{private_repo} lists no revisions with HIPPIUS_SMOKE_KEY — the key was "
+        f"accepted but the repo is empty, or the key cannot read it."
+    )
+
+    files = hippius_hub.list_repo_files(private_repo, revision=revisions[0], token=smoke_key)
+    assert files, f"{private_repo}@{revisions[0]} lists no files with HIPPIUS_SMOKE_KEY."

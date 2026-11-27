@@ -22,7 +22,7 @@ from typing import Optional
 
 # Report-file stem -> what a reader should understand failed, without opening the run.
 SUITE_LABELS = {
-    "smoke-production": "production round-trip suite (registry.hippius.com)",
+    "smoke-production": "production read suite (registry.hippius.com)",
 }
 
 STAGE_LABELS = {
