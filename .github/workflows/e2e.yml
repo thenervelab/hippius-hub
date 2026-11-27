@@ -112,7 +112,8 @@ jobs:
       # upload/download + re-upload dedup + many-packs ordering. Nothing in
       # production config/deployment changes: packs are ordinary content-addressed
       # blobs in a test namespace. `github.ref` is compared to a literal — no
-      # untrusted input reaches `run:`.
+      # untrusted input reaches `run:`. Both of its tests carry MOVES_TO_W12
+      # (tests/_hub.py) while the hub refuses this client's pushes.
       - name: Chunked-v2 pack-layout e2e (staging only, test namespace)
         if: github.ref == 'refs/heads/staging'
         env:

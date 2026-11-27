@@ -5,6 +5,7 @@ import sys
 import pytest
 
 from hippius_hub.diagnose import _verdict, format_report
+from tests._hub import MOVES_TO_W12
 
 
 HIPPIUS_CLI = [sys.executable, "-m", "hippius_hub.cli"]
@@ -163,6 +164,7 @@ def test_run_diagnose_passes_none_read_timeout_when_env_unset(monkeypatch):
     assert report["repo_id"] == "test/repo"
 
 
+@MOVES_TO_W12
 @pytest.mark.e2e
 def test_cli_diagnose_smoke(tmp_path, test_repo, creds, revision):
     src = tmp_path / "diag.bin"

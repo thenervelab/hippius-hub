@@ -119,7 +119,9 @@ def test_05_private_read_needs_the_key(client_path, smoke_key, private_repo):
     """A private repo is hidden from anonymous users and readable with a `hip_` key.
 
     The anonymous half is what makes the keyed half mean something: if the repo
-    were public, the key would never be checked.
+    were public, the key would never be checked. The repo must stay private and keep at
+    least one revision: it holds the `smoke-*` revisions the old push suite left, imported
+    from Harbor on 20 November 2026, and nothing pushes to it any more.
     """
     with pytest.raises(hippius_hub.RepositoryNotFoundError):
         hippius_hub.list_repo_refs(private_repo, token=False)

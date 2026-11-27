@@ -106,6 +106,7 @@ def test_cli_repos_delete_roundtrip(tmp_path, cli_env, logged_in, test_repo):
     assert repo_exists(repo_id) is False
 
 
+@MOVES_TO_W12
 def test_cli_repos_delete_missing_ok_is_silent(cli_env, test_repo):
     """`--missing-ok` on a never-created repo must exit 0 (HF parity), whereas
     without it the CLI maps Harbor's 404 to exit 11. 403 (no admin) short-

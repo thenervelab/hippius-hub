@@ -134,7 +134,12 @@ def test_readonly_key_cannot_push(
 ):
     """A `role=read` key must be rejected at push time. Validates that the
     role preset actually maps to a Harbor ACL that denies write — without
-    this, the role labels are decorative."""
+    this, the role labels are decorative.
+
+    Weaker while `test` is on the hub: the hub refuses this client's pushes to
+    every caller, and learns a new Harbor robot only at its next sync (every 5
+    minutes), so this passes without the role being what refused it. W12 replaces
+    it with a role check of a `hip_` key."""
     import base64
     from hippius_hub import auth
 

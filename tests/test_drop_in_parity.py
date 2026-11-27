@@ -68,29 +68,34 @@ def parity_seed():
     sess_tok = tempfile.NamedTemporaryFile(delete=False, suffix=".token")
     sess_tok.close()
     auth.TOKEN_PATH = sess_tok.name
-    auth.login(
-        username=os.environ.get("HIPPIUS_TEST_USER"),
-        password=os.environ.get("HIPPIUS_TEST_PASS"),
-        token=os.environ.get("HIPPIUS_TEST_TOKEN"),
-    )
-
     seed_dir = tempfile.mkdtemp(prefix="hippius-parity-")
-    sd = Path(seed_dir)
-    (sd / "config.json").write_text('{"model_type": "test", "vocab_size": 32}\n')
-    (sd / "tokenizer.json").write_text('{"version": "1.0", "model_type": "test"}\n')
+    # The restore runs even when the upload raises, which it does while the hub
+    # refuses this client's pushes (MOVES_TO_W12): otherwise TOKEN_PATH would stay
+    # pointed at the credential file for the rest of the session, and the file
+    # would never be deleted.
+    try:
+        auth.login(
+            username=os.environ.get("HIPPIUS_TEST_USER"),
+            password=os.environ.get("HIPPIUS_TEST_PASS"),
+            token=os.environ.get("HIPPIUS_TEST_TOKEN"),
+        )
 
-    revision = f"parity-{uuid.uuid4().hex[:8]}"
-    upload_folder(repo_id=test_repo, folder_path=str(sd), revision=revision)
+        sd = Path(seed_dir)
+        (sd / "config.json").write_text('{"model_type": "test", "vocab_size": 32}\n')
+        (sd / "tokenizer.json").write_text('{"version": "1.0", "model_type": "test"}\n')
 
-    yield {
-        "repo_id": test_repo,
-        "revision": revision,
-        "known_file": "config.json",
-    }
+        revision = f"parity-{uuid.uuid4().hex[:8]}"
+        upload_folder(repo_id=test_repo, folder_path=str(sd), revision=revision)
 
-    auth.TOKEN_PATH = orig_token_path
-    os.unlink(sess_tok.name)
-    shutil.rmtree(seed_dir, ignore_errors=True)
+        yield {
+            "repo_id": test_repo,
+            "revision": revision,
+            "known_file": "config.json",
+        }
+    finally:
+        auth.TOKEN_PATH = orig_token_path
+        os.unlink(sess_tok.name)
+        shutil.rmtree(seed_dir, ignore_errors=True)
 
 
 @pytest.fixture(params=[pytest.param("hippius", marks=MOVES_TO_W12), "hf"], ids=["hippius", "hf"])

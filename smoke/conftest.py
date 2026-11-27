@@ -67,8 +67,8 @@ def client_path():
 def smoke_key():
     """The `hip_` key the private read uses, passed as `token=` the way a user would.
 
-    A key and not a login: `hippius-hub login` writes `~/.docker/config.json`, and the
-    suite must not change the runner's (or a developer's) stored credentials.
+    A key passed per call and not a login: `hippius-hub login` writes
+    `~/.cache/hippius/hub/token`, and the suite must not change a developer's stored login.
 
     Missing is a hard failure, not a skip: a smoke suite that silently skips is
     indistinguishable from a green one, which is the failure this job exists to catch.

@@ -493,7 +493,6 @@ def test_upload_folder_delete_patterns(tmp_path, logged_in, test_repo, revision)
 
 # ---------- create_repo / delete_repo ----------
 
-@MOVES_TO_W12
 @pytest.mark.e2e
 def test_create_repo_exist_ok_returns_repo_url(logged_in, test_repo):
     url = create_repo(test_repo, exist_ok=True)
@@ -501,7 +500,6 @@ def test_create_repo_exist_ok_returns_repo_url(logged_in, test_repo):
     assert str(url).endswith(test_repo)
 
 
-@MOVES_TO_W12
 @pytest.mark.e2e
 def test_create_repo_exist_ok_false_raises_on_existing(logged_in, test_repo):
     """The test repo already has a populated 'main' manifest, so this should raise."""

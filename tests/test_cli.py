@@ -4,6 +4,8 @@ import sys
 
 import pytest
 
+from tests._hub import MOVES_TO_W12
+
 
 HIPPIUS_CLI = [sys.executable, "-m", "hippius_hub.cli"]
 
@@ -34,6 +36,7 @@ def test_cli_login_writes_token(tmp_path, monkeypatch):
     )
 
 
+@MOVES_TO_W12
 @pytest.mark.e2e
 def test_cli_download_smoke(tmp_path, test_repo, creds, revision):
     src = tmp_path / "cli.bin"
