@@ -14,6 +14,7 @@ registry. These tests assert that:
 import pytest
 
 from hippius_hub import hf_hub_download, hf_hub_url, repo_exists
+from tests._hub import MOVES_TO_W12
 
 
 # `hf_hub_url` is a pure string operation — no network — so it doesn't need
@@ -71,6 +72,7 @@ def test_repo_exists_endpoint_override_routes_to_override(logged_in, test_repo):
         repo_exists(test_repo, endpoint="https://nonexistent.hippius.invalid")
 
 
+@MOVES_TO_W12
 @pytest.mark.e2e
 def test_hf_hub_download_explicit_default_endpoint_still_works(
     tmp_path, cache_dir, logged_in, test_repo, revision,

@@ -304,7 +304,7 @@ Parallel `upload_file` calls to the same `repo_id:revision` are guarded by an `I
 - `HIPPIUS_EXPERIMENTAL_REPO_TYPES` (default off) — set `1`/`true` to allow `repo_type="dataset"` / `"space"`; off by default because those map to shared registry namespaces a customer access key holds no grants on, so the call is refused up front instead of surfacing a misleading "repository not found"
 - `HIPPIUS_HUB_NO_UPDATE_CHECK` (default off) — set `1`/`true` to skip the CLI's "newer version available" check (auto-skipped when `CI` is set)
 - `HIPPIUS_API_URL` (default `https://api.hippius.com`) — console API base for the `registry` + `models` CLI subtrees
-- `HIPPIUS_TEST_REPO` (default `test/e2e-client`) — only used by the e2e test suite
+- `HIPPIUS_TEST_REPO` (default `hippius-infra/e2e-client`) — only used by the e2e test suite
 
 Slow transfers? `hippius-hub diagnose <project>/<repo> <filename> [--verbose] [--json]` runs a phased probe (DNS/TCP/TLS handshake, auth + metadata timing, single-vs-parallel throughput) and prints a shareable verdict. Full runbook in `docs/diagnosing-speed.md`.
 

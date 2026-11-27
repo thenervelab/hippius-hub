@@ -16,11 +16,13 @@ from huggingface_hub import CommitInfo, ModelInfo
 from hippius_hub import HippiusApi
 
 from tests._helpers import sha256_of_file, write_test_file
+from tests._hub import MOVES_TO_W12
 
 
 pytestmark = pytest.mark.e2e
 
 
+@MOVES_TO_W12
 def test_hippius_api_upload_then_download_via_instance(
     tmp_path, cache_dir, logged_in, test_repo, revision,
 ):
@@ -50,6 +52,7 @@ def test_hippius_api_upload_then_download_via_instance(
     assert sha256_of_file(out) == expected
 
 
+@MOVES_TO_W12
 def test_hippius_api_inspection_methods(tmp_path, logged_in, test_repo, revision):
     """list_repo_files / file_exists / model_info via the instance.
     Catches any binding bug where these resolve to the HF base implementation
@@ -73,6 +76,7 @@ def test_hippius_api_inspection_methods(tmp_path, logged_in, test_repo, revision
     assert info.id == test_repo
 
 
+@MOVES_TO_W12
 def test_hippius_api_whoami_via_instance(logged_in):
     """The HF base class has its own whoami; we must override it so the
     call routes to harbor, not huggingface.co."""
@@ -82,6 +86,7 @@ def test_hippius_api_whoami_via_instance(logged_in):
     assert result["type"] == "robot"
 
 
+@MOVES_TO_W12
 def test_hippius_api_upload_file_accepts_binary_io(
     tmp_path, cache_dir, logged_in, test_repo, revision,
 ):

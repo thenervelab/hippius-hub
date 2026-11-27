@@ -4,8 +4,10 @@ from hippius_hub import hippius_hub_upload, hf_hub_download
 from hippius_hub.errors import EntryNotFoundError, RevisionNotFoundError
 
 from tests._helpers import write_test_file
+from tests._hub import MOVES_TO_W12
 
 
+@MOVES_TO_W12
 @pytest.mark.e2e
 def test_missing_filename_raises_EntryNotFoundError(tmp_path, cache_dir, logged_in, test_repo, revision):
     src = tmp_path / "present.bin"

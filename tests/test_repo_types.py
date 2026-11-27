@@ -21,16 +21,17 @@ from hippius_hub import (
 from hippius_hub.file_download import _cache_dirname
 
 from tests._helpers import sha256_of_file, write_test_file
+from tests._hub import MOVES_TO_W12
 
 
 pytestmark = pytest.mark.e2e
 
 
-# (repo_type, default repo_id for that type). The model case keeps the existing
-# test/e2e-client so we re-use the seeded project; dataset/space use the
-# corresponding projects pre-created on the registry.
+# (repo_type, default repo_id for that type). The model case uses the e2e repo
+# (tests/conftest.py, test_repo); dataset/space use the corresponding projects
+# pre-created on the registry.
 _REPO_TYPE_CASES = [
-    ("model", "test/e2e-client"),
+    ("model", "hippius-infra/e2e-client"),
     ("dataset", "e2e/client"),
     ("space", "e2e/client"),
 ]
@@ -46,6 +47,7 @@ def per_type_repo(request, logged_in, monkeypatch):
     return {"repo_type": repo_type, "repo_id": repo_id}
 
 
+@MOVES_TO_W12
 @pytest.mark.parametrize("per_type_repo", _REPO_TYPE_CASES, indirect=True, ids=lambda c: c[0])
 def test_roundtrip_per_repo_type(per_type_repo, tmp_path, cache_dir, revision):
     """upload_file → hf_hub_download produces a byte-identical file for each
@@ -78,6 +80,7 @@ def test_roundtrip_per_repo_type(per_type_repo, tmp_path, cache_dir, revision):
     assert expected_dirname in out
 
 
+@MOVES_TO_W12
 @pytest.mark.parametrize("per_type_repo", _REPO_TYPE_CASES, indirect=True, ids=lambda c: c[0])
 def test_inspection_helpers_per_repo_type(per_type_repo, tmp_path, revision):
     """After uploading one file, list/exists helpers see it for every type."""

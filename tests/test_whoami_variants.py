@@ -14,6 +14,7 @@ import pytest
 from hippius_hub import logout, whoami
 from hippius_hub.auth import get_token
 from hippius_hub.errors import LocalTokenNotFoundError
+from tests._hub import MOVES_TO_W12
 
 
 pytestmark = pytest.mark.e2e
@@ -27,6 +28,7 @@ def test_whoami_token_false_raises_without_network():
         whoami(token=False)
 
 
+@MOVES_TO_W12
 def test_whoami_token_true_uses_saved_token(logged_in):
     """token=True is HF's "use whatever is saved" sentinel; must behave
     identically to the default (None)."""
@@ -34,6 +36,7 @@ def test_whoami_token_true_uses_saved_token(logged_in):
     assert result["name"].startswith("robot$")
 
 
+@MOVES_TO_W12
 def test_whoami_with_raw_token_string(logged_in):
     """A raw token string (no `Bearer ` prefix) must be wrapped as `Bearer`
     internally and reach harbor successfully.
@@ -54,6 +57,7 @@ def test_whoami_with_raw_token_string(logged_in):
     assert result["name"].startswith("robot$")
 
 
+@MOVES_TO_W12
 def test_whoami_with_prewrapped_header(logged_in):
     """A token already in `Bearer <…>` / `Basic <…>` form must be passed
     through without re-wrapping (otherwise we'd get `Bearer Basic …`)."""

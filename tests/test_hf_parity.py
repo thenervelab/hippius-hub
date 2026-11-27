@@ -4,6 +4,7 @@ from pathlib import Path
 import pytest
 
 from tests._helpers import write_test_file
+from tests._hub import MOVES_TO_W12
 
 
 pytestmark = pytest.mark.e2e
@@ -56,6 +57,7 @@ def test_hf_cache_layout_reference(tmp_path):
     _assert_hf_compatible_layout(out, str(cache), HF_REFERENCE_FILE)
 
 
+@MOVES_TO_W12
 @pytest.mark.e2e
 def test_hippius_cache_layout_matches_hf(tmp_path, logged_in, test_repo, revision):
     """Apply the exact same shape assertions to hippius_hub's output."""
@@ -77,6 +79,7 @@ def test_hippius_cache_layout_matches_hf(tmp_path, logged_in, test_repo, revisio
     _assert_hf_compatible_layout(out, str(cache), "parity.bin")
 
 
+@MOVES_TO_W12
 @pytest.mark.e2e
 def test_returned_path_is_inside_snapshots(tmp_path, logged_in, test_repo, revision):
     from hippius_hub import hippius_hub_upload, hf_hub_download
@@ -100,6 +103,7 @@ def test_returned_path_is_inside_snapshots(tmp_path, logged_in, test_repo, revis
     assert rel.parts[-1] == "shape.bin"
 
 
+@MOVES_TO_W12
 @pytest.mark.e2e
 def test_symlink_target_resolves_to_blob(tmp_path, logged_in, test_repo, revision):
     from hippius_hub import hippius_hub_upload, hf_hub_download

@@ -5,11 +5,13 @@ import pytest
 from hippius_hub import hippius_hub_upload, hf_hub_download
 
 from tests._helpers import sha256_of_file, write_test_file
+from tests._hub import MOVES_TO_W12
 
 
 pytestmark = pytest.mark.e2e
 
 
+@MOVES_TO_W12
 def test_single_small_file(tmp_path, cache_dir, logged_in, test_repo, revision):
     src = tmp_path / "small.bin"
     expected = write_test_file(src, 1024, seed=b"small")
@@ -25,6 +27,7 @@ def test_single_small_file(tmp_path, cache_dir, logged_in, test_repo, revision):
     assert sha256_of_file(out) == expected
 
 
+@MOVES_TO_W12
 def test_empty_file(tmp_path, cache_dir, logged_in, test_repo, revision):
     src = tmp_path / "empty.bin"
     src.write_bytes(b"")
@@ -40,6 +43,7 @@ def test_empty_file(tmp_path, cache_dir, logged_in, test_repo, revision):
     assert os.path.getsize(out) == 0
 
 
+@MOVES_TO_W12
 def test_directory_upload(tmp_path, cache_dir, logged_in, test_repo, revision):
     src_dir = tmp_path / "tree"
     src_dir.mkdir()
@@ -62,6 +66,7 @@ def test_directory_upload(tmp_path, cache_dir, logged_in, test_repo, revision):
         assert sha256_of_file(out) == want, f"hash mismatch for {name}"
 
 
+@MOVES_TO_W12
 def test_unicode_filename(tmp_path, cache_dir, logged_in, test_repo, revision):
     src_dir = tmp_path / "uni"
     (src_dir / "café").mkdir(parents=True)
@@ -79,6 +84,7 @@ def test_unicode_filename(tmp_path, cache_dir, logged_in, test_repo, revision):
     assert sha256_of_file(out) == expected
 
 
+@MOVES_TO_W12
 @pytest.mark.parametrize(
     "file_size,chunk_size",
     [
@@ -106,6 +112,7 @@ def test_chunk_size_boundary(tmp_path, cache_dir, logged_in, test_repo, revision
     assert os.path.getsize(out) == file_size
 
 
+@MOVES_TO_W12
 def test_verify_hash_true(tmp_path, cache_dir, logged_in, test_repo, revision, monkeypatch):
     src = tmp_path / "verify.bin"
     expected = write_test_file(src, 64 * 1024, seed=b"verify")
@@ -122,6 +129,7 @@ def test_verify_hash_true(tmp_path, cache_dir, logged_in, test_repo, revision, m
     assert sha256_of_file(out) == expected
 
 
+@MOVES_TO_W12
 def test_verify_hash_false_skips_verify_but_downloads_correctly(
     tmp_path, cache_dir, logged_in, test_repo, revision, monkeypatch,
 ):
@@ -156,6 +164,7 @@ def test_verify_hash_false_skips_verify_but_downloads_correctly(
     assert sha256_of_file(out) == expected
 
 
+@MOVES_TO_W12
 def test_single_large_file(tmp_path, cache_dir, logged_in, test_repo, revision):
     size = 250 * 1024 * 1024
     src = tmp_path / "big.bin"

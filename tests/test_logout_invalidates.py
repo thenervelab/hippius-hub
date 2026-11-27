@@ -13,11 +13,13 @@ from hippius_hub.auth import clear_oci_token_cache
 from hippius_hub.errors import LocalTokenNotFoundError
 
 from tests._helpers import write_test_file
+from tests._hub import MOVES_TO_W12
 
 
 pytestmark = pytest.mark.e2e
 
 
+@MOVES_TO_W12
 def test_whoami_after_logout_raises(logged_in):
     """After logout, whoami() with no args must raise — proves the saved-token
     removal is visible to the auth path."""
@@ -30,6 +32,7 @@ def test_whoami_after_logout_raises(logged_in):
         whoami()
 
 
+@MOVES_TO_W12
 def test_upload_after_logout_requires_fresh_oci_token(tmp_path, logged_in, test_repo, revision):
     """Upload mid-session, then logout + clear the OCI cache, then re-upload:
     the second call must hit the token endpoint without a saved token and fail.

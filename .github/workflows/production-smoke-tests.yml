@@ -1,7 +1,8 @@
 name: production-smoke-tests
 
-# Hourly proof that a user who just ran `pip install hippius_hub` can push a
-# 100 MiB model to registry.hippius.com and pull it back byte-for-byte.
+# Hourly proof that a user who just ran `pip install hippius_hub` can still read
+# models from registry.hippius.com, now served by the hub (smoke/test_smoke_production.py
+# says why the suite no longer pushes).
 #
 # Deliberately distinct from e2e.yml: that workflow builds the working tree
 # (maturin develop) and runs on PRs. This one installs the LATEST PUBLISHED
@@ -21,9 +22,7 @@ jobs:
     name: Smoke Tests (registry.hippius.com)
     runs-on: ubuntu-latest
     timeout-minutes: 30
-    # Never cancel an in-flight run: each run pushes a uniquely-named revision
-    # and sweeps old ones, and a killed run leaves a half-committed manifest
-    # behind. Queueing instead just delays the next hourly check.
+    # Queue rather than cancel: a cancelled run looks like a failure in the history.
     concurrency:
       group: production-smoke-tests
       cancel-in-progress: false
@@ -72,14 +71,7 @@ jobs:
         timeout-minutes: 20
         working-directory: smoke
         env:
-          # Push and delete must share one Harbor project. The console token
-          # can only delete inside veggies-test. HIPPIUS_TEST_* is the e2e
-          # robot for project test and is intentionally not used here.
-          HIPPIUS_SMOKE_REPO: veggies-test/e2e-client
-          HIPPIUS_SMOKE_USER: ${{ secrets.HIPPIUS_SMOKE_USER }}
-          HIPPIUS_SMOKE_PASS: ${{ secrets.HIPPIUS_SMOKE_PASS }}
-          HIPPIUS_SMOKE_TOKEN: ${{ secrets.HIPPIUS_SMOKE_TOKEN }}
-          HIPPIUS_TEST_CONSOLE_TOKEN: ${{ secrets.HIPPIUS_TEST_CONSOLE_TOKEN }}
+          HIPPIUS_SMOKE_KEY: ${{ secrets.HIPPIUS_SMOKE_KEY }}
         run: |
           mkdir -p "$GITHUB_WORKSPACE/reports"
           "$GITHUB_WORKSPACE/.venv/bin/pytest" \

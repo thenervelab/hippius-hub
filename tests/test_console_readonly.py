@@ -110,7 +110,7 @@ def test_list_artifacts_known_repo(console_logged_in, console_test_project, test
     / indexed_at. Resolves the repo as `<active-project>/<repo-tail>` so the test
     works regardless of which CI account is in use."""
     repo_tail = test_repo.split("/", 1)[1] if "/" in test_repo else test_repo
-    # Use the active project — the seeded `test/e2e-client` repo is created
+    # Use the active project — the seeded e2e repo is created
     # under whatever project the CI account owns.
     try:
         rows = console.list_artifacts(f"{console_test_project}/{repo_tail}", page=1, page_size=5)

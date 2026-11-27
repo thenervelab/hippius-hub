@@ -44,11 +44,13 @@ from hippius_hub.errors import ConcurrentManifestUpdateError
 from hippius_hub.file_upload import upload_file
 
 from tests._helpers import write_test_file
+from tests._hub import MOVES_TO_W12
 
 
 pytestmark = pytest.mark.e2e
 
 
+@MOVES_TO_W12
 def test_concurrent_upload_at_same_revision_serializes_or_412s(
     tmp_path, logged_in, test_repo,
 ):

@@ -23,6 +23,7 @@ import huggingface_hub
 import pytest
 
 import hippius_hub
+from tests._hub import MOVES_TO_W12
 
 
 HF_REFERENCE_REPO = "hf-internal-testing/tiny-random-gpt2"
@@ -61,43 +62,52 @@ def parity_seed():
 
     from hippius_hub import auth, upload_folder
 
-    test_repo = os.environ.get("HIPPIUS_TEST_REPO", "test/e2e-client")
+    test_repo = os.environ.get("HIPPIUS_TEST_REPO", "hippius-infra/e2e-client")
 
     orig_token_path = auth.TOKEN_PATH
     sess_tok = tempfile.NamedTemporaryFile(delete=False, suffix=".token")
     sess_tok.close()
     auth.TOKEN_PATH = sess_tok.name
-    auth.login(
-        username=os.environ.get("HIPPIUS_TEST_USER"),
-        password=os.environ.get("HIPPIUS_TEST_PASS"),
-        token=os.environ.get("HIPPIUS_TEST_TOKEN"),
-    )
-
     seed_dir = tempfile.mkdtemp(prefix="hippius-parity-")
-    sd = Path(seed_dir)
-    (sd / "config.json").write_text('{"model_type": "test", "vocab_size": 32}\n')
-    (sd / "tokenizer.json").write_text('{"version": "1.0", "model_type": "test"}\n')
+    # The restore runs even when the upload raises, which it does while the hub
+    # refuses this client's pushes (MOVES_TO_W12): otherwise TOKEN_PATH would stay
+    # pointed at the credential file for the rest of the session, and the file
+    # would never be deleted.
+    try:
+        auth.login(
+            username=os.environ.get("HIPPIUS_TEST_USER"),
+            password=os.environ.get("HIPPIUS_TEST_PASS"),
+            token=os.environ.get("HIPPIUS_TEST_TOKEN"),
+        )
 
-    revision = f"parity-{uuid.uuid4().hex[:8]}"
-    upload_folder(repo_id=test_repo, folder_path=str(sd), revision=revision)
+        sd = Path(seed_dir)
+        (sd / "config.json").write_text('{"model_type": "test", "vocab_size": 32}\n')
+        (sd / "tokenizer.json").write_text('{"version": "1.0", "model_type": "test"}\n')
 
-    yield {
-        "repo_id": test_repo,
-        "revision": revision,
-        "known_file": "config.json",
-    }
+        revision = f"parity-{uuid.uuid4().hex[:8]}"
+        upload_folder(repo_id=test_repo, folder_path=str(sd), revision=revision)
 
-    auth.TOKEN_PATH = orig_token_path
-    os.unlink(sess_tok.name)
-    shutil.rmtree(seed_dir, ignore_errors=True)
+        yield {
+            "repo_id": test_repo,
+            "revision": revision,
+            "known_file": "config.json",
+        }
+    finally:
+        auth.TOKEN_PATH = orig_token_path
+        os.unlink(sess_tok.name)
+        shutil.rmtree(seed_dir, ignore_errors=True)
 
 
-@pytest.fixture(params=["hippius", "hf"], ids=["hippius", "hf"])
-def client(request, parity_seed):
+@pytest.fixture(params=[pytest.param("hippius", marks=MOVES_TO_W12), "hf"], ids=["hippius", "hf"])
+def client(request):
     """Backend under test. Each parametrization yields a module + context
     dict so test bodies are backend-agnostic. The HF parametrization
-    runs even without Hippius creds — it only needs public HF access."""
+    runs even without Hippius creds — it only needs public HF access.
+
+    `parity_seed` is requested only for the hippius parametrization: its upload
+    is what moves to W12, and the HF one must not fail with it."""
     if request.param == "hippius":
+        parity_seed = request.getfixturevalue("parity_seed")
         if parity_seed is None:
             pytest.skip("HIPPIUS_TEST_USER/PASS or HIPPIUS_TEST_TOKEN not set")
         return {

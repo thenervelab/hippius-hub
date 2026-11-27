@@ -343,7 +343,7 @@ Existing code that catches HF's exceptions keeps working.
 | `HIPPIUS_EXPERIMENTAL_REPO_TYPES` | off | Set `1`/`true` to allow `repo_type="dataset"` / `"space"`. Off by default: those map to shared registry namespaces a customer access key holds no grants on, so the call is refused up front instead of failing with a misleading "repository not found" |
 | `HIPPIUS_HUB_NO_UPDATE_CHECK` | off | Set `1`/`true` to skip the CLI's "newer version available" check (auto-skipped when `CI` is set) |
 | `HIPPIUS_API_URL` | `https://api.hippius.com` | Console API base used by the `registry` + `models` CLI subtrees |
-| `HIPPIUS_TEST_REPO` | `test/e2e-client` | Override the test repo used by the e2e suite |
+| `HIPPIUS_TEST_REPO` | `hippius-infra/e2e-client` | Override the test repo used by the e2e suite |
 
 Programmatic overrides via the `endpoint=` kwarg on any function let you point at an alternative Hippius registry.
 
@@ -407,7 +407,9 @@ The CI workflow (`.github/workflows/e2e.yml`) runs fast tests on every PR, the H
 
 ## Production smoke tests
 
-`.github/workflows/production-smoke-tests.yml` runs hourly and answers one question: can somebody who just ran `pip install hippius_hub` push a 100 MiB model to `registry.hippius.com` and pull it back byte-for-byte?
+`.github/workflows/production-smoke-tests.yml` runs hourly and answers one question: can somebody who just ran `pip install hippius_hub` still read models from `registry.hippius.com`?
+
+The registry's projects moved from Harbor to the Hippius Hub, which serves this client's reads and refuses its model pushes with a message that points at `huggingface_hub`. So the suite only reads: a pinned public file, anonymously and byte for byte, and a private repo with a `hip_` key. Nothing is pushed, so nothing needs sweeping.
 
 It is deliberately *not* the e2e suite:
 
@@ -425,59 +427,43 @@ The suite lives in `smoke/`, **not** `tests/`. `tests/` is a Python package whos
 # Run it locally (from inside smoke/, so rootdir resolves correctly)
 pip install -r smoke/requirements.txt
 cd smoke
-HIPPIUS_SMOKE_USER='...' HIPPIUS_SMOKE_PASS='...' HIPPIUS_TEST_CONSOLE_TOKEN='...' HIPPIUS_SMOKE_MODEL_MB=5 pytest -v
+HIPPIUS_SMOKE_KEY='hip_...' pytest -v
 ```
 
 | Env var | Default | Purpose |
 |---|---|---|
-| `HIPPIUS_SMOKE_REPO` | `veggies-test/e2e-client` | Namespace the smoke run pushes to. Must be the console token's Harbor project. `HIPPIUS_TEST_REPO` is the e2e suite only and is not read here. |
-| `HIPPIUS_SMOKE_MODEL_MB` | `100` | Size of the synthetic weights file. Lower it for a quick local run. |
-| `HIPPIUS_SMOKE_RETENTION_HOURS` | `6` | How long `smoke-*` revisions survive before the sweep deletes them. |
+| `HIPPIUS_SMOKE_PRIVATE_REPO` | `hippius-infra/smoke-private` | A private repo the key may read and anonymous users may not. |
 
-Each run pushes **freshly random** bytes at a unique `smoke-<timestamp>-<short>` revision. That's not incidental: stored objects are content-addressed, so re-uploading identical bytes would dedup server-side and the "upload" would become a no-op HEAD — the suite would go green without pushing a byte. The cost of that is ~2.4 GB/day of new data, which is why `test_01` sweeps revisions older than the retention window before anything else runs. Only revisions whose names parse as `smoke-<YYYYmmdd-HHMMSS>-…` are touched. The hourly job pushes to `veggies-test/e2e-client`, not the e2e repo `test/e2e-client`: the console API deletes only inside the token's own Harbor project (`veggies-test`).
+The public file is pinned in `smoke/test_smoke_production.py` by its manifest digest (`hipc-vm-test/hello-artifact`). It stays there, outside `hippius-infra`: the hub serves a model to this client only from the manifests the Harbor import kept, and every `hippius-infra` repo was made through the Hugging Face API.
 
 On failure, `scripts/extract_failure_details.py` (ported from `hippius-s3`, so both smoke suites alert identically) turns the pytest JSON report into a Mattermost message naming the test, a plain-language explanation of the error class, and the traceback frame in our own code.
 
 ## CI secrets
 
-The e2e workflow and the hourly smoke workflow use different registry robots. The `creds` fixture in `tests/conftest.py:34-45` accepts either the USER+PASS pair (Basic Auth) OR the TOKEN (Bearer) path; if both env vars are empty the `_have_creds()` check returns False and every `@pytest.mark.e2e` test skips cleanly. This is deliberate so PRs from **forks** — which never receive secrets under the `pull_request` trigger by GitHub's default — see the offline suite pass and the live suite skip, rather than a confusing fail.
+Both workflows use one `hip_` key, a sub-key of the `hippius-infra` account with write on the `hippius-infra` namespace. The `creds` fixture in `tests/conftest.py:34-45` accepts either the USER+PASS pair (Basic Auth) OR the TOKEN (Bearer) path; if both env vars are empty the `_have_creds()` check returns False and every `@pytest.mark.e2e` test skips cleanly. This is deliberate so PRs from **forks** — which never receive secrets under the `pull_request` trigger by GitHub's default — see the offline suite pass and the live suite skip, rather than a confusing fail.
 
 The smoke suite behaves the opposite way on purpose: missing credentials are a **hard failure**, not a skip. It only ever runs on a cron with secrets available, and a smoke suite that silently skips is indistinguishable from a green one — precisely the failure mode the job exists to prevent.
 
 | Secret name                  | Status      | Used by        | Purpose |
 |------------------------------|-------------|----------------|---------|
-| `HIPPIUS_TEST_USER`          | recommended | e2e            | Username for Basic Auth against registry.hippius.com. Paired with HIPPIUS_TEST_PASS. Robot in Harbor project `test`. |
-| `HIPPIUS_TEST_PASS`          | recommended | e2e            | Registry secret paired with HIPPIUS_TEST_USER. |
-| `HIPPIUS_TEST_TOKEN`         | optional    | e2e            | Bearer token alternative. Useful when rotating to a role-scoped key via `hippius-hub registry keys create --role push`. |
-| `HIPPIUS_SMOKE_USER`         | required    | smoke          | Push robot in Harbor project `veggies-test`, paired with HIPPIUS_SMOKE_PASS. Not the e2e robot. |
-| `HIPPIUS_SMOKE_PASS`         | required    | smoke          | Registry secret paired with HIPPIUS_SMOKE_USER. |
-| `HIPPIUS_SMOKE_TOKEN`        | optional    | smoke          | Bearer alternative to the smoke user/pass pair. |
-| `HIPPIUS_TEST_CONSOLE_TOKEN` | recommended | e2e + smoke    | console.hippius.com API token for the `veggies-test` account. The smoke suite needs it to delete a single old revision; without it `test_01` skips and old `smoke-*` revisions accumulate. |
+| `HIPPIUS_TEST_USER`          | recommended | e2e            | `hippius-infra`. Any username not starting with `robot$` works: the hub reads only the password. Paired with HIPPIUS_TEST_PASS. |
+| `HIPPIUS_TEST_PASS`          | recommended | e2e            | The `hippius-infra` sub-key, scoped to write on namespace `hippius-infra`. |
+| `HIPPIUS_SMOKE_KEY`          | required    | smoke          | The same `hippius-infra` sub-key as HIPPIUS_TEST_PASS. |
+| `HIPPIUS_TEST_CONSOLE_TOKEN` | recommended | e2e            | console.hippius.com API token for the `veggies-test` account. It stays on that account: the console tests call api.hippius.com, not the registry, and only the registry key moved to `hippius-infra`. |
 | `MATTERMOST_WEBHOOK_URL`     | optional    | smoke          | Where the hourly failure alert is posted. Unset means no notification — the run still goes red in the Actions UI. |
 
 Set them in repo settings under **Settings → Secrets and variables → Actions → Repository secrets**, or via the CLI:
 
 ```bash
-gh secret set HIPPIUS_TEST_USER            # the login printed by `registry keys create` (project test)
-gh secret set HIPPIUS_TEST_PASS            # interactive prompt; value won't appear in shell history
-gh secret set HIPPIUS_TEST_TOKEN           # only if using the Bearer path
-gh secret set HIPPIUS_SMOKE_USER           # push robot in Harbor project veggies-test
-gh secret set HIPPIUS_SMOKE_PASS
-gh secret set HIPPIUS_SMOKE_TOKEN          # only if using the Bearer path for smoke
+gh secret set HIPPIUS_TEST_USER            # hippius-infra
+gh secret set HIPPIUS_TEST_PASS            # the hip_ key; interactive prompt, so not in shell history
+gh secret set HIPPIUS_SMOKE_KEY            # the same hippius-infra sub-key
 gh secret set HIPPIUS_TEST_CONSOLE_TOKEN   # console API token for the veggies-test account
 gh secret set MATTERMOST_WEBHOOK_URL       # same webhook hippius-s3 posts its smoke alerts to
 ```
 
-**Scope the e2e credentials to `test/e2e-client` only, and the smoke credentials to `veggies-test/e2e-client` only — never to a production namespace.** That keeps the blast radius of any leak limited to test data. The two robots are different Harbor projects: the console API will not delete a tag outside the token's project. For finer-grained scope, create a role-scoped key:
+**Keep the key scoped to the `hippius-infra` namespace — never a production namespace.** That keeps the blast radius of a leak to test data. It is a sub-key of the `hippius-infra` account, the account CI uses: no other test account is made.
 
-```bash
-# On the workstation where you're already logged in:
-(umask 077; hippius-hub registry keys create ci-e2e --role push --expires-days 90 > key.txt)
-gh secret set HIPPIUS_TEST_PASS < key.txt   # the secret never reaches the terminal
-# Logged into project test: HIPPIUS_TEST_USER / HIPPIUS_TEST_PASS.
-# Logged into project veggies-test: HIPPIUS_SMOKE_USER / HIPPIUS_SMOKE_PASS.
-```
-
-The e2e namespace defaults to `test/e2e-client` (overridable via `HIPPIUS_TEST_REPO`). The hourly smoke namespace defaults to `veggies-test/e2e-client` (overridable via `HIPPIUS_SMOKE_REPO`).
+The e2e repo defaults to `hippius-infra/e2e-client` (overridable via `HIPPIUS_TEST_REPO`), a private repo only the Hippius Hub has. The hub refuses this client's model pushes, and serves its reads only of what the Harbor import kept, so it lists no revision of that repo. Its Harbor API calls fail too: the edge answers a write to a moved project with 410, and Harbor, which still answers the reads, does not know a `hip_` key (`whoami`). `tests/test_hub_refuses_push.py` asserts the refusal; the live tests that need a push or the Harbor API are marked `MOVES_TO_W12` (`tests/_hub.py`), a strict expected failure, until W12 of the hub's cutover plan.
 
 GitHub Actions auto-masks secret values in job logs (they appear as `***`), but a malicious test that explicitly `print()`s a credential could still leak it via the streamed log. Review test changes accordingly.

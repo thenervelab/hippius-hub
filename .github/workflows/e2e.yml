@@ -14,7 +14,7 @@ on:
 
 # Cancel an in-flight e2e run when a PR is force-pushed or when a newer
 # commit lands on the same branch. Without this, two PRs hitting
-# test/e2e-client at the same time can race on the manifest revision
+# the e2e repo at the same time can race on the manifest revision
 # and produce 412s that look like real If-Match regressions but are
 # actually CI-on-CI contention.
 concurrency:
@@ -102,25 +102,24 @@ jobs:
         env:
           HIPPIUS_TEST_USER: ${{ secrets.HIPPIUS_TEST_USER }}
           HIPPIUS_TEST_PASS: ${{ secrets.HIPPIUS_TEST_PASS }}
-          HIPPIUS_TEST_TOKEN: ${{ secrets.HIPPIUS_TEST_TOKEN }}
           HIPPIUS_TEST_CONSOLE_TOKEN: ${{ secrets.HIPPIUS_TEST_CONSOLE_TOKEN }}
         run: .venv/bin/pytest -v
 
-      # Chunked-v2 (pack layout) e2e — STAGING ONLY, against the test/e2e-client
+      # Chunked-v2 (pack layout) e2e — STAGING ONLY, against the e2e repo
       # namespace. Chunked writes are the default from 0.6.0, but this step still
       # sets HIPPIUS_CHUNKED_WRITE=1 explicitly to un-skip the gated live test
       # regardless of the resolver default, exercising the native pack
       # upload/download + re-upload dedup + many-packs ordering. Nothing in
       # production config/deployment changes: packs are ordinary content-addressed
       # blobs in a test namespace. `github.ref` is compared to a literal — no
-      # untrusted input reaches `run:`.
+      # untrusted input reaches `run:`. Both of its tests carry MOVES_TO_W12
+      # (tests/_hub.py) while the hub refuses this client's pushes.
       - name: Chunked-v2 pack-layout e2e (staging only, test namespace)
         if: github.ref == 'refs/heads/staging'
         env:
           HIPPIUS_CHUNKED_WRITE: '1'
           HIPPIUS_TEST_USER: ${{ secrets.HIPPIUS_TEST_USER }}
           HIPPIUS_TEST_PASS: ${{ secrets.HIPPIUS_TEST_PASS }}
-          HIPPIUS_TEST_TOKEN: ${{ secrets.HIPPIUS_TEST_TOKEN }}
         run: .venv/bin/pytest -v tests/test_live_chunked_v2_roundtrip.py
 
       # Expensive suite: on-chain subscribe/cancel, robot rotation,
@@ -136,7 +135,6 @@ jobs:
         env:
           HIPPIUS_TEST_USER: ${{ secrets.HIPPIUS_TEST_USER }}
           HIPPIUS_TEST_PASS: ${{ secrets.HIPPIUS_TEST_PASS }}
-          HIPPIUS_TEST_TOKEN: ${{ secrets.HIPPIUS_TEST_TOKEN }}
           HIPPIUS_TEST_CONSOLE_TOKEN: ${{ secrets.HIPPIUS_TEST_CONSOLE_TOKEN }}
           HIPPIUS_TEST_ALLOW_CHAIN: ${{ secrets.HIPPIUS_TEST_ALLOW_CHAIN }}
           HIPPIUS_TEST_ALLOW_PROD_MUTATION: ${{ secrets.HIPPIUS_TEST_ALLOW_PROD_MUTATION }}

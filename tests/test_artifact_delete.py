@@ -15,11 +15,13 @@ import pytest
 from hippius_hub import hippius_hub_upload, console
 
 from tests._helpers import write_test_file
+from tests._hub import MOVES_TO_W12
 
 
 pytestmark = pytest.mark.e2e
 
 
+@MOVES_TO_W12
 def test_delete_artifact_removes_tag(
     tmp_path, logged_in, console_logged_in, console_test_project, test_repo, revision,
 ):
