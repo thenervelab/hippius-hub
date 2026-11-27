@@ -102,7 +102,6 @@ jobs:
         env:
           HIPPIUS_TEST_USER: ${{ secrets.HIPPIUS_TEST_USER }}
           HIPPIUS_TEST_PASS: ${{ secrets.HIPPIUS_TEST_PASS }}
-          HIPPIUS_TEST_TOKEN: ${{ secrets.HIPPIUS_TEST_TOKEN }}
           HIPPIUS_TEST_CONSOLE_TOKEN: ${{ secrets.HIPPIUS_TEST_CONSOLE_TOKEN }}
         run: .venv/bin/pytest -v
 
@@ -120,7 +119,6 @@ jobs:
           HIPPIUS_CHUNKED_WRITE: '1'
           HIPPIUS_TEST_USER: ${{ secrets.HIPPIUS_TEST_USER }}
           HIPPIUS_TEST_PASS: ${{ secrets.HIPPIUS_TEST_PASS }}
-          HIPPIUS_TEST_TOKEN: ${{ secrets.HIPPIUS_TEST_TOKEN }}
         run: .venv/bin/pytest -v tests/test_live_chunked_v2_roundtrip.py
 
       # Expensive suite: on-chain subscribe/cancel, robot rotation,
@@ -136,7 +134,6 @@ jobs:
         env:
           HIPPIUS_TEST_USER: ${{ secrets.HIPPIUS_TEST_USER }}
           HIPPIUS_TEST_PASS: ${{ secrets.HIPPIUS_TEST_PASS }}
-          HIPPIUS_TEST_TOKEN: ${{ secrets.HIPPIUS_TEST_TOKEN }}
           HIPPIUS_TEST_CONSOLE_TOKEN: ${{ secrets.HIPPIUS_TEST_CONSOLE_TOKEN }}
           HIPPIUS_TEST_ALLOW_CHAIN: ${{ secrets.HIPPIUS_TEST_ALLOW_CHAIN }}
           HIPPIUS_TEST_ALLOW_PROD_MUTATION: ${{ secrets.HIPPIUS_TEST_ALLOW_PROD_MUTATION }}

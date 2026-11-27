@@ -446,9 +446,8 @@ The smoke suite behaves the opposite way on purpose: missing credentials are a *
 
 | Secret name                  | Status      | Used by        | Purpose |
 |------------------------------|-------------|----------------|---------|
-| `HIPPIUS_TEST_USER`          | recommended | e2e            | Username for Basic Auth against registry.hippius.com. Paired with HIPPIUS_TEST_PASS. Robot in Harbor project `test`. |
-| `HIPPIUS_TEST_PASS`          | recommended | e2e            | Registry secret paired with HIPPIUS_TEST_USER. |
-| `HIPPIUS_TEST_TOKEN`         | optional    | e2e            | Bearer token alternative. Useful when rotating to a role-scoped key via `hippius-hub registry keys create --role push`. |
+| `HIPPIUS_TEST_USER`          | recommended | e2e            | Any username (`hippius-hub`): the hub reads only the password. Paired with HIPPIUS_TEST_PASS. |
+| `HIPPIUS_TEST_PASS`          | recommended | e2e            | A `hip_` key of the `hippius-hub` account with read and write on `test`, and nothing else. |
 | `HIPPIUS_SMOKE_KEY`          | required    | smoke          | A `hip_` key (a Hippius access key from console.hippius.com) that may read `veggies-test` and nothing else. |
 | `HIPPIUS_TEST_CONSOLE_TOKEN` | recommended | e2e            | console.hippius.com API token for the `veggies-test` account. |
 | `MATTERMOST_WEBHOOK_URL`     | optional    | smoke          | Where the hourly failure alert is posted. Unset means no notification — the run still goes red in the Actions UI. |
@@ -456,23 +455,15 @@ The smoke suite behaves the opposite way on purpose: missing credentials are a *
 Set them in repo settings under **Settings → Secrets and variables → Actions → Repository secrets**, or via the CLI:
 
 ```bash
-gh secret set HIPPIUS_TEST_USER            # the login printed by `registry keys create` (project test)
-gh secret set HIPPIUS_TEST_PASS            # interactive prompt; value won't appear in shell history
-gh secret set HIPPIUS_TEST_TOKEN           # only if using the Bearer path
+gh secret set HIPPIUS_TEST_USER            # hippius-hub
+gh secret set HIPPIUS_TEST_PASS            # the hip_ key; interactive prompt, so not in shell history
 gh secret set HIPPIUS_SMOKE_KEY            # hip_ key, read on veggies-test only
 gh secret set HIPPIUS_TEST_CONSOLE_TOKEN   # console API token for the veggies-test account
 gh secret set MATTERMOST_WEBHOOK_URL       # same webhook hippius-s3 posts its smoke alerts to
 ```
 
-**Scope the e2e credentials to `test/e2e-client` only, and the smoke key to reading `veggies-test` only — never to a production namespace.** That keeps the blast radius of any leak limited to test data. For finer-grained e2e scope, create a role-scoped key:
+**Scope the e2e key to `test` only, and the smoke key to reading `veggies-test` only — never to a production namespace.** That keeps the blast radius of any leak limited to test data. Both are keys of our `hippius-hub` account, made in the console: no other test account is made for CI.
 
-```bash
-# On the workstation where you're already logged in:
-(umask 077; hippius-hub registry keys create ci-e2e --role push --expires-days 90 > key.txt)
-gh secret set HIPPIUS_TEST_PASS < key.txt   # the secret never reaches the terminal
-# Logged into project test: HIPPIUS_TEST_USER / HIPPIUS_TEST_PASS.
-```
-
-The e2e namespace defaults to `test/e2e-client` (overridable via `HIPPIUS_TEST_REPO`).
+The e2e namespace defaults to `test/e2e-client` (overridable via `HIPPIUS_TEST_REPO`). It is on the Hippius Hub, which serves this client's reads and refuses its model pushes and its Harbor API calls (`whoami`, `create_repo`, `delete_repo`). `tests/test_hub_refuses_push.py` asserts the refusal; the live tests that need a push or the Harbor API are marked `MOVES_TO_W12` (`tests/_hub.py`), a strict expected failure, until W12 of the hub's cutover plan.
 
 GitHub Actions auto-masks secret values in job logs (they appear as `***`), but a malicious test that explicitly `print()`s a credential could still leak it via the streamed log. Review test changes accordingly.
