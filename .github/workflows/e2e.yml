@@ -14,7 +14,7 @@ on:
 
 # Cancel an in-flight e2e run when a PR is force-pushed or when a newer
 # commit lands on the same branch. Without this, two PRs hitting
-# test/e2e-client at the same time can race on the manifest revision
+# the e2e repo at the same time can race on the manifest revision
 # and produce 412s that look like real If-Match regressions but are
 # actually CI-on-CI contention.
 concurrency:
@@ -105,7 +105,7 @@ jobs:
           HIPPIUS_TEST_CONSOLE_TOKEN: ${{ secrets.HIPPIUS_TEST_CONSOLE_TOKEN }}
         run: .venv/bin/pytest -v
 
-      # Chunked-v2 (pack layout) e2e — STAGING ONLY, against the test/e2e-client
+      # Chunked-v2 (pack layout) e2e — STAGING ONLY, against the e2e repo
       # namespace. Chunked writes are the default from 0.6.0, but this step still
       # sets HIPPIUS_CHUNKED_WRITE=1 explicitly to un-skip the gated live test
       # regardless of the resolver default, exercising the native pack

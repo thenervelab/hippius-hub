@@ -69,9 +69,9 @@ def test_oci_call_with_garbage_token_fails(tmp_path, monkeypatch, test_repo):
     """A bogus docker-registry token must make a PUSH fail loudly with an auth
     error (401/403) — not a silent success or a hang.
 
-    Why push and not pull: `test/e2e-client` is a public repo (so anonymous
-    pull tokens are issued even with garbage credentials — the registry just
-    drops the bogus Authorization header and treats the request as anonymous).
+    Why push and not pull: a public repo issues anonymous pull tokens even with
+    garbage credentials (the registry drops the bogus Authorization header and
+    treats the request as anonymous).
     The push scope, however, requires authenticated identity, so the token
     endpoint refuses it for an invalid Basic header. This is the genuine
     "auth is actually evaluated" signal.
@@ -136,7 +136,7 @@ def test_readonly_key_cannot_push(
     role preset actually maps to a Harbor ACL that denies write — without
     this, the role labels are decorative.
 
-    Weaker while `test` is on the hub: the hub refuses this client's pushes to
+    Weaker while the e2e repo is on the hub: the hub refuses this client's pushes to
     every caller, and learns a new Harbor robot only at its next sync (every 5
     minutes), so this passes without the role being what refused it. W12 replaces
     it with a role check of a `hip_` key."""

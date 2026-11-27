@@ -343,7 +343,7 @@ Existing code that catches HF's exceptions keeps working.
 | `HIPPIUS_EXPERIMENTAL_REPO_TYPES` | off | Set `1`/`true` to allow `repo_type="dataset"` / `"space"`. Off by default: those map to shared registry namespaces a customer access key holds no grants on, so the call is refused up front instead of failing with a misleading "repository not found" |
 | `HIPPIUS_HUB_NO_UPDATE_CHECK` | off | Set `1`/`true` to skip the CLI's "newer version available" check (auto-skipped when `CI` is set) |
 | `HIPPIUS_API_URL` | `https://api.hippius.com` | Console API base used by the `registry` + `models` CLI subtrees |
-| `HIPPIUS_TEST_REPO` | `test/e2e-client` | Override the test repo used by the e2e suite |
+| `HIPPIUS_TEST_REPO` | `hippius-infra/e2e-client` | Override the test repo used by the e2e suite |
 
 Programmatic overrides via the `endpoint=` kwarg on any function let you point at an alternative Hippius registry.
 
@@ -432,38 +432,38 @@ HIPPIUS_SMOKE_KEY='hip_...' pytest -v
 
 | Env var | Default | Purpose |
 |---|---|---|
-| `HIPPIUS_SMOKE_PRIVATE_REPO` | `veggies-test/e2e-client` | A private repo the key may read and anonymous users may not. |
+| `HIPPIUS_SMOKE_PRIVATE_REPO` | `hippius-infra/smoke-private` | A private repo the key may read and anonymous users may not. |
 
-The public file is pinned in `smoke/test_smoke_production.py` by its manifest digest (`hipc-vm-test/hello-artifact`).
+The public file is pinned in `smoke/test_smoke_production.py` by its manifest digest (`hipc-vm-test/hello-artifact`). It stays there, outside `hippius-infra`: the hub serves a model to this client only from the manifests the Harbor import kept, and every `hippius-infra` repo was made through the Hugging Face API.
 
 On failure, `scripts/extract_failure_details.py` (ported from `hippius-s3`, so both smoke suites alert identically) turns the pytest JSON report into a Mattermost message naming the test, a plain-language explanation of the error class, and the traceback frame in our own code.
 
 ## CI secrets
 
-Both workflows use `hip_` keys of the `hippius-hub` account. The `creds` fixture in `tests/conftest.py:34-45` accepts either the USER+PASS pair (Basic Auth) OR the TOKEN (Bearer) path; if both env vars are empty the `_have_creds()` check returns False and every `@pytest.mark.e2e` test skips cleanly. This is deliberate so PRs from **forks** — which never receive secrets under the `pull_request` trigger by GitHub's default — see the offline suite pass and the live suite skip, rather than a confusing fail.
+Both workflows use one `hip_` key, a sub-key of the `hippius-infra` account with write on the `hippius-infra` namespace. The `creds` fixture in `tests/conftest.py:34-45` accepts either the USER+PASS pair (Basic Auth) OR the TOKEN (Bearer) path; if both env vars are empty the `_have_creds()` check returns False and every `@pytest.mark.e2e` test skips cleanly. This is deliberate so PRs from **forks** — which never receive secrets under the `pull_request` trigger by GitHub's default — see the offline suite pass and the live suite skip, rather than a confusing fail.
 
 The smoke suite behaves the opposite way on purpose: missing credentials are a **hard failure**, not a skip. It only ever runs on a cron with secrets available, and a smoke suite that silently skips is indistinguishable from a green one — precisely the failure mode the job exists to prevent.
 
 | Secret name                  | Status      | Used by        | Purpose |
 |------------------------------|-------------|----------------|---------|
-| `HIPPIUS_TEST_USER`          | recommended | e2e            | Any username not starting with `robot$` (`hippius-hub`): the hub reads only the password. Paired with HIPPIUS_TEST_PASS. |
-| `HIPPIUS_TEST_PASS`          | recommended | e2e            | A `hip_` key of the `hippius-hub` account with read and write on `test`, and nothing else. |
-| `HIPPIUS_SMOKE_KEY`          | required    | smoke          | A `hip_` key (a Hippius access key from console.hippius.com) that may read `veggies-test` and nothing else. |
+| `HIPPIUS_TEST_USER`          | recommended | e2e            | `hippius-infra`. Any username not starting with `robot$` works: the hub reads only the password. Paired with HIPPIUS_TEST_PASS. |
+| `HIPPIUS_TEST_PASS`          | recommended | e2e            | The `hippius-infra` sub-key, scoped to write on namespace `hippius-infra`. |
+| `HIPPIUS_SMOKE_KEY`          | required    | smoke          | The same `hippius-infra` sub-key as HIPPIUS_TEST_PASS. |
 | `HIPPIUS_TEST_CONSOLE_TOKEN` | recommended | e2e            | console.hippius.com API token for the `veggies-test` account. |
 | `MATTERMOST_WEBHOOK_URL`     | optional    | smoke          | Where the hourly failure alert is posted. Unset means no notification — the run still goes red in the Actions UI. |
 
 Set them in repo settings under **Settings → Secrets and variables → Actions → Repository secrets**, or via the CLI:
 
 ```bash
-gh secret set HIPPIUS_TEST_USER            # hippius-hub
+gh secret set HIPPIUS_TEST_USER            # hippius-infra
 gh secret set HIPPIUS_TEST_PASS            # the hip_ key; interactive prompt, so not in shell history
-gh secret set HIPPIUS_SMOKE_KEY            # hip_ key, read on veggies-test only
+gh secret set HIPPIUS_SMOKE_KEY            # the same hippius-infra sub-key
 gh secret set HIPPIUS_TEST_CONSOLE_TOKEN   # console API token for the veggies-test account
 gh secret set MATTERMOST_WEBHOOK_URL       # same webhook hippius-s3 posts its smoke alerts to
 ```
 
-**Scope the e2e key to `test` only, and the smoke key to reading `veggies-test` only — never to a production namespace.** That keeps the blast radius of any leak limited to test data. Both are keys of our `hippius-hub` account, made in the console: no other test account is made for CI.
+**Keep the key scoped to the `hippius-infra` namespace — never a production namespace.** That keeps the blast radius of a leak to test data. It is a sub-key of the `hippius-infra` account, the account CI uses: no other test account is made.
 
-The e2e namespace defaults to `test/e2e-client` (overridable via `HIPPIUS_TEST_REPO`). It is on the Hippius Hub, which serves this client's reads and refuses its model pushes. Its Harbor API calls fail too: the edge answers a write to a moved project with 410, and Harbor, which still answers the reads, does not know a `hip_` key (`whoami`). `tests/test_hub_refuses_push.py` asserts the refusal; the live tests that need a push or the Harbor API are marked `MOVES_TO_W12` (`tests/_hub.py`), a strict expected failure, until W12 of the hub's cutover plan.
+The e2e repo defaults to `hippius-infra/e2e-client` (overridable via `HIPPIUS_TEST_REPO`), a private repo only the Hippius Hub has. The hub refuses this client's model pushes, and serves its reads only of what the Harbor import kept, so it lists no revision of that repo. Its Harbor API calls fail too: the edge answers a write to a moved project with 410, and Harbor, which still answers the reads, does not know a `hip_` key (`whoami`). `tests/test_hub_refuses_push.py` asserts the refusal; the live tests that need a push or the Harbor API are marked `MOVES_TO_W12` (`tests/_hub.py`), a strict expected failure, until W12 of the hub's cutover plan.
 
 GitHub Actions auto-masks secret values in job logs (they appear as `***`), but a malicious test that explicitly `print()`s a credential could still leak it via the streamed log. Review test changes accordingly.

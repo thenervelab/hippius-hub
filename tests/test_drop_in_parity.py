@@ -62,7 +62,7 @@ def parity_seed():
 
     from hippius_hub import auth, upload_folder
 
-    test_repo = os.environ.get("HIPPIUS_TEST_REPO", "test/e2e-client")
+    test_repo = os.environ.get("HIPPIUS_TEST_REPO", "hippius-infra/e2e-client")
 
     orig_token_path = auth.TOKEN_PATH
     sess_tok = tempfile.NamedTemporaryFile(delete=False, suffix=".token")

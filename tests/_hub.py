@@ -1,9 +1,12 @@
 """What the hub serves this client, for the live tests.
 
-The live tests run against `registry.hippius.com`, whose projects, `test` included, moved
-from Harbor to the Hippius Hub in November 2026 (hippius-hub-rust
-`docs/plans/2026-11-18-production-cutover-plan.md`). The hub serves this client's reads. It
-refuses its model pushes, which `test_hub_refuses_push.py` asserts. The Harbor API
+The live tests run against `registry.hippius.com` in `hippius-infra/e2e-client`, a private
+repo of the `hippius-infra` account, which only the Hippius Hub has (registry.hippius.com's
+projects moved from Harbor to the hub in November 2026: hippius-hub-rust
+`docs/plans/2026-11-18-production-cutover-plan.md`). The hub serves this client's reads only
+of what the Harbor import kept, so it lists no revision of that repo, which was made
+through the Hugging Face API. It refuses this client's model pushes, which
+`test_hub_refuses_push.py` asserts. The Harbor API
 (`/api/v2.0`) is not the hub's: the edge answers a write to a moved project there with 410,
 and reads still go to Harbor, which does not know a `hip_` key, so `whoami` and the deletes of
 `delete_repo` fail. Until W12 of that plan gives this client a way to do those against the

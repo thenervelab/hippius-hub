@@ -531,7 +531,7 @@ def test_upload_file_create_pr_warns_and_proceeds_to_validation(tmp_path):
             upload_file(
                 path_or_fileobj=str(src),
                 path_in_repo="f.bin",
-                repo_id="test/e2e-client",
+                repo_id="hippius-infra/e2e-client",
                 create_pr=True,
                 token=False,
             )
@@ -547,7 +547,7 @@ def test_upload_file_parent_commit_warns(tmp_path):
             upload_file(
                 path_or_fileobj=str(src),
                 path_in_repo="f.bin",
-                repo_id="test/e2e-client",
+                repo_id="hippius-infra/e2e-client",
                 parent_commit="abc123",
                 token=False,
             )
@@ -562,7 +562,7 @@ def test_upload_file_run_as_future_still_raises(tmp_path):
         upload_file(
             path_or_fileobj=str(src),
             path_in_repo="f.bin",
-            repo_id="test/e2e-client",
+            repo_id="hippius-infra/e2e-client",
             run_as_future=True,
             token=False,
         )

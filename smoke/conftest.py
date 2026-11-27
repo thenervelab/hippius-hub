@@ -77,16 +77,17 @@ def smoke_key():
     if not key:
         raise RuntimeError(
             "Set HIPPIUS_SMOKE_KEY to a hip_ key that may read the private repo in "
-            "HIPPIUS_SMOKE_PRIVATE_REPO (veggies-test/e2e-client by default), and nothing "
-            "more. README, 'Production smoke tests', says how to make one."
+            "HIPPIUS_SMOKE_PRIVATE_REPO (hippius-infra/smoke-private by default): a sub-key "
+            "of the hippius-infra account. README, 'CI secrets', says how it is set."
         )
     return key
 
 
 @pytest.fixture(scope="session")
 def private_repo():
-    """A private repo of ours on the hub, which the key may read and anonymous may not."""
-    return os.environ.get("HIPPIUS_SMOKE_PRIVATE_REPO", "veggies-test/e2e-client")
+    """A private repo of ours on the hub, which the key may read and anonymous may not.
+    Made through the Hugging Face API on 27 November 2026 with one file, `private.txt`."""
+    return os.environ.get("HIPPIUS_SMOKE_PRIVATE_REPO", "hippius-infra/smoke-private")
 
 
 @pytest.fixture

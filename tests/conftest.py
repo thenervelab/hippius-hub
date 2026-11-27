@@ -68,7 +68,7 @@ def console_token():
 
 @pytest.fixture(scope="session")
 def test_repo():
-    return os.environ.get("HIPPIUS_TEST_REPO", "test/e2e-client")
+    return os.environ.get("HIPPIUS_TEST_REPO", "hippius-infra/e2e-client")
 
 
 @pytest.fixture

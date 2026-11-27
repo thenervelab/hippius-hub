@@ -27,11 +27,11 @@ from tests._hub import MOVES_TO_W12
 pytestmark = pytest.mark.e2e
 
 
-# (repo_type, default repo_id for that type). The model case keeps the existing
-# test/e2e-client so we re-use the seeded project; dataset/space use the
-# corresponding projects pre-created on the registry.
+# (repo_type, default repo_id for that type). The model case uses the e2e repo
+# (tests/conftest.py, test_repo); dataset/space use the corresponding projects
+# pre-created on the registry.
 _REPO_TYPE_CASES = [
-    ("model", "test/e2e-client"),
+    ("model", "hippius-infra/e2e-client"),
     ("dataset", "e2e/client"),
     ("space", "e2e/client"),
 ]
